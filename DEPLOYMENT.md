@@ -12,8 +12,8 @@ This document outlines the process for building and deploying the Zola-based blo
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/yourrepository.git
-   cd yourrepository
+   git clone https://github.com/unknownue/unknownue.github.io.git
+   cd unknownue.github.io
    ```
 
 2. Start the Zola development server:
@@ -47,7 +47,7 @@ This will generate the static site in the `public` directory.
    git init
    git add .
    git commit -m "Deploy website"
-   git remote add origin https://github.com/yourusername/yourrepository.git
+   git remote add origin https://github.com/unknownue/unknownue.github.io.git
    git push -f origin master:gh-pages
    ```
 
@@ -60,7 +60,7 @@ name: Build and Deploy
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
 
 jobs:
   build:
@@ -68,6 +68,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: true
 
       - name: Build and Deploy
         uses: shalzz/zola-deploy-action@v0.17.2
@@ -76,7 +78,7 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-This workflow will automatically build and deploy your site to the `gh-pages` branch whenever you push to the `main` branch.
+This workflow will automatically build and deploy your site to the `gh-pages` branch whenever you push to the `main` or `master` branch.
 
 ## GitHub Pages Configuration
 
@@ -86,7 +88,7 @@ This workflow will automatically build and deploy your site to the `gh-pages` br
 4. Select the `gh-pages` branch and root directory
 5. Save the settings
 
-Your site will be available at `https://yourusername.github.io/yourrepository/` (or your custom domain if configured).
+Your site will be available at `https://unknownue.github.io` (or your custom domain if configured).
 
 ## Custom Domain (Optional)
 
