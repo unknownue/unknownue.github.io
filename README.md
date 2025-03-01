@@ -1,4 +1,4 @@
-# Personal Blog
+# Unknownue's Blog
 
 This is a personal blog built with [Zola](https://www.getzola.org/), a fast static site generator written in Rust.
 
