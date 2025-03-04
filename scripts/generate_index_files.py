@@ -42,6 +42,7 @@ def create_index_file(dir_path):
     content = f"""+++
 title = "{title}"
 sort_by = "date"
+template = "pull_request.html"
 +++
 """
     
@@ -67,8 +68,25 @@ def ensure_front_matter(md_file_path):
     with open(md_file_path, "r", encoding="utf-8") as f:
         content = f.read()
     
-    # Check if front matter already exists
+    # Check if file already has front matter
     if content.startswith("+++"):
+        # Fix existing front matter if needed
+        front_matter_match = re.match(r'\+\+\+(.*?)\+\+\+', content, re.DOTALL)
+        if front_matter_match:
+            front_matter = front_matter_match.group(1)
+            # Fix draft field if it's a string instead of boolean
+            draft_match = re.search(r'draft\s*=\s*"(true|false)"', front_matter)
+            if draft_match:
+                draft_value = draft_match.group(1)
+                fixed_front_matter = re.sub(
+                    r'draft\s*=\s*"(true|false)"', 
+                    f'draft = {draft_value}', 
+                    front_matter
+                )
+                content = content.replace(front_matter, fixed_front_matter)
+                with open(md_file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f"Fixed front matter in: {md_file_path}")
         return
     
     # Extract information from filename
@@ -97,10 +115,12 @@ def ensure_front_matter(md_file_path):
         # Use current date and time if can't extract from filename
         date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     
-    # Create front matter
+    # Create front matter - note: draft is a boolean, not a string
     front_matter = f"""+++
 title = "{title}"
 date = "{date}"
+draft = false
+template = "pull_request_page.html"
 +++
 
 """
