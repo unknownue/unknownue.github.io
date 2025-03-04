@@ -5,19 +5,17 @@ path = "about"
 
 # About Me
 
-Hello! I'm Unknownue, a software developer and technology enthusiast. This is my personal blog where I share my thoughts, projects, and experiences.
+Hello! I'm a software developer based in China. This blog serves as my portfolio and technical documentation hub.
 
 ## Skills
 
-- Programming Languages: Rust, Python, JavaScript
-- Web Development: HTML, CSS, React
-- Tools: Git, Docker, VS Code
+- Programming Languages: Rust, Python, C++
+- Tools: Git, Docker, Cursor, Neovim
 
 ## Interests
 
 - Open Source Software
 - Machine Learning
 - Game Development
-- Reading
 
 Feel free to connect with me on [GitHub](https://github.com/unknownue)!
