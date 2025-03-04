@@ -63,43 +63,66 @@ def process_directory(dir_path):
         if os.path.isdir(item_path):
             process_directory(item_path)
 
+def get_language_name(lang_code):
+    """Return the full name of a language based on its code"""
+    language_names = {
+        "en": "English",
+        "zh-cn": "中文",
+        "fr": "Français",
+        # Add more languages as needed
+    }
+    return language_names.get(lang_code, lang_code)
+
+def find_language_versions(file_path, pr_number):
+    """Find all language versions of a PR and return them as a dictionary"""
+    dir_path = os.path.dirname(file_path)
+    available_languages = {}
+    
+    # Get all files in the same directory
+    for file in os.listdir(dir_path):
+        if file.endswith(".md") and file != "_index.md":
+            # Look for PR number and language code in filename
+            match = re.search(r'pr_(\d+)(?:_([a-z]{2}(?:-[a-z]{2})?))?_', file)
+            if match and match.group(1) == pr_number:
+                # Extract language code or default to "en"
+                lang_code = match.group(2) if match.group(2) else "en"
+                lang_name = get_language_name(lang_code)
+                
+                # Create relative URL for this language version
+                # Replace underscores with hyphens to match Zola's URL generation rules
+                # Do not include .html suffix as Zola generates clean URLs
+                file_name_without_ext = os.path.splitext(file)[0]
+                file_name_with_hyphens = file_name_without_ext.replace('_', '-')
+                rel_dir_path = os.path.relpath(dir_path, CONTENT_DIR)
+                url = f"/pull_request/{rel_dir_path}/{file_name_with_hyphens}"
+                url = url.replace(os.sep, '/')
+                
+                available_languages[lang_code] = {
+                    "name": lang_name,
+                    "url": url
+                }
+    
+    return available_languages
+
 def ensure_front_matter(md_file_path):
     """Ensure Markdown file has front matter"""
     with open(md_file_path, "r", encoding="utf-8") as f:
         content = f.read()
     
-    # Check if file already has front matter
-    if content.startswith("+++"):
-        # Fix existing front matter if needed
-        front_matter_match = re.match(r'\+\+\+(.*?)\+\+\+', content, re.DOTALL)
-        if front_matter_match:
-            front_matter = front_matter_match.group(1)
-            # Fix draft field if it's a string instead of boolean
-            draft_match = re.search(r'draft\s*=\s*"(true|false)"', front_matter)
-            if draft_match:
-                draft_value = draft_match.group(1)
-                fixed_front_matter = re.sub(
-                    r'draft\s*=\s*"(true|false)"', 
-                    f'draft = {draft_value}', 
-                    front_matter
-                )
-                content = content.replace(front_matter, fixed_front_matter)
-                with open(md_file_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                print(f"Fixed front matter in: {md_file_path}")
-        return
-    
     # Extract information from filename
     filename = os.path.basename(md_file_path)
-    # Look for PR number and datetime in format: pr_18143_zh-cn_20250303_215251.md
-    # This matches PR number and datetime with optional time component
-    match = re.search(r'pr_(\d+).*?(\d{8})(?:_(\d{6}))?', filename)
+    # Look for PR number, language code, and datetime in format: pr_18143_zh-cn_20250303_215251.md
+    match = re.search(r'pr_(\d+)(?:_([a-z]{2}(?:-[a-z]{2})?))?_(\d{8})(?:_(\d{6}))?', filename)
     
     title = "Pull Request"
+    language_code = "en"  # Default language
+    
     if match:
         pr_number = match.group(1)
-        date_str = match.group(2)
-        time_str = match.group(3) if match.group(3) else "000000"  # Default to midnight if no time
+        # Extract language code if present, otherwise default to "en"
+        language_code = match.group(2) if match.group(2) else "en"
+        date_str = match.group(3)
+        time_str = match.group(4) if match.group(4) else "000000"  # Default to midnight if no time
         
         title = f"PR #{pr_number}"
         
@@ -111,12 +134,69 @@ def ensure_front_matter(md_file_path):
         
         # Format date (YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM)
         date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+        
+        # Find other language versions of the same PR
+        available_languages = find_language_versions(md_file_path, pr_number)
+        
+        # Format available languages as TOML table
+        languages_toml = "{"
+        for lang, info in available_languages.items():
+            languages_toml += f'"{lang}" = {{ name = "{info["name"]}", url = "{info["url"]}" }}, '
+        languages_toml = languages_toml.rstrip(", ") + "}"
+        
+        # Determine if this file should be included in search index
+        # Only include English version in search index and PR list
+        in_search_index = language_code == "en"
+        
+        # Check if file already has front matter
+        if content.startswith("+++"):
+            # Extract existing front matter and content
+            front_matter_match = re.match(r'\+\+\+(.*?)\+\+\+', content, re.DOTALL)
+            if front_matter_match:
+                # Extract content after front matter
+                content_after_front_matter = content[front_matter_match.end():]
+                
+                # Create new front matter with language information
+                new_front_matter = f"""+++
+title = "{title}"
+date = "{date}"
+draft = false
+template = "pull_request_page.html"
+in_search_index = {str(in_search_index).lower()}
+
+[extra]
+current_language = "{language_code}"
+available_languages = {languages_toml}
++++
+"""
+                
+                # Update file with new front matter
+                with open(md_file_path, "w", encoding="utf-8") as f:
+                    f.write(new_front_matter + content_after_front_matter)
+                
+                print(f"Updated front matter: {md_file_path}")
+                return
+        
+        # Create front matter with language information
+        front_matter = f"""+++
+title = "{title}"
+date = "{date}"
+draft = false
+template = "pull_request_page.html"
+in_search_index = {str(in_search_index).lower()}
+
+[extra]
+current_language = "{language_code}"
+available_languages = {languages_toml}
++++
+
+"""
     else:
         # Use current date and time if can't extract from filename
         date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    
-    # Create front matter - note: draft is a boolean, not a string
-    front_matter = f"""+++
+        
+        # Create basic front matter without language information
+        front_matter = f"""+++
 title = "{title}"
 date = "{date}"
 draft = false
