@@ -1,7 +1,9 @@
 +++
 title = "Unknownue Blog"
+template = "home.html"
 +++
 
-# Welcome to My Blog
+# Homepage
 
-This is a personal blog built with Zola and the Apollo theme.
+- [Blog Posts](/posts) - Regular blog posts and articles
+- [Pull Requests](/pull_request) - Documentation of pull requests to various projects

@@ -8,6 +8,7 @@ This is a personal blog built with [Zola](https://www.getzola.org/) and the [Apo
 
 - [Zola](https://www.getzola.org/documentation/getting-started/installation/) installed on your system
 - Git
+- Python 3 (for automatic index generation)
 
 ### Installation
 
@@ -24,7 +25,13 @@ This is a personal blog built with [Zola](https://www.getzola.org/) and the [Apo
 
 ### Local Development
 
-To start the development server:
+To start the development server with automatic index generation:
+
+```bash
+./serve.sh
+```
+
+Or, if you prefer to use Zola directly (without automatic index generation):
 
 ```bash
 zola serve
@@ -34,7 +41,13 @@ This will start a local server at `http://127.0.0.1:1111`.
 
 ### Building the Site
 
-To build the site for production:
+To build the site for production with automatic index generation:
+
+```bash
+./build.sh
+```
+
+Or, if you prefer to use Zola directly (without automatic index generation):
 
 ```bash
 zola build
@@ -50,15 +63,19 @@ The output will be in the `public` directory.
 - Math rendering with KaTeX
 - Diagram support with Mermaid
 - Chart visualization with Chart.js
+- Pull request documentation system (see [PULL_REQUEST.md](./PULL_REQUEST.md))
 
 ## Content Structure
 
 - `content/`: Contains all the blog posts and pages
   - `posts/`: Blog posts
+  - `pull_request/`: Pull request documentation (see [PULL_REQUEST.md](./PULL_REQUEST.md))
   - `about/`: About page
 - `static/`: Static files like images, CSS, JavaScript
 - `templates/`: Custom templates (if any)
 - `themes/apollo/`: The Apollo theme
+- `scripts/`: Utility scripts
+  - `generate_index_files.py`: Automatically generates index files for the pull request structure
 
 ## License
 
