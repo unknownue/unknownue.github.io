@@ -82,6 +82,7 @@ def find_language_versions(file_path, pr_number):
     for file in os.listdir(dir_path):
         if file.endswith(".md") and file != "_index.md":
             # Look for PR number and language code in filename
+            # Updated to handle both formats: pr_18143_zh-cn_20250303.md and pr_18143_zh-cn_20250303_215251.md
             match = re.search(r'pr_(\d+)(?:_([a-z]{2}(?:-[a-z]{2})?))?_', file)
             if match and match.group(1) == pr_number:
                 # Extract language code or default to "en"
@@ -112,7 +113,8 @@ def ensure_front_matter(md_file_path):
     # Extract information from filename
     filename = os.path.basename(md_file_path)
     # Look for PR number, language code, and datetime in format: pr_18143_zh-cn_20250303_215251.md
-    match = re.search(r'pr_(\d+)(?:_([a-z]{2}(?:-[a-z]{2})?))?_(\d{8})(?:_(\d{6}))?', filename)
+    # Updated to handle both formats: pr_18143_zh-cn_20250303.md and pr_18143_zh-cn_20250303_215251.md
+    match = re.search(r'pr_(\d+)(?:_([a-z]{2}(?:-[a-z]{2})?))?_(\d{8})(?:_\d{6})?', filename)
     
     title = "Pull Request"
     language_code = "en"  # Default language
@@ -122,7 +124,7 @@ def ensure_front_matter(md_file_path):
         # Extract language code if present, otherwise default to "en"
         language_code = match.group(2) if match.group(2) else "en"
         date_str = match.group(3)
-        time_str = match.group(4) if match.group(4) else "000000"  # Default to midnight if no time
+        # Time part is now optional and ignored for processing
         
         title = f"PR #{pr_number}"
         
@@ -132,8 +134,8 @@ def ensure_front_matter(md_file_path):
         if title_match:
             title = title_match.group(1).strip()
         
-        # Format date (YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM)
-        date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+        # Format date (YYYYMMDD -> YYYY-MM-DD 00:00)
+        date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T00:00:00"
         
         # Find other language versions of the same PR
         available_languages = find_language_versions(md_file_path, pr_number)
@@ -163,7 +165,16 @@ date = "{date}"
 draft = false
 template = "pull_request_page.html"
 in_search_index = {str(in_search_index).lower()}
+"""
 
+                # Add taxonomies for English version to make it show in the list
+                if language_code == "en":
+                    new_front_matter += """
+[taxonomies]
+list_display = ["show"]
+"""
+
+                new_front_matter += f"""
 [extra]
 current_language = "{language_code}"
 available_languages = {languages_toml}
@@ -184,7 +195,16 @@ date = "{date}"
 draft = false
 template = "pull_request_page.html"
 in_search_index = {str(in_search_index).lower()}
+"""
 
+        # Add taxonomies for English version to make it show in the list
+        if language_code == "en":
+            front_matter += """
+[taxonomies]
+list_display = ["show"]
+"""
+
+        front_matter += f"""
 [extra]
 current_language = "{language_code}"
 available_languages = {languages_toml}
