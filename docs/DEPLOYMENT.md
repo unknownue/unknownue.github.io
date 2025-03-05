@@ -117,32 +117,36 @@ The script includes robust error handling and will:
 
 ### Usage
 
-You can run the script manually:
+You can run the script with different options:
 
 ```bash
+# Run once and exit (default behavior)
 ./publish.py
+
+# Explicitly run once and exit
+./publish.py --once
+
+# Run in schedule mode, publishing every 12 hours
+./publish.py --schedule 12
 ```
 
-No command-line arguments are required. The script automatically:
-- Determines its own location and changes to that directory
-- Generates a timestamp for logging and commit messages
-- Handles all Git operations
+The script supports the following command-line arguments:
+- `--once`: Run the publish operation once and exit (this is the default behavior)
+- `--schedule HOURS`: Run in schedule mode, publishing every HOURS hours
+
+When running in schedule mode, the script will:
+- Execute the publishing process immediately
+- Sleep for the specified interval
+- Repeat the process until interrupted (Ctrl+C)
+- Display the next scheduled update time
 
 ### Setting Up Automated Updates
 
-To schedule automatic updates, you can use cron:
+Run the script in schedule mode in a terminal session (consider using tools like `screen` or `tmux` to keep it running):
 
-1. Open your crontab for editing:
-   ```bash
-   crontab -e
-   ```
-
-2. Add a line to schedule the script. For example, to run it daily at 2:00 AM:
-   ```bash
-   0 2 * * * /full/path/to/publish.py >> /full/path/to/publish.log 2>&1
-   ```
-
-3. Save and exit the editor.
+```bash
+./publish.py --schedule 24  # Update every 24 hours
+```
 
 This will automatically update your blog on the specified schedule, triggering the GitHub Pages deployment process.
 
