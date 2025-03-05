@@ -98,6 +98,61 @@ If you want to use a custom domain:
 2. Create a `CNAME` file in the `static` directory of your Zola project with your domain name
 3. Update your DNS settings to point to GitHub Pages
 
+## Automated Blog Updates
+
+The repository includes a `publish.py` script that automates the process of generating index files and pushing changes to the remote repository. This is useful for keeping the blog updated on a regular schedule.
+
+### How It Works
+
+The `publish.py` script performs the following operations:
+1. Executes the Python script to generate index files (`scripts/generate_index_files.py`)
+2. Adds all changes to git
+3. Commits the changes with a timestamp
+4. Pushes the changes to the remote repository
+
+The script includes robust error handling and will:
+- Provide detailed error messages if any command fails
+- Continue execution if there are no changes to commit
+- Exit with appropriate error codes on failure
+
+### Usage
+
+You can run the script manually:
+
+```bash
+./publish.py
+```
+
+No command-line arguments are required. The script automatically:
+- Determines its own location and changes to that directory
+- Generates a timestamp for logging and commit messages
+- Handles all Git operations
+
+### Setting Up Automated Updates
+
+To schedule automatic updates, you can use cron:
+
+1. Open your crontab for editing:
+   ```bash
+   crontab -e
+   ```
+
+2. Add a line to schedule the script. For example, to run it daily at 2:00 AM:
+   ```bash
+   0 2 * * * /full/path/to/publish.py >> /full/path/to/publish.log 2>&1
+   ```
+
+3. Save and exit the editor.
+
+This will automatically update your blog on the specified schedule, triggering the GitHub Pages deployment process.
+
+### Requirements
+
+The script requires:
+- Python 3.6 or newer
+- Git installed and configured with appropriate remote repository access
+- Proper permissions to execute the script (`chmod +x publish.py`)
+
 ## Troubleshooting
 
 - If your site is not displaying correctly, check the GitHub Pages settings and ensure the build process completed successfully
