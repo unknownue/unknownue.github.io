@@ -57,8 +57,20 @@ def publish_blog():
                       "Failed to generate index files. Aborting."):
         return 1
     
+    # Check if there are any changes to commit
+    print("Checking for changes...")
+    status_result = subprocess.run(["git", "status", "--porcelain"], 
+                                  capture_output=True, 
+                                  text=True)
+    
+    # If there are no changes, exit early
+    if not status_result.stdout.strip():
+        print("No changes detected. Skipping commit and push.")
+        print(f"Blog update completed successfully at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        return 0
+    
     # Add all changes to Git
-    print("Adding changes to git...")
+    print("Changes detected. Adding changes to git...")
     if not run_command(["git", "add", "."], 
                       "Failed to add changes to git. Aborting."):
         return 1
