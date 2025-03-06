@@ -158,6 +158,9 @@ def ensure_front_matter(md_file_path):
                 # Extract content after front matter
                 content_after_front_matter = content[front_matter_match.end():]
                 
+                # Remove leading newlines to prevent accumulating empty lines
+                content_after_front_matter = content_after_front_matter.lstrip('\r\n')
+                
                 # Create new front matter with language information
                 new_front_matter = f"""+++
 title = "{title}"
@@ -178,12 +181,15 @@ list_display = ["show"]
 [extra]
 current_language = "{language_code}"
 available_languages = {languages_toml}
-+++
-"""
++++"""
                 
                 # Update file with new front matter
                 with open(md_file_path, "w", encoding="utf-8") as f:
-                    f.write(new_front_matter + content_after_front_matter)
+                    # Ensure exactly one newline between front matter and content
+                    if not content_after_front_matter.startswith('\n') and not content_after_front_matter.startswith('\r\n'):
+                        f.write(new_front_matter + "\n\n" + content_after_front_matter)
+                    else:
+                        f.write(new_front_matter + "\n" + content_after_front_matter)
                 
                 print(f"Updated front matter: {md_file_path}")
                 return
@@ -208,9 +214,7 @@ list_display = ["show"]
 [extra]
 current_language = "{language_code}"
 available_languages = {languages_toml}
-+++
-
-"""
++++"""
     else:
         # Use current date and time if can't extract from filename
         date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -221,13 +225,17 @@ title = "{title}"
 date = "{date}"
 draft = false
 template = "pull_request_page.html"
-+++
-
-"""
++++"""
     
     # Add front matter to file
     with open(md_file_path, "w", encoding="utf-8") as f:
-        f.write(front_matter + content)
+        # Check if content already starts with newlines to avoid duplicate empty lines
+        if content.startswith('\n') or content.startswith('\r\n'):
+            # Content already has leading newlines, so just add front matter
+            f.write(front_matter + "\n" + content.lstrip('\r\n'))
+        else:
+            # No leading newlines in content, add a separator
+            f.write(front_matter + "\n\n" + content)
     
     print(f"Added front matter: {md_file_path}")
 
