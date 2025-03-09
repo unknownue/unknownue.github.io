@@ -116,6 +116,7 @@ def ensure_front_matter(md_file_path):
     # Updated to handle both formats: pr_18143_zh-cn_20250303.md and pr_18143_zh-cn_20250303_215251.md
     match = re.search(r'pr_(\d+)(?:_([a-z]{2}(?:-[a-z]{2})?))?_(\d{8})(?:_\d{6})?', filename)
     
+    # Initialize title with PR number
     title = "Pull Request"
     language_code = "en"  # Default language
     
@@ -126,13 +127,36 @@ def ensure_front_matter(md_file_path):
         date_str = match.group(3)
         # Time part is now optional and ignored for processing
         
-        title = f"PR #{pr_number}"
+        # Initialize title with PR number
+        title = f"#{pr_number}"
         
-        # Try to extract a better title from content
-        # Look for "**标题**:" pattern which contains the PR title in Chinese docs
-        title_match = re.search(r'\*\*标题\*\*:\s*`?(.*?)`?(?:\r?\n|\*\*)', content)
+        # Try multiple patterns to extract a better title from content
+        title_found = False
+        
+        # Pattern 1: Look for "# Title: XXX" at the beginning of the document
+        title_match = re.search(r'# Title: (.*?)(?:\r?\n)', content)
         if title_match:
-            title = title_match.group(1).strip()
+            title = f"#{pr_number} {title_match.group(1).strip()}"
+            title_found = True
+        
+        # Pattern 2: Look for "**Title**: XXX" in the Basic Information section
+        if not title_found:
+            # First try to find the Basic Information section
+            basic_info_match = re.search(r'## Basic Information(.*?)(?:##|\Z)', content, re.DOTALL)
+            if basic_info_match:
+                basic_info_content = basic_info_match.group(1)
+                # Then look for the title within that section
+                title_in_section_match = re.search(r'\*\*Title\*\*: (.*?)(?:\r?\n)', basic_info_content)
+                if title_in_section_match:
+                    title = f"#{pr_number} {title_in_section_match.group(1).strip()}"
+                    title_found = True
+        
+        # Pattern 3: Look for "**标题**: XXX" pattern in Chinese docs
+        if not title_found:
+            title_match = re.search(r'\*\*标题\*\*:\s*`?(.*?)`?(?:\r?\n|\*\*)', content)
+            if title_match:
+                title = f"#{pr_number} {title_match.group(1).strip()}"
+                title_found = True
         
         # Format date (YYYYMMDD -> YYYY-MM-DD 00:00)
         date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T00:00:00"
@@ -239,12 +263,28 @@ template = "pull_request_page.html"
     
     print(f"Added front matter: {md_file_path}")
 
-def process_markdown_files(dir_path):
+def process_markdown_files(dir_path, force_update=False):
     """Process all Markdown files in the directory"""
     for root, _, files in os.walk(dir_path):
         for file in files:
             if file.endswith(".md") and file != "_index.md":
                 md_file_path = os.path.join(root, file)
+                if force_update:
+                    # Force update by reading the file, removing front matter, and then ensuring front matter
+                    with open(md_file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    
+                    # Remove existing front matter if present
+                    if content.startswith("+++"):
+                        front_matter_match = re.match(r'\+\+\+(.*?)\+\+\+', content, re.DOTALL)
+                        if front_matter_match:
+                            content = content[front_matter_match.end():].lstrip('\r\n')
+                            
+                            # Write content without front matter
+                            with open(md_file_path, "w", encoding="utf-8") as f:
+                                f.write(content)
+                
+                # Now ensure front matter (it will be added since we removed it)
                 ensure_front_matter(md_file_path)
 
 def main():
@@ -257,8 +297,8 @@ def main():
     # Process directory structure
     process_directory(CONTENT_DIR)
     
-    # Process Markdown files
-    process_markdown_files(CONTENT_DIR)
+    # Process Markdown files with force update
+    process_markdown_files(CONTENT_DIR, force_update=True)
     
     print("Done!")
 
