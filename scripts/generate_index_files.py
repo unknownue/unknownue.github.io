@@ -261,7 +261,7 @@ template = "pull_request_page.html"
             # No leading newlines in content, add a separator
             f.write(front_matter + "\n\n" + content)
     
-    print(f"Added front matter: {md_file_path}")
+    # print(f"Added front matter: {md_file_path}")
 
 def process_markdown_files(dir_path, force_update=False):
     """Process all Markdown files in the directory"""
