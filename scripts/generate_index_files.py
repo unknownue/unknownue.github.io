@@ -13,6 +13,15 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Target directory to process
 CONTENT_DIR = os.path.join(ROOT_DIR, "content", "pull_request")
 
+def escape_toml_string(s):
+    """Escape special characters in a TOML string"""
+    # Replace backslashes first to avoid double escaping
+    s = s.replace('\\', '\\\\')
+    # Replace double quotes with escaped double quotes
+    s = s.replace('"', '\\"')
+    # Escape other special characters if needed
+    return s
+
 def format_title(dir_name):
     """Format directory name as a title"""
     # Handle year-month format (e.g., 2025-03)
@@ -37,10 +46,12 @@ def create_index_file(dir_path):
     # Get directory name
     dir_name = os.path.basename(dir_path)
     title = format_title(dir_name)
+    # Escape the title for TOML
+    escaped_title = escape_toml_string(title)
     
     # Create _index.md content
     content = f"""+++
-title = "{title}"
+title = "{escaped_title}"
 sort_by = "date"
 template = "pull_request.html"
 +++
@@ -158,6 +169,9 @@ def ensure_front_matter(md_file_path):
                 title = f"#{pr_number} {title_match.group(1).strip()}"
                 title_found = True
         
+        # Escape the title for TOML
+        escaped_title = escape_toml_string(title)
+        
         # Format date (YYYYMMDD -> YYYY-MM-DD 00:00)
         date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T00:00:00"
         
@@ -167,7 +181,9 @@ def ensure_front_matter(md_file_path):
         # Format available languages as TOML table
         languages_toml = "{"
         for lang, info in available_languages.items():
-            languages_toml += f'"{lang}" = {{ name = "{info["name"]}", url = "{info["url"]}" }}, '
+            lang_name = escape_toml_string(info["name"])
+            lang_url = escape_toml_string(info["url"])
+            languages_toml += f'"{lang}" = {{ name = "{lang_name}", url = "{lang_url}" }}, '
         languages_toml = languages_toml.rstrip(", ") + "}"
         
         # Determine if this file should be included in search index
@@ -187,7 +203,7 @@ def ensure_front_matter(md_file_path):
                 
                 # Create new front matter with language information
                 new_front_matter = f"""+++
-title = "{title}"
+title = "{escaped_title}"
 date = "{date}"
 draft = false
 template = "pull_request_page.html"
@@ -220,7 +236,7 @@ available_languages = {languages_toml}
         
         # Create front matter with language information
         front_matter = f"""+++
-title = "{title}"
+title = "{escaped_title}"
 date = "{date}"
 draft = false
 template = "pull_request_page.html"
@@ -243,9 +259,12 @@ available_languages = {languages_toml}
         # Use current date and time if can't extract from filename
         date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         
+        # Escape the title for TOML
+        escaped_title = escape_toml_string(title)
+        
         # Create basic front matter without language information
         front_matter = f"""+++
-title = "{title}"
+title = "{escaped_title}"
 date = "{date}"
 draft = false
 template = "pull_request_page.html"
@@ -302,5 +321,26 @@ def main():
     
     print("Done!")
 
+def test_escape_toml():
+    """Test the TOML string escaping function"""
+    test_cases = [
+        'Normal title',
+        'Title with "quotes"',
+        'Title with both "quotes" and \\backslashes\\',
+        'Multi-line\ntitle',
+        'Title with "embedded "nested" quotes"'
+    ]
+    
+    print("\nTesting TOML string escaping:")
+    for test_case in test_cases:
+        escaped = escape_toml_string(test_case)
+        print(f'Original: "{test_case}"')
+        print(f'Escaped:  "{escaped}"')
+        print(f'TOML:     title = "{escaped}"')
+        print("---")
+
 if __name__ == "__main__":
+    # Uncomment to run tests
+    # test_escape_toml()
+    
     main() 
