@@ -1,76 +1,150 @@
 document.addEventListener('DOMContentLoaded', function() {
-    // Only display button on article pages
-    // Check if this is an article page (has an article element)
-    const isPostPage = document.querySelector('article') !== null;
+    // Check if this is a MD content page (contains article with class md-content-page)
+    const isMdContentPage = document.querySelector('article.md-content-page') !== null;
     
-    if (isPostPage) {
+    // Check if URL suggests this is a MD file
+    const currentUrl = window.location.pathname;
+    const urlSuggestsMdFile = currentUrl.endsWith('.md') || 
+                             currentUrl.includes('/posts/') || 
+                             currentUrl.includes('/pull_request/') || 
+                             (currentUrl.split('/').pop() && !currentUrl.split('/').pop().includes('.'));
+    
+    // Display button only on MD content pages
+    if (isMdContentPage || urlSuggestsMdFile) {
         // Check if patch info element exists
         const patchInfoElement = document.getElementById('patch-info');
         
-        // Extract information from article URL
-        const currentUrl = window.location.pathname;
-        const isArticlePage = currentUrl.includes('/posts/') || currentUrl.includes('/pull_request/');
-        
-        if (patchInfoElement && patchInfoElement.getAttribute('data-patch-exists') === 'true') {
-            // Get patch path from page element
-            const patchRelativePath = patchInfoElement.getAttribute('data-patch-path');
+        if (patchInfoElement) {
+            // Get patch path from page element if available, otherwise use default path strategy
+            let patchRelativePath = patchInfoElement.getAttribute('data-patch-path');
             
-            // Create button without checking file existence
-            createDiffButton(patchRelativePath);
+            // Create Diff button regardless of patch file existence check
+            createDiffButton(patchRelativePath || buildDefaultPatchPath(currentUrl));
             
-            // Still try to check file for debugging, but don't depend on the result
-            if (patchRelativePath) {
+            // Try to find appropriate patch file if path not explicitly specified
+            if (!patchRelativePath) {
+                detectPatchFile(currentUrl);
+            } else {
+                // Still verify the patch file exists
                 checkPatchFile(patchRelativePath);
             }
-        } else if (isArticlePage) {
-            // Fallback mechanism: if no patch info element in page, use URL detection
-            
-            // Extract article name from URL
-            let articlePath = currentUrl;
-            
-            // Remove trailing slash (if any)
-            if (articlePath.endsWith('/')) {
-                articlePath = articlePath.slice(0, -1);
+        } else {
+            // No patch info element, use URL-based detection
+            detectPatchFile(currentUrl);
+        }
+    }
+    
+    // Build default patch path based on current URL
+    function buildDefaultPatchPath(url) {
+        // Remove trailing slash
+        if (url.endsWith('/')) {
+            url = url.slice(0, -1);
+        }
+        
+        // Get the last part of the URL as article name (without .html or .md)
+        const articleName = url.split('/').pop().replace(/\.(html|md)$/, '');
+        
+        // Try to extract PR number if it's a PR page
+        // Example: pr_16427_en_20250319 -> extract 16427
+        if (articleName.startsWith('pr_')) {
+            const parts = articleName.split('_');
+            if (parts.length >= 2) {
+                const prNumber = parts[1];
+                return `/patches/pr_${prNumber}.patch`;
             }
-            
-            // Get the last part of the URL as article name (without .html)
-            const articleName = articlePath.split('/').pop().replace('.html', '');
-            
-            // Build possible paths for patch file
-            // Use array to store all possible path locations
-            const possiblePatchPaths = [
-                `/${articleName}.patch`,                      // /article-name.patch
-                `/posts/${articleName}.patch`,                // /posts/article-name.patch
-                `/content/posts/${articleName}.patch`,        // /content/posts/article-name.patch 
-                `/patches/${articleName}.patch`,              // /patches/article-name.patch
-                `/static/patches/${articleName}.patch`        // /static/patches/article-name.patch
-            ];
-            
-            // Check if patch file exists in any location
-            checkMultiplePatchPaths(possiblePatchPaths, function(patchExists, patchPath) {
-                if (patchExists) {
-                    // Patch file exists, create button
+        }
+        
+        // Return a default path
+        return `/patches/${articleName}.patch`;
+    }
+    
+    // Try to detect the patch file based on URL
+    function detectPatchFile(url) {
+        // Remove trailing slash
+        if (url.endsWith('/')) {
+            url = url.slice(0, -1);
+        }
+        
+        // Get the last part of the URL as article name (without .html or .md)
+        const articleName = url.split('/').pop().replace(/\.(html|md)$/, '');
+        
+        // Try to extract PR number if it's a PR page
+        let prNumber = null;
+        if (articleName.startsWith('pr_')) {
+            const parts = articleName.split('_');
+            if (parts.length >= 2) {
+                prNumber = parts[1];
+            }
+        }
+        
+        // Build possible paths for patch file
+        const possiblePatchPaths = [];
+        
+        if (prNumber) {
+            // If PR number was found, prioritize these paths
+            possiblePatchPaths.push(
+                `/pr_${prNumber}.patch`,
+                `/patches/pr_${prNumber}.patch`,
+                `/pull_request/pr_${prNumber}.patch`,
+                `/content/pull_request/pr_${prNumber}.patch`,
+                `/static/patches/pr_${prNumber}.patch`
+            );
+        }
+        
+        // Add standard paths as fallback
+        possiblePatchPaths.push(
+            `/${articleName}.patch`,                      // /article-name.patch
+            `/posts/${articleName}.patch`,                // /posts/article-name.patch
+            `/content/posts/${articleName}.patch`,        // /content/posts/article-name.patch 
+            `/patches/${articleName}.patch`,              // /patches/article-name.patch
+            `/static/patches/${articleName}.patch`        // /static/patches/article-name.patch
+        );
+        
+        // Check if patch file exists in any location
+        checkMultiplePatchPaths(possiblePatchPaths, function(patchExists, patchPath) {
+            if (patchExists) {
+                // Update the button's patch path if it exists
+                const diffButton = document.querySelector('.diff-button');
+                if (diffButton) {
+                    diffButton.setAttribute('data-patch-path', patchPath);
+                } else {
+                    // Button doesn't exist yet, create it
                     createDiffButton(patchPath);
                 }
-                // If patch file doesn't exist, don't show button
-            });
-        }
+            }
+        });
     }
     
     // Check a single patch file
     function checkPatchFile(patchRelativePath) {
+        // If path already starts with slash, don't add another one
+        const normalizedPath = patchRelativePath.startsWith('/') ? 
+                              patchRelativePath : 
+                              `/${patchRelativePath}`;
+        
         // Build possible full paths
         const possiblePaths = [
-            `/${patchRelativePath}`,
-            `/content/${patchRelativePath}`,
-            `/static/patches/${patchRelativePath.split('/').pop()}`,
-            `/posts/${patchRelativePath.split('/').pop()}`
+            normalizedPath,
+            `/content${normalizedPath}`,
+            `/static/patches/${normalizedPath.split('/').pop()}`
         ];
+        
+        // If it's a PR patch, add PR-specific paths
+        if (normalizedPath.includes('pr_')) {
+            const patchFilename = normalizedPath.split('/').pop();
+            possiblePaths.push(
+                `/patches/${patchFilename}`,
+                `/pull_request/${patchFilename}`
+            );
+        }
         
         checkMultiplePatchPaths(possiblePaths, function(patchExists, patchPath) {
             if (patchExists) {
-                // Patch file exists, create button
-                createDiffButton(patchPath);
+                // Update the button's patch path if it exists
+                const diffButton = document.querySelector('.diff-button');
+                if (diffButton) {
+                    diffButton.setAttribute('data-patch-path', patchPath);
+                }
             }
         });
     }
@@ -102,6 +176,11 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Create Diff button and sidebar
     function createDiffButton(patchPath) {
+        // Don't create button if it already exists
+        if (document.querySelector('.diff-button')) {
+            return;
+        }
+        
         // Create the diff button
         const diffButton = document.createElement('button');
         diffButton.className = 'diff-button';
