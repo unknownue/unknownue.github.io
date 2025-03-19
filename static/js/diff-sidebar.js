@@ -1,54 +1,43 @@
 document.addEventListener('DOMContentLoaded', function() {
-    console.log('Diff sidebar script loaded');
-    
-    // 只在文章页面显示按钮
-    // 检查是否是文章页面（页面上有article元素）
+    // Only display button on article pages
+    // Check if this is an article page (has an article element)
     const isPostPage = document.querySelector('article') !== null;
-    console.log('Is post page:', isPostPage);
     
     if (isPostPage) {
-        // 检查是否存在patch信息元素
+        // Check if patch info element exists
         const patchInfoElement = document.getElementById('patch-info');
         
-        // 从文章URL提取信息
+        // Extract information from article URL
         const currentUrl = window.location.pathname;
         const isArticlePage = currentUrl.includes('/posts/') || currentUrl.includes('/pull_request/');
         
-        console.log('Current URL:', currentUrl);
-        console.log('Patch info element exists:', !!patchInfoElement);
-        
         if (patchInfoElement && patchInfoElement.getAttribute('data-patch-exists') === 'true') {
-            // 从页面元素获取patch路径
+            // Get patch path from page element
             const patchRelativePath = patchInfoElement.getAttribute('data-patch-path');
             
-            console.log('DEBUG: Patch relative path from page element:', patchRelativePath);
-            console.log('DEBUG: 直接创建按钮，不检查文件存在');
-            
-            // 由于检测可能不可靠，我们直接创建按钮
+            // Create button without checking file existence
             createDiffButton(patchRelativePath);
             
-            // 我们仍然尝试检查文件（用于调试），但不依赖检查结果
+            // Still try to check file for debugging, but don't depend on the result
             if (patchRelativePath) {
                 checkPatchFile(patchRelativePath);
             }
         } else if (isArticlePage) {
-            // 回退机制：如果页面中没有patch信息元素，使用URL检测
-            console.log('Using URL-based patch detection');
+            // Fallback mechanism: if no patch info element in page, use URL detection
             
-            // 从URL中提取文章名
+            // Extract article name from URL
             let articlePath = currentUrl;
             
-            // 移除尾部的斜杠（如果有）
+            // Remove trailing slash (if any)
             if (articlePath.endsWith('/')) {
                 articlePath = articlePath.slice(0, -1);
             }
             
-            // 获取URL的最后一部分作为文章名（不包含.html）
+            // Get the last part of the URL as article name (without .html)
             const articleName = articlePath.split('/').pop().replace('.html', '');
-            console.log('Article name from URL:', articleName);
             
-            // 构建patch文件的可能路径
-            // 使用数组存储所有可能的路径位置
+            // Build possible paths for patch file
+            // Use array to store all possible path locations
             const possiblePatchPaths = [
                 `/${articleName}.patch`,                      // /article-name.patch
                 `/posts/${articleName}.patch`,                // /posts/article-name.patch
@@ -57,25 +46,20 @@ document.addEventListener('DOMContentLoaded', function() {
                 `/static/patches/${articleName}.patch`        // /static/patches/article-name.patch
             ];
             
-            console.log('Checking possible patch paths:', possiblePatchPaths);
-            
-            // 检查patch文件是否存在于任一位置
+            // Check if patch file exists in any location
             checkMultiplePatchPaths(possiblePatchPaths, function(patchExists, patchPath) {
-                console.log('Patch exists:', patchExists, 'Path:', patchPath);
                 if (patchExists) {
-                    // Patch文件存在，创建按钮
+                    // Patch file exists, create button
                     createDiffButton(patchPath);
                 }
-                // 如果patch文件不存在，不显示按钮
+                // If patch file doesn't exist, don't show button
             });
         }
     }
     
-    // 检查单个patch文件
+    // Check a single patch file
     function checkPatchFile(patchRelativePath) {
-        console.log('DEBUG: checkPatchFile called with:', patchRelativePath);
-        
-        // 构建可能的完整路径
+        // Build possible full paths
         const possiblePaths = [
             `/${patchRelativePath}`,
             `/content/${patchRelativePath}`,
@@ -83,63 +67,52 @@ document.addEventListener('DOMContentLoaded', function() {
             `/posts/${patchRelativePath.split('/').pop()}`
         ];
         
-        console.log('DEBUG: Checking possible paths for file:', possiblePaths);
-        
         checkMultiplePatchPaths(possiblePaths, function(patchExists, patchPath) {
-            console.log('DEBUG: checkMultiplePatchPaths callback result: exists=', patchExists, 'path=', patchPath);
             if (patchExists) {
-                // Patch文件存在，创建按钮
+                // Patch file exists, create button
                 createDiffButton(patchPath);
-                console.log('DEBUG: 已找到patch文件, 创建按钮:', patchPath);
-            } else {
-                console.log('DEBUG: 未找到patch文件:', patchRelativePath);
             }
         });
     }
     
-    // 检查多个路径中是否存在patch文件
+    // Check multiple paths for patch file existence
     function checkMultiplePatchPaths(paths, callback, index = 0) {
-        // 如果已经检查了所有路径还没找到，则返回不存在
+        // If we've checked all paths and found nothing, return false
         if (index >= paths.length) {
-            console.log('DEBUG: No patch file found after checking all paths');
             callback(false, null);
             return;
         }
         
-        console.log(`DEBUG: Checking path (${index + 1}/${paths.length}):`, paths[index]);
-        
-        // 检查当前路径
+        // Check current path
         fetch(paths[index])
             .then(response => {
-                console.log('DEBUG: Fetch response for', paths[index], ':', response.status, response.ok);
                 if (response.ok) {
-                    // 文件存在，返回
-                    console.log('DEBUG: Patch file found at:', paths[index]);
+                    // File exists, return
                     callback(true, paths[index]);
                 } else {
-                    // 检查下一个路径
-                    console.log('DEBUG: Path not found, trying next one');
+                    // Check next path
                     checkMultiplePatchPaths(paths, callback, index + 1);
                 }
             })
             .catch((error) => {
-                // 发生错误，检查下一个路径
-                console.log('DEBUG: Error fetching', paths[index], ':', error);
+                // Error occurred, check next path
                 checkMultiplePatchPaths(paths, callback, index + 1);
             });
     }
     
-    // 创建Diff按钮和侧边栏
+    // Create Diff button and sidebar
     function createDiffButton(patchPath) {
-        console.log('Creating diff button for path:', patchPath);
-        
         // Create the diff button
         const diffButton = document.createElement('button');
         diffButton.className = 'diff-button';
         diffButton.textContent = 'View Diff';
-        diffButton.title = '查看此文章的差异';
-        diffButton.setAttribute('aria-label', '显示差异侧边栏');
+        diffButton.title = 'View diff for this article';
+        diffButton.setAttribute('aria-label', 'Show diff sidebar');
         diffButton.setAttribute('data-patch-path', patchPath);
+        
+        // Adjust button position to prevent overlap with top bar
+        diffButton.style.top = '80px';
+        
         document.body.appendChild(diffButton);
     
         // Create diff sidebar
@@ -167,14 +140,14 @@ document.addEventListener('DOMContentLoaded', function() {
         const splitViewButton = document.createElement('button');
         splitViewButton.id = 'diff-split-view';
         splitViewButton.className = 'diff-view-button active';
-        splitViewButton.textContent = '并排视图';
-        splitViewButton.title = '切换到并排视图';
+        splitViewButton.textContent = 'Split View';
+        splitViewButton.title = 'Switch to split view';
         
         const unifiedViewButton = document.createElement('button');
         unifiedViewButton.id = 'diff-unified-view';
         unifiedViewButton.className = 'diff-view-button';
-        unifiedViewButton.textContent = '统一视图';
-        unifiedViewButton.title = '切换到统一视图';
+        unifiedViewButton.textContent = 'Unified View';
+        unifiedViewButton.title = 'Switch to unified view';
         
         viewControls.appendChild(splitViewButton);
         viewControls.appendChild(unifiedViewButton);
@@ -185,8 +158,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const closeButton = document.createElement('button');
         closeButton.className = 'diff-close-button';
         closeButton.textContent = '×';
-        closeButton.title = '关闭差异视图';
-        closeButton.setAttribute('aria-label', '关闭差异侧边栏');
+        closeButton.title = 'Close diff view';
+        closeButton.setAttribute('aria-label', 'Close diff sidebar');
         sidebarHeader.appendChild(closeButton);
         
         diffSidebar.appendChild(sidebarHeader);
@@ -204,7 +177,7 @@ document.addEventListener('DOMContentLoaded', function() {
         // Add loading indicator
         const loadingIndicator = document.createElement('div');
         loadingIndicator.className = 'diff-loading';
-        loadingIndicator.innerHTML = '<div class="loader"></div><p>加载差异内容...</p>';
+        loadingIndicator.innerHTML = '<div class="loader"></div><p>Loading diff content...</p>';
         diffContent.appendChild(loadingIndicator);
         
         diffSidebar.appendChild(diffContent);
@@ -218,7 +191,7 @@ document.addEventListener('DOMContentLoaded', function() {
         document.body.appendChild(overlay);
         
         // Initial view mode
-        let currentViewMode = 'side-by-side'; // 默认并排视图
+        let currentViewMode = 'side-by-side'; // Default split view
         let diffInstance = null;
         let patchContent = null;
         
@@ -229,24 +202,25 @@ document.addEventListener('DOMContentLoaded', function() {
             diffSidebar.classList.toggle('open');
             overlay.classList.toggle('open');
             
-            // 更新按钮文本
+            // Update button text
             if (diffSidebar.classList.contains('open')) {
                 diffButton.textContent = 'Hide Diff';
                 document.body.style.overflow = 'hidden';
                 
-                // 加载patch内容（如果是首次打开）
+                // Load patch content (if first time opening)
                 if (isOpening && !patchContent) {
                     loadPatchContent(patchPath);
                 }
             } else {
                 diffButton.textContent = 'View Diff';
                 document.body.style.overflow = '';
+                // Reset sidebar width, ensure complete hiding when closed
+                diffSidebar.style.width = '90%';
             }
         }
         
-        // 加载Patch文件内容
+        // Load Patch file content
         function loadPatchContent(url) {
-            console.log('Loading patch content from:', url);
             loadingIndicator.style.display = 'block';
             diffContainer.style.display = 'none';
             
@@ -259,14 +233,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 })
                 .then(text => {
                     patchContent = text;
-                    console.log('Patch content loaded, length:', patchContent.length);
                     renderDiff(patchContent, currentViewMode);
                 })
                 .catch(error => {
-                    console.error('Error loading patch file:', error);
                     diffContainer.innerHTML = `
                         <div class="diff-error">
-                            <h3>加载差异文件失败</h3>
+                            <h3>Failed to load diff file</h3>
                             <p>${error.message}</p>
                         </div>
                     `;
@@ -275,15 +247,13 @@ document.addEventListener('DOMContentLoaded', function() {
                 });
         }
         
-        // 使用diff2html渲染差异内容
+        // Render diff content using diff2html
         function renderDiff(diffText, outputFormat) {
-            console.log('Rendering diff with format:', outputFormat);
-            
-            // 清空之前的内容
+            // Clear previous content
             diffContainer.innerHTML = '';
             
             try {
-                // 创建diff2html配置
+                // Create diff2html configuration
                 const configuration = {
                     drawFileList: true,
                     matching: 'lines',
@@ -292,11 +262,11 @@ document.addEventListener('DOMContentLoaded', function() {
                     renderNothingWhenEmpty: true
                 };
                 
-                // 初始化diff2html UI
+                // Initialize diff2html UI
                 diffInstance = new Diff2HtmlUI(diffContainer, diffText, configuration);
                 diffInstance.draw();
                 
-                // 设置容器的类，区分统一视图和并排视图
+                // Set container class to distinguish unified and split views
                 diffContainer.classList.remove('d2h-inline-file', 'side-by-side-file-diff');
                 if (outputFormat === 'line-by-line') {
                     diffContainer.classList.add('d2h-inline-file');
@@ -304,17 +274,16 @@ document.addEventListener('DOMContentLoaded', function() {
                     diffContainer.classList.add('side-by-side-file-diff');
                 }
                 
-                // 应用自定义样式和高亮
+                // Apply custom styling and highlighting
                 setTimeout(applyCustomHighlighting, 100);
                 
-                // 隐藏加载指示器
+                // Hide loading indicator
                 loadingIndicator.style.display = 'none';
                 diffContainer.style.display = 'block';
             } catch (error) {
-                console.error('Error rendering diff:', error);
                 diffContainer.innerHTML = `
                     <div class="diff-error">
-                        <h3>渲染差异内容失败</h3>
+                        <h3>Failed to render diff content</h3>
                         <p>${error.message}</p>
                     </div>
                 `;
@@ -323,24 +292,24 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         }
         
-        // 应用自定义语法高亮
+        // Apply custom syntax highlighting
         function applyCustomHighlighting() {
             const codeContainers = document.querySelectorAll('#diff-container .d2h-code-line-ctn');
             
             codeContainers.forEach(function(container) {
                 let html = container.innerHTML;
                 
-                // 跳过已高亮的内容
+                // Skip already highlighted content
                 if (html.includes('class="hljs') || html.includes('class="deleted"') || html.includes('class="added"')) {
                     return;
                 }
                 
-                // 检测当前文件类型
+                // Detect current file type
                 const fileElem = container.closest('.d2h-file-wrapper');
                 const fileName = fileElem ? fileElem.querySelector('.d2h-file-name').textContent.trim() : '';
                 const fileExt = fileName.split('.').pop().toLowerCase();
                 
-                // 为不同文件类型应用不同的高亮规则
+                // Apply different highlighting rules for different file types
                 if (container.innerHTML.startsWith('+')) {
                     html = html.replace(/^(\+)(.*)$/, '$1<span class="added">$2</span>');
                 } else if (container.innerHTML.startsWith('-')) {
@@ -351,14 +320,14 @@ document.addEventListener('DOMContentLoaded', function() {
             });
         }
         
-        // 视图切换按钮事件
+        // View switching button events
         splitViewButton.addEventListener('click', function() {
             if (currentViewMode !== 'side-by-side') {
                 splitViewButton.classList.add('active');
                 unifiedViewButton.classList.remove('active');
                 currentViewMode = 'side-by-side';
                 
-                // 立即更新容器类名
+                // Immediately update container class
                 diffContainer.classList.remove('d2h-inline-file');
                 diffContainer.classList.add('side-by-side-file-diff');
                 
@@ -374,7 +343,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 splitViewButton.classList.remove('active');
                 currentViewMode = 'line-by-line';
                 
-                // 立即更新容器类名
+                // Immediately update container class
                 diffContainer.classList.add('d2h-inline-file');
                 diffContainer.classList.remove('side-by-side-file-diff');
                 
@@ -389,7 +358,7 @@ document.addEventListener('DOMContentLoaded', function() {
         closeButton.addEventListener('click', toggleSidebar);
         overlay.addEventListener('click', toggleSidebar);
         
-        // 添加手动调整大小功能
+        // Add manual resize functionality
         let isResizing = false;
         let startX, startWidth;
         
@@ -398,20 +367,20 @@ document.addEventListener('DOMContentLoaded', function() {
             startX = e.clientX;
             startWidth = parseInt(window.getComputedStyle(diffSidebar).width, 10);
             document.documentElement.style.cursor = 'ew-resize';
-            diffSidebar.classList.add('resizing'); // 添加调整大小的类
+            diffSidebar.classList.add('resizing'); // Add resizing class
             e.preventDefault();
         });
         
         document.addEventListener('mousemove', function(e) {
             if (!isResizing) return;
             const width = startWidth + (e.clientX - startX);
-            // 设置最小和最大宽度限制
+            // Set minimum and maximum width limits
             if (width > 300 && width < window.innerWidth * 0.98) {
                 diffSidebar.style.width = width + 'px';
                 
-                // 实时更新内容布局
+                // Update content layout in real-time
                 if (diffInstance) {
-                    // 调整DOM元素的大小，使其符合新的容器宽度
+                    // Adjust DOM element sizes to match new container width
                     const diffContainerElements = diffContainer.querySelectorAll('.d2h-file-diff');
                     diffContainerElements.forEach(el => {
                         el.style.width = '100%';
@@ -424,19 +393,19 @@ document.addEventListener('DOMContentLoaded', function() {
             if (isResizing) {
                 isResizing = false;
                 document.documentElement.style.cursor = '';
-                diffSidebar.classList.remove('resizing'); // 移除调整大小的类
+                diffSidebar.classList.remove('resizing'); // Remove resizing class
             }
         });
         
-        // 键盘事件处理
+        // Keyboard event handling
         document.addEventListener('keydown', function(e) {
-            // 当按ESC键时关闭侧边栏
+            // Close sidebar when ESC key is pressed
             if (e.key === 'Escape' && diffSidebar.classList.contains('open')) {
                 toggleSidebar();
             }
         });
         
-        // 添加触摸事件支持
+        // Add touch event support
         resizeHandle.addEventListener('touchstart', function(e) {
             if (e.touches.length === 1) {
                 isResizing = true;
@@ -453,7 +422,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (width > 300 && width < window.innerWidth * 0.98) {
                 diffSidebar.style.width = width + 'px';
                 
-                // 实时更新内容布局
+                // Update content layout in real-time
                 if (diffInstance) {
                     const diffContainerElements = diffContainer.querySelectorAll('.d2h-file-diff');
                     diffContainerElements.forEach(el => {
@@ -461,7 +430,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     });
                 }
             }
-            e.preventDefault(); // 防止页面滚动
+            e.preventDefault(); // Prevent page scrolling
         });
         
         document.addEventListener('touchend', function() {
