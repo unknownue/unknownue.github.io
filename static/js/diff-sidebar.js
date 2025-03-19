@@ -21,10 +21,14 @@ document.addEventListener('DOMContentLoaded', function() {
             // 从页面元素获取patch路径
             const patchRelativePath = patchInfoElement.getAttribute('data-patch-path');
             
-            console.log('Patch relative path from page element:', patchRelativePath);
+            console.log('DEBUG: Patch relative path from page element:', patchRelativePath);
+            console.log('DEBUG: 直接创建按钮，不检查文件存在');
             
+            // 由于检测可能不可靠，我们直接创建按钮
+            createDiffButton(patchRelativePath);
+            
+            // 我们仍然尝试检查文件（用于调试），但不依赖检查结果
             if (patchRelativePath) {
-                // 检查patch文件是否存在
                 checkPatchFile(patchRelativePath);
             }
         } else if (isArticlePage) {
@@ -69,6 +73,8 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 检查单个patch文件
     function checkPatchFile(patchRelativePath) {
+        console.log('DEBUG: checkPatchFile called with:', patchRelativePath);
+        
         // 构建可能的完整路径
         const possiblePaths = [
             `/${patchRelativePath}`,
@@ -77,15 +83,16 @@ document.addEventListener('DOMContentLoaded', function() {
             `/posts/${patchRelativePath.split('/').pop()}`
         ];
         
-        console.log('Checking possible paths for file:', possiblePaths);
+        console.log('DEBUG: Checking possible paths for file:', possiblePaths);
         
         checkMultiplePatchPaths(possiblePaths, function(patchExists, patchPath) {
+            console.log('DEBUG: checkMultiplePatchPaths callback result: exists=', patchExists, 'path=', patchPath);
             if (patchExists) {
                 // Patch文件存在，创建按钮
                 createDiffButton(patchPath);
-                console.log('已找到patch文件:', patchPath);
+                console.log('DEBUG: 已找到patch文件, 创建按钮:', patchPath);
             } else {
-                console.log('未找到patch文件:', patchRelativePath);
+                console.log('DEBUG: 未找到patch文件:', patchRelativePath);
             }
         });
     }
@@ -94,29 +101,30 @@ document.addEventListener('DOMContentLoaded', function() {
     function checkMultiplePatchPaths(paths, callback, index = 0) {
         // 如果已经检查了所有路径还没找到，则返回不存在
         if (index >= paths.length) {
-            console.log('No patch file found after checking all paths');
+            console.log('DEBUG: No patch file found after checking all paths');
             callback(false, null);
             return;
         }
         
-        console.log(`Checking path (${index + 1}/${paths.length}):`, paths[index]);
+        console.log(`DEBUG: Checking path (${index + 1}/${paths.length}):`, paths[index]);
         
         // 检查当前路径
         fetch(paths[index])
             .then(response => {
-                console.log('Fetch response for', paths[index], ':', response.status);
+                console.log('DEBUG: Fetch response for', paths[index], ':', response.status, response.ok);
                 if (response.ok) {
                     // 文件存在，返回
-                    console.log('Patch file found at:', paths[index]);
+                    console.log('DEBUG: Patch file found at:', paths[index]);
                     callback(true, paths[index]);
                 } else {
                     // 检查下一个路径
+                    console.log('DEBUG: Path not found, trying next one');
                     checkMultiplePatchPaths(paths, callback, index + 1);
                 }
             })
             .catch((error) => {
                 // 发生错误，检查下一个路径
-                console.log('Error fetching', paths[index], ':', error);
+                console.log('DEBUG: Error fetching', paths[index], ':', error);
                 checkMultiplePatchPaths(paths, callback, index + 1);
             });
     }
