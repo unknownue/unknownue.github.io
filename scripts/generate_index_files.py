@@ -71,23 +71,22 @@ def collect_section_labels(dir_path):
     if not os.path.exists(index_path):
         return
     
-    # Collect all labels from markdown files in this directory
+    # Collect all labels from markdown files in this directory and subdirectories
     all_labels = set()
     
+    # Process current directory
     for file in os.listdir(dir_path):
         file_path = os.path.join(dir_path, file)
         if file.endswith(".md") and file != "_index.md" and os.path.isfile(file_path):
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                    
-                    # Extract labels from the file
                     labels = extract_labels(content)
                     all_labels.update(labels)
             except Exception as e:
                 print(f"Error processing file {file_path}: {e}")
     
-    # Also collect labels from all subdirectories
+    # Process subdirectories
     for item in os.listdir(dir_path):
         item_path = os.path.join(dir_path, item)
         if os.path.isdir(item_path):
@@ -106,85 +105,61 @@ def collect_section_labels(dir_path):
     if not all_labels:
         return
     
+    # Sort labels alphabetically
+    sorted_labels = sorted(list(all_labels))
+    
+    # Format labels as TOML array
+    labels_str = "all_labels = ["
+    for label in sorted_labels:
+        escaped_label = escape_toml_string(label)
+        labels_str += f'"{escaped_label}", '
+    labels_str = labels_str.rstrip(", ") + "]"
+    
     # Read the current index file
     with open(index_path, "r", encoding="utf-8") as f:
         content = f.read()
     
-    # Sort labels alphabetically
-    sorted_labels = sorted(list(all_labels))
+    # Check if the file has front matter
+    if not content.startswith("+++"):
+        return
     
-    # Check if the file already has front matter
-    if content.startswith("+++"):
-        # Parse the front matter and content
-        front_matter_match = re.match(r'\+\+\+(.*?)\+\+\+', content, re.DOTALL)
-        if front_matter_match:
-            front_matter_content = front_matter_match.group(1)
-            content_after_front_matter = content[front_matter_match.end():]
-            
-            # Parse existing front matter into sections and fields
-            sections = {}
-            current_section = "root"
-            sections[current_section] = {}
-            
-            lines = front_matter_content.strip().split('\n')
-            for line in lines:
-                line = line.strip()
-                if not line:  # Skip empty lines
-                    continue
-                
-                # Check for section headers
-                if line.startswith('[') and line.endswith(']'):
-                    current_section = line[1:-1]  # Remove brackets
-                    if current_section not in sections:
-                        sections[current_section] = {}
-                    continue
-                
-                # Parse key-value pairs
-                if '=' in line:
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-                    sections[current_section][key] = value
-            
-            # Update or add the all_labels field in the extra section
-            if "extra" not in sections:
-                sections["extra"] = {}
-            
-            # Format labels as TOML array
-            labels_value = "["
-            for label in sorted_labels:
-                escaped_label = escape_toml_string(label)
-                labels_value += f'"{escaped_label}", '
-            labels_value = labels_value.rstrip(", ") + "]"
-            
-            sections["extra"]["all_labels"] = labels_value
-            
-            # Rebuild the front matter without unnecessary blank lines
-            new_front_matter = "+++\n"
-            
-            # Add root section fields first
-            for key, value in sections.get("root", {}).items():
-                new_front_matter += f"{key} = {value}\n"
-            
-            # Then add other sections
-            for section_name, fields in sections.items():
-                if section_name != "root" and fields:
-                    new_front_matter += f"\n[{section_name}]\n"
-                    for key, value in fields.items():
-                        new_front_matter += f"{key} = {value}\n"
-            
-            new_front_matter += "+++"
-            
-            # Write the updated content
-            with open(index_path, "w", encoding="utf-8") as f:
-                # Ensure exactly one newline between front matter and content
-                if content_after_front_matter.startswith('\n') or content_after_front_matter.startswith('\r\n'):
-                    f.write(new_front_matter + "\n" + content_after_front_matter)
-                else:
-                    f.write(new_front_matter + "\n\n" + content_after_front_matter)
-            
-            print(f"Updated labels in index file: {index_path}")
-            return
+    # Extract front matter and content after it
+    front_matter_match = re.match(r'\+\+\+(.*?)\+\+\+', content, re.DOTALL)
+    if not front_matter_match:
+        return
+        
+    front_matter = front_matter_match.group(1)
+    content_after_front_matter = content[front_matter_match.end():].lstrip('\r\n')
+    
+    # Check if there's an [extra] section
+    extra_section = re.search(r'\[extra\](.*?)(?=\[|\Z)', front_matter, re.DOTALL)
+    
+    if extra_section:
+        # Remove existing all_labels entry if present
+        extra_content = extra_section.group(1)
+        extra_content = re.sub(r'all_labels\s*=\s*\[.*?\]', '', extra_content)
+        # Clean up any empty lines created by the removal
+        extra_content = re.sub(r'\n\s*\n', '\n', extra_content)
+        # Add the new labels at the end
+        new_extra_content = extra_content.rstrip() + "\n" + labels_str
+        # Replace the extra section with the updated one
+        new_front_matter = front_matter.replace(extra_section.group(0), "[extra]" + new_extra_content)
+    else:
+        # No [extra] section, add one
+        new_front_matter = front_matter.rstrip() + "\n\n[extra]\n" + labels_str
+    
+    # Clean up any consecutive empty lines in the front matter
+    new_front_matter = re.sub(r'\n\s*\n\s*\n', '\n\n', new_front_matter)
+    
+    # Update the file
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write("+++" + new_front_matter + "+++")
+        if content_after_front_matter:
+            f.write("\n\n" + content_after_front_matter)
+        else:
+            f.write("\n")
+    
+    print(f"Updated labels in index file: {index_path}")
 
 def process_directory(dir_path):
     """Process directory and its subdirectories"""
