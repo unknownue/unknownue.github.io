@@ -63,6 +63,129 @@ template = "pull_request.html"
     
     print(f"Created: {index_path}")
 
+def collect_section_labels(dir_path):
+    """Collect all labels from PR files in the directory and update the _index.md file"""
+    index_path = os.path.join(dir_path, "_index.md")
+    
+    # Skip if file doesn't exist
+    if not os.path.exists(index_path):
+        return
+    
+    # Collect all labels from markdown files in this directory
+    all_labels = set()
+    
+    for file in os.listdir(dir_path):
+        file_path = os.path.join(dir_path, file)
+        if file.endswith(".md") and file != "_index.md" and os.path.isfile(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    
+                    # Extract labels from the file
+                    labels = extract_labels(content)
+                    all_labels.update(labels)
+            except Exception as e:
+                print(f"Error processing file {file_path}: {e}")
+    
+    # Also collect labels from all subdirectories
+    for item in os.listdir(dir_path):
+        item_path = os.path.join(dir_path, item)
+        if os.path.isdir(item_path):
+            for file in os.listdir(item_path):
+                if file.endswith(".md") and file != "_index.md":
+                    file_path = os.path.join(item_path, file)
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            labels = extract_labels(content)
+                            all_labels.update(labels)
+                    except Exception as e:
+                        print(f"Error processing file {file_path}: {e}")
+    
+    # Skip if no labels found
+    if not all_labels:
+        return
+    
+    # Read the current index file
+    with open(index_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    # Sort labels alphabetically
+    sorted_labels = sorted(list(all_labels))
+    
+    # Check if the file already has front matter
+    if content.startswith("+++"):
+        # Parse the front matter and content
+        front_matter_match = re.match(r'\+\+\+(.*?)\+\+\+', content, re.DOTALL)
+        if front_matter_match:
+            front_matter_content = front_matter_match.group(1)
+            content_after_front_matter = content[front_matter_match.end():]
+            
+            # Parse existing front matter into sections and fields
+            sections = {}
+            current_section = "root"
+            sections[current_section] = {}
+            
+            lines = front_matter_content.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+                
+                # Check for section headers
+                if line.startswith('[') and line.endswith(']'):
+                    current_section = line[1:-1]  # Remove brackets
+                    if current_section not in sections:
+                        sections[current_section] = {}
+                    continue
+                
+                # Parse key-value pairs
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    sections[current_section][key] = value
+            
+            # Update or add the all_labels field in the extra section
+            if "extra" not in sections:
+                sections["extra"] = {}
+            
+            # Format labels as TOML array
+            labels_value = "["
+            for label in sorted_labels:
+                escaped_label = escape_toml_string(label)
+                labels_value += f'"{escaped_label}", '
+            labels_value = labels_value.rstrip(", ") + "]"
+            
+            sections["extra"]["all_labels"] = labels_value
+            
+            # Rebuild the front matter without unnecessary blank lines
+            new_front_matter = "+++\n"
+            
+            # Add root section fields first
+            for key, value in sections.get("root", {}).items():
+                new_front_matter += f"{key} = {value}\n"
+            
+            # Then add other sections
+            for section_name, fields in sections.items():
+                if section_name != "root" and fields:
+                    new_front_matter += f"\n[{section_name}]\n"
+                    for key, value in fields.items():
+                        new_front_matter += f"{key} = {value}\n"
+            
+            new_front_matter += "+++"
+            
+            # Write the updated content
+            with open(index_path, "w", encoding="utf-8") as f:
+                # Ensure exactly one newline between front matter and content
+                if content_after_front_matter.startswith('\n') or content_after_front_matter.startswith('\r\n'):
+                    f.write(new_front_matter + "\n" + content_after_front_matter)
+                else:
+                    f.write(new_front_matter + "\n\n" + content_after_front_matter)
+            
+            print(f"Updated labels in index file: {index_path}")
+            return
+
 def process_directory(dir_path):
     """Process directory and its subdirectories"""
     # Create _index.md for current directory
@@ -73,6 +196,9 @@ def process_directory(dir_path):
         item_path = os.path.join(dir_path, item)
         if os.path.isdir(item_path):
             process_directory(item_path)
+    
+    # After processing all subdirectories, collect labels
+    collect_section_labels(dir_path)
 
 def get_language_name(lang_code):
     """Return the full name of a language based on its code"""
@@ -83,6 +209,23 @@ def get_language_name(lang_code):
         # Add more languages as needed
     }
     return language_names.get(lang_code, lang_code)
+
+def extract_labels(content):
+    """Extract PR labels from the Basic Information section"""
+    # Try to find the Basic Information section
+    basic_info_match = re.search(r'## Basic Information(.*?)(?:##|\Z)', content, re.DOTALL)
+    if basic_info_match:
+        basic_info_content = basic_info_match.group(1)
+        # Look for the Labels field
+        labels_match = re.search(r'\*\*Labels\*\*:\s*(.*?)(?:\r?\n|$)', basic_info_content)
+        if labels_match:
+            labels_str = labels_match.group(1).strip()
+            # Check if labels are "None" or empty
+            if labels_str.lower() == "none" or not labels_str:
+                return []
+            # Split by comma and strip whitespace
+            return [label.strip() for label in labels_str.split(',')]
+    return []
 
 def find_language_versions(file_path, pr_number):
     """Find all language versions of a PR and return them as a dictionary"""
@@ -175,6 +318,9 @@ def ensure_front_matter(md_file_path):
         # Format date (YYYYMMDD -> YYYY-MM-DD 00:00)
         date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T00:00:00"
         
+        # Extract PR labels
+        labels = extract_labels(content)
+        
         # Find other language versions of the same PR
         available_languages = find_language_versions(md_file_path, pr_number)
         
@@ -201,27 +347,77 @@ def ensure_front_matter(md_file_path):
                 # Remove leading newlines to prevent accumulating empty lines
                 content_after_front_matter = content_after_front_matter.lstrip('\r\n')
                 
-                # Create new front matter with language information
-                new_front_matter = f"""+++
-title = "{escaped_title}"
-date = "{date}"
-draft = false
-template = "pull_request_page.html"
-in_search_index = {str(in_search_index).lower()}
-"""
-
-                # Add taxonomies for English version to make it show in the list
+                # Parse existing front matter to extract all sections and fields
+                front_matter_content = front_matter_match.group(1)
+                sections = {}
+                current_section = "root"
+                sections[current_section] = {}
+                
+                # Process front matter line by line
+                lines = front_matter_content.strip().split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line:  # Skip empty lines
+                        continue
+                    
+                    # Check for section headers like [extra] or [taxonomies]
+                    if line.startswith('[') and line.endswith(']'):
+                        current_section = line[1:-1]  # Remove brackets
+                        if current_section not in sections:
+                            sections[current_section] = {}
+                        continue
+                    
+                    # Parse key-value pairs
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        sections[current_section][key] = value
+                
+                # Update base fields
+                sections["root"]["title"] = f'"{escaped_title}"'
+                sections["root"]["date"] = f'"{date}"'
+                sections["root"]["draft"] = "false"
+                sections["root"]["template"] = '"pull_request_page.html"'
+                sections["root"]["in_search_index"] = str(in_search_index).lower()
+                
+                # Update taxonomies section
                 if language_code == "en":
-                    new_front_matter += """
-[taxonomies]
-list_display = ["show"]
-"""
-
-                new_front_matter += f"""
-[extra]
-current_language = "{language_code}"
-available_languages = {languages_toml}
-+++"""
+                    if "taxonomies" not in sections:
+                        sections["taxonomies"] = {}
+                    sections["taxonomies"]["list_display"] = '["show"]'
+                
+                # Update extra section
+                if "extra" not in sections:
+                    sections["extra"] = {}
+                
+                sections["extra"]["current_language"] = f'"{language_code}"'
+                sections["extra"]["available_languages"] = languages_toml
+                
+                # Add labels if available
+                if labels:
+                    labels_value = "["
+                    for label in labels:
+                        escaped_label = escape_toml_string(label)
+                        labels_value += f'"{escaped_label}", '
+                    labels_value = labels_value.rstrip(", ") + "]"
+                    sections["extra"]["labels"] = labels_value
+                
+                # Reconstruct front matter in a clean format
+                new_front_matter = "+++\n"
+                
+                # Root section first (title, sort_by, etc.)
+                for key, value in sections.get('root', {}).items():
+                    new_front_matter += f"{key} = {value}\n"
+                
+                # Then other sections
+                for section_name, section_data in sections.items():
+                    if section_name != 'root' and section_data:  # Skip empty sections and root
+                        new_front_matter += f"\n[{section_name}]\n"
+                        for key, value in section_data.items():
+                            new_front_matter += f"{key} = {value}\n"
+                
+                new_front_matter += "+++"
                 
                 # Update file with new front matter
                 with open(md_file_path, "w", encoding="utf-8") as f:
@@ -233,28 +429,55 @@ available_languages = {languages_toml}
                 
                 print(f"Updated front matter: {md_file_path}")
                 return
-        
-        # Create front matter with language information
-        front_matter = f"""+++
-title = "{escaped_title}"
-date = "{date}"
-draft = false
-template = "pull_request_page.html"
-in_search_index = {str(in_search_index).lower()}
-"""
-
-        # Add taxonomies for English version to make it show in the list
-        if language_code == "en":
-            front_matter += """
-[taxonomies]
-list_display = ["show"]
-"""
-
-        front_matter += f"""
-[extra]
-current_language = "{language_code}"
-available_languages = {languages_toml}
-+++"""
+        else:
+            # Create sections structure for front matter
+            sections = {}
+            
+            # Root section - basic metadata
+            sections["root"] = {
+                "title": f'"{escaped_title}"',
+                "date": f'"{date}"',
+                "draft": "false",
+                "template": '"pull_request_page.html"',
+                "in_search_index": str(in_search_index).lower()
+            }
+            
+            # Taxonomies section for English version
+            if language_code == "en":
+                sections["taxonomies"] = {
+                    "list_display": '["show"]'
+                }
+            
+            # Extra section - language info and labels
+            sections["extra"] = {
+                "current_language": f'"{language_code}"',
+                "available_languages": languages_toml
+            }
+            
+            # Add labels if available
+            if labels:
+                labels_value = "["
+                for label in labels:
+                    escaped_label = escape_toml_string(label)
+                    labels_value += f'"{escaped_label}", '
+                labels_value = labels_value.rstrip(", ") + "]"
+                sections["extra"]["labels"] = labels_value
+            
+            # Reconstruct front matter in a clean format
+            front_matter = "+++\n"
+            
+            # Root section first (title, sort_by, etc.)
+            for key, value in sections.get('root', {}).items():
+                front_matter += f"{key} = {value}\n"
+            
+            # Then other sections
+            for section_name, section_data in sections.items():
+                if section_name != 'root' and section_data:  # Skip empty sections and root
+                    front_matter += f"\n[{section_name}]\n"
+                    for key, value in section_data.items():
+                        front_matter += f"{key} = {value}\n"
+            
+            front_matter += "+++"
     else:
         # Use current date and time if can't extract from filename
         date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -262,13 +485,30 @@ available_languages = {languages_toml}
         # Escape the title for TOML
         escaped_title = escape_toml_string(title)
         
-        # Create basic front matter without language information
-        front_matter = f"""+++
-title = "{escaped_title}"
-date = "{date}"
-draft = false
-template = "pull_request_page.html"
-+++"""
+        # Create sections structure for front matter
+        sections = {}
+        sections["root"] = {
+            "title": f'"{escaped_title}"',
+            "date": f'"{date}"',
+            "draft": "false",
+            "template": '"pull_request_page.html"'
+        }
+        
+        # Reconstruct front matter in a clean format
+        front_matter = "+++\n"
+        
+        # Root section first (title, sort_by, etc.)
+        for key, value in sections.get('root', {}).items():
+            front_matter += f"{key} = {value}\n"
+        
+        # Then other sections
+        for section_name, section_data in sections.items():
+            if section_name != 'root' and section_data:  # Skip empty sections and root
+                front_matter += f"\n[{section_name}]\n"
+                for key, value in section_data.items():
+                    front_matter += f"{key} = {value}\n"
+        
+        front_matter += "+++"
     
     # Add front matter to file
     with open(md_file_path, "w", encoding="utf-8") as f:
