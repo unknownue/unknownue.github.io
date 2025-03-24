@@ -12,6 +12,29 @@ from datetime import datetime
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Target directory to process
 CONTENT_DIR = os.path.join(ROOT_DIR, "content", "pull_request")
+# Configuration file
+CONFIG_FILE = os.path.join(ROOT_DIR, "config.toml")
+
+def load_filtered_labels():
+    """Load filtered labels from config.toml using regex parsing"""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        # Find filtered_labels array using regex
+        match = re.search(r'filtered_labels\s*=\s*\[(.*?)\]', content, re.DOTALL)
+        if match:
+            labels_str = match.group(1)
+            # Extract each label string from the array
+            labels = re.findall(r'"([^"]*)"', labels_str)
+            return labels
+        
+        return []
+    except Exception as e:
+        print(f"Error loading filtered labels from config: {e}")
+        return []
+
+FILTERED_LABELS = load_filtered_labels()
 
 def escape_toml_string(s):
     """Escape special characters in a TOML string"""
@@ -82,6 +105,8 @@ def collect_section_labels(dir_path):
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
                     labels = extract_labels(content)
+                    # Filter out unwanted labels
+                    labels = [label for label in labels if label not in FILTERED_LABELS]
                     all_labels.update(labels)
             except Exception as e:
                 print(f"Error processing file {file_path}: {e}")
@@ -97,6 +122,8 @@ def collect_section_labels(dir_path):
                         with open(file_path, "r", encoding="utf-8") as f:
                             content = f.read()
                             labels = extract_labels(content)
+                            # Filter out unwanted labels
+                            labels = [label for label in labels if label not in FILTERED_LABELS]
                             all_labels.update(labels)
                     except Exception as e:
                         print(f"Error processing file {file_path}: {e}")
@@ -325,6 +352,9 @@ def ensure_front_matter(md_file_path):
         
         # Extract PR labels
         labels = extract_labels(content)
+        
+        # Filter out unwanted labels
+        labels = [label for label in labels if label not in FILTERED_LABELS]
         
         # Find other language versions of the same PR
         available_languages = find_language_versions(md_file_path, pr_number)
