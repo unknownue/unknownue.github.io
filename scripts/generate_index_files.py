@@ -226,7 +226,10 @@ def extract_labels(content):
             if labels_str.lower() == "none" or not labels_str:
                 return []
             # Split by comma and strip whitespace
-            return [label.strip() for label in labels_str.split(',')]
+            labels = [label.strip() for label in labels_str.split(',')]
+            # Remove backtick characters from each label
+            labels = [label.replace('`', '') for label in labels]
+            return labels
     return []
 
 def find_language_versions(file_path, pr_number):

@@ -57,8 +57,8 @@ unknownue.github.io/
 
 1. **Scripts**
    - `scripts/`: Utility scripts for site maintenance
+     - `generate_index_files.py`: Automatically generates `_index.md` files for content directories, updates front matter in Markdown files, processes PR labels (removing backticks), and manages multi-language content relationships
    - `serve.sh`: Script to run the local development server
-   - `create_soft_links.sh`: Utility for creating symbolic links
    - `publish.py`: Python script for publishing the site
 
 2. **CI/CD**
