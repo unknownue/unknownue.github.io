@@ -1,0 +1,105 @@
+diff --git a/crates/bevy_dylib/Cargo.toml b/crates/bevy_dylib/Cargo.toml
+index 054441dd66a0f..26aec33b8358c 100644
+--- a/crates/bevy_dylib/Cargo.toml
++++ b/crates/bevy_dylib/Cargo.toml
+@@ -12,11 +12,7 @@ keywords = ["bevy"]
+ crate-type = ["dylib"]
+ 
+ [dependencies]
+-# feature std is needed to avoid an issue when linking critical_section
+-# bevy_dylib is not expected to work in no_std
+-bevy_internal = { path = "../bevy_internal", version = "0.16.0-dev", default-features = false, features = [
+-  "std",
+-] }
++bevy_internal = { path = "../bevy_internal", version = "0.16.0-dev", default-features = false }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/bevy_tasks/Cargo.toml b/crates/bevy_tasks/Cargo.toml
+index a8b256f35e457..9f878e71b7b87 100644
+--- a/crates/bevy_tasks/Cargo.toml
++++ b/crates/bevy_tasks/Cargo.toml
+@@ -26,12 +26,7 @@ async_executor = ["std", "dep:async-executor"]
+ ## Allows access to the `std` crate. Enabling this feature will prevent compilation
+ ## on `no_std` targets, but provides access to certain additional features on
+ ## supported platforms.
+-std = [
+-  "futures-lite/std",
+-  "async-task/std",
+-  "bevy_platform_support/std",
+-  "once_cell/std",
+-]
++std = ["futures-lite/std", "async-task/std", "bevy_platform_support/std"]
+ 
+ ## `critical-section` provides the building blocks for synchronization primitives
+ ## on all platforms, including `no_std`.
+@@ -65,9 +60,6 @@ async-channel = { version = "2.3.0", optional = true }
+ async-io = { version = "2.0.0", optional = true }
+ concurrent-queue = { version = "2.0.0", optional = true }
+ atomic-waker = { version = "1", default-features = false }
+-once_cell = { version = "1.18", default-features = false, features = [
+-  "critical-section",
+-] }
+ crossbeam-queue = { version = "0.3", default-features = false, features = [
+   "alloc",
+ ] }
+diff --git a/crates/bevy_tasks/src/edge_executor.rs b/crates/bevy_tasks/src/edge_executor.rs
+index c0821890828cb..da45c38d3a11c 100644
+--- a/crates/bevy_tasks/src/edge_executor.rs
++++ b/crates/bevy_tasks/src/edge_executor.rs
+@@ -22,9 +22,8 @@ use core::{
+ 
+ use async_task::{Runnable, Task};
+ use atomic_waker::AtomicWaker;
+-use bevy_platform_support::sync::Arc;
++use bevy_platform_support::sync::{Arc, LazyLock};
+ use futures_lite::FutureExt;
+-use once_cell::sync::OnceCell;
+ 
+ /// An async executor.
+ ///
+@@ -51,7 +50,7 @@ use once_cell::sync::OnceCell;
+ ///     }));
+ /// ```
+ pub struct Executor<'a, const C: usize = 64> {
+-    state: OnceCell<Arc<State<C>>>,
++    state: LazyLock<Arc<State<C>>>,
+     _invariant: PhantomData<core::cell::UnsafeCell<&'a ()>>,
+ }
+ 
+@@ -67,7 +66,7 @@ impl<'a, const C: usize> Executor<'a, C> {
+     /// ```
+     pub const fn new() -> Self {
+         Self {
+-            state: OnceCell::new(),
++            state: LazyLock::new(|| Arc::new(State::new())),
+             _invariant: PhantomData,
+         }
+     }
+@@ -284,7 +283,7 @@ impl<'a, const C: usize> Executor<'a, C> {
+ 
+     /// Returns a reference to the inner state.
+     fn state(&self) -> &Arc<State<C>> {
+-        self.state.get_or_init(|| Arc::new(State::new()))
++        &self.state
+     }
+ }
+ 
+@@ -526,15 +525,15 @@ mod drop_tests {
+     use core::task::{Poll, Waker};
+     use std::sync::Mutex;
+ 
++    use bevy_platform_support::sync::LazyLock;
+     use futures_lite::future;
+-    use once_cell::sync::Lazy;
+ 
+     use super::{Executor, Task};
+ 
+     #[test]
+     fn leaked_executor_leaks_everything() {
+         static DROP: AtomicUsize = AtomicUsize::new(0);
+-        static WAKER: Lazy<Mutex<Option<Waker>>> = Lazy::new(Default::default);
++        static WAKER: LazyLock<Mutex<Option<Waker>>> = LazyLock::new(Default::default);
+ 
+         let ex: Executor = Default::default();
+ 
