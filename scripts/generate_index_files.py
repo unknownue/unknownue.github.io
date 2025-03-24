@@ -131,19 +131,45 @@ def collect_section_labels(dir_path):
     front_matter = front_matter_match.group(1)
     content_after_front_matter = content[front_matter_match.end():].lstrip('\r\n')
     
-    # Check if there's an [extra] section
-    extra_section = re.search(r'\[extra\](.*?)(?=\[|\Z)', front_matter, re.DOTALL)
+    # Create fresh front matter without any all_labels entries
+    new_front_matter = ""
     
-    if extra_section:
-        # Remove existing all_labels entry if present
-        extra_content = extra_section.group(1)
-        extra_content = re.sub(r'all_labels\s*=\s*\[.*?\]', '', extra_content)
-        # Clean up any empty lines created by the removal
-        extra_content = re.sub(r'\n\s*\n', '\n', extra_content)
-        # Add the new labels at the end
-        new_extra_content = extra_content.rstrip() + "\n" + labels_str
-        # Replace the extra section with the updated one
-        new_front_matter = front_matter.replace(extra_section.group(0), "[extra]" + new_extra_content)
+    # Check if there's an [extra] section
+    extra_section_match = re.search(r'\[extra\](.*?)(?=\[|\Z)', front_matter, re.DOTALL)
+    
+    if extra_section_match:
+        # Get the lines from extra section
+        extra_content = extra_section_match.group(1)
+        # Remove all all_labels lines
+        cleaned_lines = []
+        for line in extra_content.split('\n'):
+            if not line.strip().startswith('all_labels'):
+                cleaned_lines.append(line)
+        
+        # Create new extra content with our labels
+        new_extra_content = '\n'.join(cleaned_lines).rstrip() + "\n" + labels_str
+        
+        # Replace entire front matter
+        sections = re.split(r'\[(\w+)\]', front_matter)
+        new_sections = []
+        
+        # Process sections
+        i = 0
+        while i < len(sections):
+            if i == 0:  # Root section
+                new_sections.append(sections[i])
+                i += 1
+            elif sections[i] == "extra":  # Extra section - replace with our new one
+                new_sections.append("[extra]")
+                new_sections.append(new_extra_content)
+                i += 2  # Skip the original extra content
+            else:  # Other sections - keep as is
+                new_sections.append("[" + sections[i] + "]")
+                if i + 1 < len(sections):
+                    new_sections.append(sections[i+1])
+                i += 2
+        
+        new_front_matter = ''.join(new_sections)
     else:
         # No [extra] section, add one
         new_front_matter = front_matter.rstrip() + "\n\n[extra]\n" + labels_str
@@ -153,11 +179,9 @@ def collect_section_labels(dir_path):
     
     # Update the file
     with open(index_path, "w", encoding="utf-8") as f:
-        f.write("+++" + new_front_matter + "+++")
+        f.write("+++" + new_front_matter + "\n+++\n")
         if content_after_front_matter:
-            f.write("\n\n" + content_after_front_matter)
-        else:
-            f.write("\n")
+            f.write("\n" + content_after_front_matter)
     
     print(f"Updated labels in index file: {index_path}")
 
@@ -173,7 +197,10 @@ def process_directory(dir_path):
             process_directory(item_path)
     
     # After processing all subdirectories, collect labels
-    collect_section_labels(dir_path)
+    # Only collect labels for month-level directories (YYYY-MM format)
+    dir_name = os.path.basename(dir_path)
+    if re.match(r'\d{4}-\d{2}', dir_name):
+        collect_section_labels(dir_path)
 
 def get_language_name(lang_code):
     """Return the full name of a language based on its code"""
