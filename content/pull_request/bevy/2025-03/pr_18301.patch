@@ -1,0 +1,116 @@
+diff --git a/crates/bevy_app/src/lib.rs b/crates/bevy_app/src/lib.rs
+index 5e4b87ff5543b..6772136414876 100644
+--- a/crates/bevy_app/src/lib.rs
++++ b/crates/bevy_app/src/lib.rs
+@@ -58,6 +58,6 @@ pub mod prelude {
+             RunFixedMainLoopSystem, SpawnScene, Startup, Update,
+         },
+         sub_app::SubApp,
+-        NonSendMarker, Plugin, PluginGroup, TaskPoolOptions, TaskPoolPlugin,
++        Plugin, PluginGroup, TaskPoolOptions, TaskPoolPlugin,
+     };
+ }
+diff --git a/crates/bevy_app/src/task_pool_plugin.rs b/crates/bevy_app/src/task_pool_plugin.rs
+index aa1dd23fd5724..b2fde7768e6e3 100644
+--- a/crates/bevy_app/src/task_pool_plugin.rs
++++ b/crates/bevy_app/src/task_pool_plugin.rs
+@@ -3,18 +3,19 @@ use crate::{App, Plugin};
+ use alloc::string::ToString;
+ use bevy_platform_support::sync::Arc;
+ use bevy_tasks::{AsyncComputeTaskPool, ComputeTaskPool, IoTaskPool, TaskPoolBuilder};
+-use core::{fmt::Debug, marker::PhantomData};
++use core::fmt::Debug;
+ use log::trace;
+ 
+ cfg_if::cfg_if! {
+     if #[cfg(not(all(target_arch = "wasm32", feature = "web")))] {
+-        use {crate::Last, bevy_ecs::prelude::NonSend, bevy_tasks::tick_global_task_pools_on_main_thread};
++        use {crate::Last, bevy_tasks::tick_global_task_pools_on_main_thread};
++        use bevy_ecs::system::NonSendMarker;
+ 
+         /// A system used to check and advanced our task pools.
+         ///
+         /// Calls [`tick_global_task_pools_on_main_thread`],
+         /// and uses [`NonSendMarker`] to ensure that this system runs on the main thread
+-        fn tick_global_task_pools(_main_thread_marker: Option<NonSend<NonSendMarker>>) {
++        fn tick_global_task_pools(_main_thread_marker: NonSendMarker) {
+             tick_global_task_pools_on_main_thread();
+         }
+     }
+@@ -36,8 +37,6 @@ impl Plugin for TaskPoolPlugin {
+         _app.add_systems(Last, tick_global_task_pools);
+     }
+ }
+-/// A dummy type that is [`!Send`](Send), to force systems to run on the main thread.
+-pub struct NonSendMarker(PhantomData<*mut ()>);
+ 
+ /// Defines a simple way to determine how many threads to use given the number of remaining cores
+ /// and number of total cores
+diff --git a/crates/bevy_ecs/src/lib.rs b/crates/bevy_ecs/src/lib.rs
+index 7ccfd4caa9774..0f47e24624b49 100644
+--- a/crates/bevy_ecs/src/lib.rs
++++ b/crates/bevy_ecs/src/lib.rs
+@@ -91,8 +91,8 @@ pub mod prelude {
+         spawn::{Spawn, SpawnRelated},
+         system::{
+             Command, Commands, Deferred, EntityCommand, EntityCommands, In, InMut, InRef,
+-            IntoSystem, Local, NonSend, NonSendMut, ParamSet, Populated, Query, ReadOnlySystem,
+-            Res, ResMut, Single, System, SystemIn, SystemInput, SystemParamBuilder,
++            IntoSystem, Local, NonSend, NonSendMarker, NonSendMut, ParamSet, Populated, Query,
++            ReadOnlySystem, Res, ResMut, Single, System, SystemIn, SystemInput, SystemParamBuilder,
+             SystemParamFunction, WithParamWarnPolicy,
+         },
+         world::{
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index ddfcddaa76e47..319f5490a7269 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -1420,6 +1420,33 @@ unsafe impl<T: SystemBuffer> SystemParam for Deferred<'_, T> {
+     }
+ }
+ 
++/// A dummy type that is [`!Send`](Send), to force systems to run on the main thread.
++pub struct NonSendMarker;
++
++// SAFETY: No world access.
++unsafe impl SystemParam for NonSendMarker {
++    type State = ();
++    type Item<'w, 's> = Self;
++
++    #[inline]
++    fn init_state(_world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
++        system_meta.set_non_send();
++    }
++
++    #[inline]
++    unsafe fn get_param<'world, 'state>(
++        _state: &'state mut Self::State,
++        _system_meta: &SystemMeta,
++        _world: UnsafeWorldCell<'world>,
++        _change_tick: Tick,
++    ) -> Self::Item<'world, 'state> {
++        Self
++    }
++}
++
++// SAFETY: Does not read any world state
++unsafe impl ReadOnlySystemParam for NonSendMarker {}
++
+ /// Shared borrow of a non-[`Send`] resource.
+ ///
+ /// Only `Send` resources may be accessed with the [`Res`] [`SystemParam`]. In case that the
+diff --git a/crates/bevy_render/src/view/window/mod.rs b/crates/bevy_render/src/view/window/mod.rs
+index 14a984ff3921e..cb6eb5876269c 100644
+--- a/crates/bevy_render/src/view/window/mod.rs
++++ b/crates/bevy_render/src/view/window/mod.rs
+@@ -304,9 +304,7 @@ const DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
+ pub fn create_surfaces(
+     // By accessing a NonSend resource, we tell the scheduler to put this system on the main thread,
+     // which is necessary for some OS's
+-    #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: Option<
+-        NonSend<bevy_app::NonSendMarker>,
+-    >,
++    #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: NonSendMarker,
+     windows: Res<ExtractedWindows>,
+     mut window_surfaces: ResMut<WindowSurfaces>,
+     render_instance: Res<RenderInstance>,
