@@ -4,5 +4,5 @@ sort_by = "date"
 template = "pull_request.html"
 
 [extra]
-all_labels = ["A-Accessibility", "A-Assets", "A-ECS", "A-Math", "A-Reflection", "A-Rendering", "A-Tasks", "A-Text", "A-UI", "A-Windowing", "C-Bug", "C-Code-Quality", "C-Dependencies", "C-Docs", "C-Examples", "C-Feature", "C-Performance", "C-Usability", "D-Modest", "D-Straightforward", "D-Trivial", "M-Needs-Migration-Guide", "O-Linux", "P-Compile-Failure", "P-Regression", "X-Contentious", "X-Uncontroversial"]
+all_labels = ["A-Accessibility", "A-Assets", "A-ECS", "A-Math", "A-Meta", "A-Reflection", "A-Rendering", "A-Tasks", "A-Text", "A-UI", "A-Windowing", "C-Bug", "C-Code-Quality", "C-Dependencies", "C-Docs", "C-Examples", "C-Feature", "C-Performance", "C-Usability", "D-Modest", "D-Straightforward", "D-Trivial", "M-Needs-Migration-Guide", "O-Embedded", "O-Linux", "P-Compile-Failure", "P-Regression", "X-Contentious", "X-Uncontroversial"]
 +++
