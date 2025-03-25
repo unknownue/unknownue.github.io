@@ -63,7 +63,7 @@ def create_index_file(dir_path):
     
     # Skip if file already exists
     if os.path.exists(index_path):
-        print(f"Skipping existing file: {index_path}")
+        # print(f"Skipping existing file: {index_path}")
         return
     
     # Get directory name
@@ -210,7 +210,7 @@ def collect_section_labels(dir_path):
         if content_after_front_matter:
             f.write("\n" + content_after_front_matter)
     
-    print(f"Updated labels in index file: {index_path}")
+    # print(f"Updated labels in index file: {index_path}")
 
 def process_directory(dir_path):
     """Process directory and its subdirectories"""
