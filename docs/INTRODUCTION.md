@@ -27,14 +27,25 @@ unknownue.github.io/
 │   ├── DEPLOYMENT.md       # Deployment instructions
 │   └── README.md           # Project overview
 ├── sass/                   # SASS/SCSS styling
+│   ├── components/         # SCSS components
+│   │   ├── labels.scss     # Label component styles
+│   │   ├── diff_button.scss # View diff button styles
+│   │   └── diff_view/      # Diff view component styles
+│   │       ├── diff_container.scss # Container styles
+│   │       ├── diff_code.scss     # Code highlighting styles
+│   │       ├── diff_table.scss    # Table layout styles
+│   │       ├── diff_sidebar.scss  # Sidebar styles
+│   │       ├── diff_mobile.scss   # Mobile adaptations
+│   │       └── diff_responsive.scss # Responsive layout styles
+│   ├── custom.scss         # Custom site-wide styles
+│   ├── pull_request.scss   # Pull request page styles
+│   ├── pull_request_page.scss # PR detail page styles
+│   ├── posts.scss          # Blog posts styles
+│   ├── home.scss           # Home page styles
+│   ├── fonts.scss          # Font definitions
+│   └── main.scss           # Main SCSS file that imports all others
 ├── scripts/                # Utility scripts
-├── static/                 # Static assets (images, CSS, JS)
-│   ├── css/                # Custom CSS files and components
-│   │   ├── components/     # CSS components (labels, etc.)
-│   │   ├── custom.css      # Custom overrides and styles
-│   │   ├── style.css       # Basic styles
-│   │   ├── diff_button.css # Styling for diff buttons
-│   │   └── diff_view.css   # Styling for diff views
+├── static/                 # Static assets (images, JS)
 │   ├── js/                 # JavaScript files
 │   ├── icons/              # Icon assets
 │   └── fonts/              # Font files
@@ -182,16 +193,17 @@ The blog includes several advanced features:
    - Responsive design for mobile and desktop
    - Light/dark mode toggle
    - Table of contents generation
-   - Custom CSS for enhanced styling
+   - Custom styling with SCSS
 
 3. **CSS and Styling**
    - SASS/SCSS compilation through Zola (compile_sass = true in config.toml)
-   - Main SASS file (sass/main.scss) imports Apollo theme's styles and custom styles
-   - Custom SCSS files for specific components (pull_request.scss, pull_request_page.scss)
-   - Theme-specific styles (light.scss, dark.scss) for theme toggling
-   - Custom CSS for overrides and additional styling in static/css/
-   - Component-based CSS organization in static/css/components/
-   - Custom styles linked in config.toml via stylesheets array
+   - Modular SCSS organization with component-based architecture
+   - Main SCSS file (sass/main.scss) imports Apollo theme's styles and custom styles
+   - Custom component styles for specific features (diff view, labels, etc.)
+   - Styles organized by page type (home, posts, pull request, etc.)
+   - Responsive designs with mobile-specific adaptations
+   - Theme-specific styles for light/dark mode support
+   - CSS is automatically compiled during the build process
 
 4. **Technical Features**
    - Search functionality with Elasticlunr
@@ -205,16 +217,17 @@ The blog extends the Apollo theme with several custom features:
 
 1. Custom templates for specialized content types
 2. Additional shortcodes for enhanced markdown functionality
-3. CSS customizations for styling and layout
+3. SCSS customizations for styling and layout
 4. Pull request documentation system
 5. Extended syntax highlighting support
 
 ## Development Workflow
 
 1. Content is written in Markdown in the `content/` directory
-2. Local development is done using `serve.sh` which runs Zola's built-in server
-3. The site is built using Zola's build system with custom pre/post-processing
-4. Deployment is handled through GitHub Pages or other static hosting
+2. Styles are developed in SCSS in the `sass/` directory
+3. Local development is done using `serve.sh` which runs Zola's built-in server
+4. The site is built using Zola's build system with custom pre/post-processing
+5. Deployment is handled through GitHub Pages or other static hosting
 
 ## Conclusion
 
