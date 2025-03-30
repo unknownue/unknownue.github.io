@@ -25,7 +25,6 @@ unknownue.github.io/
 ├── docs/                   # Project documentation
 │   ├── INTRODUCTION.md     # This file
 │   ├── DEPLOYMENT.md       # Deployment instructions
-│   ├── PULL_REQUEST.md     # PR system documentation
 │   └── README.md           # Project overview
 ├── sass/                   # SASS/SCSS styling
 ├── scripts/                # Utility scripts
@@ -93,6 +92,66 @@ The blog consists of the following main pages and sections:
    - Custom documentation system organized like GitHub pull requests
    - List of all PR documentation entries
    - Individual PR pages at `/pull_request/{slug}`
+
+   ### PR Directory Structure
+   
+   The `pull_request` directory follows this structure:
+   
+   ```
+   content/
+   └── pull_request/
+       └── repo_name/
+           └── year-month/
+               └── pr_number_lang_date_time.md
+   ```
+   
+   For example:
+   ```
+   content/
+   └── pull_request/
+       ├── bevy/
+       │   └── 2025-03/
+       │       └── pr_18143_zh-cn_20250303_215251.md
+       └── rust/
+           └── 2025-04/
+               └── pr_12345_zh-cn_20250410_123456.md
+   ```
+   
+   ### Automatic Front Matter Generation
+   
+   The blog includes a script that automatically generates:
+   
+   1. `_index.md` files for each directory in the `pull_request` structure
+   2. Front matter for PR Markdown files that don't have it
+   
+   #### How It Works
+   
+   The `scripts/generate_index_files.py` script:
+   
+   1. Scans the `content/pull_request` directory and its subdirectories
+   2. Creates `_index.md` files with appropriate titles:
+      - Repository names are capitalized (e.g., "Bevy", "Rust")
+      - Year-month directories are formatted as "Month Year" (e.g., "March 2025")
+   3. Adds front matter to PR Markdown files, extracting:
+      - Title from the PR content
+      - Date from the filename or PR creation date
+   
+   #### Adding New PR Documentation
+   
+   1. Create the appropriate directory structure if it doesn't exist:
+      ```bash
+      mkdir -p content/pull_request/repo_name/year-month/
+      ```
+   
+   2. Create a new Markdown file with the naming convention:
+      ```
+      pr_number_lang_date_time.md
+      ```
+      For example: `pr_12345_zh-cn_20250410_123456.md`
+   
+   3. Add the content, and the script will automatically:
+      - Create any missing `_index.md` files
+      - Add front matter to your PR Markdown file
 
 5. **Taxonomy Pages**
    - Tags listing at `/tags`
