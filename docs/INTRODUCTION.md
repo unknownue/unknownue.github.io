@@ -30,6 +30,15 @@ unknownue.github.io/
 ├── sass/                   # SASS/SCSS styling
 ├── scripts/                # Utility scripts
 ├── static/                 # Static assets (images, CSS, JS)
+│   ├── css/                # Custom CSS files and components
+│   │   ├── components/     # CSS components (labels, etc.)
+│   │   ├── custom.css      # Custom overrides and styles
+│   │   ├── style.css       # Basic styles
+│   │   ├── diff_button.css # Styling for diff buttons
+│   │   └── diff_view.css   # Styling for diff views
+│   ├── js/                 # JavaScript files
+│   ├── icons/              # Icon assets
+│   └── fonts/              # Font files
 ├── syntaxes/               # Custom syntax highlighting
 ├── templates/              # HTML templates
 │   ├── macros/             # Reusable template components
@@ -116,7 +125,16 @@ The blog includes several advanced features:
    - Table of contents generation
    - Custom CSS for enhanced styling
 
-3. **Technical Features**
+3. **CSS and Styling**
+   - SASS/SCSS compilation through Zola (compile_sass = true in config.toml)
+   - Main SASS file (sass/main.scss) imports Apollo theme's styles and custom styles
+   - Custom SCSS files for specific components (pull_request.scss, pull_request_page.scss)
+   - Theme-specific styles (light.scss, dark.scss) for theme toggling
+   - Custom CSS for overrides and additional styling in static/css/
+   - Component-based CSS organization in static/css/components/
+   - Custom styles linked in config.toml via stylesheets array
+
+4. **Technical Features**
    - Search functionality with Elasticlunr
    - RSS feed generation
    - Taxonomy system (tags, categories)
