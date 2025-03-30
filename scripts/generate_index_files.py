@@ -97,6 +97,9 @@ def collect_section_labels(dir_path):
     # Collect all labels from markdown files in this directory and subdirectories
     all_labels = set()
     
+    # Track unique PR numbers to calculate actual PR count
+    unique_prs = set()
+    
     # Process current directory
     for file in os.listdir(dir_path):
         file_path = os.path.join(dir_path, file)
@@ -108,6 +111,11 @@ def collect_section_labels(dir_path):
                     # Filter out unwanted labels
                     labels = [label for label in labels if label not in FILTERED_LABELS]
                     all_labels.update(labels)
+                    
+                    # Extract PR number from filename
+                    pr_match = re.search(r'pr_(\d+)', file)
+                    if pr_match:
+                        unique_prs.add(pr_match.group(1))
             except Exception as e:
                 print(f"Error processing file {file_path}: {e}")
     
@@ -125,11 +133,16 @@ def collect_section_labels(dir_path):
                             # Filter out unwanted labels
                             labels = [label for label in labels if label not in FILTERED_LABELS]
                             all_labels.update(labels)
+                            
+                            # Extract PR number from filename
+                            pr_match = re.search(r'pr_(\d+)', file)
+                            if pr_match:
+                                unique_prs.add(pr_match.group(1))
                     except Exception as e:
                         print(f"Error processing file {file_path}: {e}")
     
     # Skip if no labels found
-    if not all_labels:
+    if not all_labels and not unique_prs:
         return
     
     # Sort labels alphabetically
@@ -141,6 +154,10 @@ def collect_section_labels(dir_path):
         escaped_label = escape_toml_string(label)
         labels_str += f'"{escaped_label}", '
     labels_str = labels_str.rstrip(", ") + "]"
+    
+    # Add unique PR count
+    unique_pr_count = len(unique_prs)
+    pr_count_str = f'unique_pr_count = {unique_pr_count}'
     
     # Read the current index file
     with open(index_path, "r", encoding="utf-8") as f:
@@ -167,14 +184,14 @@ def collect_section_labels(dir_path):
     if extra_section_match:
         # Get the lines from extra section
         extra_content = extra_section_match.group(1)
-        # Remove all all_labels lines
+        # Remove all all_labels lines and unique_pr_count lines
         cleaned_lines = []
         for line in extra_content.split('\n'):
-            if not line.strip().startswith('all_labels'):
+            if not line.strip().startswith('all_labels') and not line.strip().startswith('unique_pr_count'):
                 cleaned_lines.append(line)
         
-        # Create new extra content with our labels
-        new_extra_content = '\n'.join(cleaned_lines).rstrip() + "\n" + labels_str
+        # Create new extra content with our labels and PR count
+        new_extra_content = '\n'.join(cleaned_lines).rstrip() + "\n" + labels_str + "\n" + pr_count_str
         
         # Replace entire front matter
         sections = re.split(r'\[(\w+)\]', front_matter)
@@ -199,7 +216,7 @@ def collect_section_labels(dir_path):
         new_front_matter = ''.join(new_sections)
     else:
         # No [extra] section, add one
-        new_front_matter = front_matter.rstrip() + "\n\n[extra]\n" + labels_str
+        new_front_matter = front_matter.rstrip() + "\n\n[extra]\n" + labels_str + "\n" + pr_count_str
     
     # Clean up any consecutive empty lines in the front matter
     new_front_matter = re.sub(r'\n\s*\n\s*\n', '\n\n', new_front_matter)
@@ -210,7 +227,7 @@ def collect_section_labels(dir_path):
         if content_after_front_matter:
             f.write("\n" + content_after_front_matter)
     
-    # print(f"Updated labels in index file: {index_path}")
+    # print(f"Updated labels and PR count in index file: {index_path}")
 
 def process_directory(dir_path):
     """Process directory and its subdirectories"""
