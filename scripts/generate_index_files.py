@@ -7,6 +7,7 @@ Also adds front matter to Markdown files that don't have it.
 import os
 import re
 from datetime import datetime
+from collections import OrderedDict
 
 # Project root directory
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -279,32 +280,40 @@ def extract_labels(content):
 def find_language_versions(file_path, pr_number):
     """Find all language versions of a PR and return them as a dictionary"""
     dir_path = os.path.dirname(file_path)
-    available_languages = {}
+    available_languages = OrderedDict()
     
-    # Get all files in the same directory
+    # Collect all matching files first
+    matching_files = []
     for file in os.listdir(dir_path):
         if file.endswith(".md") and file != "_index.md":
             # Look for PR number and language code in filename
             # Updated to handle both formats: pr_18143_zh-cn_20250303.md and pr_18143_zh-cn_20250303_215251.md
             match = re.search(r'pr_(\d+)(?:_([a-z]{2}(?:-[a-z]{2})?))?_', file)
             if match and match.group(1) == pr_number:
-                # Extract language code or default to "en"
-                lang_code = match.group(2) if match.group(2) else "en"
-                lang_name = get_language_name(lang_code)
-                
-                # Create relative URL for this language version
-                # Replace underscores with hyphens to match Zola's URL generation rules
-                # Do not include .html suffix as Zola generates clean URLs
-                file_name_without_ext = os.path.splitext(file)[0]
-                file_name_with_hyphens = file_name_without_ext.replace('_', '-')
-                rel_dir_path = os.path.relpath(dir_path, CONTENT_DIR)
-                url = f"/pull_request/{rel_dir_path}/{file_name_with_hyphens}"
-                url = url.replace(os.sep, '/')
-                
-                available_languages[lang_code] = {
-                    "name": lang_name,
-                    "url": url
-                }
+                matching_files.append((file, match))
+    
+    # Sort files by language code to ensure consistent order across platforms
+    matching_files.sort(key=lambda x: x[1].group(2) if x[1].group(2) else "en")
+    
+    # Process files in sorted order
+    for file, match in matching_files:
+        # Extract language code or default to "en"
+        lang_code = match.group(2) if match.group(2) else "en"
+        lang_name = get_language_name(lang_code)
+        
+        # Create relative URL for this language version
+        # Replace underscores with hyphens to match Zola's URL generation rules
+        # Do not include .html suffix as Zola generates clean URLs
+        file_name_without_ext = os.path.splitext(file)[0]
+        file_name_with_hyphens = file_name_without_ext.replace('_', '-')
+        rel_dir_path = os.path.relpath(dir_path, CONTENT_DIR)
+        url = f"/pull_request/{rel_dir_path}/{file_name_with_hyphens}"
+        url = url.replace(os.sep, '/')
+        
+        available_languages[lang_code] = {
+            "name": lang_name,
+            "url": url
+        }
     
     return available_languages
 
