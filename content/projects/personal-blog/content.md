@@ -46,3 +46,9 @@ fn main() {
 - Implementing analytics
 - Creating a newsletter subscription feature
 - Improving performance optimizations 
+
+## WebAssembly Demo
+
+Below is a demonstration of a WebAssembly application:
+
+{{ wasm_viewer(path="gensokyo.js", id="gensokyo-demo") }} 
