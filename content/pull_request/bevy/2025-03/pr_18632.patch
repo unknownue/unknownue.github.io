@@ -1,0 +1,190 @@
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 0cf6686b3e9a6..f1a6f06498f42 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -51,6 +51,7 @@ use bevy_render::{
+ };
+ use bevy_render::{mesh::allocator::MeshAllocator, sync_world::MainEntityHashMap};
+ use bevy_render::{texture::FallbackImage, view::RenderVisibleEntities};
++use bevy_utils::Parallel;
+ use core::{hash::Hash, marker::PhantomData};
+ use tracing::error;
+ 
+@@ -796,14 +797,18 @@ pub fn check_entities_needing_specialization<M>(
+             AssetChanged<MeshMaterial3d<M>>,
+         )>,
+     >,
++    mut par_local: Local<Parallel<Vec<Entity>>>,
+     mut entities_needing_specialization: ResMut<EntitiesNeedingSpecialization<M>>,
+ ) where
+     M: Material,
+ {
+     entities_needing_specialization.clear();
+-    for entity in &needs_specialization {
+-        entities_needing_specialization.push(entity);
+-    }
++
++    needs_specialization
++        .par_iter()
++        .for_each(|entity| par_local.borrow_local_mut().push(entity));
++
++    par_local.drain_into(&mut entities_needing_specialization);
+ }
+ 
+ pub fn specialize_material_meshes<M: Material>(
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 7b70df38aab70..a13a5487da969 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -268,20 +268,22 @@ type PreviousMeshFilter = Or<(With<Mesh3d>, With<MeshletMesh3d>)>;
+ pub fn update_mesh_previous_global_transforms(
+     mut commands: Commands,
+     views: Query<&Camera, Or<(With<Camera3d>, With<ShadowView>)>>,
+-    meshes: Query<(Entity, &GlobalTransform, Option<&PreviousGlobalTransform>), PreviousMeshFilter>,
++    new_meshes: Query<
++        (Entity, &GlobalTransform),
++        (PreviousMeshFilter, Without<PreviousGlobalTransform>),
++    >,
++    mut meshes: Query<(&GlobalTransform, &mut PreviousGlobalTransform), PreviousMeshFilter>,
+ ) {
+     let should_run = views.iter().any(|camera| camera.is_active);
+ 
+     if should_run {
+-        for (entity, transform, old_previous_transform) in &meshes {
++        for (entity, transform) in &new_meshes {
+             let new_previous_transform = PreviousGlobalTransform(transform.affine());
+-            // Make sure not to trigger change detection on
+-            // `PreviousGlobalTransform` if the previous transform hasn't
+-            // changed.
+-            if old_previous_transform != Some(&new_previous_transform) {
+-                commands.entity(entity).try_insert(new_previous_transform);
+-            }
++            commands.entity(entity).try_insert(new_previous_transform);
+         }
++        meshes.par_iter_mut().for_each(|(transform, mut previous)| {
++            previous.set_if_neq(PreviousGlobalTransform(transform.affine()));
++        });
+     }
+ }
+ 
+diff --git a/crates/bevy_render/src/view/visibility/range.rs b/crates/bevy_render/src/view/visibility/range.rs
+index 86e75733c5070..74ac212bf34dd 100644
+--- a/crates/bevy_render/src/view/visibility/range.rs
++++ b/crates/bevy_render/src/view/visibility/range.rs
+@@ -15,13 +15,13 @@ use bevy_ecs::{
+     removal_detection::RemovedComponents,
+     resource::Resource,
+     schedule::IntoScheduleConfigs as _,
+-    system::{Query, Res, ResMut},
++    system::{Local, Query, Res, ResMut},
+ };
+ use bevy_math::{vec4, FloatOrd, Vec4};
+ use bevy_platform_support::collections::HashMap;
+ use bevy_reflect::Reflect;
+ use bevy_transform::components::GlobalTransform;
+-use bevy_utils::prelude::default;
++use bevy_utils::{prelude::default, Parallel};
+ use nonmax::NonMaxU16;
+ use wgpu::{BufferBindingType, BufferUsages};
+ 
+@@ -385,7 +385,8 @@ impl VisibleEntityRanges {
+ pub fn check_visibility_ranges(
+     mut visible_entity_ranges: ResMut<VisibleEntityRanges>,
+     view_query: Query<(Entity, &GlobalTransform), With<Camera>>,
+-    mut entity_query: Query<(Entity, &GlobalTransform, Option<&Aabb>, &VisibilityRange)>,
++    mut par_local: Local<Parallel<Vec<(Entity, u32)>>>,
++    entity_query: Query<(Entity, &GlobalTransform, Option<&Aabb>, &VisibilityRange)>,
+ ) {
+     visible_entity_ranges.clear();
+ 
+@@ -404,30 +405,34 @@ pub fn check_visibility_ranges(
+ 
+     // Check each entity/view pair. Only consider entities with
+     // [`VisibilityRange`] components.
+-    for (entity, entity_transform, maybe_model_aabb, visibility_range) in entity_query.iter_mut() {
+-        let mut visibility = 0;
+-        for (view_index, &(_, view_position)) in views.iter().enumerate() {
+-            // If instructed to use the AABB and the model has one, use its
+-            // center as the model position. Otherwise, use the model's
+-            // translation.
+-            let model_position = match (visibility_range.use_aabb, maybe_model_aabb) {
+-                (true, Some(model_aabb)) => entity_transform
+-                    .affine()
+-                    .transform_point3a(model_aabb.center),
+-                _ => entity_transform.translation_vec3a(),
+-            };
+-
+-            if visibility_range.is_visible_at_all((view_position - model_position).length()) {
+-                visibility |= 1 << view_index;
++    entity_query.par_iter().for_each(
++        |(entity, entity_transform, maybe_model_aabb, visibility_range)| {
++            let mut visibility = 0;
++            for (view_index, &(_, view_position)) in views.iter().enumerate() {
++                // If instructed to use the AABB and the model has one, use its
++                // center as the model position. Otherwise, use the model's
++                // translation.
++                let model_position = match (visibility_range.use_aabb, maybe_model_aabb) {
++                    (true, Some(model_aabb)) => entity_transform
++                        .affine()
++                        .transform_point3a(model_aabb.center),
++                    _ => entity_transform.translation_vec3a(),
++                };
++
++                if visibility_range.is_visible_at_all((view_position - model_position).length()) {
++                    visibility |= 1 << view_index;
++                }
+             }
+-        }
+ 
+-        // Invisible entities have no entry at all in the hash map. This speeds
+-        // up checks slightly in this common case.
+-        if visibility != 0 {
+-            visible_entity_ranges.entities.insert(entity, visibility);
+-        }
+-    }
++            // Invisible entities have no entry at all in the hash map. This speeds
++            // up checks slightly in this common case.
++            if visibility != 0 {
++                par_local.borrow_local_mut().push((entity, visibility));
++            }
++        },
++    );
++
++    visible_entity_ranges.entities.extend(par_local.drain());
+ }
+ 
+ /// Extracts all [`VisibilityRange`] components from the main world to the
+diff --git a/crates/bevy_sprite/src/mesh2d/material.rs b/crates/bevy_sprite/src/mesh2d/material.rs
+index ce2803b261680..ac67972c81331 100644
+--- a/crates/bevy_sprite/src/mesh2d/material.rs
++++ b/crates/bevy_sprite/src/mesh2d/material.rs
+@@ -44,6 +44,7 @@ use bevy_render::{
+     view::{ExtractedView, ViewVisibility},
+     Extract, ExtractSchedule, Render, RenderApp, RenderSet,
+ };
++use bevy_utils::Parallel;
+ use core::{hash::Hash, marker::PhantomData};
+ use derive_more::derive::From;
+ use tracing::error;
+@@ -644,14 +645,18 @@ pub fn check_entities_needing_specialization<M>(
+             AssetChanged<MeshMaterial2d<M>>,
+         )>,
+     >,
++    mut par_local: Local<Parallel<Vec<Entity>>>,
+     mut entities_needing_specialization: ResMut<EntitiesNeedingSpecialization<M>>,
+ ) where
+     M: Material2d,
+ {
+     entities_needing_specialization.clear();
+-    for entity in &needs_specialization {
+-        entities_needing_specialization.push(entity);
+-    }
++
++    needs_specialization
++        .par_iter()
++        .for_each(|entity| par_local.borrow_local_mut().push(entity));
++
++    par_local.drain_into(&mut entities_needing_specialization);
+ }
+ 
+ pub fn specialize_material2d_meshes<M: Material2d>(
