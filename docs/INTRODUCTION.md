@@ -18,6 +18,7 @@ unknownue.github.io/
 ├── .git/                   # Git repository
 ├── content/                # All blog content in Markdown
 │   ├── posts/              # Blog posts
+│   ├── projects/           # Project showcases
 │   ├── pull_request/       # Pull request documentation
 │   ├── empty-posts/        # Template/placeholder posts
 │   ├── _index.md           # Landing page content
@@ -41,6 +42,7 @@ unknownue.github.io/
 │   ├── pull_request.scss   # Pull request page styles
 │   ├── pull_request_page.scss # PR detail page styles
 │   ├── posts.scss          # Blog posts styles
+│   ├── projects.scss       # Projects page styles
 │   ├── home.scss           # Home page styles
 │   ├── fonts.scss          # Font definitions
 │   └── main.scss           # Main SCSS file that imports all others
@@ -59,6 +61,7 @@ unknownue.github.io/
 │   ├── base.html           # Base layout template
 │   ├── home.html           # Home page template
 │   ├── posts.html          # Posts page template
+│   ├── projects.html       # Projects page template
 │   └── ... other templates
 ├── themes/                 # Apollo theme (submodule)
 │   └── apollo/             # Theme files
@@ -96,10 +99,15 @@ The blog consists of the following main pages and sections:
    - Individual post pages at `/posts/{slug}`
    - Posts are organized by date and can be filtered by tags/categories
 
-3. **About Page (/about)**
+3. **Projects Section (/projects)**
+   - Showcases personal and open source projects
+   - Individual project pages at `/projects/{slug}`
+   - Projects are organized by date and can be filtered by tags/categories
+
+4. **About Page (/about)**
    - Personal information and site description
 
-4. **Pull Request Documentation (/pull_request)**
+5. **Pull Request Documentation (/pull_request)**
    - Custom documentation system organized like GitHub pull requests
    - List of all PR documentation entries
    - Individual PR pages at `/pull_request/{slug}`
@@ -164,13 +172,13 @@ The blog consists of the following main pages and sections:
       - Create any missing `_index.md` files
       - Add front matter to your PR Markdown file
 
-5. **Taxonomy Pages**
+6. **Taxonomy Pages**
    - Tags listing at `/tags`
    - Individual tag pages at `/tags/{tag-name}`
    - Categories listing at `/categories`
    - Individual category pages at `/categories/{category-name}`
 
-6. **Other Utility Pages**
+7. **Other Utility Pages**
    - 404 error page
    - RSS feed at `/atom.xml`
    - Search functionality
