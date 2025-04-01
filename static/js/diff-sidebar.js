@@ -6,11 +6,19 @@ document.addEventListener('DOMContentLoaded', function() {
     const currentUrl = window.location.pathname;
     const urlSuggestsMdFile = currentUrl.endsWith('.md') || 
                              currentUrl.includes('/posts/') || 
-                             currentUrl.includes('/pull_request/') || 
+                             (currentUrl.includes('/pull_request/') && currentUrl.split('/').length > 2) || 
                              (currentUrl.split('/').pop() && !currentUrl.split('/').pop().includes('.'));
     
-    // Display button only on MD content pages
-    if (isMdContentPage || urlSuggestsMdFile) {
+    // Skip list pages and section pages - don't try to detect patch files on them
+    const isListPage = document.querySelector('.pr-list') !== null || 
+                       document.querySelector('.pull-request-content > h2') !== null ||
+                       document.querySelector('.projects-content') !== null ||
+                       document.querySelector('.project-section-content') !== null ||
+                       document.querySelector('.project-list') !== null ||
+                       document.querySelector('.project-content-list') !== null;
+    
+    // Display button only on MD content pages and not on list pages
+    if ((isMdContentPage || urlSuggestsMdFile) && !isListPage) {
         // Check if patch info element exists
         const patchInfoElement = document.getElementById('patch-info');
         
@@ -176,6 +184,7 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Create Diff button and sidebar
     function createDiffButton(patchPath) {
+        if (!checkDocumentBody()) return;
         // Don't create button if it already exists
         if (document.querySelector('.diff-button')) {
             return;
@@ -266,8 +275,10 @@ document.addEventListener('DOMContentLoaded', function() {
         overlay.className = 'diff-overlay';
         
         // Add elements to body
-        document.body.appendChild(diffSidebar);
-        document.body.appendChild(overlay);
+        if (checkDocumentBody()) {
+            document.body.appendChild(diffSidebar);
+            document.body.appendChild(overlay);
+        }
         
         // Initial view mode
         let currentViewMode = 'side-by-side'; // Default split view
@@ -276,6 +287,8 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // Toggle sidebar function
         function toggleSidebar() {
+            if (!checkDocumentBody()) return;
+            
             const isOpening = !diffSidebar.classList.contains('open');
             
             diffSidebar.classList.toggle('open');
@@ -525,5 +538,10 @@ document.addEventListener('DOMContentLoaded', function() {
                 diffSidebar.classList.remove('resizing');
             }
         });
+    }
+    
+    // 添加document.body存在性检查的函数
+    function checkDocumentBody() {
+        return document.body !== null;
     }
 }); 

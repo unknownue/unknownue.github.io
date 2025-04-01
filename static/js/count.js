@@ -163,7 +163,16 @@
 
 			var rm = function() { if (img && img.parentNode) img.parentNode.removeChild(img) }
 			img.addEventListener('load', rm, false)
-			document.body.appendChild(img)
+			
+			// Check if document.body exists before appending
+			if (document.body) {
+				document.body.appendChild(img)
+			} else {
+				// Wait for the document body to be ready
+				document.addEventListener('DOMContentLoaded', function() {
+					if (document.body) document.body.appendChild(img)
+				})
+			}
 		}
 	}
 

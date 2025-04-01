@@ -1,5 +1,11 @@
 // WASM viewer initialization and management
 function initWasmViewer(idValue, wasmPath) {
+    // Check if document.body exists
+    if (!document.body) {
+        console.error("document.body is null, cannot initialize WASM viewer");
+        return;
+    }
+
     // Setup container ID
     var containerId = "wasm-container-" + idValue;
     var container = document.getElementById(containerId);
@@ -30,6 +36,12 @@ function initWasmViewer(idValue, wasmPath) {
 
     // Load WASM module
     function loadWasm() {
+        // Check if document.body exists
+        if (!document.body) {
+            console.error("document.body is null, cannot load WASM");
+            return;
+        }
+
         var script = document.createElement('script');
         script.type = 'module';
         

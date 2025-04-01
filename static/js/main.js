@@ -5,6 +5,9 @@ for (let i = 0; i < mmdElements.length; i++) {
 }
 
 function mermaidRender(theme) {
+	// Check if document.body exists
+	if (!document.body) return;
+
 	if (theme == "dark") {
 		initOptions = {
 			startOnLoad: false,
@@ -26,7 +29,7 @@ function mermaidRender(theme) {
 
 document.addEventListener('DOMContentLoaded', function() {
 	// Initialize Mermaid diagrams if they exist
-	if (typeof mermaid !== 'undefined') {
+	if (typeof mermaid !== 'undefined' && document.body) {
 		mermaid.initialize({
 			startOnLoad: true,
 			theme: document.body.classList.contains('dark') ? 'dark' : 'default',
@@ -86,6 +89,9 @@ function convertMermaidCodeBlocks() {
 
 // Function to process emojis in text
 function processEmojis() {
+	// Check if document.body exists
+	if (!document.body) return;
+
 	// Replace emoji shortcodes with actual emojis
 	const emojiMap = {
 		':smile:': '😊',
@@ -160,6 +166,9 @@ function processSuperSubScript() {
 
 // Function to initialize back to top button
 function initBackToTopButton() {
+    // Check if document.body exists
+    if (!document.body) return;
+
     // Create the container for both buttons
     const scrollButtonsContainer = document.createElement('div');
     scrollButtonsContainer.className = 'scroll-buttons';

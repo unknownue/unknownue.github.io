@@ -27,6 +27,13 @@ function setupLabelFiltering() {
     const labels = document.querySelectorAll('.pr-label.clickable');
     const prItems = document.querySelectorAll('.pr-item');
     const clearFiltersBtn = document.getElementById('clear-filters');
+    
+    // Exit early if required elements don't exist (not a PR page)
+    if (!clearFiltersBtn || labels.length === 0 || prItems.length === 0) {
+        console.log('Not a PR page or filtering elements not found, skipping label filtering setup');
+        return;
+    }
+    
     const labelsContainer = document.querySelector('.pr-labels-list');
     
     // Track selected labels
