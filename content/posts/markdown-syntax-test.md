@@ -2,6 +2,9 @@
 title = "Markdown Syntax Test"
 date = "2023-01-01T12:30:00"
 description = "This article tests Zola's support for various Markdown syntax features"
+
+[taxonomies]
+tags = ["markdown"]
 +++
 
 # Markdown Syntax Test
