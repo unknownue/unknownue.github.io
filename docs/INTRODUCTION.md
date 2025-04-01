@@ -97,12 +97,12 @@ The blog consists of the following main pages and sections:
 2. **Posts Section (/posts)**
    - Blog posts listing page
    - Individual post pages at `/posts/{slug}`
-   - Posts are organized by date and can be filtered by tags/categories
+   - Posts are organized by date and can be filtered by tags
 
 3. **Projects Section (/projects)**
    - Showcases personal and open source projects
    - Individual project pages at `/projects/{slug}`
-   - Projects are organized by date and can be filtered by tags/categories
+   - Projects are organized by date and can be filtered by tags
 
 4. **About Page (/about)**
    - Personal information and site description
@@ -175,8 +175,6 @@ The blog consists of the following main pages and sections:
 6. **Taxonomy Pages**
    - Tags listing at `/tags`
    - Individual tag pages at `/tags/{tag-name}`
-   - Categories listing at `/categories`
-   - Individual category pages at `/categories/{category-name}`
 
 7. **Other Utility Pages**
    - 404 error page
@@ -216,7 +214,7 @@ The blog includes several advanced features:
 4. **Technical Features**
    - Search functionality with Elasticlunr
    - RSS feed generation
-   - Taxonomy system (tags, categories)
+   - Taxonomy system (tags)
    - Pull request style documentation system
 
 ## Customizations

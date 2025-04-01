@@ -6,7 +6,6 @@ draft = false
 
 [taxonomies]
 tags = ["rust", "data-processing", "open-source"]
-categories = ["software development"]
 +++
 
 # Data Processing Library

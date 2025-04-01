@@ -6,7 +6,6 @@ draft = false
 
 [taxonomies]
 tags = ["web", "zola", "blog"]
-categories = ["web development"]
 +++
 
 # Personal Blog Project

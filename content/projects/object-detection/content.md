@@ -6,7 +6,6 @@ draft = false
 
 [taxonomies]
 tags = ["machine-learning", "computer-vision", "python", "deep-learning"]
-categories = ["artificial intelligence"]
 +++
 
 # Real-Time Object Detection
