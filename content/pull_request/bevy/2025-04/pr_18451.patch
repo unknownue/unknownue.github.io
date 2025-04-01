@@ -1,0 +1,524 @@
+diff --git a/crates/bevy_ecs/Cargo.toml b/crates/bevy_ecs/Cargo.toml
+index c5350dd91ad17..a8d817f43a1d3 100644
+--- a/crates/bevy_ecs/Cargo.toml
++++ b/crates/bevy_ecs/Cargo.toml
+@@ -34,7 +34,7 @@ bevy_reflect = ["dep:bevy_reflect"]
+ reflect_functions = ["bevy_reflect", "bevy_reflect/functions"]
+ 
+ ## Use the configurable global error handler as the default error handler.
+-## 
++##
+ ## This is typically used to turn panics from the ECS into loggable errors.
+ ## This may be useful for production builds,
+ ## but can result in a measurable performance impact, especially for commands.
+@@ -110,7 +110,6 @@ bevy_platform_support = { path = "../bevy_platform_support", version = "0.16.0-d
+ ] }
+ 
+ bitflags = { version = "2.3", default-features = false }
+-concurrent-queue = { version = "2.5.0", default-features = false }
+ disqualified = { version = "1.0", default-features = false }
+ fixedbitset = { version = "0.5", default-features = false }
+ serde = { version = "1", default-features = false, features = [
+@@ -133,6 +132,7 @@ tracing = { version = "0.1", default-features = false, optional = true }
+ log = { version = "0.4", default-features = false }
+ bumpalo = "3"
+ 
++concurrent-queue = { version = "2.5.0", default-features = false }
+ [target.'cfg(not(all(target_has_atomic = "8", target_has_atomic = "16", target_has_atomic = "32", target_has_atomic = "64", target_has_atomic = "ptr")))'.dependencies]
+ concurrent-queue = { version = "2.5.0", default-features = false, features = [
+   "portable-atomic",
+diff --git a/crates/bevy_ecs/src/component.rs b/crates/bevy_ecs/src/component.rs
+index 9a2bdff16ebf2..dca2580cd51ee 100644
+--- a/crates/bevy_ecs/src/component.rs
++++ b/crates/bevy_ecs/src/component.rs
+@@ -1175,8 +1175,9 @@ impl ComponentCloneBehavior {
+ 
+ /// A queued component registration.
+ struct QueuedRegistration {
+-    registrator: Box<dyn FnOnce(&mut ComponentsRegistrator, ComponentId)>,
++    registrator: Box<dyn FnOnce(&mut ComponentsRegistrator, ComponentId, ComponentDescriptor)>,
+     id: ComponentId,
++    descriptor: ComponentDescriptor,
+ }
+ 
+ impl QueuedRegistration {
+@@ -1187,17 +1188,19 @@ impl QueuedRegistration {
+     /// [`ComponentId`] must be unique.
+     unsafe fn new(
+         id: ComponentId,
+-        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId) + 'static,
++        descriptor: ComponentDescriptor,
++        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId, ComponentDescriptor) + 'static,
+     ) -> Self {
+         Self {
+             registrator: Box::new(func),
+             id,
++            descriptor,
+         }
+     }
+ 
+     /// Performs the registration, returning the now valid [`ComponentId`].
+     fn register(self, registrator: &mut ComponentsRegistrator) -> ComponentId {
+-        (self.registrator)(registrator, self.id);
++        (self.registrator)(registrator, self.id, self.descriptor);
+         self.id
+     }
+ }
+@@ -1294,6 +1297,7 @@ impl ComponentIds {
+ ///
+ /// As a rule of thumb, if you have mutable access to [`ComponentsRegistrator`], prefer to use that instead.
+ /// Use this only if you need to know the id of a component but do not need to modify the contents of the world based on that id.
++#[derive(Clone, Copy)]
+ pub struct ComponentsQueuedRegistrator<'w> {
+     components: &'w Components,
+     ids: &'w ComponentIds,
+@@ -1326,7 +1330,8 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+     unsafe fn force_register_arbitrary_component(
+         &self,
+         type_id: TypeId,
+-        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId) + 'static,
++        descriptor: ComponentDescriptor,
++        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId, ComponentDescriptor) + 'static,
+     ) -> ComponentId {
+         let id = self.ids.next();
+         self.components
+@@ -1337,7 +1342,7 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+             .insert(
+                 type_id,
+                 // SAFETY: The id was just generated.
+-                unsafe { QueuedRegistration::new(id, func) },
++                unsafe { QueuedRegistration::new(id, descriptor, func) },
+             );
+         id
+     }
+@@ -1350,7 +1355,8 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+     unsafe fn force_register_arbitrary_resource(
+         &self,
+         type_id: TypeId,
+-        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId) + 'static,
++        descriptor: ComponentDescriptor,
++        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId, ComponentDescriptor) + 'static,
+     ) -> ComponentId {
+         let id = self.ids.next();
+         self.components
+@@ -1361,7 +1367,7 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+             .insert(
+                 type_id,
+                 // SAFETY: The id was just generated.
+-                unsafe { QueuedRegistration::new(id, func) },
++                unsafe { QueuedRegistration::new(id, descriptor, func) },
+             );
+         id
+     }
+@@ -1369,7 +1375,8 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+     /// Queues this function to run as a dynamic registrator.
+     fn force_register_arbitrary_dynamic(
+         &self,
+-        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId) + 'static,
++        descriptor: ComponentDescriptor,
++        func: impl FnOnce(&mut ComponentsRegistrator, ComponentId, ComponentDescriptor) + 'static,
+     ) -> ComponentId {
+         let id = self.ids.next();
+         self.components
+@@ -1379,7 +1386,7 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+             .dynamic_registrations
+             .push(
+                 // SAFETY: The id was just generated.
+-                unsafe { QueuedRegistration::new(id, func) },
++                unsafe { QueuedRegistration::new(id, descriptor, func) },
+             );
+         id
+     }
+@@ -1388,6 +1395,8 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+     /// This will reserve an id and queue the registration.
+     /// These registrations will be carried out at the next opportunity.
+     ///
++    /// If this has already been registered or queued, this returns the previous [`ComponentId`].
++    ///
+     /// # Note
+     ///
+     /// Technically speaking, the returned [`ComponentId`] is not valid, but it will become valid later.
+@@ -1397,13 +1406,17 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+         self.component_id::<T>().unwrap_or_else(|| {
+             // SAFETY: We just checked that this type was not in the queue.
+             unsafe {
+-                self.force_register_arbitrary_component(TypeId::of::<T>(), |registrator, id| {
+-                    // SAFETY: We just checked that this is not currently registered or queued, and if it was registered since, this would have been dropped from the queue.
+-                    #[expect(unused_unsafe, reason = "More precise to specify.")]
+-                    unsafe {
+-                        registrator.register_component_unchecked::<T>(&mut Vec::new(), id);
+-                    }
+-                })
++                self.force_register_arbitrary_component(
++                    TypeId::of::<T>(),
++                    ComponentDescriptor::new::<T>(),
++                    |registrator, id, _descriptor| {
++                        // SAFETY: We just checked that this is not currently registered or queued, and if it was registered since, this would have been dropped from the queue.
++                        #[expect(unused_unsafe, reason = "More precise to specify.")]
++                        unsafe {
++                            registrator.register_component_unchecked::<T>(&mut Vec::new(), id);
++                        }
++                    },
++                )
+             }
+         })
+     }
+@@ -1421,7 +1434,7 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+         &self,
+         descriptor: ComponentDescriptor,
+     ) -> ComponentId {
+-        self.force_register_arbitrary_dynamic(|registrator, id| {
++        self.force_register_arbitrary_dynamic(descriptor, |registrator, id, descriptor| {
+             // SAFETY: Id uniqueness handled by caller.
+             unsafe {
+                 registrator.register_component_inner(id, descriptor);
+@@ -1433,6 +1446,8 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+     /// This will reserve an id and queue the registration.
+     /// These registrations will be carried out at the next opportunity.
+     ///
++    /// If this has already been registered or queued, this returns the previous [`ComponentId`].
++    ///
+     /// # Note
+     ///
+     /// Technically speaking, the returned [`ComponentId`] is not valid, but it will become valid later.
+@@ -1443,16 +1458,18 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+         self.get_resource_id(type_id).unwrap_or_else(|| {
+             // SAFETY: We just checked that this type was not in the queue.
+             unsafe {
+-                self.force_register_arbitrary_resource(type_id, move |registrator, id| {
+-                    // SAFETY: We just checked that this is not currently registered or queued, and if it was registered since, this would have been dropped from the queue.
+-                    // SAFETY: Id uniqueness handled by caller, and the type_id matches descriptor.
+-                    #[expect(unused_unsafe, reason = "More precise to specify.")]
+-                    unsafe {
+-                        registrator.register_resource_unchecked_with(type_id, id, || {
+-                            ComponentDescriptor::new_resource::<T>()
+-                        });
+-                    }
+-                })
++                self.force_register_arbitrary_resource(
++                    type_id,
++                    ComponentDescriptor::new_resource::<T>(),
++                    move |registrator, id, descriptor| {
++                        // SAFETY: We just checked that this is not currently registered or queued, and if it was registered since, this would have been dropped from the queue.
++                        // SAFETY: Id uniqueness handled by caller, and the type_id matches descriptor.
++                        #[expect(unused_unsafe, reason = "More precise to specify.")]
++                        unsafe {
++                            registrator.register_resource_unchecked(type_id, id, descriptor);
++                        }
++                    },
++                )
+             }
+         })
+     }
+@@ -1461,6 +1478,8 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+     /// This will reserve an id and queue the registration.
+     /// These registrations will be carried out at the next opportunity.
+     ///
++    /// If this has already been registered or queued, this returns the previous [`ComponentId`].
++    ///
+     /// # Note
+     ///
+     /// Technically speaking, the returned [`ComponentId`] is not valid, but it will become valid later.
+@@ -1471,16 +1490,18 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+         self.get_resource_id(type_id).unwrap_or_else(|| {
+             // SAFETY: We just checked that this type was not in the queue.
+             unsafe {
+-                self.force_register_arbitrary_resource(type_id, move |registrator, id| {
+-                    // SAFETY: We just checked that this is not currently registered or queued, and if it was registered since, this would have been dropped from the queue.
+-                    // SAFETY: Id uniqueness handled by caller, and the type_id matches descriptor.
+-                    #[expect(unused_unsafe, reason = "More precise to specify.")]
+-                    unsafe {
+-                        registrator.register_resource_unchecked_with(type_id, id, || {
+-                            ComponentDescriptor::new_non_send::<T>(StorageType::default())
+-                        });
+-                    }
+-                })
++                self.force_register_arbitrary_resource(
++                    type_id,
++                    ComponentDescriptor::new_non_send::<T>(StorageType::default()),
++                    move |registrator, id, descriptor| {
++                        // SAFETY: We just checked that this is not currently registered or queued, and if it was registered since, this would have been dropped from the queue.
++                        // SAFETY: Id uniqueness handled by caller, and the type_id matches descriptor.
++                        #[expect(unused_unsafe, reason = "More precise to specify.")]
++                        unsafe {
++                            registrator.register_resource_unchecked(type_id, id, descriptor);
++                        }
++                    },
++                )
+             }
+         })
+     }
+@@ -1498,7 +1519,7 @@ impl<'w> ComponentsQueuedRegistrator<'w> {
+         &self,
+         descriptor: ComponentDescriptor,
+     ) -> ComponentId {
+-        self.force_register_arbitrary_dynamic(|registrator, id| {
++        self.force_register_arbitrary_dynamic(descriptor, |registrator, id, descriptor| {
+             // SAFETY: Id uniqueness handled by caller.
+             unsafe {
+                 registrator.register_component_inner(id, descriptor);
+@@ -1802,7 +1823,7 @@ impl<'w> ComponentsRegistrator<'w> {
+         }
+     }
+ 
+-    /// Same as [`Components::register_resource_unchecked_with`] but handles safety.
++    /// Same as [`Components::register_resource_unchecked`] but handles safety.
+     ///
+     /// # Safety
+     ///
+@@ -1833,7 +1854,7 @@ impl<'w> ComponentsRegistrator<'w> {
+         let id = self.ids.next_mut();
+         // SAFETY: The resource is not currently registered, the id is fresh, and the [`ComponentDescriptor`] matches the [`TypeId`]
+         unsafe {
+-            self.register_resource_unchecked_with(type_id, id, descriptor);
++            self.register_resource_unchecked(type_id, id, descriptor());
+         }
+         id
+     }
+@@ -1959,13 +1980,53 @@ impl Components {
+         self.components.get(id.0).and_then(|info| info.as_ref())
+     }
+ 
+-    /// Returns the name associated with the given component, if it is registered.
+-    /// This will return `None` if the id is not regiserted or is queued.
++    /// Gets the [`ComponentDescriptor`] of the component with this [`ComponentId`] if it is present.
++    /// This will return `None` only if the id is neither regisered nor queued to be registered.
++    ///
++    /// Currently, the [`Cow`] will be [`Cow::Owned`] if and only if the component is queued. It will be [`Cow::Borrowed`] otherwise.
+     ///
+     /// This will return an incorrect result if `id` did not come from the same world as `self`. It may return `None` or a garbage value.
+     #[inline]
+-    pub fn get_name(&self, id: ComponentId) -> Option<&str> {
+-        self.get_info(id).map(ComponentInfo::name)
++    pub fn get_descriptor<'a>(&'a self, id: ComponentId) -> Option<Cow<'a, ComponentDescriptor>> {
++        self.components
++            .get(id.0)
++            .and_then(|info| info.as_ref().map(|info| Cow::Borrowed(&info.descriptor)))
++            .or_else(|| {
++                let queued = self.queued.read().unwrap_or_else(PoisonError::into_inner);
++                // first check components, then resources, then dynamic
++                queued
++                    .components
++                    .values()
++                    .chain(queued.resources.values())
++                    .chain(queued.dynamic_registrations.iter())
++                    .find(|queued| queued.id == id)
++                    .map(|queued| Cow::Owned(queued.descriptor.clone()))
++            })
++    }
++
++    /// Gets the name of the component with this [`ComponentId`] if it is present.
++    /// This will return `None` only if the id is neither regisered nor queued to be registered.
++    ///
++    /// This will return an incorrect result if `id` did not come from the same world as `self`. It may return `None` or a garbage value.
++    #[inline]
++    pub fn get_name<'a>(&'a self, id: ComponentId) -> Option<Cow<'a, str>> {
++        self.components
++            .get(id.0)
++            .and_then(|info| {
++                info.as_ref()
++                    .map(|info| Cow::Borrowed(info.descriptor.name()))
++            })
++            .or_else(|| {
++                let queued = self.queued.read().unwrap_or_else(PoisonError::into_inner);
++                // first check components, then resources, then dynamic
++                queued
++                    .components
++                    .values()
++                    .chain(queued.resources.values())
++                    .chain(queued.dynamic_registrations.iter())
++                    .find(|queued| queued.id == id)
++                    .map(|queued| queued.descriptor.name.clone())
++            })
+     }
+ 
+     /// Gets the metadata associated with the given component.
+@@ -2388,15 +2449,15 @@ impl Components {
+     /// The [`ComponentId`] must be unique.
+     /// The [`TypeId`] and [`ComponentId`] must not be registered or queued.
+     #[inline]
+-    unsafe fn register_resource_unchecked_with(
++    unsafe fn register_resource_unchecked(
+         &mut self,
+         type_id: TypeId,
+         component_id: ComponentId,
+-        func: impl FnOnce() -> ComponentDescriptor,
++        descriptor: ComponentDescriptor,
+     ) {
+         // SAFETY: ensured by caller
+         unsafe {
+-            self.register_component_inner(component_id, func());
++            self.register_component_inner(component_id, descriptor);
+         }
+         let prev = self.resource_indices.insert(type_id, component_id);
+         debug_assert!(prev.is_none());
+@@ -2872,13 +2933,13 @@ pub fn enforce_no_required_components_recursion(
+                 "Recursive required components detected: {}\nhelp: {}",
+                 recursion_check_stack
+                     .iter()
+-                    .map(|id| format!("{}", ShortName(components.get_name(*id).unwrap())))
++                    .map(|id| format!("{}", ShortName(&components.get_name(*id).unwrap())))
+                     .collect::<Vec<_>>()
+                     .join(" → "),
+                 if direct_recursion {
+                     format!(
+                         "Remove require({}).",
+-                        ShortName(components.get_name(requiree).unwrap())
++                        ShortName(&components.get_name(requiree).unwrap())
+                     )
+                 } else {
+                     "If this is intentional, consider merging the components.".into()
+diff --git a/crates/bevy_ecs/src/query/access.rs b/crates/bevy_ecs/src/query/access.rs
+index 6591507892e7e..01e3713ad624d 100644
+--- a/crates/bevy_ecs/src/query/access.rs
++++ b/crates/bevy_ecs/src/query/access.rs
+@@ -968,11 +968,10 @@ impl AccessConflicts {
+                     format!(
+                         "{}",
+                         ShortName(
+-                            world
++                            &world
+                                 .components
+-                                .get_info(ComponentId::get_sparse_set_index(index))
++                                .get_name(ComponentId::get_sparse_set_index(index))
+                                 .unwrap()
+-                                .name()
+                         )
+                     )
+                 })
+diff --git a/crates/bevy_ecs/src/schedule/mod.rs b/crates/bevy_ecs/src/schedule/mod.rs
+index d7a66faa63d68..aeaf8e3929ce6 100644
+--- a/crates/bevy_ecs/src/schedule/mod.rs
++++ b/crates/bevy_ecs/src/schedule/mod.rs
+@@ -1097,28 +1097,38 @@ mod tests {
+             let ambiguities: Vec<_> = schedule
+                 .graph()
+                 .conflicts_to_string(schedule.graph().conflicting_systems(), world.components())
++                .map(|item| {
++                    (
++                        item.0,
++                        item.1,
++                        item.2
++                            .into_iter()
++                            .map(|name| name.to_string())
++                            .collect::<Vec<_>>(),
++                    )
++                })
+                 .collect();
+ 
+             let expected = &[
+                 (
+                     "system_d".to_string(),
+                     "system_a".to_string(),
+-                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R"],
++                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R".into()],
+                 ),
+                 (
+                     "system_d".to_string(),
+                     "system_e".to_string(),
+-                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R"],
++                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R".into()],
+                 ),
+                 (
+                     "system_b".to_string(),
+                     "system_a".to_string(),
+-                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R"],
++                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R".into()],
+                 ),
+                 (
+                     "system_b".to_string(),
+                     "system_e".to_string(),
+-                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R"],
++                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R".into()],
+                 ),
+             ];
+ 
+@@ -1146,6 +1156,16 @@ mod tests {
+             let ambiguities: Vec<_> = schedule
+                 .graph()
+                 .conflicts_to_string(schedule.graph().conflicting_systems(), world.components())
++                .map(|item| {
++                    (
++                        item.0,
++                        item.1,
++                        item.2
++                            .into_iter()
++                            .map(|name| name.to_string())
++                            .collect::<Vec<_>>(),
++                    )
++                })
+                 .collect();
+ 
+             assert_eq!(
+@@ -1153,7 +1173,7 @@ mod tests {
+                 (
+                     "resmut_system (in set (resmut_system, resmut_system))".to_string(),
+                     "resmut_system (in set (resmut_system, resmut_system))".to_string(),
+-                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R"],
++                    vec!["bevy_ecs::schedule::tests::system_ambiguity::R".into()],
+                 )
+             );
+         }
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index 217bf9a0e642f..11d42020f3eb0 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -2,6 +2,7 @@
+     clippy::module_inception,
+     reason = "This instance of module inception is being discussed; see #17344."
+ )]
++use alloc::borrow::Cow;
+ use alloc::{
+     boxed::Box,
+     collections::{BTreeMap, BTreeSet},
+@@ -1902,7 +1903,7 @@ impl ScheduleGraph {
+         &'a self,
+         ambiguities: &'a [(NodeId, NodeId, Vec<ComponentId>)],
+         components: &'a Components,
+-    ) -> impl Iterator<Item = (String, String, Vec<&'a str>)> + 'a {
++    ) -> impl Iterator<Item = (String, String, Vec<Cow<'a, str>>)> + 'a {
+         ambiguities
+             .iter()
+             .map(move |(system_a, system_b, conflicts)| {
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index f9f8828015dd5..52f64902c3403 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -2847,6 +2847,7 @@ impl World {
+         &mut self,
+         component_id: ComponentId,
+     ) -> &mut ResourceData<true> {
++        self.flush_components();
+         let archetypes = &mut self.archetypes;
+         self.storages
+             .resources
+@@ -2862,6 +2863,7 @@ impl World {
+         &mut self,
+         component_id: ComponentId,
+     ) -> &mut ResourceData<false> {
++        self.flush_components();
+         let archetypes = &mut self.archetypes;
+         self.storages
+             .non_send_resources
+diff --git a/crates/bevy_ecs/src/world/reflect.rs b/crates/bevy_ecs/src/world/reflect.rs
+index 4337416aa2dc9..fdd8b28142576 100644
+--- a/crates/bevy_ecs/src/world/reflect.rs
++++ b/crates/bevy_ecs/src/world/reflect.rs
+@@ -80,7 +80,7 @@ impl World {
+             let component_name = self
+                 .components()
+                 .get_name(component_id)
+-                .map(ToString::to_string);
++                .map(|name| name.to_string());
+ 
+             return Err(GetComponentReflectError::EntityDoesNotHaveComponent {
+                 entity,
+@@ -169,7 +169,7 @@ impl World {
+         let component_name = self
+             .components()
+             .get_name(component_id)
+-            .map(ToString::to_string);
++            .map(|name| name.to_string());
+ 
+         let Some(comp_mut_untyped) = self.get_mut_by_id(entity, component_id) else {
+             return Err(GetComponentReflectError::EntityDoesNotHaveComponent {
