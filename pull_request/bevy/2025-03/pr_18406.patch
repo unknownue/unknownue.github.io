@@ -1,0 +1,193 @@
+diff --git a/crates/bevy_ecs/src/observer/runner.rs b/crates/bevy_ecs/src/observer/runner.rs
+index 95fda3b2f168a..26ac54c65e563 100644
+--- a/crates/bevy_ecs/src/observer/runner.rs
++++ b/crates/bevy_ecs/src/observer/runner.rs
+@@ -402,6 +402,7 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+     // - `update_archetype_component_access` is called first
+     // - there are no outstanding references to world except a private component
+     // - system is an `ObserverSystem` so won't mutate world beyond the access of a `DeferredWorld`
++    //   and is never exclusive
+     // - system is the same type erased system from above
+     unsafe {
+         (*system).update_archetype_component_access(world);
+diff --git a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+index bf63de8dc57c0..98d08884f1fda 100644
+--- a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+@@ -452,6 +452,8 @@ impl ExecutorState {
+ 
+                 // SAFETY:
+                 // - Caller ensured no other reference to this system exists.
++                // - `system_task_metadata[system_index].is_exclusive` is `false`,
++                //   so `System::is_exclusive` returned `false` when we called it.
+                 // - `can_run` has been called, which calls `update_archetype_component_access` with this system.
+                 // - `can_run` returned true, so no systems with conflicting world access are running.
+                 unsafe {
+@@ -592,6 +594,7 @@ impl ExecutorState {
+ 
+     /// # Safety
+     /// - Caller must not alias systems that are running.
++    /// - `is_exclusive` must have returned `false` for the specified system.
+     /// - `world` must have permission to access the world data
+     ///   used by the specified system.
+     /// - `update_archetype_component_access` must have been called with `world`
+@@ -609,6 +612,7 @@ impl ExecutorState {
+                 // SAFETY:
+                 // - The caller ensures that we have permission to
+                 // access the world data used by the system.
++                // - `is_exclusive` returned false
+                 // - `update_archetype_component_access` has been called.
+                 unsafe {
+                     if let Err(err) = __rust_begin_short_backtrace::run_unsafe(
+diff --git a/crates/bevy_ecs/src/system/adapter_system.rs b/crates/bevy_ecs/src/system/adapter_system.rs
+index 27e812928c8a1..385a1b78efe0d 100644
+--- a/crates/bevy_ecs/src/system/adapter_system.rs
++++ b/crates/bevy_ecs/src/system/adapter_system.rs
+@@ -162,12 +162,6 @@ where
+         })
+     }
+ 
+-    #[inline]
+-    fn run(&mut self, input: SystemIn<'_, Self>, world: &mut crate::prelude::World) -> Self::Out {
+-        self.func
+-            .adapt(input, |input| self.system.run(input, world))
+-    }
+-
+     #[inline]
+     fn apply_deferred(&mut self, world: &mut crate::prelude::World) {
+         self.system.apply_deferred(world);
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index f6e696a106a96..ccdf27620d621 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -176,6 +176,7 @@ where
+             input,
+             // SAFETY: The world accesses for both underlying systems have been registered,
+             // so the caller will guarantee that no other systems will conflict with `a` or `b`.
++            // If either system has `is_exclusive()`, then the combined system also has `is_exclusive`.
+             // Since these closures are `!Send + !Sync + !'static`, they can never be called
+             // in parallel, so their world accesses will not conflict with each other.
+             // Additionally, `update_archetype_component_access` has been called,
+@@ -186,19 +187,6 @@ where
+         )
+     }
+ 
+-    fn run(&mut self, input: SystemIn<'_, Self>, world: &mut World) -> Self::Out {
+-        let world = world.as_unsafe_world_cell();
+-        Func::combine(
+-            input,
+-            // SAFETY: Since these closures are `!Send + !Sync + !'static`, they can never
+-            // be called in parallel. Since mutable access to `world` only exists within
+-            // the scope of either closure, we can be sure they will never alias one another.
+-            |input| self.a.run(input, unsafe { world.world_mut() }),
+-            // SAFETY: See the above safety comment.
+-            |input| self.b.run(input, unsafe { world.world_mut() }),
+-        )
+-    }
+-
+     #[inline]
+     fn apply_deferred(&mut self, world: &mut World) {
+         self.a.apply_deferred(world);
+@@ -416,11 +404,6 @@ where
+         self.b.run_unsafe(value, world)
+     }
+ 
+-    fn run(&mut self, input: SystemIn<'_, Self>, world: &mut World) -> Self::Out {
+-        let value = self.a.run(input, world);
+-        self.b.run(value, world)
+-    }
+-
+     fn apply_deferred(&mut self, world: &mut World) {
+         self.a.apply_deferred(world);
+         self.b.apply_deferred(world);
+diff --git a/crates/bevy_ecs/src/system/exclusive_function_system.rs b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+index f3072dfdb77d2..600179533cf2a 100644
+--- a/crates/bevy_ecs/src/system/exclusive_function_system.rs
++++ b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+@@ -110,18 +110,12 @@ where
+ 
+     #[inline]
+     unsafe fn run_unsafe(
+-        &mut self,
+-        _input: SystemIn<'_, Self>,
+-        _world: UnsafeWorldCell,
+-    ) -> Self::Out {
+-        panic!("Cannot run exclusive systems with a shared World reference");
+-    }
+-
+-    fn run_without_applying_deferred(
+         &mut self,
+         input: SystemIn<'_, Self>,
+-        world: &mut World,
++        world: UnsafeWorldCell,
+     ) -> Self::Out {
++        // SAFETY: The safety is upheld by the caller.
++        let world = unsafe { world.world_mut() };
+         world.last_change_tick_scope(self.system_meta.last_run, |world| {
+             #[cfg(feature = "trace")]
+             let _span_guard = self.system_meta.system_span.enter();
+diff --git a/crates/bevy_ecs/src/system/observer_system.rs b/crates/bevy_ecs/src/system/observer_system.rs
+index 17dd4fb01784a..1874137f68031 100644
+--- a/crates/bevy_ecs/src/system/observer_system.rs
++++ b/crates/bevy_ecs/src/system/observer_system.rs
+@@ -138,12 +138,6 @@ where
+         Ok(())
+     }
+ 
+-    #[inline]
+-    fn run(&mut self, input: SystemIn<'_, Self>, world: &mut World) -> Self::Out {
+-        self.observer.run(input, world);
+-        Ok(())
+-    }
+-
+     #[inline]
+     fn apply_deferred(&mut self, world: &mut World) {
+         self.observer.apply_deferred(world);
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index 749060d2b968a..a61ce3deaa8b9 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -65,12 +65,6 @@ impl<S: System<In = (), Out = ()>> System for InfallibleSystemWrapper<S> {
+         Ok(())
+     }
+ 
+-    #[inline]
+-    fn run(&mut self, input: SystemIn<'_, Self>, world: &mut World) -> Self::Out {
+-        self.0.run(input, world);
+-        Ok(())
+-    }
+-
+     #[inline]
+     fn apply_deferred(&mut self, world: &mut World) {
+         self.0.apply_deferred(world);
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index b44cd29440546..455a3e40ef4a1 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -69,6 +69,8 @@ pub trait System: Send + Sync + 'static {
+     /// - The caller must ensure that [`world`](UnsafeWorldCell) has permission to access any world data
+     ///   registered in `archetype_component_access`. There must be no conflicting
+     ///   simultaneous accesses while the system is running.
++    /// - If [`System::is_exclusive`] returns `true`, then it must be valid to call
++    ///   [`UnsafeWorldCell::world_mut`] on `world`.
+     /// - The method [`System::update_archetype_component_access`] must be called at some
+     ///   point before this one, with the same exact [`World`]. If [`System::update_archetype_component_access`]
+     ///   panics (or otherwise does not return for any reason), this method must not be called.
+diff --git a/crates/bevy_ecs/src/system/system_registry.rs b/crates/bevy_ecs/src/system/system_registry.rs
+index 11d74beca5c1a..14563b76c7442 100644
+--- a/crates/bevy_ecs/src/system/system_registry.rs
++++ b/crates/bevy_ecs/src/system/system_registry.rs
+@@ -894,4 +894,13 @@ mod tests {
+ 
+         assert_eq!(INVOCATIONS_LEFT.get(), 0);
+     }
++
++    #[test]
++    fn run_system_exclusive_adapters() {
++        let mut world = World::new();
++        fn system(_: &mut World) {}
++        world.run_system_cached(system).unwrap();
++        world.run_system_cached(system.pipe(system)).unwrap();
++        world.run_system_cached(system.map(|()| {})).unwrap();
++    }
+ }
