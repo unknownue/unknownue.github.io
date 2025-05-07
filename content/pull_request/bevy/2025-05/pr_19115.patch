@@ -1,0 +1,564 @@
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index c244f7fbcb00d..56e1953ad8f8c 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -486,12 +486,22 @@ unsafe impl QueryData for EntityLocation {
+ /// SAFETY: access is read only
+ unsafe impl ReadOnlyQueryData for EntityLocation {}
+ 
++/// The [`WorldQuery::Fetch`] type for WorldQueries that can fetch multiple components from an entity
++/// ([`EntityRef`], [`EntityMut`], etc.)
++#[derive(Copy, Clone)]
++#[doc(hidden)]
++pub struct EntityFetch<'w> {
++    world: UnsafeWorldCell<'w>,
++    last_run: Tick,
++    this_run: Tick,
++}
++
+ /// SAFETY:
+ /// `fetch` accesses all components in a readonly way.
+ /// This is sound because `update_component_access` and `update_archetype_component_access` set read access for all components and panic when appropriate.
+ /// Filters are unchanged.
+ unsafe impl<'a> WorldQuery for EntityRef<'a> {
+-    type Fetch<'w> = UnsafeWorldCell<'w>;
++    type Fetch<'w> = EntityFetch<'w>;
+     type State = ();
+ 
+     fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+@@ -501,10 +511,14 @@ unsafe impl<'a> WorldQuery for EntityRef<'a> {
+     unsafe fn init_fetch<'w>(
+         world: UnsafeWorldCell<'w>,
+         _state: &Self::State,
+-        _last_run: Tick,
+-        _this_run: Tick,
++        last_run: Tick,
++        this_run: Tick,
+     ) -> Self::Fetch<'w> {
+-        world
++        EntityFetch {
++            world,
++            last_run,
++            this_run,
++        }
+     }
+ 
+     const IS_DENSE: bool = true;
+@@ -556,12 +570,17 @@ unsafe impl<'a> QueryData for EntityRef<'a> {
+ 
+     #[inline(always)]
+     unsafe fn fetch<'w>(
+-        world: &mut Self::Fetch<'w>,
++        fetch: &mut Self::Fetch<'w>,
+         entity: Entity,
+         _table_row: TableRow,
+     ) -> Self::Item<'w> {
+         // SAFETY: `fetch` must be called with an entity that exists in the world
+-        let cell = unsafe { world.get_entity(entity).debug_checked_unwrap() };
++        let cell = unsafe {
++            fetch
++                .world
++                .get_entity_with_ticks(entity, fetch.last_run, fetch.this_run)
++                .debug_checked_unwrap()
++        };
+         // SAFETY: Read-only access to every component has been registered.
+         unsafe { EntityRef::new(cell) }
+     }
+@@ -572,7 +591,7 @@ unsafe impl ReadOnlyQueryData for EntityRef<'_> {}
+ 
+ /// SAFETY: The accesses of `Self::ReadOnly` are a subset of the accesses of `Self`
+ unsafe impl<'a> WorldQuery for EntityMut<'a> {
+-    type Fetch<'w> = UnsafeWorldCell<'w>;
++    type Fetch<'w> = EntityFetch<'w>;
+     type State = ();
+ 
+     fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+@@ -582,10 +601,14 @@ unsafe impl<'a> WorldQuery for EntityMut<'a> {
+     unsafe fn init_fetch<'w>(
+         world: UnsafeWorldCell<'w>,
+         _state: &Self::State,
+-        _last_run: Tick,
+-        _this_run: Tick,
++        last_run: Tick,
++        this_run: Tick,
+     ) -> Self::Fetch<'w> {
+-        world
++        EntityFetch {
++            world,
++            last_run,
++            this_run,
++        }
+     }
+ 
+     const IS_DENSE: bool = true;
+@@ -637,12 +660,17 @@ unsafe impl<'a> QueryData for EntityMut<'a> {
+ 
+     #[inline(always)]
+     unsafe fn fetch<'w>(
+-        world: &mut Self::Fetch<'w>,
++        fetch: &mut Self::Fetch<'w>,
+         entity: Entity,
+         _table_row: TableRow,
+     ) -> Self::Item<'w> {
+         // SAFETY: `fetch` must be called with an entity that exists in the world
+-        let cell = unsafe { world.get_entity(entity).debug_checked_unwrap() };
++        let cell = unsafe {
++            fetch
++                .world
++                .get_entity_with_ticks(entity, fetch.last_run, fetch.this_run)
++                .debug_checked_unwrap()
++        };
+         // SAFETY: mutable access to every component has been registered.
+         unsafe { EntityMut::new(cell) }
+     }
+@@ -650,7 +678,7 @@ unsafe impl<'a> QueryData for EntityMut<'a> {
+ 
+ /// SAFETY: The accesses of `Self::ReadOnly` are a subset of the accesses of `Self`
+ unsafe impl<'a> WorldQuery for FilteredEntityRef<'a> {
+-    type Fetch<'w> = (UnsafeWorldCell<'w>, Access<ComponentId>);
++    type Fetch<'w> = (EntityFetch<'w>, Access<ComponentId>);
+     type State = Access<ComponentId>;
+ 
+     fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+@@ -662,12 +690,19 @@ unsafe impl<'a> WorldQuery for FilteredEntityRef<'a> {
+     unsafe fn init_fetch<'w>(
+         world: UnsafeWorldCell<'w>,
+         _state: &Self::State,
+-        _last_run: Tick,
+-        _this_run: Tick,
++        last_run: Tick,
++        this_run: Tick,
+     ) -> Self::Fetch<'w> {
+         let mut access = Access::default();
+         access.read_all_components();
+-        (world, access)
++        (
++            EntityFetch {
++                world,
++                last_run,
++                this_run,
++            },
++            access,
++        )
+     }
+ 
+     #[inline]
+@@ -743,12 +778,17 @@ unsafe impl<'a> QueryData for FilteredEntityRef<'a> {
+ 
+     #[inline(always)]
+     unsafe fn fetch<'w>(
+-        (world, access): &mut Self::Fetch<'w>,
++        (fetch, access): &mut Self::Fetch<'w>,
+         entity: Entity,
+         _table_row: TableRow,
+     ) -> Self::Item<'w> {
+         // SAFETY: `fetch` must be called with an entity that exists in the world
+-        let cell = unsafe { world.get_entity(entity).debug_checked_unwrap() };
++        let cell = unsafe {
++            fetch
++                .world
++                .get_entity_with_ticks(entity, fetch.last_run, fetch.this_run)
++                .debug_checked_unwrap()
++        };
+         // SAFETY: mutable access to every component has been registered.
+         unsafe { FilteredEntityRef::new(cell, access.clone()) }
+     }
+@@ -759,7 +799,7 @@ unsafe impl ReadOnlyQueryData for FilteredEntityRef<'_> {}
+ 
+ /// SAFETY: The accesses of `Self::ReadOnly` are a subset of the accesses of `Self`
+ unsafe impl<'a> WorldQuery for FilteredEntityMut<'a> {
+-    type Fetch<'w> = (UnsafeWorldCell<'w>, Access<ComponentId>);
++    type Fetch<'w> = (EntityFetch<'w>, Access<ComponentId>);
+     type State = Access<ComponentId>;
+ 
+     fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+@@ -771,12 +811,19 @@ unsafe impl<'a> WorldQuery for FilteredEntityMut<'a> {
+     unsafe fn init_fetch<'w>(
+         world: UnsafeWorldCell<'w>,
+         _state: &Self::State,
+-        _last_run: Tick,
+-        _this_run: Tick,
++        last_run: Tick,
++        this_run: Tick,
+     ) -> Self::Fetch<'w> {
+         let mut access = Access::default();
+         access.write_all_components();
+-        (world, access)
++        (
++            EntityFetch {
++                world,
++                last_run,
++                this_run,
++            },
++            access,
++        )
+     }
+ 
+     #[inline]
+@@ -850,12 +897,17 @@ unsafe impl<'a> QueryData for FilteredEntityMut<'a> {
+ 
+     #[inline(always)]
+     unsafe fn fetch<'w>(
+-        (world, access): &mut Self::Fetch<'w>,
++        (fetch, access): &mut Self::Fetch<'w>,
+         entity: Entity,
+         _table_row: TableRow,
+     ) -> Self::Item<'w> {
+         // SAFETY: `fetch` must be called with an entity that exists in the world
+-        let cell = unsafe { world.get_entity(entity).debug_checked_unwrap() };
++        let cell = unsafe {
++            fetch
++                .world
++                .get_entity_with_ticks(entity, fetch.last_run, fetch.this_run)
++                .debug_checked_unwrap()
++        };
+         // SAFETY: mutable access to every component has been registered.
+         unsafe { FilteredEntityMut::new(cell, access.clone()) }
+     }
+@@ -868,7 +920,7 @@ unsafe impl<'a, B> WorldQuery for EntityRefExcept<'a, B>
+ where
+     B: Bundle,
+ {
+-    type Fetch<'w> = UnsafeWorldCell<'w>;
++    type Fetch<'w> = EntityFetch<'w>;
+     type State = SmallVec<[ComponentId; 4]>;
+ 
+     fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+@@ -878,10 +930,14 @@ where
+     unsafe fn init_fetch<'w>(
+         world: UnsafeWorldCell<'w>,
+         _: &Self::State,
+-        _: Tick,
+-        _: Tick,
++        last_run: Tick,
++        this_run: Tick,
+     ) -> Self::Fetch<'w> {
+-        world
++        EntityFetch {
++            world,
++            last_run,
++            this_run,
++        }
+     }
+ 
+     const IS_DENSE: bool = true;
+@@ -948,11 +1004,14 @@ where
+     }
+ 
+     unsafe fn fetch<'w>(
+-        world: &mut Self::Fetch<'w>,
++        fetch: &mut Self::Fetch<'w>,
+         entity: Entity,
+         _: TableRow,
+     ) -> Self::Item<'w> {
+-        let cell = world.get_entity(entity).unwrap();
++        let cell = fetch
++            .world
++            .get_entity_with_ticks(entity, fetch.last_run, fetch.this_run)
++            .unwrap();
+         EntityRefExcept::new(cell)
+     }
+ }
+@@ -968,7 +1027,7 @@ unsafe impl<'a, B> WorldQuery for EntityMutExcept<'a, B>
+ where
+     B: Bundle,
+ {
+-    type Fetch<'w> = UnsafeWorldCell<'w>;
++    type Fetch<'w> = EntityFetch<'w>;
+     type State = SmallVec<[ComponentId; 4]>;
+ 
+     fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+@@ -978,10 +1037,14 @@ where
+     unsafe fn init_fetch<'w>(
+         world: UnsafeWorldCell<'w>,
+         _: &Self::State,
+-        _: Tick,
+-        _: Tick,
++        last_run: Tick,
++        this_run: Tick,
+     ) -> Self::Fetch<'w> {
+-        world
++        EntityFetch {
++            world,
++            last_run,
++            this_run,
++        }
+     }
+ 
+     const IS_DENSE: bool = true;
+@@ -1049,11 +1112,14 @@ where
+     }
+ 
+     unsafe fn fetch<'w>(
+-        world: &mut Self::Fetch<'w>,
++        fetch: &mut Self::Fetch<'w>,
+         entity: Entity,
+         _: TableRow,
+     ) -> Self::Item<'w> {
+-        let cell = world.get_entity(entity).unwrap();
++        let cell = fetch
++            .world
++            .get_entity_with_ticks(entity, fetch.last_run, fetch.this_run)
++            .unwrap();
+         EntityMutExcept::new(cell)
+     }
+ }
+@@ -2544,10 +2610,11 @@ impl<C: Component, T: Copy, S: Copy> Copy for StorageSwitch<C, T, S> {}
+ 
+ #[cfg(test)]
+ mod tests {
+-    use bevy_ecs_macros::QueryData;
+-
+     use super::*;
++    use crate::change_detection::DetectChanges;
+     use crate::system::{assert_is_system, Query};
++    use bevy_ecs::prelude::Schedule;
++    use bevy_ecs_macros::QueryData;
+ 
+     #[derive(Component)]
+     pub struct A;
+@@ -2641,4 +2708,34 @@ mod tests {
+ 
+         assert_is_system(client_system);
+     }
++
++    // Test that EntityRef::get_ref::<T>() returns a Ref<T> value with the correct
++    // ticks when the EntityRef was retrieved from a Query.
++    // See: https://github.com/bevyengine/bevy/issues/13735
++    #[test]
++    fn test_entity_ref_query_with_ticks() {
++        #[derive(Component)]
++        pub struct C;
++
++        fn system(query: Query<EntityRef>) {
++            for entity_ref in &query {
++                if let Some(c) = entity_ref.get_ref::<C>() {
++                    if !c.is_added() {
++                        panic!("Expected C to be added");
++                    }
++                }
++            }
++        }
++
++        let mut world = World::new();
++        let mut schedule = Schedule::default();
++        schedule.add_systems(system);
++        world.spawn(C);
++
++        // reset the change ticks
++        world.clear_trackers();
++
++        // we want EntityRef to use the change ticks of the system
++        schedule.run(&mut world);
++    }
+ }
+diff --git a/crates/bevy_ecs/src/world/entity_ref.rs b/crates/bevy_ecs/src/world/entity_ref.rs
+index f711c7d2704c8..9cc2cc3963bff 100644
+--- a/crates/bevy_ecs/src/world/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_ref.rs
+@@ -1113,26 +1113,38 @@ impl<'w> EntityWorldMut<'w> {
+ 
+     fn as_unsafe_entity_cell_readonly(&self) -> UnsafeEntityCell<'_> {
+         self.assert_not_despawned();
++        let last_change_tick = self.world.last_change_tick;
++        let change_tick = self.world.read_change_tick();
+         UnsafeEntityCell::new(
+             self.world.as_unsafe_world_cell_readonly(),
+             self.entity,
+             self.location,
++            last_change_tick,
++            change_tick,
+         )
+     }
+     fn as_unsafe_entity_cell(&mut self) -> UnsafeEntityCell<'_> {
+         self.assert_not_despawned();
++        let last_change_tick = self.world.last_change_tick;
++        let change_tick = self.world.change_tick();
+         UnsafeEntityCell::new(
+             self.world.as_unsafe_world_cell(),
+             self.entity,
+             self.location,
++            last_change_tick,
++            change_tick,
+         )
+     }
+     fn into_unsafe_entity_cell(self) -> UnsafeEntityCell<'w> {
+         self.assert_not_despawned();
++        let last_change_tick = self.world.last_change_tick;
++        let change_tick = self.world.change_tick();
+         UnsafeEntityCell::new(
+             self.world.as_unsafe_world_cell(),
+             self.entity,
+             self.location,
++            last_change_tick,
++            change_tick,
+         )
+     }
+ 
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index e6bc1606a0211..661449e60ebf5 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -976,6 +976,8 @@ impl World {
+                         self.as_unsafe_world_cell_readonly(),
+                         entity,
+                         location,
++                        self.last_change_tick,
++                        self.read_change_tick(),
+                     );
+                     // SAFETY: `&self` gives read access to the entire world.
+                     unsafe { EntityRef::new(cell) }
+@@ -985,6 +987,8 @@ impl World {
+ 
+     /// Returns a mutable iterator over all entities in the `World`.
+     pub fn iter_entities_mut(&mut self) -> impl Iterator<Item = EntityMut<'_>> + '_ {
++        let last_change_tick = self.last_change_tick;
++        let change_tick = self.change_tick();
+         let world_cell = self.as_unsafe_world_cell();
+         world_cell.archetypes().iter().flat_map(move |archetype| {
+             archetype
+@@ -1001,7 +1005,13 @@ impl World {
+                     };
+ 
+                     // SAFETY: entity exists and location accurately specifies the archetype where the entity is stored.
+-                    let cell = UnsafeEntityCell::new(world_cell, entity, location);
++                    let cell = UnsafeEntityCell::new(
++                        world_cell,
++                        entity,
++                        location,
++                        last_change_tick,
++                        change_tick,
++                    );
+                     // SAFETY: We have exclusive access to the entire world. We only create one borrow for each entity,
+                     // so none will conflict with one another.
+                     unsafe { EntityMut::new(cell) }
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index b46b4a154b359..129d48214e8af 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -365,7 +365,31 @@ impl<'w> UnsafeWorldCell<'w> {
+             .entities()
+             .get(entity)
+             .ok_or(EntityDoesNotExistError::new(entity, self.entities()))?;
+-        Ok(UnsafeEntityCell::new(self, entity, location))
++        Ok(UnsafeEntityCell::new(
++            self,
++            entity,
++            location,
++            self.last_change_tick(),
++            self.change_tick(),
++        ))
++    }
++
++    /// Retrieves an [`UnsafeEntityCell`] that exposes read and write operations for the given `entity`.
++    /// Similar to the [`UnsafeWorldCell`], you are in charge of making sure that no aliasing rules are violated.
++    #[inline]
++    pub fn get_entity_with_ticks(
++        self,
++        entity: Entity,
++        last_run: Tick,
++        this_run: Tick,
++    ) -> Result<UnsafeEntityCell<'w>, EntityDoesNotExistError> {
++        let location = self
++            .entities()
++            .get(entity)
++            .ok_or(EntityDoesNotExistError::new(entity, self.entities()))?;
++        Ok(UnsafeEntityCell::new(
++            self, entity, location, last_run, this_run,
++        ))
+     }
+ 
+     /// Gets a reference to the resource of the given type if it exists
+@@ -696,6 +720,8 @@ pub struct UnsafeEntityCell<'w> {
+     world: UnsafeWorldCell<'w>,
+     entity: Entity,
+     location: EntityLocation,
++    last_run: Tick,
++    this_run: Tick,
+ }
+ 
+ impl<'w> UnsafeEntityCell<'w> {
+@@ -704,11 +730,15 @@ impl<'w> UnsafeEntityCell<'w> {
+         world: UnsafeWorldCell<'w>,
+         entity: Entity,
+         location: EntityLocation,
++        last_run: Tick,
++        this_run: Tick,
+     ) -> Self {
+         UnsafeEntityCell {
+             world,
+             entity,
+             location,
++            last_run,
++            this_run,
+         }
+     }
+ 
+@@ -807,8 +837,8 @@ impl<'w> UnsafeEntityCell<'w> {
+     /// - no other mutable references to the component exist at the same time
+     #[inline]
+     pub unsafe fn get_ref<T: Component>(self) -> Option<Ref<'w, T>> {
+-        let last_change_tick = self.world.last_change_tick();
+-        let change_tick = self.world.change_tick();
++        let last_change_tick = self.last_run;
++        let change_tick = self.this_run;
+         let component_id = self.world.components().get_id(TypeId::of::<T>())?;
+ 
+         // SAFETY:
+@@ -909,12 +939,7 @@ impl<'w> UnsafeEntityCell<'w> {
+     #[inline]
+     pub unsafe fn get_mut_assume_mutable<T: Component>(self) -> Option<Mut<'w, T>> {
+         // SAFETY: same safety requirements
+-        unsafe {
+-            self.get_mut_using_ticks_assume_mutable(
+-                self.world.last_change_tick(),
+-                self.world.change_tick(),
+-            )
+-        }
++        unsafe { self.get_mut_using_ticks_assume_mutable(self.last_run, self.this_run) }
+     }
+ 
+     /// # Safety
+@@ -976,14 +1001,8 @@ impl<'w> UnsafeEntityCell<'w> {
+         };
+         if Q::matches_component_set(&state, &|id| archetype.contains(id)) {
+             // SAFETY: state was initialized above using the world passed into this function
+-            let mut fetch = unsafe {
+-                Q::init_fetch(
+-                    self.world,
+-                    &state,
+-                    self.world.last_change_tick(),
+-                    self.world.change_tick(),
+-                )
+-            };
++            let mut fetch =
++                unsafe { Q::init_fetch(self.world, &state, self.last_run, self.this_run) };
+             // SAFETY: Table is guaranteed to exist
+             let table = unsafe {
+                 self.world
+@@ -1070,11 +1089,7 @@ impl<'w> UnsafeEntityCell<'w> {
+             .map(|(value, cells, caller)| MutUntyped {
+                 // SAFETY: world access validated by caller and ties world lifetime to `MutUntyped` lifetime
+                 value: value.assert_unique(),
+-                ticks: TicksMut::from_tick_cells(
+-                    cells,
+-                    self.world.last_change_tick(),
+-                    self.world.change_tick(),
+-                ),
++                ticks: TicksMut::from_tick_cells(cells, self.last_run, self.this_run),
+                 changed_by: caller.map(|caller| caller.deref_mut()),
+             })
+             .ok_or(GetEntityMutByIdError::ComponentNotFound)
+@@ -1118,11 +1133,7 @@ impl<'w> UnsafeEntityCell<'w> {
+             .map(|(value, cells, caller)| MutUntyped {
+                 // SAFETY: world access validated by caller and ties world lifetime to `MutUntyped` lifetime
+                 value: value.assert_unique(),
+-                ticks: TicksMut::from_tick_cells(
+-                    cells,
+-                    self.world.last_change_tick(),
+-                    self.world.change_tick(),
+-                ),
++                ticks: TicksMut::from_tick_cells(cells, self.last_run, self.this_run),
+                 changed_by: caller.map(|caller| caller.deref_mut()),
+             })
+             .ok_or(GetEntityMutByIdError::ComponentNotFound)
