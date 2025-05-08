@@ -1,0 +1,1256 @@
+diff --git a/crates/bevy_ecs/src/bundle.rs b/crates/bevy_ecs/src/bundle.rs
+index 5ef3064b23f5f..a7fb4f6fd4dbd 100644
+--- a/crates/bevy_ecs/src/bundle.rs
++++ b/crates/bevy_ecs/src/bundle.rs
+@@ -1736,7 +1736,7 @@ impl<'w> BundleSpawner<'w> {
+                 InsertMode::Replace,
+                 caller,
+             );
+-            entities.set(entity.index(), location);
++            entities.set_spawn_despawn(entity.index(), location, caller, self.change_tick);
+             (location, after_effect)
+         };
+ 
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index 830c9919d0d87..e4d4b26d97de9 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -76,11 +76,18 @@ pub use unique_vec::{UniqueEntityEquivalentVec, UniqueEntityVec};
+ use crate::{
+     archetype::{ArchetypeId, ArchetypeRow},
+     change_detection::MaybeLocation,
++    component::Tick,
+     storage::{SparseSetIndex, TableId, TableRow},
+ };
+ use alloc::vec::Vec;
+ use bevy_platform::sync::atomic::Ordering;
+-use core::{fmt, hash::Hash, mem, num::NonZero, panic::Location};
++use core::{
++    fmt,
++    hash::Hash,
++    mem::{self, MaybeUninit},
++    num::NonZero,
++    panic::Location,
++};
+ use log::warn;
+ 
+ #[cfg(feature = "serialize")]
+@@ -899,7 +906,10 @@ impl Entities {
+     }
+ 
+     /// Updates the location of an [`Entity`]. This must be called when moving the components of
+-    /// the entity around in storage.
++    /// the existing entity around in storage.
++    ///
++    /// For spawning and despawning entities, [`set_spawn_despawn`](Self::set_spawn_despawn) must
++    /// be used instead.
+     ///
+     /// # Safety
+     ///  - `index` must be a valid entity index.
+@@ -912,6 +922,27 @@ impl Entities {
+         meta.location = location;
+     }
+ 
++    /// Updates the location of an [`Entity`]. This must be called when moving the components of
++    /// the spawned or despawned entity around in storage.
++    ///
++    /// # Safety
++    ///  - `index` must be a valid entity index.
++    ///  - `location` must be valid for the entity at `index` or immediately made valid afterwards
++    ///    before handing control to unknown code.
++    #[inline]
++    pub(crate) unsafe fn set_spawn_despawn(
++        &mut self,
++        index: u32,
++        location: EntityLocation,
++        by: MaybeLocation,
++        at: Tick,
++    ) {
++        // SAFETY: Caller guarantees that `index` a valid entity index
++        let meta = unsafe { self.meta.get_unchecked_mut(index as usize) };
++        meta.location = location;
++        meta.spawned_or_despawned = MaybeUninit::new(SpawnedOrDespawned { by, at });
++    }
++
+     /// Increments the `generation` of a freed [`Entity`]. The next entity ID allocated with this
+     /// `index` will count `generation` starting from the prior `generation` + the specified
+     /// value + 1.
+@@ -1052,19 +1083,6 @@ impl Entities {
+         self.len() == 0
+     }
+ 
+-    /// Sets the source code location from which this entity has last been spawned
+-    /// or despawned.
+-    #[inline]
+-    pub(crate) fn set_spawned_or_despawned_by(&mut self, index: u32, caller: MaybeLocation) {
+-        caller.map(|caller| {
+-            let meta = self
+-                .meta
+-                .get_mut(index as usize)
+-                .expect("Entity index invalid");
+-            meta.spawned_or_despawned_by = MaybeLocation::new(Some(caller));
+-        });
+-    }
+-
+     /// Returns the source code location from which this entity has last been spawned
+     /// or despawned. Returns `None` if its index has been reused by another entity
+     /// or if this entity has never existed.
+@@ -1073,16 +1091,67 @@ impl Entities {
+         entity: Entity,
+     ) -> MaybeLocation<Option<&'static Location<'static>>> {
+         MaybeLocation::new_with_flattened(|| {
+-            self.meta
+-                .get(entity.index() as usize)
+-                .filter(|meta|
+-                // Generation is incremented immediately upon despawn
+-                (meta.generation == entity.generation)
+-                || (meta.location.archetype_id == ArchetypeId::INVALID)
+-                && (meta.generation == entity.generation.after_versions(1)))
+-                .map(|meta| meta.spawned_or_despawned_by)
++            self.entity_get_spawned_or_despawned(entity)
++                .map(|spawned_or_despawned| spawned_or_despawned.by)
+         })
+-        .map(Option::flatten)
++    }
++
++    /// Returns the [`Tick`] at which this entity has last been spawned or despawned.
++    /// Returns `None` if its index has been reused by another entity or if this entity
++    /// has never existed.
++    pub fn entity_get_spawned_or_despawned_at(&self, entity: Entity) -> Option<Tick> {
++        self.entity_get_spawned_or_despawned(entity)
++            .map(|spawned_or_despawned| spawned_or_despawned.at)
++    }
++
++    /// Returns the [`SpawnedOrDespawned`] related to the entity's last spawn or
++    /// respawn. Returns `None` if its index has been reused by another entity or if
++    /// this entity has never existed.
++    #[inline]
++    fn entity_get_spawned_or_despawned(&self, entity: Entity) -> Option<SpawnedOrDespawned> {
++        self.meta
++            .get(entity.index() as usize)
++            .filter(|meta|
++            // Generation is incremented immediately upon despawn
++            (meta.generation == entity.generation)
++            || (meta.location.archetype_id == ArchetypeId::INVALID)
++            && (meta.generation == entity.generation.after_versions(1)))
++            .map(|meta| {
++                // SAFETY: valid archetype or non-min generation is proof this is init
++                unsafe { meta.spawned_or_despawned.assume_init() }
++            })
++    }
++
++    /// Returns the source code location from which this entity has last been spawned
++    /// or despawned and the Tick of when that happened.
++    ///
++    /// # Safety
++    ///
++    /// The entity index must belong to an entity that is currently alive or, if it
++    /// despawned, was not overwritten by a new entity of the same index.
++    #[inline]
++    pub(crate) unsafe fn entity_get_spawned_or_despawned_unchecked(
++        &self,
++        entity: Entity,
++    ) -> (MaybeLocation, Tick) {
++        // SAFETY: caller ensures entity is allocated
++        let meta = unsafe { self.meta.get_unchecked(entity.index() as usize) };
++        // SAFETY: caller ensures entities of this index were at least spawned
++        let spawned_or_despawned = unsafe { meta.spawned_or_despawned.assume_init() };
++        (spawned_or_despawned.by, spawned_or_despawned.at)
++    }
++
++    #[inline]
++    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++        for meta in &mut self.meta {
++            if meta.generation != EntityGeneration::FIRST
++                || meta.location.archetype_id != ArchetypeId::INVALID
++            {
++                // SAFETY: non-min generation or valid archetype is proof this is init
++                let spawned_or_despawned = unsafe { meta.spawned_or_despawned.assume_init_mut() };
++                spawned_or_despawned.at.check_tick(change_tick);
++            }
++        }
+     }
+ 
+     /// Constructs a message explaining why an entity does not exist, if known.
+@@ -1145,7 +1214,13 @@ struct EntityMeta {
+     /// The current location of the [`EntityRow`]
+     pub location: EntityLocation,
+     /// Location of the last spawn or despawn of this entity
+-    spawned_or_despawned_by: MaybeLocation<Option<&'static Location<'static>>>,
++    spawned_or_despawned: MaybeUninit<SpawnedOrDespawned>,
++}
++
++#[derive(Copy, Clone, Debug)]
++struct SpawnedOrDespawned {
++    by: MaybeLocation,
++    at: Tick,
+ }
+ 
+ impl EntityMeta {
+@@ -1153,7 +1228,7 @@ impl EntityMeta {
+     const EMPTY: EntityMeta = EntityMeta {
+         generation: EntityGeneration::FIRST,
+         location: EntityLocation::INVALID,
+-        spawned_or_despawned_by: MaybeLocation::new(None),
++        spawned_or_despawned: MaybeUninit::uninit(),
+     };
+ }
+ 
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 56e1953ad8f8c..3c1ff5262cd15 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -31,6 +31,8 @@ use variadics_please::all_tuples;
+ ///   Gets the identifier of the queried entity.
+ /// - **[`EntityLocation`].**
+ ///   Gets the location metadata of the queried entity.
++/// - **[`SpawnDetails`].**
++///   Gets the tick the entity was spawned at.
+ /// - **[`EntityRef`].**
+ ///   Read-only access to arbitrary components on the queried entity.
+ /// - **[`EntityMut`].**
+@@ -486,6 +488,166 @@ unsafe impl QueryData for EntityLocation {
+ /// SAFETY: access is read only
+ unsafe impl ReadOnlyQueryData for EntityLocation {}
+ 
++/// The `SpawnDetails` query parameter fetches the [`Tick`] the entity was spawned at.
++///
++/// To evaluate whether the spawn happened since the last time the system ran, the system
++/// param [`SystemChangeTick`](bevy_ecs::system::SystemChangeTick) needs to be used.
++///
++/// If the query should filter for spawned entities instead, use the
++/// [`Spawned`](bevy_ecs::query::Spawned) query filter instead.
++///
++/// # Examples
++///
++/// ```
++/// # use bevy_ecs::component::Component;
++/// # use bevy_ecs::entity::Entity;
++/// # use bevy_ecs::system::Query;
++/// # use bevy_ecs::query::Spawned;
++/// # use bevy_ecs::query::SpawnDetails;
++///
++/// fn print_spawn_details(query: Query<(Entity, SpawnDetails)>) {
++///     for (entity, spawn_details) in &query {
++///         if spawn_details.is_spawned() {
++///             print!("new ");
++///         }
++///         print!(
++///             "entity {:?} spawned at {:?}",
++///             entity,
++///             spawn_details.spawned_at()
++///         );
++///         match spawn_details.spawned_by().into_option() {
++///             Some(location) => println!(" by {:?}", location),
++///             None => println!()
++///         }    
++///     }
++/// }
++///
++/// # bevy_ecs::system::assert_is_system(print_spawn_details);
++/// ```
++#[derive(Clone, Copy, Debug)]
++pub struct SpawnDetails {
++    spawned_by: MaybeLocation,
++    spawned_at: Tick,
++    last_run: Tick,
++    this_run: Tick,
++}
++
++impl SpawnDetails {
++    /// Returns `true` if the entity spawned since the last time this system ran.
++    /// Otherwise, returns `false`.
++    pub fn is_spawned(self) -> bool {
++        self.spawned_at.is_newer_than(self.last_run, self.this_run)
++    }
++
++    /// Returns the `Tick` this entity spawned at.
++    pub fn spawned_at(self) -> Tick {
++        self.spawned_at
++    }
++
++    /// Returns the source code location from which this entity has been spawned.
++    pub fn spawned_by(self) -> MaybeLocation {
++        self.spawned_by
++    }
++}
++
++#[doc(hidden)]
++#[derive(Clone)]
++pub struct SpawnDetailsFetch<'w> {
++    entities: &'w Entities,
++    last_run: Tick,
++    this_run: Tick,
++}
++
++// SAFETY:
++// No components are accessed.
++unsafe impl WorldQuery for SpawnDetails {
++    type Fetch<'w> = SpawnDetailsFetch<'w>;
++    type State = ();
++
++    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
++        fetch
++    }
++
++    unsafe fn init_fetch<'w>(
++        world: UnsafeWorldCell<'w>,
++        _state: &Self::State,
++        last_run: Tick,
++        this_run: Tick,
++    ) -> Self::Fetch<'w> {
++        SpawnDetailsFetch {
++            entities: world.entities(),
++            last_run,
++            this_run,
++        }
++    }
++
++    const IS_DENSE: bool = true;
++
++    #[inline]
++    unsafe fn set_archetype<'w>(
++        _fetch: &mut Self::Fetch<'w>,
++        _state: &Self::State,
++        _archetype: &'w Archetype,
++        _table: &'w Table,
++    ) {
++    }
++
++    #[inline]
++    unsafe fn set_table<'w>(_fetch: &mut Self::Fetch<'w>, _state: &Self::State, _table: &'w Table) {
++    }
++
++    fn update_component_access(_state: &Self::State, _access: &mut FilteredAccess<ComponentId>) {}
++
++    fn init_state(_world: &mut World) {}
++
++    fn get_state(_components: &Components) -> Option<()> {
++        Some(())
++    }
++
++    fn matches_component_set(
++        _state: &Self::State,
++        _set_contains_id: &impl Fn(ComponentId) -> bool,
++    ) -> bool {
++        true
++    }
++}
++
++// SAFETY:
++// No components are accessed.
++// Is its own ReadOnlyQueryData.
++unsafe impl QueryData for SpawnDetails {
++    const IS_READ_ONLY: bool = true;
++    type ReadOnly = Self;
++    type Item<'w> = Self;
++
++    fn shrink<'wlong: 'wshort, 'wshort>(item: Self::Item<'wlong>) -> Self::Item<'wshort> {
++        item
++    }
++
++    #[inline(always)]
++    unsafe fn fetch<'w>(
++        fetch: &mut Self::Fetch<'w>,
++        entity: Entity,
++        _table_row: TableRow,
++    ) -> Self::Item<'w> {
++        // SAFETY: only living entities are queried
++        let (spawned_by, spawned_at) = unsafe {
++            fetch
++                .entities
++                .entity_get_spawned_or_despawned_unchecked(entity)
++        };
++        Self {
++            spawned_by,
++            spawned_at,
++            last_run: fetch.last_run,
++            this_run: fetch.this_run,
++        }
++    }
++}
++
++/// SAFETY: access is read only
++unsafe impl ReadOnlyQueryData for SpawnDetails {}
++
+ /// The [`WorldQuery::Fetch`] type for WorldQueries that can fetch multiple components from an entity
+ /// ([`EntityRef`], [`EntityMut`], etc.)
+ #[derive(Copy, Clone)]
+diff --git a/crates/bevy_ecs/src/query/filter.rs b/crates/bevy_ecs/src/query/filter.rs
+index dc6acabe9ba32..38c7cfcb32c92 100644
+--- a/crates/bevy_ecs/src/query/filter.rs
++++ b/crates/bevy_ecs/src/query/filter.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     archetype::Archetype,
+     component::{Component, ComponentId, Components, StorageType, Tick},
+-    entity::Entity,
++    entity::{Entities, Entity},
+     query::{DebugCheckedUnwrap, FilteredAccess, StorageSwitch, WorldQuery},
+     storage::{ComponentSparseSet, Table, TableRow},
+     world::{unsafe_world_cell::UnsafeWorldCell, World},
+@@ -17,6 +17,8 @@ use variadics_please::all_tuples;
+ ///   [`With`] and [`Without`] filters can be applied to check if the queried entity does or does not contain a particular component.
+ /// - **Change detection filters.**
+ ///   [`Added`] and [`Changed`] filters can be applied to detect component changes to an entity.
++/// - **Spawned filter.**
++///   [`Spawned`] filter can be applied to check if the queried entity was spawned recently.
+ /// - **`QueryFilter` tuples.**
+ ///   If every element of a tuple implements `QueryFilter`, then the tuple itself also implements the same trait.
+ ///   This enables a single `Query` to filter over multiple conditions.
+@@ -624,8 +626,8 @@ unsafe impl<T: Component> QueryFilter for Allows<T> {
+ /// # Deferred
+ ///
+ /// Note, that entity modifications issued with [`Commands`](crate::system::Commands)
+-/// are visible only after deferred operations are applied,
+-/// typically at the end of the schedule iteration.
++/// are visible only after deferred operations are applied, typically after the system
++/// that queued them.
+ ///
+ /// # Time complexity
+ ///
+@@ -849,9 +851,8 @@ unsafe impl<T: Component> QueryFilter for Added<T> {
+ /// # Deferred
+ ///
+ /// Note, that entity modifications issued with [`Commands`](crate::system::Commands)
+-/// (like entity creation or entity component addition or removal)
+-/// are visible only after deferred operations are applied,
+-/// typically at the end of the schedule iteration.
++/// (like entity creation or entity component addition or removal) are visible only
++/// after deferred operations are applied, typically after the system that queued them.
+ ///
+ /// # Time complexity
+ ///
+@@ -1062,6 +1063,146 @@ unsafe impl<T: Component> QueryFilter for Changed<T> {
+     }
+ }
+ 
++/// A filter that only retains results the first time after the entity has been spawned.
++///
++/// A common use for this filter is one-time initialization.
++///
++/// To retain all results without filtering but still check whether they were spawned after the
++/// system last ran, use [`SpawnDetails`](crate::query::SpawnDetails) instead.
++///
++/// **Note** that this includes entities that spawned before the first time this Query was run.
++///
++/// # Deferred
++///
++/// Note, that entity spawns issued with [`Commands`](crate::system::Commands)
++/// are visible only after deferred operations are applied, typically after the
++/// system that queued them.
++///
++/// # Time complexity
++///
++/// `Spawned` is not [`ArchetypeFilter`], which practically means that if query matches million
++/// entities, `Spawned` filter will iterate over all of them even if none of them were spawned.
++///
++/// For example, these two systems are roughly equivalent in terms of performance:
++///
++/// ```
++/// # use bevy_ecs::entity::Entity;
++/// # use bevy_ecs::system::Query;
++/// # use bevy_ecs::query::Spawned;
++/// # use bevy_ecs::query::SpawnDetails;
++///
++/// fn system1(query: Query<Entity, Spawned>) {
++///     for entity in &query { /* entity spawned */ }
++/// }
++///
++/// fn system2(query: Query<(Entity, SpawnDetails)>) {
++///     for (entity, spawned) in &query {
++///         if spawned.is_spawned() { /* entity spawned */ }
++///     }
++/// }
++/// ```
++///
++/// # Examples
++///
++/// ```
++/// # use bevy_ecs::component::Component;
++/// # use bevy_ecs::query::Spawned;
++/// # use bevy_ecs::system::IntoSystem;
++/// # use bevy_ecs::system::Query;
++/// #
++/// # #[derive(Component, Debug)]
++/// # struct Name {};
++///
++/// fn print_spawning_entities(query: Query<&Name, Spawned>) {
++///     for name in &query {
++///         println!("Entity spawned: {:?}", name);
++///     }
++/// }
++///
++/// # bevy_ecs::system::assert_is_system(print_spawning_entities);
++/// ```
++pub struct Spawned;
++
++#[doc(hidden)]
++#[derive(Clone)]
++pub struct SpawnedFetch<'w> {
++    entities: &'w Entities,
++    last_run: Tick,
++    this_run: Tick,
++}
++
++// SAFETY: WorldQuery impl accesses no components or component ticks
++unsafe impl WorldQuery for Spawned {
++    type Fetch<'w> = SpawnedFetch<'w>;
++    type State = ();
++
++    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
++        fetch
++    }
++
++    #[inline]
++    unsafe fn init_fetch<'w>(
++        world: UnsafeWorldCell<'w>,
++        _state: &(),
++        last_run: Tick,
++        this_run: Tick,
++    ) -> Self::Fetch<'w> {
++        SpawnedFetch {
++            entities: world.entities(),
++            last_run,
++            this_run,
++        }
++    }
++
++    const IS_DENSE: bool = true;
++
++    #[inline]
++    unsafe fn set_archetype<'w>(
++        _fetch: &mut Self::Fetch<'w>,
++        _state: &(),
++        _archetype: &'w Archetype,
++        _table: &'w Table,
++    ) {
++    }
++
++    #[inline]
++    unsafe fn set_table<'w>(_fetch: &mut Self::Fetch<'w>, _state: &(), _table: &'w Table) {}
++
++    #[inline]
++    fn update_component_access(_state: &(), _access: &mut FilteredAccess<ComponentId>) {}
++
++    fn init_state(_world: &mut World) {}
++
++    fn get_state(_components: &Components) -> Option<()> {
++        Some(())
++    }
++
++    fn matches_component_set(_state: &(), _set_contains_id: &impl Fn(ComponentId) -> bool) -> bool {
++        true
++    }
++}
++
++// SAFETY: WorldQuery impl accesses no components or component ticks
++unsafe impl QueryFilter for Spawned {
++    const IS_ARCHETYPAL: bool = false;
++
++    #[inline(always)]
++    unsafe fn filter_fetch(
++        fetch: &mut Self::Fetch<'_>,
++        entity: Entity,
++        _table_row: TableRow,
++    ) -> bool {
++        // SAFETY: only living entities are queried
++        let spawned = unsafe {
++            fetch
++                .entities
++                .entity_get_spawned_or_despawned_unchecked(entity)
++                .1
++        };
++        spawned.is_newer_than(fetch.last_run, fetch.this_run)
++    }
++}
++
+ /// A marker trait to indicate that the filter works at an archetype level.
+ ///
+ /// This is needed to implement [`ExactSizeIterator`] for
+@@ -1072,7 +1213,7 @@ unsafe impl<T: Component> QueryFilter for Changed<T> {
+ /// [Tuples](prim@tuple) and [`Or`] filters are automatically implemented with the trait only if its containing types
+ /// also implement the same trait.
+ ///
+-/// [`Added`] and [`Changed`] works with entities, and therefore are not archetypal. As such
++/// [`Added`], [`Changed`] and [`Spawned`] work with entities, and therefore are not archetypal. As such
+ /// they do not implement [`ArchetypeFilter`].
+ #[diagnostic::on_unimplemented(
+     message = "`{Self}` is not a valid `Query` filter based on archetype information",
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index 81cae32f2cac9..cae8e592e757e 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -459,8 +459,8 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+     ///
+     /// This is equivalent to `self.iter().next().is_none()`, and thus the worst case runtime will be `O(n)`
+     /// where `n` is the number of *potential* matches. This can be notably expensive for queries that rely
+-    /// on non-archetypal filters such as [`Added`] or [`Changed`] which must individually check each query
+-    /// result for a match.
++    /// on non-archetypal filters such as [`Added`], [`Changed`] or [`Spawned`] which must individually check
++    /// each query result for a match.
+     ///
+     /// # Panics
+     ///
+@@ -468,6 +468,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+     ///
+     /// [`Added`]: crate::query::Added
+     /// [`Changed`]: crate::query::Changed
++    /// [`Spawned`]: crate::query::Spawned
+     #[inline]
+     pub fn is_empty(&self, world: &World, last_run: Tick, this_run: Tick) -> bool {
+         self.validate_world(world.id());
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index c64e30822b406..5cf3fe2a44cd6 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -183,7 +183,7 @@ impl SystemMeta {
+ /// [`SystemState`] values created can be cached to improve performance,
+ /// and *must* be cached and reused in order for system parameters that rely on local state to work correctly.
+ /// These include:
+-/// - [`Added`](crate::query::Added) and [`Changed`](crate::query::Changed) query filters
++/// - [`Added`](crate::query::Added), [`Changed`](crate::query::Changed) and [`Spawned`](crate::query::Spawned) query filters
+ /// - [`Local`](crate::system::Local) variables that hold state
+ /// - [`EventReader`](crate::event::EventReader) system parameters, which rely on a [`Local`](crate::system::Local) to track which events have been seen
+ ///
+diff --git a/crates/bevy_ecs/src/system/mod.rs b/crates/bevy_ecs/src/system/mod.rs
+index 7ba3dba4fb33c..011c220c856fb 100644
+--- a/crates/bevy_ecs/src/system/mod.rs
++++ b/crates/bevy_ecs/src/system/mod.rs
+@@ -410,7 +410,7 @@ mod tests {
+         error::Result,
+         name::Name,
+         prelude::{AnyOf, EntityRef, Trigger},
+-        query::{Added, Changed, Or, With, Without},
++        query::{Added, Changed, Or, SpawnDetails, Spawned, With, Without},
+         removal_detection::RemovedComponents,
+         resource::Resource,
+         schedule::{
+@@ -1326,6 +1326,25 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn system_state_spawned() {
++        let mut world = World::default();
++        world.spawn_empty();
++        let spawn_tick = world.change_tick();
++
++        let mut system_state: SystemState<Option<Single<SpawnDetails, Spawned>>> =
++            SystemState::new(&mut world);
++        {
++            let query = system_state.get(&world);
++            assert_eq!(query.unwrap().spawned_at(), spawn_tick);
++        }
++
++        {
++            let query = system_state.get(&world);
++            assert!(query.is_none());
++        }
++    }
++
+     #[test]
+     #[should_panic]
+     fn system_state_invalid_world() {
+@@ -1551,6 +1570,21 @@ mod tests {
+             let mut sys = IntoSystem::into_system(mutable_query);
+             sys.initialize(&mut world);
+         }
++
++        {
++            let mut world = World::new();
++
++            fn mutable_query(mut query: Query<(&mut A, &mut B, SpawnDetails), Spawned>) {
++                for _ in &mut query {}
++
++                immutable_query(query.as_readonly());
++            }
++
++            fn immutable_query(_: Query<(&A, &B, SpawnDetails), Spawned>) {}
++
++            let mut sys = IntoSystem::into_system(mutable_query);
++            sys.initialize(&mut world);
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_ecs/src/system/query.rs b/crates/bevy_ecs/src/system/query.rs
+index fddbe5376c5ec..c1d9e671a0e4f 100644
+--- a/crates/bevy_ecs/src/system/query.rs
++++ b/crates/bevy_ecs/src/system/query.rs
+@@ -440,7 +440,7 @@ use core::{
+ /// |[`get_many`]|O(k)|
+ /// |[`get_many_mut`]|O(k<sup>2</sup>)|
+ /// |Archetype-based filtering ([`With`], [`Without`], [`Or`])|O(a)|
+-/// |Change detection filtering ([`Added`], [`Changed`])|O(a + n)|
++/// |Change detection filtering ([`Added`], [`Changed`], [`Spawned`])|O(a + n)|
+ ///
+ /// [component storage types]: crate::component::StorageType
+ /// [`Table`]: crate::storage::Table
+@@ -449,6 +449,7 @@ use core::{
+ /// [`Or`]: crate::query::Or
+ /// [`Added`]: crate::query::Added
+ /// [`Changed`]: crate::query::Changed
++/// [`Spawned`]: crate::query::Spawned
+ ///
+ /// # `Iterator::for_each`
+ ///
+@@ -1956,8 +1957,8 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// This is equivalent to `self.iter().next().is_none()`, and thus the worst case runtime will be `O(n)`
+     /// where `n` is the number of *potential* matches. This can be notably expensive for queries that rely
+-    /// on non-archetypal filters such as [`Added`] or [`Changed`] which must individually check each query
+-    /// result for a match.
++    /// on non-archetypal filters such as [`Added`], [`Changed`] or [`Spawned`] which must individually check
++    /// each query result for a match.
+     ///
+     /// # Example
+     ///
+@@ -1980,6 +1981,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// [`Added`]: crate::query::Added
+     /// [`Changed`]: crate::query::Changed
++    /// [`Spawned`]: crate::query::Spawned
+     #[inline]
+     pub fn is_empty(&self) -> bool {
+         self.as_nop().iter().next().is_none()
+@@ -2018,9 +2020,9 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// For example, this can transform a `Query<(&A, &mut B)>` to a `Query<&B>`.
+     /// This can be useful for passing the query to another function. Note that since
+-    /// filter terms are dropped, non-archetypal filters like [`Added`](crate::query::Added) and
+-    /// [`Changed`](crate::query::Changed) will not be respected. To maintain or change filter
+-    /// terms see [`Self::transmute_lens_filtered`]
++    /// filter terms are dropped, non-archetypal filters like [`Added`](crate::query::Added),
++    /// [`Changed`](crate::query::Changed) and [`Spawned`](crate::query::Spawned) will not be
++    /// respected. To maintain or change filter terms see [`Self::transmute_lens_filtered`]
+     ///
+     /// ## Panics
+     ///
+@@ -2075,7 +2077,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     /// * Tuples of query data and `#[derive(QueryData)]` structs have the union of the access of their subqueries
+     /// * [`EntityMut`](crate::world::EntityMut) has read and write access to all components, but no required access
+     /// * [`EntityRef`](crate::world::EntityRef) has read access to all components, but no required access
+-    /// * [`Entity`], [`EntityLocation`], [`&Archetype`], [`Has<T>`], and [`PhantomData<T>`] have no access at all,
++    /// * [`Entity`], [`EntityLocation`], [`SpawnDetails`], [`&Archetype`], [`Has<T>`], and [`PhantomData<T>`] have no access at all,
+     ///   so can be added to any query
+     /// * [`FilteredEntityRef`](crate::world::FilteredEntityRef) and [`FilteredEntityMut`](crate::world::FilteredEntityMut)
+     ///   have access determined by the [`QueryBuilder`](crate::query::QueryBuilder) used to construct them.
+@@ -2165,6 +2167,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     /// ```
+     ///
+     /// [`EntityLocation`]: crate::entity::EntityLocation
++    /// [`SpawnDetails`]: crate::query::SpawnDetails
+     /// [`&Archetype`]: crate::archetype::Archetype
+     /// [`Has<T>`]: crate::query::Has
+     #[track_caller]
+@@ -2177,9 +2180,9 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// For example, this can transform a `Query<(&A, &mut B)>` to a `Query<&B>`.
+     /// This can be useful for passing the query to another function. Note that since
+-    /// filter terms are dropped, non-archetypal filters like [`Added`](crate::query::Added) and
+-    /// [`Changed`](crate::query::Changed) will not be respected. To maintain or change filter
+-    /// terms see [`Self::transmute_lens_filtered`]
++    /// filter terms are dropped, non-archetypal filters like [`Added`](crate::query::Added),
++    /// [`Changed`](crate::query::Changed) and [`Spawned`](crate::query::Spawned) will not be
++    /// respected. To maintain or change filter terms see [`Self::transmute_lens_filtered`]
+     ///
+     /// ## Panics
+     ///
+@@ -2250,8 +2253,9 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// Note that the lens will iterate the same tables and archetypes as the original query. This means that
+     /// additional archetypal query terms like [`With`](crate::query::With) and [`Without`](crate::query::Without)
+-    /// will not necessarily be respected and non-archetypal terms like [`Added`](crate::query::Added) and
+-    /// [`Changed`](crate::query::Changed) will only be respected if they are in the type signature.
++    /// will not necessarily be respected and non-archetypal terms like [`Added`](crate::query::Added),
++    /// [`Changed`](crate::query::Changed) and [`Spawned`](crate::query::Spawned) will only be respected if they
++    /// are in the type signature.
+     #[track_caller]
+     pub fn transmute_lens_filtered<NewD: QueryData, NewF: QueryFilter>(
+         &mut self,
+@@ -2264,8 +2268,8 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// Note that the lens will iterate the same tables and archetypes as the original query. This means that
+     /// additional archetypal query terms like [`With`](crate::query::With) and [`Without`](crate::query::Without)
+-    /// will not necessarily be respected and non-archetypal terms like [`Added`](crate::query::Added) and
+-    /// [`Changed`](crate::query::Changed) will only be respected if they are in the type signature.
++    /// will not necessarily be respected and non-archetypal terms like [`Added`](crate::query::Added),
++    /// [`Changed`](crate::query::Changed) and [`Spawned`](crate::query::Spawned) will only be respected if they
+     ///
+     /// # See also
+     ///
+@@ -2301,7 +2305,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// For example, this can take a `Query<&A>` and a `Query<&B>` and return a `Query<(&A, &B)>`.
+     /// The returned query will only return items with both `A` and `B`. Note that since filters
+-    /// are dropped, non-archetypal filters like `Added` and `Changed` will not be respected.
++    /// are dropped, non-archetypal filters like `Added`, `Changed` and `Spawned` will not be respected.
+     /// To maintain or change filter terms see `Self::join_filtered`.
+     ///
+     /// ## Example
+@@ -2363,7 +2367,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     ///
+     /// For example, this can take a `Query<&A>` and a `Query<&B>` and return a `Query<(&A, &B)>`.
+     /// The returned query will only return items with both `A` and `B`. Note that since filters
+-    /// are dropped, non-archetypal filters like `Added` and `Changed` will not be respected.
++    /// are dropped, non-archetypal filters like `Added`, `Changed` and `Spawned` will not be respected.
+     /// To maintain or change filter terms see `Self::join_filtered`.
+     ///
+     /// ## Panics
+@@ -2390,8 +2394,8 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     /// Note that the lens with iterate a subset of the original queries' tables
+     /// and archetypes. This means that additional archetypal query terms like
+     /// `With` and `Without` will not necessarily be respected and non-archetypal
+-    /// terms like `Added` and `Changed` will only be respected if they are in
+-    /// the type signature.
++    /// terms like `Added`, `Changed` and `Spawned` will only be respected if they
++    /// are in the type signature.
+     pub fn join_filtered<
+         'a,
+         OtherD: QueryData,
+@@ -2411,8 +2415,8 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+     /// Note that the lens with iterate a subset of the original queries' tables
+     /// and archetypes. This means that additional archetypal query terms like
+     /// `With` and `Without` will not necessarily be respected and non-archetypal
+-    /// terms like `Added` and `Changed` will only be respected if they are in
+-    /// the type signature.
++    /// terms like `Added`, `Changed` and `Spawned` will only be respected if they
++    /// are in the type signature.
+     ///
+     /// # See also
+     ///
+@@ -2593,8 +2597,9 @@ impl<'w, D: QueryData, F: QueryFilter> Single<'w, D, F> {
+ /// This will cause the system to be skipped, according to the rules laid out in [`SystemParamValidationError`](crate::system::SystemParamValidationError).
+ ///
+ /// Much like [`Query::is_empty`] the worst case runtime will be `O(n)` where `n` is the number of *potential* matches.
+-/// This can be notably expensive for queries that rely on non-archetypal filters such as [`Added`](crate::query::Added) or [`Changed`](crate::query::Changed)
+-/// which must individually check each query result for a match.
++/// This can be notably expensive for queries that rely on non-archetypal filters such as [`Added`](crate::query::Added),
++/// [`Changed`](crate::query::Changed) of [`Spawned`](crate::query::Spawned) which must individually check each query
++/// result for a match.
+ ///
+ /// See [`Query`] for more details.
+ ///
+diff --git a/crates/bevy_ecs/src/world/entity_ref.rs b/crates/bevy_ecs/src/world/entity_ref.rs
+index df8f6762d173c..64610f8e4eac4 100644
+--- a/crates/bevy_ecs/src/world/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_ref.rs
+@@ -7,7 +7,7 @@ use crate::{
+     change_detection::{MaybeLocation, MutUntyped},
+     component::{
+         Component, ComponentId, ComponentTicks, Components, ComponentsRegistrator, Mutable,
+-        StorageType,
++        StorageType, Tick,
+     },
+     entity::{
+         ContainsEntity, Entity, EntityCloner, EntityClonerBuilder, EntityEquivalent, EntityLocation,
+@@ -296,6 +296,11 @@ impl<'w> EntityRef<'w> {
+     pub fn spawned_by(&self) -> MaybeLocation {
+         self.cell.spawned_by()
+     }
++
++    /// Returns the [`Tick`] at which this entity has been spawned.
++    pub fn spawned_at(&self) -> Tick {
++        self.cell.spawned_at()
++    }
+ }
+ 
+ impl<'w> From<EntityWorldMut<'w>> for EntityRef<'w> {
+@@ -983,6 +988,11 @@ impl<'w> EntityMut<'w> {
+     pub fn spawned_by(&self) -> MaybeLocation {
+         self.cell.spawned_by()
+     }
++
++    /// Returns the [`Tick`] at which this entity has been spawned.
++    pub fn spawned_at(&self) -> Tick {
++        self.cell.spawned_at()
++    }
+ }
+ 
+ impl<'w> From<&'w mut EntityMut<'_>> for EntityMut<'w> {
+@@ -2415,6 +2425,7 @@ impl<'w> EntityWorldMut<'w> {
+             .expect("entity should exist at this point.");
+         let table_row;
+         let moved_entity;
++        let change_tick = world.change_tick();
+ 
+         {
+             let archetype = &mut world.archetypes[self.location.archetype_id];
+@@ -2424,7 +2435,7 @@ impl<'w> EntityWorldMut<'w> {
+                 // SAFETY: swapped_entity is valid and the swapped entity's components are
+                 // moved to the new location immediately after.
+                 unsafe {
+-                    world.entities.set(
++                    world.entities.set_spawn_despawn(
+                         swapped_entity.index(),
+                         EntityLocation {
+                             archetype_id: swapped_location.archetype_id,
+@@ -2432,6 +2443,8 @@ impl<'w> EntityWorldMut<'w> {
+                             table_id: swapped_location.table_id,
+                             table_row: swapped_location.table_row,
+                         },
++                        caller,
++                        change_tick,
+                     );
+                 }
+             }
+@@ -2453,7 +2466,7 @@ impl<'w> EntityWorldMut<'w> {
+             // SAFETY: `moved_entity` is valid and the provided `EntityLocation` accurately reflects
+             //         the current location of the entity and its component data.
+             unsafe {
+-                world.entities.set(
++                world.entities.set_spawn_despawn(
+                     moved_entity.index(),
+                     EntityLocation {
+                         archetype_id: moved_location.archetype_id,
+@@ -2461,19 +2474,14 @@ impl<'w> EntityWorldMut<'w> {
+                         table_id: moved_location.table_id,
+                         table_row,
+                     },
++                    caller,
++                    change_tick,
+                 );
+             }
+             world.archetypes[moved_location.archetype_id]
+                 .set_entity_table_row(moved_location.archetype_row, table_row);
+         }
+         world.flush();
+-
+-        // SAFETY: No structural changes
+-        unsafe {
+-            world
+-                .entities_mut()
+-                .set_spawned_or_despawned_by(self.entity.index(), caller);
+-        }
+     }
+ 
+     /// Ensures any commands triggered by the actions of Self are applied, equivalent to [`World::flush`]
+@@ -2815,6 +2823,19 @@ impl<'w> EntityWorldMut<'w> {
+             .map(|location| location.unwrap())
+     }
+ 
++    /// Returns the [`Tick`] at which this entity has last been spawned.
++    pub fn spawned_at(&self) -> Tick {
++        self.assert_not_despawned();
++
++        // SAFETY: entity being alive was asserted
++        unsafe {
++            self.world()
++                .entities()
++                .entity_get_spawned_or_despawned_unchecked(self.entity)
++                .1
++        }
++    }
++
+     /// Reborrows this entity in a temporary scope.
+     /// This is useful for executing a function that requires a `EntityWorldMut`
+     /// but you do not want to move out the entity ownership.
+@@ -3336,6 +3357,11 @@ impl<'w> FilteredEntityRef<'w> {
+     pub fn spawned_by(&self) -> MaybeLocation {
+         self.entity.spawned_by()
+     }
++
++    /// Returns the [`Tick`] at which this entity has been spawned.
++    pub fn spawned_at(&self) -> Tick {
++        self.entity.spawned_at()
++    }
+ }
+ 
+ impl<'w> From<FilteredEntityMut<'w>> for FilteredEntityRef<'w> {
+@@ -3709,6 +3735,11 @@ impl<'w> FilteredEntityMut<'w> {
+     pub fn spawned_by(&self) -> MaybeLocation {
+         self.entity.spawned_by()
+     }
++
++    /// Returns the [`Tick`] at which this entity has been spawned.
++    pub fn spawned_at(&self) -> Tick {
++        self.entity.spawned_at()
++    }
+ }
+ 
+ impl<'a> From<EntityMut<'a>> for FilteredEntityMut<'a> {
+@@ -3907,6 +3938,11 @@ where
+         self.entity.spawned_by()
+     }
+ 
++    /// Returns the [`Tick`] at which this entity has been spawned.
++    pub fn spawned_at(&self) -> Tick {
++        self.entity.spawned_at()
++    }
++
+     /// Gets the component of the given [`ComponentId`] from the entity.
+     ///
+     /// **You should prefer to use the typed API [`Self::get`] where possible and only
+@@ -4151,6 +4187,11 @@ where
+         self.entity.spawned_by()
+     }
+ 
++    /// Returns the [`Tick`] at which this entity has been spawned.
++    pub fn spawned_at(&self) -> Tick {
++        self.entity.spawned_at()
++    }
++
+     /// Returns `true` if the current entity has a component of type `T`.
+     /// Otherwise, this returns `false`.
+     ///
+@@ -4690,7 +4731,7 @@ mod tests {
+     use core::panic::AssertUnwindSafe;
+     use std::sync::OnceLock;
+ 
+-    use crate::component::HookContext;
++    use crate::component::{HookContext, Tick};
+     use crate::{
+         change_detection::{MaybeLocation, MutUntyped},
+         component::ComponentId,
+@@ -5978,22 +6019,27 @@ mod tests {
+         #[component(on_remove = get_tracked)]
+         struct C;
+ 
+-        static TRACKED: OnceLock<MaybeLocation> = OnceLock::new();
++        static TRACKED: OnceLock<(MaybeLocation, Tick)> = OnceLock::new();
+         fn get_tracked(world: DeferredWorld, HookContext { entity, .. }: HookContext) {
+             TRACKED.get_or_init(|| {
+-                world
++                let by = world
+                     .entities
+                     .entity_get_spawned_or_despawned_by(entity)
+-                    .map(|l| l.unwrap())
++                    .map(|l| l.unwrap());
++                let at = world
++                    .entities
++                    .entity_get_spawned_or_despawned_at(entity)
++                    .unwrap();
++                (by, at)
+             });
+         }
+ 
+         #[track_caller]
+-        fn caller_spawn(world: &mut World) -> (Entity, MaybeLocation) {
++        fn caller_spawn(world: &mut World) -> (Entity, MaybeLocation, Tick) {
+             let caller = MaybeLocation::caller();
+-            (world.spawn(C).id(), caller)
++            (world.spawn(C).id(), caller, world.change_tick())
+         }
+-        let (entity, spawner) = caller_spawn(&mut world);
++        let (entity, spawner, spawn_tick) = caller_spawn(&mut world);
+ 
+         assert_eq!(
+             spawner,
+@@ -6004,13 +6050,13 @@ mod tests {
+         );
+ 
+         #[track_caller]
+-        fn caller_despawn(world: &mut World, entity: Entity) -> MaybeLocation {
++        fn caller_despawn(world: &mut World, entity: Entity) -> (MaybeLocation, Tick) {
+             world.despawn(entity);
+-            MaybeLocation::caller()
++            (MaybeLocation::caller(), world.change_tick())
+         }
+-        let despawner = caller_despawn(&mut world, entity);
++        let (despawner, despawn_tick) = caller_despawn(&mut world, entity);
+ 
+-        assert_eq!(spawner, *TRACKED.get().unwrap());
++        assert_eq!((spawner, spawn_tick), *TRACKED.get().unwrap());
+         assert_eq!(
+             despawner,
+             world
+@@ -6018,6 +6064,13 @@ mod tests {
+                 .entity_get_spawned_or_despawned_by(entity)
+                 .map(|l| l.unwrap())
+         );
++        assert_eq!(
++            despawn_tick,
++            world
++                .entities()
++                .entity_get_spawned_or_despawned_at(entity)
++                .unwrap()
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 661449e60ebf5..87340551af477 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -1185,9 +1185,6 @@ impl World {
+                 .unwrap_or(EntityLocation::INVALID);
+         }
+ 
+-        self.entities
+-            .set_spawned_or_despawned_by(entity.index(), caller);
+-
+         // SAFETY: entity and location are valid, as they were just created above
+         let mut entity = unsafe { EntityWorldMut::new(self, entity, entity_location) };
+         after_effect.apply(&mut entity);
+@@ -1207,10 +1204,9 @@ impl World {
+         // SAFETY: no components are allocated by archetype.allocate() because the archetype is
+         // empty
+         let location = unsafe { archetype.allocate(entity, table_row) };
+-        self.entities.set(entity.index(), location);
+-
++        let change_tick = self.change_tick();
+         self.entities
+-            .set_spawned_or_despawned_by(entity.index(), caller);
++            .set_spawn_despawn(entity.index(), location, caller, change_tick);
+ 
+         EntityWorldMut::new(self, entity, location)
+     }
+@@ -2979,6 +2975,7 @@ impl World {
+         sparse_sets.check_change_ticks(change_tick);
+         resources.check_change_ticks(change_tick);
+         non_send_resources.check_change_ticks(change_tick);
++        self.entities.check_change_ticks(change_tick);
+ 
+         if let Some(mut schedules) = self.get_resource_mut::<Schedules>() {
+             schedules.check_change_ticks(change_tick);
+@@ -4272,22 +4269,38 @@ mod tests {
+             world.entities.entity_get_spawned_or_despawned_by(entity),
+             MaybeLocation::new(Some(Location::caller()))
+         );
++        assert_eq!(
++            world.entities.entity_get_spawned_or_despawned_at(entity),
++            Some(world.change_tick())
++        );
+         world.despawn(entity);
+         assert_eq!(
+             world.entities.entity_get_spawned_or_despawned_by(entity),
+             MaybeLocation::new(Some(Location::caller()))
+         );
++        assert_eq!(
++            world.entities.entity_get_spawned_or_despawned_at(entity),
++            Some(world.change_tick())
++        );
+         let new = world.spawn_empty().id();
+         assert_eq!(entity.index(), new.index());
+         assert_eq!(
+             world.entities.entity_get_spawned_or_despawned_by(entity),
+             MaybeLocation::new(None)
+         );
++        assert_eq!(
++            world.entities.entity_get_spawned_or_despawned_at(entity),
++            None
++        );
+         world.despawn(new);
+         assert_eq!(
+             world.entities.entity_get_spawned_or_despawned_by(entity),
+             MaybeLocation::new(None)
+         );
++        assert_eq!(
++            world.entities.entity_get_spawned_or_despawned_at(entity),
++            None
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index 129d48214e8af..ea5f21c22ecca 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -1147,6 +1147,17 @@ impl<'w> UnsafeEntityCell<'w> {
+             .entity_get_spawned_or_despawned_by(self.entity)
+             .map(|o| o.unwrap())
+     }
++
++    /// Returns the [`Tick`] at which this entity has been spawned.
++    pub fn spawned_at(self) -> Tick {
++        // SAFETY: UnsafeEntityCell is only constructed for living entities and offers no despawn method
++        unsafe {
++            self.world()
++                .entities()
++                .entity_get_spawned_or_despawned_unchecked(self.entity)
++                .1
++        }
++    }
+ }
+ 
+ /// Error that may be returned when calling [`UnsafeEntityCell::get_mut_by_id`].
+diff --git a/release-content/release-notes/entity-spawn-ticks.md b/release-content/release-notes/entity-spawn-ticks.md
+new file mode 100644
+index 0000000000000..54c6d664fe424
+--- /dev/null
++++ b/release-content/release-notes/entity-spawn-ticks.md
+@@ -0,0 +1,83 @@
++---
++title: Entity Spawn Ticks
++authors: ["@urben1680"]
++pull_requests: [19047]
++---
++
++Keeping track which entities have been spawned since the last time a system ran could only be done indirectly by inserting marker components and do your logic on entities that match an `Added<MyMarker>` filter or in `MyMarker`'s `on_add` hook.
++
++This has the issue however that not every add reacts on a spawn but also on insertions at existing entities. Sometimes you cannot even add your marker because the spawn call is hidden in some non-public API.
++
++The new `SpawnDetails` query data and `Spawned` query filter enable you to find recently spawned entities without any marker components.
++
++## `SpawnDetails`
++
++Use this in your query when you want to get information about the entity's spawn. You might want to do that for debug purposes, using the struct's `Debug` implementation.
++
++You can also get specific information via methods. The following example prints the entity id (prefixed with "new" if it showed up for the first time), the `Tick` it spawned at and, if the `track_location` feature is activated, the source code location where it was spawned. Said feature is not enabled by default because it comes with a runtime cost.
++
++```rs
++fn print_spawn_details(query: Query<(Entity, SpawnDetails)>) {
++    for (entity, spawn_details) in &query {
++        if spawn_details.is_spawned() {
++            print!("new ");
++        }
++        print!(
++            "entity {:?} spawned at {:?}",
++            entity,
++            spawn_details.spawned_at()
++        );
++        match spawn_details.spawned_by().into_option() {
++            Some(location) => println!(" by {:?}", location),
++            None => println!()
++        }    
++    }
++}
++```
++
++## `Spawned`
++
++Use this filter in your query if you are only interested in entities that were spawned after the last time your system ran.
++
++Note that this, like `Added<T>` and `Changed<T>`, is a non-archetypal filter. This means that your query could still go through millions of entities without yielding any recently spawned ones. Unlike filters like `With<T>` which can easily skip all entities that do not have `T` without checking them one-by-one.
++
++Because of this, these systems have roughly the same performance:
++
++```rs
++fn system1(q: Query<Entity, Spawned>) {
++    for entity in &q { /* entity spawned */ }
++}
++
++fn system2(query: Query<(Entity, SpawnDetails)>) {
++    for (entity, spawned) in &query {
++        if spawned.is_spawned() { /* entity spawned */ }
++    }
++}
++```
++
++## Getter methods
++
++Getting around this weakness of non-archetypal filters can be to check only specific entities for their spawn tick: The method `spawned_at` was added to all entity pointer structs, such as `EntityRef`, `EntityMut` and `EntityWorldMut`.
++
++In this example we want to filter for entities that were spawned after a certain `tick`:
++
++```rs
++fn filter_spawned_after(
++    entities: impl IntoIterator<Item = Entity>,
++    world: &World,
++    tick: Tick,
++) -> impl Iterator<Item = Entity> {
++    let now = world.last_change_tick();
++    entities.into_iter().filter(move |entity| world
++        .entity(*entity)
++        .spawned_at()
++        .is_newer_than(tick, now)
++    )
++}
++```
++
++---
++
++The tick is stored in `Entities`. It's method `entity_get_spawned_or_despawned_at` not only returns when a living entity spawned at, it also returns when a despawned entity found it's bitter end.
++
++Note however that despawned entities can be replaced by bevy at any following spawn. Then this method returns `None` for the despawned entity. The same is true if the entity is not even spawned yet, only allocated.
