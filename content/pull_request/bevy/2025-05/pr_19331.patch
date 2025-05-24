@@ -1,0 +1,164 @@
+diff --git a/crates/bevy_gltf/src/assets.rs b/crates/bevy_gltf/src/assets.rs
+index fe3303dd81059..bfc920ebcea1f 100644
+--- a/crates/bevy_gltf/src/assets.rs
++++ b/crates/bevy_gltf/src/assets.rs
+@@ -1,5 +1,7 @@
+ //! Representation of assets present in a glTF file
+ 
++use core::ops::Deref;
++
+ #[cfg(feature = "bevy_animation")]
+ use bevy_animation::AnimationClip;
+ use bevy_asset::{Asset, Handle};
+@@ -297,6 +299,21 @@ pub struct GltfMeshExtras {
+     pub value: String,
+ }
+ 
++/// The mesh name of a glTF primitive.
++///
++/// See [the relevant glTF specification section](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#reference-mesh).
++#[derive(Clone, Debug, Reflect, Default, Component)]
++#[reflect(Component, Clone)]
++pub struct GltfMeshName(pub String);
++
++impl Deref for GltfMeshName {
++    type Target = str;
++
++    fn deref(&self) -> &Self::Target {
++        self.0.as_ref()
++    }
++}
++
+ /// Additional untyped data that can be present on most glTF types at the material level.
+ ///
+ /// See [the relevant glTF specification section](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#reference-extras).
+@@ -313,3 +330,11 @@ pub struct GltfMaterialExtras {
+ #[derive(Clone, Debug, Reflect, Default, Component)]
+ #[reflect(Component, Clone)]
+ pub struct GltfMaterialName(pub String);
++
++impl Deref for GltfMaterialName {
++    type Target = str;
++
++    fn deref(&self) -> &Self::Target {
++        self.0.as_ref()
++    }
++}
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index 02c14f4197117..bb29a8571a302 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -193,6 +193,7 @@ impl Plugin for GltfPlugin {
+         app.register_type::<GltfExtras>()
+             .register_type::<GltfSceneExtras>()
+             .register_type::<GltfMeshExtras>()
++            .register_type::<GltfMeshName>()
+             .register_type::<GltfMaterialExtras>()
+             .register_type::<GltfMaterialName>()
+             .init_asset::<Gltf>()
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index b65e4bf81aee5..9bdeb23f26885 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -66,7 +66,7 @@ use tracing::{error, info_span, warn};
+ 
+ use crate::{
+     vertex_attributes::convert_attribute, Gltf, GltfAssetLabel, GltfExtras, GltfMaterialExtras,
+-    GltfMaterialName, GltfMeshExtras, GltfNode, GltfSceneExtras, GltfSkin,
++    GltfMaterialName, GltfMeshExtras, GltfMeshName, GltfNode, GltfSceneExtras, GltfSkin,
+ };
+ 
+ #[cfg(feature = "bevy_animation")]
+@@ -1463,6 +1463,10 @@ fn load_node(
+                         });
+                     }
+ 
++                    if let Some(name) = mesh.name() {
++                        mesh_entity.insert(GltfMeshName(name.to_string()));
++                    }
++
+                     if let Some(name) = material.name() {
+                         mesh_entity.insert(GltfMaterialName(name.to_string()));
+                     }
+diff --git a/examples/3d/depth_of_field.rs b/examples/3d/depth_of_field.rs
+index d6ca77bbde0ca..03565eee54071 100644
+--- a/examples/3d/depth_of_field.rs
++++ b/examples/3d/depth_of_field.rs
+@@ -15,6 +15,7 @@ use bevy::{
+         dof::{self, DepthOfField, DepthOfFieldMode},
+         tonemapping::Tonemapping,
+     },
++    gltf::GltfMeshName,
+     pbr::Lightmap,
+     prelude::*,
+     render::camera::PhysicalCameraParameters,
+@@ -186,7 +187,7 @@ fn tweak_scene(
+     mut materials: ResMut<Assets<StandardMaterial>>,
+     mut lights: Query<&mut DirectionalLight, Changed<DirectionalLight>>,
+     mut named_entities: Query<
+-        (Entity, &Name, &MeshMaterial3d<StandardMaterial>),
++        (Entity, &GltfMeshName, &MeshMaterial3d<StandardMaterial>),
+         (With<Mesh3d>, Without<Lightmap>),
+     >,
+ ) {
+diff --git a/examples/3d/lightmaps.rs b/examples/3d/lightmaps.rs
+index 975b37d7f2873..c994741150ad3 100644
+--- a/examples/3d/lightmaps.rs
++++ b/examples/3d/lightmaps.rs
+@@ -3,6 +3,7 @@
+ use argh::FromArgs;
+ use bevy::{
+     core_pipeline::prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass},
++    gltf::GltfMeshName,
+     pbr::{DefaultOpaqueRendererMethod, Lightmap},
+     prelude::*,
+ };
+@@ -63,7 +64,7 @@ fn add_lightmaps_to_meshes(
+     asset_server: Res<AssetServer>,
+     mut materials: ResMut<Assets<StandardMaterial>>,
+     meshes: Query<
+-        (Entity, &Name, &MeshMaterial3d<StandardMaterial>),
++        (Entity, &GltfMeshName, &MeshMaterial3d<StandardMaterial>),
+         (With<Mesh3d>, Without<Lightmap>),
+     >,
+     args: Res<Args>,
+diff --git a/examples/3d/mixed_lighting.rs b/examples/3d/mixed_lighting.rs
+index b087281be75af..4d4dab79cea3e 100644
+--- a/examples/3d/mixed_lighting.rs
++++ b/examples/3d/mixed_lighting.rs
+@@ -1,6 +1,7 @@
+ //! Demonstrates how to combine baked and dynamic lighting.
+ 
+ use bevy::{
++    gltf::GltfMeshName,
+     pbr::Lightmap,
+     picking::{backend::HitData, pointer::PointerInteraction},
+     prelude::*,
+@@ -221,7 +222,7 @@ fn update_lightmaps(
+     mut commands: Commands,
+     asset_server: Res<AssetServer>,
+     mut materials: ResMut<Assets<StandardMaterial>>,
+-    meshes: Query<(Entity, &Name, &MeshMaterial3d<StandardMaterial>), With<Mesh3d>>,
++    meshes: Query<(Entity, &GltfMeshName, &MeshMaterial3d<StandardMaterial>), With<Mesh3d>>,
+     mut lighting_mode_change_event_reader: EventReader<LightingModeChanged>,
+     app_status: Res<AppStatus>,
+ ) {
+@@ -432,7 +433,7 @@ fn reset_sphere_position(
+ fn move_sphere(
+     mouse_button_input: Res<ButtonInput<MouseButton>>,
+     pointers: Query<&PointerInteraction>,
+-    mut meshes: Query<(&Name, &ChildOf), With<Mesh3d>>,
++    mut meshes: Query<(&GltfMeshName, &ChildOf), With<Mesh3d>>,
+     mut transforms: Query<&mut Transform>,
+     app_status: Res<AppStatus>,
+ ) {
+diff --git a/release-content/migration-guides/rename_spawn_gltf_material_name.md b/release-content/migration-guides/rename_spawn_gltf_material_name.md
+index 630697b5fdc10..6e4922f68c3d9 100644
+--- a/release-content/migration-guides/rename_spawn_gltf_material_name.md
++++ b/release-content/migration-guides/rename_spawn_gltf_material_name.md
+@@ -7,3 +7,5 @@ pull_requests: [19287]
+ When loading a Gltf scene in Bevy, each mesh primitive will generate an entity and store a `GltfMaterialName` component and `Name` component.
+ 
+ The `Name` components were previously stored as mesh name plus primitive index - for example, `MeshName.0` and `MeshName.1`. To make it easier to view these entities in Inspector-style tools, they are now stored as mesh name plus material name - for example, `MeshName.Material1Name` and `MeshName.Material2Name`.
++
++If you were relying on the previous value of the `Name` component on meshes, use the new `GltfMeshName` component instead.
