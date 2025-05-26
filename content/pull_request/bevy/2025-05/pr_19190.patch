@@ -1,0 +1,154 @@
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index 02c14f4197117..203ad8323e58d 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -99,15 +99,15 @@ extern crate alloc;
+ 
+ use alloc::sync::Arc;
+ use std::sync::Mutex;
++use tracing::warn;
+ 
+ use bevy_platform::collections::HashMap;
+ 
+ use bevy_app::prelude::*;
+ use bevy_asset::AssetApp;
+ use bevy_ecs::prelude::Resource;
+-use bevy_image::{CompressedImageFormats, ImageSamplerDescriptor};
++use bevy_image::{CompressedImageFormatSupport, CompressedImageFormats, ImageSamplerDescriptor};
+ use bevy_mesh::MeshVertexAttribute;
+-use bevy_render::renderer::RenderDevice;
+ 
+ /// The glTF prelude.
+ ///
+@@ -204,10 +204,16 @@ impl Plugin for GltfPlugin {
+     }
+ 
+     fn finish(&self, app: &mut App) {
+-        let supported_compressed_formats = match app.world().get_resource::<RenderDevice>() {
+-            Some(render_device) => CompressedImageFormats::from_features(render_device.features()),
+-            None => CompressedImageFormats::NONE,
++        let supported_compressed_formats = if let Some(resource) =
++            app.world().get_resource::<CompressedImageFormatSupport>()
++        {
++            resource.0
++        } else {
++            warn!("CompressedImageFormatSupport resource not found. It should either be initialized in finish() of \
++            RenderPlugin, or manually if not using the RenderPlugin or the WGPU backend.");
++            CompressedImageFormats::NONE
+         };
++
+         let default_sampler_resource = DefaultGltfImageSampler::new(&self.default_sampler);
+         let default_sampler = default_sampler_resource.get_internal();
+         app.insert_resource(default_sampler_resource);
+diff --git a/crates/bevy_image/Cargo.toml b/crates/bevy_image/Cargo.toml
+index 988325c7076b8..c8d795d44e7ba 100644
+--- a/crates/bevy_image/Cargo.toml
++++ b/crates/bevy_image/Cargo.toml
+@@ -46,6 +46,7 @@ bevy_color = { path = "../bevy_color", version = "0.16.0-dev", features = [
+   "serialize",
+   "wgpu-types",
+ ] }
++bevy_ecs = { path = "../bevy_ecs", version = "0.16.0-dev", default-features = false }
+ bevy_math = { path = "../bevy_math", version = "0.16.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.16.0-dev" }
+ bevy_utils = { path = "../bevy_utils", version = "0.16.0-dev" }
+diff --git a/crates/bevy_image/src/image.rs b/crates/bevy_image/src/image.rs
+index 5260c70bfc8a9..609d0133bcd2a 100644
+--- a/crates/bevy_image/src/image.rs
++++ b/crates/bevy_image/src/image.rs
+@@ -11,6 +11,7 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ 
+ use bevy_asset::{Asset, RenderAssetUsages};
+ use bevy_color::{Color, ColorToComponents, Gray, LinearRgba, Srgba, Xyza};
++use bevy_ecs::resource::Resource;
+ use bevy_math::{AspectRatio, UVec2, UVec3, Vec2};
+ use core::hash::Hash;
+ use serde::{Deserialize, Serialize};
+@@ -1651,6 +1652,12 @@ impl CompressedImageFormats {
+     }
+ }
+ 
++/// For defining which compressed image formats are supported. This will be initialized from available device features
++/// in `finish()` of the bevy `RenderPlugin`, but is left for the user to specify if not using the `RenderPlugin`, or
++/// the WGPU backend.
++#[derive(Resource)]
++pub struct CompressedImageFormatSupport(pub CompressedImageFormats);
++
+ #[cfg(test)]
+ mod test {
+     use super::*;
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index b4c9011c7887e..20bb19cb90f95 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -73,6 +73,7 @@ pub mod prelude {
+ }
+ use batching::gpu_preprocessing::BatchingPlugin;
+ use bevy_ecs::schedule::ScheduleBuildSettings;
++use bevy_image::{CompressedImageFormatSupport, CompressedImageFormats};
+ use bevy_utils::prelude::default;
+ pub use extract_param::Extract;
+ 
+@@ -462,10 +463,15 @@ impl Plugin for RenderPlugin {
+             let RenderResources(device, queue, adapter_info, render_adapter, instance) =
+                 future_render_resources.0.lock().unwrap().take().unwrap();
+ 
++            let compressed_image_format_support = CompressedImageFormatSupport(
++                CompressedImageFormats::from_features(device.features()),
++            );
++
+             app.insert_resource(device.clone())
+                 .insert_resource(queue.clone())
+                 .insert_resource(adapter_info.clone())
+-                .insert_resource(render_adapter.clone());
++                .insert_resource(render_adapter.clone())
++                .insert_resource(compressed_image_format_support);
+ 
+             let render_app = app.sub_app_mut(RenderApp);
+ 
+diff --git a/crates/bevy_render/src/texture/mod.rs b/crates/bevy_render/src/texture/mod.rs
+index de5361aad801b..6c2dc67aae3a4 100644
+--- a/crates/bevy_render/src/texture/mod.rs
++++ b/crates/bevy_render/src/texture/mod.rs
+@@ -8,7 +8,10 @@ pub use crate::render_resource::DefaultImageSampler;
+ use bevy_image::CompressedImageSaver;
+ #[cfg(feature = "hdr")]
+ use bevy_image::HdrTextureLoader;
+-use bevy_image::{CompressedImageFormats, Image, ImageLoader, ImageSamplerDescriptor};
++use bevy_image::{
++    CompressedImageFormatSupport, CompressedImageFormats, Image, ImageLoader,
++    ImageSamplerDescriptor,
++};
+ pub use fallback_image::*;
+ pub use gpu_image::*;
+ pub use texture_attachment::*;
+@@ -20,6 +23,7 @@ use crate::{
+ use bevy_app::{App, Plugin};
+ use bevy_asset::{weak_handle, AssetApp, Assets, Handle};
+ use bevy_ecs::prelude::*;
++use tracing::warn;
+ 
+ /// A handle to a 1 x 1 transparent white image.
+ ///
+@@ -111,12 +115,16 @@ impl Plugin for ImagePlugin {
+ 
+     fn finish(&self, app: &mut App) {
+         if !ImageLoader::SUPPORTED_FORMATS.is_empty() {
+-            let supported_compressed_formats = match app.world().get_resource::<RenderDevice>() {
+-                Some(render_device) => {
+-                    CompressedImageFormats::from_features(render_device.features())
+-                }
+-                None => CompressedImageFormats::NONE,
++            let supported_compressed_formats = if let Some(resource) =
++                app.world().get_resource::<CompressedImageFormatSupport>()
++            {
++                resource.0
++            } else {
++                warn!("CompressedImageFormatSupport resource not found. It should either be initialized in finish() of \
++                       RenderPlugin, or manually if not using the RenderPlugin or the WGPU backend.");
++                CompressedImageFormats::NONE
+             };
++
+             app.register_asset_loader(ImageLoader::new(supported_compressed_formats));
+         }
+ 

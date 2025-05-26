@@ -1,0 +1,1592 @@
+diff --git a/crates/bevy_ecs/src/archetype.rs b/crates/bevy_ecs/src/archetype.rs
+index 2468c5e9a8fbf..516c90a873371 100644
+--- a/crates/bevy_ecs/src/archetype.rs
++++ b/crates/bevy_ecs/src/archetype.rs
+@@ -32,6 +32,7 @@ use core::{
+     hash::Hash,
+     ops::{Index, IndexMut, RangeFrom},
+ };
++use nonmax::NonMaxU32;
+ 
+ /// An opaque location within a [`Archetype`].
+ ///
+@@ -44,23 +45,30 @@ use core::{
+ #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+ // SAFETY: Must be repr(transparent) due to the safety requirements on EntityLocation
+ #[repr(transparent)]
+-pub struct ArchetypeRow(u32);
++pub struct ArchetypeRow(NonMaxU32);
+ 
+ impl ArchetypeRow {
+     /// Index indicating an invalid archetype row.
+     /// This is meant to be used as a placeholder.
+-    pub const INVALID: ArchetypeRow = ArchetypeRow(u32::MAX);
++    // TODO: Deprecate in favor of options, since `INVALID` is, technically, valid.
++    pub const INVALID: ArchetypeRow = ArchetypeRow(NonMaxU32::MAX);
+ 
+     /// Creates a `ArchetypeRow`.
+     #[inline]
+-    pub const fn new(index: usize) -> Self {
+-        Self(index as u32)
++    pub const fn new(index: NonMaxU32) -> Self {
++        Self(index)
+     }
+ 
+     /// Gets the index of the row.
+     #[inline]
+     pub const fn index(self) -> usize {
+-        self.0 as usize
++        self.0.get() as usize
++    }
++
++    /// Gets the index of the row.
++    #[inline]
++    pub const fn index_u32(self) -> u32 {
++        self.0.get()
+     }
+ }
+ 
+@@ -467,6 +475,27 @@ impl Archetype {
+         &self.entities
+     }
+ 
++    /// Fetches the entities contained in this archetype.
++    #[inline]
++    pub fn entities_with_location(&self) -> impl Iterator<Item = (Entity, EntityLocation)> {
++        self.entities.iter().enumerate().map(
++            |(archetype_row, &ArchetypeEntity { entity, table_row })| {
++                (
++                    entity,
++                    EntityLocation {
++                        archetype_id: self.id,
++                        // SAFETY: The entities in the archetype must be unique and there are never more than u32::MAX entities.
++                        archetype_row: unsafe {
++                            ArchetypeRow::new(NonMaxU32::new_unchecked(archetype_row as u32))
++                        },
++                        table_id: self.table_id,
++                        table_row,
++                    },
++                )
++            },
++        )
++    }
++
+     /// Gets an iterator of all of the components stored in [`Table`]s.
+     ///
+     /// All of the IDs are unique.
+@@ -569,7 +598,8 @@ impl Archetype {
+         entity: Entity,
+         table_row: TableRow,
+     ) -> EntityLocation {
+-        let archetype_row = ArchetypeRow::new(self.entities.len());
++        // SAFETY: An entity can not have multiple archetype rows and there can not be more than u32::MAX entities.
++        let archetype_row = unsafe { ArchetypeRow::new(NonMaxU32::new_unchecked(self.len())) };
+         self.entities.push(ArchetypeEntity { entity, table_row });
+ 
+         EntityLocation {
+@@ -606,8 +636,10 @@ impl Archetype {
+ 
+     /// Gets the total number of entities that belong to the archetype.
+     #[inline]
+-    pub fn len(&self) -> usize {
+-        self.entities.len()
++    pub fn len(&self) -> u32 {
++        // No entity may have more than one archetype row, so there are no duplicates,
++        // and there may only ever be u32::MAX entities, so the length never exceeds u32's cappacity.
++        self.entities.len() as u32
+     }
+ 
+     /// Checks if the archetype has any entities.
+diff --git a/crates/bevy_ecs/src/batching.rs b/crates/bevy_ecs/src/batching.rs
+index cdffbfa05dd36..ab9f2d582c781 100644
+--- a/crates/bevy_ecs/src/batching.rs
++++ b/crates/bevy_ecs/src/batching.rs
+@@ -22,7 +22,7 @@ use core::ops::Range;
+ /// [`EventReader::par_read`]: crate::event::EventReader::par_read
+ #[derive(Clone, Debug)]
+ pub struct BatchingStrategy {
+-    /// The upper and lower limits for a batch of entities.
++    /// The upper and lower limits for a batch of items.
+     ///
+     /// Setting the bounds to the same value will result in a fixed
+     /// batch size.
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 3c1ff5262cd15..e3d17cdcadcd2 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -518,7 +518,7 @@ unsafe impl ReadOnlyQueryData for EntityLocation {}
+ ///         match spawn_details.spawned_by().into_option() {
+ ///             Some(location) => println!(" by {:?}", location),
+ ///             None => println!()
+-///         }    
++///         }
+ ///     }
+ /// }
+ ///
+@@ -1505,7 +1505,7 @@ unsafe impl<T: Component> QueryData for &T {
+                 // SAFETY: set_table was previously called
+                 let table = unsafe { table.debug_checked_unwrap() };
+                 // SAFETY: Caller ensures `table_row` is in range.
+-                let item = unsafe { table.get(table_row.as_usize()) };
++                let item = unsafe { table.get(table_row.index()) };
+                 item.deref()
+             },
+             |sparse_set| {
+@@ -1617,11 +1617,15 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
+     ) {
+         let column = table.get_column(component_id).debug_checked_unwrap();
+         let table_data = Some((
+-            column.get_data_slice(table.entity_count()).into(),
+-            column.get_added_ticks_slice(table.entity_count()).into(),
+-            column.get_changed_ticks_slice(table.entity_count()).into(),
++            column.get_data_slice(table.entity_count() as usize).into(),
++            column
++                .get_added_ticks_slice(table.entity_count() as usize)
++                .into(),
++            column
++                .get_changed_ticks_slice(table.entity_count() as usize)
++                .into(),
+             column
+-                .get_changed_by_slice(table.entity_count())
++                .get_changed_by_slice(table.entity_count() as usize)
+                 .map(Into::into),
+         ));
+         // SAFETY: set_table is only called when T::STORAGE_TYPE = StorageType::Table
+@@ -1679,13 +1683,13 @@ unsafe impl<'__w, T: Component> QueryData for Ref<'__w, T> {
+                     unsafe { table.debug_checked_unwrap() };
+ 
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let component = unsafe { table_components.get(table_row.as_usize()) };
++                let component = unsafe { table_components.get(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let added = unsafe { added_ticks.get(table_row.as_usize()) };
++                let added = unsafe { added_ticks.get(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let changed = unsafe { changed_ticks.get(table_row.as_usize()) };
++                let changed = unsafe { changed_ticks.get(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let caller = callers.map(|callers| unsafe { callers.get(table_row.as_usize()) });
++                let caller = callers.map(|callers| unsafe { callers.get(table_row.index()) });
+ 
+                 Ref {
+                     value: component.deref(),
+@@ -1812,11 +1816,15 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
+     ) {
+         let column = table.get_column(component_id).debug_checked_unwrap();
+         let table_data = Some((
+-            column.get_data_slice(table.entity_count()).into(),
+-            column.get_added_ticks_slice(table.entity_count()).into(),
+-            column.get_changed_ticks_slice(table.entity_count()).into(),
++            column.get_data_slice(table.entity_count() as usize).into(),
++            column
++                .get_added_ticks_slice(table.entity_count() as usize)
++                .into(),
++            column
++                .get_changed_ticks_slice(table.entity_count() as usize)
++                .into(),
+             column
+-                .get_changed_by_slice(table.entity_count())
++                .get_changed_by_slice(table.entity_count() as usize)
+                 .map(Into::into),
+         ));
+         // SAFETY: set_table is only called when T::STORAGE_TYPE = StorageType::Table
+@@ -1874,13 +1882,13 @@ unsafe impl<'__w, T: Component<Mutability = Mutable>> QueryData for &'__w mut T
+                     unsafe { table.debug_checked_unwrap() };
+ 
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let component = unsafe { table_components.get(table_row.as_usize()) };
++                let component = unsafe { table_components.get(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let added = unsafe { added_ticks.get(table_row.as_usize()) };
++                let added = unsafe { added_ticks.get(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let changed = unsafe { changed_ticks.get(table_row.as_usize()) };
++                let changed = unsafe { changed_ticks.get(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let caller = callers.map(|callers| unsafe { callers.get(table_row.as_usize()) });
++                let caller = callers.map(|callers| unsafe { callers.get(table_row.index()) });
+ 
+                 Mut {
+                     value: component.deref_mut(),
+diff --git a/crates/bevy_ecs/src/query/filter.rs b/crates/bevy_ecs/src/query/filter.rs
+index 38c7cfcb32c92..119afe32ab886 100644
+--- a/crates/bevy_ecs/src/query/filter.rs
++++ b/crates/bevy_ecs/src/query/filter.rs
+@@ -817,7 +817,7 @@ unsafe impl<T: Component> QueryFilter for Added<T> {
+                 // SAFETY: set_table was previously called
+                 let table = unsafe { table.debug_checked_unwrap() };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let tick = unsafe { table.get(table_row.as_usize()) };
++                let tick = unsafe { table.get(table_row.index()) };
+ 
+                 tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+             },
+@@ -1044,7 +1044,7 @@ unsafe impl<T: Component> QueryFilter for Changed<T> {
+                 // SAFETY: set_table was previously called
+                 let table = unsafe { table.debug_checked_unwrap() };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let tick = unsafe { table.get(table_row.as_usize()) };
++                let tick = unsafe { table.get(table_row.index()) };
+ 
+                 tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+             },
+diff --git a/crates/bevy_ecs/src/query/iter.rs b/crates/bevy_ecs/src/query/iter.rs
+index fc89843493a03..fb247719df51a 100644
+--- a/crates/bevy_ecs/src/query/iter.rs
++++ b/crates/bevy_ecs/src/query/iter.rs
+@@ -19,6 +19,7 @@ use core::{
+     mem::MaybeUninit,
+     ops::Range,
+ };
++use nonmax::NonMaxU32;
+ 
+ /// An [`Iterator`] over query results of a [`Query`](crate::system::Query).
+ ///
+@@ -136,7 +137,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         mut accum: B,
+         func: &mut Func,
+         storage: StorageId,
+-        range: Option<Range<usize>>,
++        range: Option<Range<u32>>,
+     ) -> B
+     where
+         Func: FnMut(B, D::Item<'w>) -> B,
+@@ -199,7 +200,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         mut accum: B,
+         func: &mut Func,
+         table: &'w Table,
+-        rows: Range<usize>,
++        rows: Range<u32>,
+     ) -> B
+     where
+         Func: FnMut(B, D::Item<'w>) -> B,
+@@ -207,10 +208,6 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         if table.is_empty() {
+             return accum;
+         }
+-        debug_assert!(
+-            rows.end <= u32::MAX as usize,
+-            "TableRow is only valid up to u32::MAX"
+-        );
+ 
+         D::set_table(&mut self.cursor.fetch, &self.query_state.fetch_state, table);
+         F::set_table(
+@@ -222,8 +219,9 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         let entities = table.entities();
+         for row in rows {
+             // SAFETY: Caller assures `row` in range of the current archetype.
+-            let entity = unsafe { entities.get_unchecked(row) };
+-            let row = TableRow::from_usize(row);
++            let entity = unsafe { entities.get_unchecked(row as usize) };
++            // SAFETY: This is from an exclusive range, so it can't be max.
++            let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(row)) };
+ 
+             // SAFETY: set_table was called prior.
+             // Caller assures `row` in range of the current archetype.
+@@ -254,7 +252,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         mut accum: B,
+         func: &mut Func,
+         archetype: &'w Archetype,
+-        indices: Range<usize>,
++        indices: Range<u32>,
+     ) -> B
+     where
+         Func: FnMut(B, D::Item<'w>) -> B,
+@@ -279,7 +277,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         let entities = archetype.entities();
+         for index in indices {
+             // SAFETY: Caller assures `index` in range of the current archetype.
+-            let archetype_entity = unsafe { entities.get_unchecked(index) };
++            let archetype_entity = unsafe { entities.get_unchecked(index as usize) };
+ 
+             // SAFETY: set_archetype was called prior.
+             // Caller assures `index` in range of the current archetype.
+@@ -323,7 +321,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         mut accum: B,
+         func: &mut Func,
+         archetype: &'w Archetype,
+-        rows: Range<usize>,
++        rows: Range<u32>,
+     ) -> B
+     where
+         Func: FnMut(B, D::Item<'w>) -> B,
+@@ -331,10 +329,6 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         if archetype.is_empty() {
+             return accum;
+         }
+-        debug_assert!(
+-            rows.end <= u32::MAX as usize,
+-            "TableRow is only valid up to u32::MAX"
+-        );
+         let table = self.tables.get(archetype.table_id()).debug_checked_unwrap();
+         debug_assert!(
+             archetype.len() == table.entity_count(),
+@@ -356,8 +350,9 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
+         let entities = table.entities();
+         for row in rows {
+             // SAFETY: Caller assures `row` in range of the current archetype.
+-            let entity = unsafe { *entities.get_unchecked(row) };
+-            let row = TableRow::from_usize(row);
++            let entity = unsafe { *entities.get_unchecked(row as usize) };
++            // SAFETY: This is from an exclusive range, so it can't be max.
++            let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(row)) };
+ 
+             // SAFETY: set_table was called prior.
+             // Caller assures `row` in range of the current archetype.
+@@ -895,7 +890,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, 's, D, F>
+         let max_size = self.cursor.max_remaining(self.tables, self.archetypes);
+         let archetype_query = F::IS_ARCHETYPAL;
+         let min_size = if archetype_query { max_size } else { 0 };
+-        (min_size, Some(max_size))
++        (min_size as usize, Some(max_size as usize))
+     }
+ 
+     #[inline]
+@@ -2275,7 +2270,7 @@ impl<'w, 's, D: ReadOnlyQueryData, F: QueryFilter, const K: usize> Iterator
+             .enumerate()
+             .try_fold(0, |acc, (i, cursor)| {
+                 let n = cursor.max_remaining(self.tables, self.archetypes);
+-                Some(acc + choose(n, K - i)?)
++                Some(acc + choose(n as usize, K - i)?)
+             });
+ 
+         let archetype_query = F::IS_ARCHETYPAL;
+@@ -2317,9 +2312,9 @@ struct QueryIterationCursor<'w, 's, D: QueryData, F: QueryFilter> {
+     fetch: D::Fetch<'w>,
+     filter: F::Fetch<'w>,
+     // length of the table or length of the archetype, depending on whether both `D`'s and `F`'s fetches are dense
+-    current_len: usize,
++    current_len: u32,
+     // either table row or archetype index, depending on whether both `D`'s and `F`'s fetches are dense
+-    current_row: usize,
++    current_row: u32,
+ }
+ 
+ impl<D: QueryData, F: QueryFilter> Clone for QueryIterationCursor<'_, '_, D, F> {
+@@ -2400,7 +2395,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIterationCursor<'w, 's, D, F> {
+             let index = self.current_row - 1;
+             if self.is_dense {
+                 // SAFETY: This must have been called previously in `next` as `current_row > 0`
+-                let entity = unsafe { self.table_entities.get_unchecked(index) };
++                let entity = unsafe { self.table_entities.get_unchecked(index as usize) };
+                 // SAFETY:
+                 //  - `set_table` must have been called previously either in `next` or before it.
+                 //  - `*entity` and `index` are in the current table.
+@@ -2408,12 +2403,14 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIterationCursor<'w, 's, D, F> {
+                     Some(D::fetch(
+                         &mut self.fetch,
+                         *entity,
+-                        TableRow::from_usize(index),
++                        // SAFETY: This is from an exclusive range, so it can't be max.
++                        TableRow::new(NonMaxU32::new_unchecked(index)),
+                     ))
+                 }
+             } else {
+                 // SAFETY: This must have been called previously in `next` as `current_row > 0`
+-                let archetype_entity = unsafe { self.archetype_entities.get_unchecked(index) };
++                let archetype_entity =
++                    unsafe { self.archetype_entities.get_unchecked(index as usize) };
+                 // SAFETY:
+                 //  - `set_archetype` must have been called previously either in `next` or before it.
+                 //  - `archetype_entity.id()` and `archetype_entity.table_row()` are in the current archetype.
+@@ -2434,9 +2431,9 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIterationCursor<'w, 's, D, F> {
+     ///
+     /// Note that if `F::IS_ARCHETYPAL`, the return value
+     /// will be **the exact count of remaining values**.
+-    fn max_remaining(&self, tables: &'w Tables, archetypes: &'w Archetypes) -> usize {
++    fn max_remaining(&self, tables: &'w Tables, archetypes: &'w Archetypes) -> u32 {
+         let ids = self.storage_id_iter.clone();
+-        let remaining_matched: usize = if self.is_dense {
++        let remaining_matched: u32 = if self.is_dense {
+             // SAFETY: The if check ensures that storage_id_iter stores TableIds
+             unsafe { ids.map(|id| tables[id.table_id].entity_count()).sum() }
+         } else {
+@@ -2483,8 +2480,10 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIterationCursor<'w, 's, D, F> {
+ 
+                 // SAFETY: set_table was called prior.
+                 // `current_row` is a table row in range of the current table, because if it was not, then the above would have been executed.
+-                let entity = unsafe { self.table_entities.get_unchecked(self.current_row) };
+-                let row = TableRow::from_usize(self.current_row);
++                let entity =
++                    unsafe { self.table_entities.get_unchecked(self.current_row as usize) };
++                // SAFETY: The row is less than the u32 len, so it must not be max.
++                let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(self.current_row)) };
+                 if !F::filter_fetch(&mut self.filter, *entity, row) {
+                     self.current_row += 1;
+                     continue;
+@@ -2532,8 +2531,10 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIterationCursor<'w, 's, D, F> {
+ 
+                 // SAFETY: set_archetype was called prior.
+                 // `current_row` is an archetype index row in range of the current archetype, because if it was not, then the if above would have been executed.
+-                let archetype_entity =
+-                    unsafe { self.archetype_entities.get_unchecked(self.current_row) };
++                let archetype_entity = unsafe {
++                    self.archetype_entities
++                        .get_unchecked(self.current_row as usize)
++                };
+                 if !F::filter_fetch(
+                     &mut self.filter,
+                     archetype_entity.id(),
+diff --git a/crates/bevy_ecs/src/query/par_iter.rs b/crates/bevy_ecs/src/query/par_iter.rs
+index 6683238aa36ee..c685659260fe6 100644
+--- a/crates/bevy_ecs/src/query/par_iter.rs
++++ b/crates/bevy_ecs/src/query/par_iter.rs
+@@ -62,7 +62,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
+     ///     query.par_iter().for_each_init(|| queue.borrow_local_mut(),|local_queue, item| {
+     ///         **local_queue += 1;
+     ///      });
+-    ///     
++    ///
+     ///     // collect value from every thread
+     ///     let entity_count: usize = queue.iter_mut().map(|v| *v).sum();
+     /// }
+@@ -130,7 +130,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
+     }
+ 
+     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+-    fn get_batch_size(&self, thread_count: usize) -> usize {
++    fn get_batch_size(&self, thread_count: usize) -> u32 {
+         let max_items = || {
+             let id_iter = self.state.matched_storage_ids.iter();
+             if self.state.is_dense {
+@@ -147,10 +147,11 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
+                     .map(|id| unsafe { archetypes[id.archetype_id].len() })
+                     .max()
+             }
++            .map(|v| v as usize)
+             .unwrap_or(0)
+         };
+         self.batching_strategy
+-            .calc_batch_size(max_items, thread_count)
++            .calc_batch_size(max_items, thread_count) as u32
+     }
+ }
+ 
+@@ -232,7 +233,7 @@ impl<'w, 's, D: ReadOnlyQueryData, F: QueryFilter, E: EntityEquivalent + Sync>
+     ///     query.par_iter_many(&entities).for_each_init(|| queue.borrow_local_mut(),|local_queue, item| {
+     ///         **local_queue += some_expensive_operation(item);
+     ///     });
+-    ///     
++    ///
+     ///     // collect value from every thread
+     ///     let final_value: usize = queue.iter_mut().map(|v| *v).sum();
+     /// }
+@@ -301,9 +302,9 @@ impl<'w, 's, D: ReadOnlyQueryData, F: QueryFilter, E: EntityEquivalent + Sync>
+     }
+ 
+     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+-    fn get_batch_size(&self, thread_count: usize) -> usize {
++    fn get_batch_size(&self, thread_count: usize) -> u32 {
+         self.batching_strategy
+-            .calc_batch_size(|| self.entity_list.len(), thread_count)
++            .calc_batch_size(|| self.entity_list.len(), thread_count) as u32
+     }
+ }
+ 
+@@ -387,7 +388,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter, E: EntityEquivalent + Sync>
+     ///     query.par_iter_many_unique(&entities).for_each_init(|| queue.borrow_local_mut(),|local_queue, item| {
+     ///         **local_queue += some_expensive_operation(item);
+     ///     });
+-    ///     
++    ///
+     ///     // collect value from every thread
+     ///     let final_value: usize = queue.iter_mut().map(|v| *v).sum();
+     /// }
+@@ -456,8 +457,8 @@ impl<'w, 's, D: QueryData, F: QueryFilter, E: EntityEquivalent + Sync>
+     }
+ 
+     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+-    fn get_batch_size(&self, thread_count: usize) -> usize {
++    fn get_batch_size(&self, thread_count: usize) -> u32 {
+         self.batching_strategy
+-            .calc_batch_size(|| self.entity_list.len(), thread_count)
++            .calc_batch_size(|| self.entity_list.len(), thread_count) as u32
+     }
+ }
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index cae8e592e757e..8c74d1a018b4f 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -1502,7 +1502,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         &self,
+         init_accum: INIT,
+         world: UnsafeWorldCell<'w>,
+-        batch_size: usize,
++        batch_size: u32,
+         func: FN,
+         last_run: Tick,
+         this_run: Tick,
+@@ -1545,7 +1545,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+ 
+             // submit single storage larger than batch_size
+             let submit_single = |count, storage_id: StorageId| {
+-                for offset in (0..count).step_by(batch_size) {
++                for offset in (0..count).step_by(batch_size as usize) {
+                     let mut func = func.clone();
+                     let init_accum = init_accum.clone();
+                     let len = batch_size.min(count - offset);
+@@ -1561,7 +1561,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+                 }
+             };
+ 
+-            let storage_entity_count = |storage_id: StorageId| -> usize {
++            let storage_entity_count = |storage_id: StorageId| -> u32 {
+                 if self.is_dense {
+                     tables[storage_id.table_id].entity_count()
+                 } else {
+@@ -1617,7 +1617,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         init_accum: INIT,
+         world: UnsafeWorldCell<'w>,
+         entity_list: &UniqueEntityEquivalentSlice<E>,
+-        batch_size: usize,
++        batch_size: u32,
+         mut func: FN,
+         last_run: Tick,
+         this_run: Tick,
+@@ -1631,7 +1631,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual
+ 
+         bevy_tasks::ComputeTaskPool::get().scope(|scope| {
+-            let chunks = entity_list.chunks_exact(batch_size);
++            let chunks = entity_list.chunks_exact(batch_size as usize);
+             let remainder = chunks.remainder();
+ 
+             for batch in chunks {
+@@ -1680,7 +1680,7 @@ impl<D: ReadOnlyQueryData, F: QueryFilter> QueryState<D, F> {
+         init_accum: INIT,
+         world: UnsafeWorldCell<'w>,
+         entity_list: &[E],
+-        batch_size: usize,
++        batch_size: u32,
+         mut func: FN,
+         last_run: Tick,
+         this_run: Tick,
+@@ -1694,7 +1694,7 @@ impl<D: ReadOnlyQueryData, F: QueryFilter> QueryState<D, F> {
+         // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual
+ 
+         bevy_tasks::ComputeTaskPool::get().scope(|scope| {
+-            let chunks = entity_list.chunks_exact(batch_size);
++            let chunks = entity_list.chunks_exact(batch_size as usize);
+             let remainder = chunks.remainder();
+ 
+             for batch in chunks {
+diff --git a/crates/bevy_ecs/src/storage/sparse_set.rs b/crates/bevy_ecs/src/storage/sparse_set.rs
+index 69305e8a141ce..42adcd89dc3b3 100644
+--- a/crates/bevy_ecs/src/storage/sparse_set.rs
++++ b/crates/bevy_ecs/src/storage/sparse_set.rs
+@@ -1,15 +1,13 @@
+ use crate::{
+     change_detection::MaybeLocation,
+     component::{ComponentId, ComponentInfo, ComponentTicks, Tick, TickCells},
+-    entity::Entity,
++    entity::{Entity, EntityRow},
+     storage::{Column, TableRow},
+ };
+ use alloc::{boxed::Box, vec::Vec};
+ use bevy_ptr::{OwningPtr, Ptr};
+ use core::{cell::UnsafeCell, hash::Hash, marker::PhantomData, panic::Location};
+-use nonmax::NonMaxUsize;
+-
+-type EntityIndex = u32;
++use nonmax::{NonMaxU32, NonMaxUsize};
+ 
+ #[derive(Debug)]
+ pub(crate) struct SparseArray<I, V = I> {
+@@ -121,10 +119,10 @@ pub struct ComponentSparseSet {
+     // stored for entities that are alive. The generation is not required, but is stored
+     // in debug builds to validate that access is correct.
+     #[cfg(not(debug_assertions))]
+-    entities: Vec<EntityIndex>,
++    entities: Vec<EntityRow>,
+     #[cfg(debug_assertions)]
+     entities: Vec<Entity>,
+-    sparse: SparseArray<EntityIndex, TableRow>,
++    sparse: SparseArray<EntityRow, TableRow>,
+ }
+ 
+ impl ComponentSparseSet {
+@@ -170,20 +168,25 @@ impl ComponentSparseSet {
+         change_tick: Tick,
+         caller: MaybeLocation,
+     ) {
+-        if let Some(&dense_index) = self.sparse.get(entity.index()) {
++        if let Some(&dense_index) = self.sparse.get(entity.row()) {
+             #[cfg(debug_assertions)]
+-            assert_eq!(entity, self.entities[dense_index.as_usize()]);
++            assert_eq!(entity, self.entities[dense_index.index()]);
+             self.dense.replace(dense_index, value, change_tick, caller);
+         } else {
+             let dense_index = self.dense.len();
+             self.dense
+                 .push(value, ComponentTicks::new(change_tick), caller);
+-            self.sparse
+-                .insert(entity.index(), TableRow::from_usize(dense_index));
++
++            // SAFETY: This entity row does not exist here yet, so there are no duplicates,
++            // and the entity index can not be the max, so the length must not be max either.
++            // To do so would have caused a panic in the entity alloxator.
++            let table_row = unsafe { TableRow::new(NonMaxU32::new_unchecked(dense_index as u32)) };
++
++            self.sparse.insert(entity.row(), table_row);
+             #[cfg(debug_assertions)]
+             assert_eq!(self.entities.len(), dense_index);
+             #[cfg(not(debug_assertions))]
+-            self.entities.push(entity.index());
++            self.entities.push(entity.row());
+             #[cfg(debug_assertions)]
+             self.entities.push(entity);
+         }
+@@ -194,16 +197,16 @@ impl ComponentSparseSet {
+     pub fn contains(&self, entity: Entity) -> bool {
+         #[cfg(debug_assertions)]
+         {
+-            if let Some(&dense_index) = self.sparse.get(entity.index()) {
++            if let Some(&dense_index) = self.sparse.get(entity.row()) {
+                 #[cfg(debug_assertions)]
+-                assert_eq!(entity, self.entities[dense_index.as_usize()]);
++                assert_eq!(entity, self.entities[dense_index.index()]);
+                 true
+             } else {
+                 false
+             }
+         }
+         #[cfg(not(debug_assertions))]
+-        self.sparse.contains(entity.index())
++        self.sparse.contains(entity.row())
+     }
+ 
+     /// Returns a reference to the entity's component value.
+@@ -211,9 +214,9 @@ impl ComponentSparseSet {
+     /// Returns `None` if `entity` does not have a component in the sparse set.
+     #[inline]
+     pub fn get(&self, entity: Entity) -> Option<Ptr<'_>> {
+-        self.sparse.get(entity.index()).map(|&dense_index| {
++        self.sparse.get(entity.row()).map(|&dense_index| {
+             #[cfg(debug_assertions)]
+-            assert_eq!(entity, self.entities[dense_index.as_usize()]);
++            assert_eq!(entity, self.entities[dense_index.index()]);
+             // SAFETY: if the sparse index points to something in the dense vec, it exists
+             unsafe { self.dense.get_data_unchecked(dense_index) }
+         })
+@@ -231,9 +234,9 @@ impl ComponentSparseSet {
+         TickCells<'_>,
+         MaybeLocation<&UnsafeCell<&'static Location<'static>>>,
+     )> {
+-        let dense_index = *self.sparse.get(entity.index())?;
++        let dense_index = *self.sparse.get(entity.row())?;
+         #[cfg(debug_assertions)]
+-        assert_eq!(entity, self.entities[dense_index.as_usize()]);
++        assert_eq!(entity, self.entities[dense_index.index()]);
+         // SAFETY: if the sparse index points to something in the dense vec, it exists
+         unsafe {
+             Some((
+@@ -252,9 +255,9 @@ impl ComponentSparseSet {
+     /// Returns `None` if `entity` does not have a component in the sparse set.
+     #[inline]
+     pub fn get_added_tick(&self, entity: Entity) -> Option<&UnsafeCell<Tick>> {
+-        let dense_index = *self.sparse.get(entity.index())?;
++        let dense_index = *self.sparse.get(entity.row())?;
+         #[cfg(debug_assertions)]
+-        assert_eq!(entity, self.entities[dense_index.as_usize()]);
++        assert_eq!(entity, self.entities[dense_index.index()]);
+         // SAFETY: if the sparse index points to something in the dense vec, it exists
+         unsafe { Some(self.dense.get_added_tick_unchecked(dense_index)) }
+     }
+@@ -264,9 +267,9 @@ impl ComponentSparseSet {
+     /// Returns `None` if `entity` does not have a component in the sparse set.
+     #[inline]
+     pub fn get_changed_tick(&self, entity: Entity) -> Option<&UnsafeCell<Tick>> {
+-        let dense_index = *self.sparse.get(entity.index())?;
++        let dense_index = *self.sparse.get(entity.row())?;
+         #[cfg(debug_assertions)]
+-        assert_eq!(entity, self.entities[dense_index.as_usize()]);
++        assert_eq!(entity, self.entities[dense_index.index()]);
+         // SAFETY: if the sparse index points to something in the dense vec, it exists
+         unsafe { Some(self.dense.get_changed_tick_unchecked(dense_index)) }
+     }
+@@ -276,9 +279,9 @@ impl ComponentSparseSet {
+     /// Returns `None` if `entity` does not have a component in the sparse set.
+     #[inline]
+     pub fn get_ticks(&self, entity: Entity) -> Option<ComponentTicks> {
+-        let dense_index = *self.sparse.get(entity.index())?;
++        let dense_index = *self.sparse.get(entity.row())?;
+         #[cfg(debug_assertions)]
+-        assert_eq!(entity, self.entities[dense_index.as_usize()]);
++        assert_eq!(entity, self.entities[dense_index.index()]);
+         // SAFETY: if the sparse index points to something in the dense vec, it exists
+         unsafe { Some(self.dense.get_ticks_unchecked(dense_index)) }
+     }
+@@ -292,9 +295,9 @@ impl ComponentSparseSet {
+         entity: Entity,
+     ) -> MaybeLocation<Option<&UnsafeCell<&'static Location<'static>>>> {
+         MaybeLocation::new_with_flattened(|| {
+-            let dense_index = *self.sparse.get(entity.index())?;
++            let dense_index = *self.sparse.get(entity.row())?;
+             #[cfg(debug_assertions)]
+-            assert_eq!(entity, self.entities[dense_index.as_usize()]);
++            assert_eq!(entity, self.entities[dense_index.index()]);
+             // SAFETY: if the sparse index points to something in the dense vec, it exists
+             unsafe { Some(self.dense.get_changed_by_unchecked(dense_index)) }
+         })
+@@ -311,19 +314,19 @@ impl ComponentSparseSet {
+     /// it exists).
+     #[must_use = "The returned pointer must be used to drop the removed component."]
+     pub(crate) fn remove_and_forget(&mut self, entity: Entity) -> Option<OwningPtr<'_>> {
+-        self.sparse.remove(entity.index()).map(|dense_index| {
++        self.sparse.remove(entity.row()).map(|dense_index| {
+             #[cfg(debug_assertions)]
+-            assert_eq!(entity, self.entities[dense_index.as_usize()]);
+-            self.entities.swap_remove(dense_index.as_usize());
+-            let is_last = dense_index.as_usize() == self.dense.len() - 1;
++            assert_eq!(entity, self.entities[dense_index.index()]);
++            self.entities.swap_remove(dense_index.index());
++            let is_last = dense_index.index() == self.dense.len() - 1;
+             // SAFETY: dense_index was just removed from `sparse`, which ensures that it is valid
+             let (value, _, _) = unsafe { self.dense.swap_remove_and_forget_unchecked(dense_index) };
+             if !is_last {
+-                let swapped_entity = self.entities[dense_index.as_usize()];
++                let swapped_entity = self.entities[dense_index.index()];
+                 #[cfg(not(debug_assertions))]
+                 let index = swapped_entity;
+                 #[cfg(debug_assertions)]
+-                let index = swapped_entity.index();
++                let index = swapped_entity.row();
+                 *self.sparse.get_mut(index).unwrap() = dense_index;
+             }
+             value
+@@ -334,21 +337,21 @@ impl ComponentSparseSet {
+     ///
+     /// Returns `true` if `entity` had a component value in the sparse set.
+     pub(crate) fn remove(&mut self, entity: Entity) -> bool {
+-        if let Some(dense_index) = self.sparse.remove(entity.index()) {
++        if let Some(dense_index) = self.sparse.remove(entity.row()) {
+             #[cfg(debug_assertions)]
+-            assert_eq!(entity, self.entities[dense_index.as_usize()]);
+-            self.entities.swap_remove(dense_index.as_usize());
+-            let is_last = dense_index.as_usize() == self.dense.len() - 1;
++            assert_eq!(entity, self.entities[dense_index.index()]);
++            self.entities.swap_remove(dense_index.index());
++            let is_last = dense_index.index() == self.dense.len() - 1;
+             // SAFETY: if the sparse index points to something in the dense vec, it exists
+             unsafe {
+                 self.dense.swap_remove_unchecked(dense_index);
+             }
+             if !is_last {
+-                let swapped_entity = self.entities[dense_index.as_usize()];
++                let swapped_entity = self.entities[dense_index.index()];
+                 #[cfg(not(debug_assertions))]
+                 let index = swapped_entity;
+                 #[cfg(debug_assertions)]
+-                let index = swapped_entity.index();
++                let index = swapped_entity.row();
+                 *self.sparse.get_mut(index).unwrap() = dense_index;
+             }
+             true
+diff --git a/crates/bevy_ecs/src/storage/table/column.rs b/crates/bevy_ecs/src/storage/table/column.rs
+index 522df222c6379..78fafe0a2612d 100644
+--- a/crates/bevy_ecs/src/storage/table/column.rs
++++ b/crates/bevy_ecs/src/storage/table/column.rs
+@@ -49,13 +49,13 @@ impl ThinColumn {
+         row: TableRow,
+     ) {
+         self.data
+-            .swap_remove_and_drop_unchecked_nonoverlapping(row.as_usize(), last_element_index);
++            .swap_remove_and_drop_unchecked_nonoverlapping(row.index(), last_element_index);
+         self.added_ticks
+-            .swap_remove_unchecked_nonoverlapping(row.as_usize(), last_element_index);
++            .swap_remove_unchecked_nonoverlapping(row.index(), last_element_index);
+         self.changed_ticks
+-            .swap_remove_unchecked_nonoverlapping(row.as_usize(), last_element_index);
++            .swap_remove_unchecked_nonoverlapping(row.index(), last_element_index);
+         self.changed_by.as_mut().map(|changed_by| {
+-            changed_by.swap_remove_unchecked_nonoverlapping(row.as_usize(), last_element_index);
++            changed_by.swap_remove_unchecked_nonoverlapping(row.index(), last_element_index);
+         });
+     }
+ 
+@@ -71,13 +71,13 @@ impl ThinColumn {
+         row: TableRow,
+     ) {
+         self.data
+-            .swap_remove_and_drop_unchecked(row.as_usize(), last_element_index);
++            .swap_remove_and_drop_unchecked(row.index(), last_element_index);
+         self.added_ticks
+-            .swap_remove_and_drop_unchecked(row.as_usize(), last_element_index);
++            .swap_remove_and_drop_unchecked(row.index(), last_element_index);
+         self.changed_ticks
+-            .swap_remove_and_drop_unchecked(row.as_usize(), last_element_index);
++            .swap_remove_and_drop_unchecked(row.index(), last_element_index);
+         self.changed_by.as_mut().map(|changed_by| {
+-            changed_by.swap_remove_and_drop_unchecked(row.as_usize(), last_element_index);
++            changed_by.swap_remove_and_drop_unchecked(row.index(), last_element_index);
+         });
+     }
+ 
+@@ -94,14 +94,14 @@ impl ThinColumn {
+     ) {
+         let _ = self
+             .data
+-            .swap_remove_unchecked(row.as_usize(), last_element_index);
++            .swap_remove_unchecked(row.index(), last_element_index);
+         self.added_ticks
+-            .swap_remove_unchecked(row.as_usize(), last_element_index);
++            .swap_remove_unchecked(row.index(), last_element_index);
+         self.changed_ticks
+-            .swap_remove_unchecked(row.as_usize(), last_element_index);
++            .swap_remove_unchecked(row.index(), last_element_index);
+         self.changed_by
+             .as_mut()
+-            .map(|changed_by| changed_by.swap_remove_unchecked(row.as_usize(), last_element_index));
++            .map(|changed_by| changed_by.swap_remove_unchecked(row.index(), last_element_index));
+     }
+ 
+     /// Call [`realloc`](std::alloc::realloc) to expand / shrink the memory allocation for this [`ThinColumn`]
+@@ -148,15 +148,12 @@ impl ThinColumn {
+         tick: Tick,
+         caller: MaybeLocation,
+     ) {
+-        self.data.initialize_unchecked(row.as_usize(), data);
+-        *self.added_ticks.get_unchecked_mut(row.as_usize()).get_mut() = tick;
+-        *self
+-            .changed_ticks
+-            .get_unchecked_mut(row.as_usize())
+-            .get_mut() = tick;
++        self.data.initialize_unchecked(row.index(), data);
++        *self.added_ticks.get_unchecked_mut(row.index()).get_mut() = tick;
++        *self.changed_ticks.get_unchecked_mut(row.index()).get_mut() = tick;
+         self.changed_by
+             .as_mut()
+-            .map(|changed_by| changed_by.get_unchecked_mut(row.as_usize()).get_mut())
++            .map(|changed_by| changed_by.get_unchecked_mut(row.index()).get_mut())
+             .assign(caller);
+     }
+ 
+@@ -173,14 +170,11 @@ impl ThinColumn {
+         change_tick: Tick,
+         caller: MaybeLocation,
+     ) {
+-        self.data.replace_unchecked(row.as_usize(), data);
+-        *self
+-            .changed_ticks
+-            .get_unchecked_mut(row.as_usize())
+-            .get_mut() = change_tick;
++        self.data.replace_unchecked(row.index(), data);
++        *self.changed_ticks.get_unchecked_mut(row.index()).get_mut() = change_tick;
+         self.changed_by
+             .as_mut()
+-            .map(|changed_by| changed_by.get_unchecked_mut(row.as_usize()).get_mut())
++            .map(|changed_by| changed_by.get_unchecked_mut(row.index()).get_mut())
+             .assign(caller);
+     }
+ 
+@@ -206,25 +200,25 @@ impl ThinColumn {
+         // Init the data
+         let src_val = other
+             .data
+-            .swap_remove_unchecked(src_row.as_usize(), other_last_element_index);
+-        self.data.initialize_unchecked(dst_row.as_usize(), src_val);
++            .swap_remove_unchecked(src_row.index(), other_last_element_index);
++        self.data.initialize_unchecked(dst_row.index(), src_val);
+         // Init added_ticks
+         let added_tick = other
+             .added_ticks
+-            .swap_remove_unchecked(src_row.as_usize(), other_last_element_index);
++            .swap_remove_unchecked(src_row.index(), other_last_element_index);
+         self.added_ticks
+-            .initialize_unchecked(dst_row.as_usize(), added_tick);
++            .initialize_unchecked(dst_row.index(), added_tick);
+         // Init changed_ticks
+         let changed_tick = other
+             .changed_ticks
+-            .swap_remove_unchecked(src_row.as_usize(), other_last_element_index);
++            .swap_remove_unchecked(src_row.index(), other_last_element_index);
+         self.changed_ticks
+-            .initialize_unchecked(dst_row.as_usize(), changed_tick);
++            .initialize_unchecked(dst_row.index(), changed_tick);
+         self.changed_by.as_mut().zip(other.changed_by.as_mut()).map(
+             |(self_changed_by, other_changed_by)| {
+                 let changed_by = other_changed_by
+-                    .swap_remove_unchecked(src_row.as_usize(), other_last_element_index);
+-                self_changed_by.initialize_unchecked(dst_row.as_usize(), changed_by);
++                    .swap_remove_unchecked(src_row.index(), other_last_element_index);
++                self_changed_by.initialize_unchecked(dst_row.index(), changed_by);
+             },
+         );
+     }
+@@ -384,15 +378,12 @@ impl Column {
+         change_tick: Tick,
+         caller: MaybeLocation,
+     ) {
+-        debug_assert!(row.as_usize() < self.len());
+-        self.data.replace_unchecked(row.as_usize(), data);
+-        *self
+-            .changed_ticks
+-            .get_unchecked_mut(row.as_usize())
+-            .get_mut() = change_tick;
++        debug_assert!(row.index() < self.len());
++        self.data.replace_unchecked(row.index(), data);
++        *self.changed_ticks.get_unchecked_mut(row.index()).get_mut() = change_tick;
+         self.changed_by
+             .as_mut()
+-            .map(|changed_by| changed_by.get_unchecked_mut(row.as_usize()).get_mut())
++            .map(|changed_by| changed_by.get_unchecked_mut(row.index()).get_mut())
+             .assign(caller);
+     }
+ 
+@@ -419,12 +410,12 @@ impl Column {
+     /// `row` must be within the range `[0, self.len())`.
+     #[inline]
+     pub(crate) unsafe fn swap_remove_unchecked(&mut self, row: TableRow) {
+-        self.data.swap_remove_and_drop_unchecked(row.as_usize());
+-        self.added_ticks.swap_remove(row.as_usize());
+-        self.changed_ticks.swap_remove(row.as_usize());
++        self.data.swap_remove_and_drop_unchecked(row.index());
++        self.added_ticks.swap_remove(row.index());
++        self.changed_ticks.swap_remove(row.index());
+         self.changed_by
+             .as_mut()
+-            .map(|changed_by| changed_by.swap_remove(row.as_usize()));
++            .map(|changed_by| changed_by.swap_remove(row.index()));
+     }
+ 
+     /// Removes an element from the [`Column`] and returns it and its change detection ticks.
+@@ -444,13 +435,13 @@ impl Column {
+         &mut self,
+         row: TableRow,
+     ) -> (OwningPtr<'_>, ComponentTicks, MaybeLocation) {
+-        let data = self.data.swap_remove_and_forget_unchecked(row.as_usize());
+-        let added = self.added_ticks.swap_remove(row.as_usize()).into_inner();
+-        let changed = self.changed_ticks.swap_remove(row.as_usize()).into_inner();
++        let data = self.data.swap_remove_and_forget_unchecked(row.index());
++        let added = self.added_ticks.swap_remove(row.index()).into_inner();
++        let changed = self.changed_ticks.swap_remove(row.index()).into_inner();
+         let caller = self
+             .changed_by
+             .as_mut()
+-            .map(|changed_by| changed_by.swap_remove(row.as_usize()).into_inner());
++            .map(|changed_by| changed_by.swap_remove(row.index()).into_inner());
+         (data, ComponentTicks { added, changed }, caller)
+     }
+ 
+@@ -520,15 +511,15 @@ impl Column {
+     /// Returns `None` if `row` is out of bounds.
+     #[inline]
+     pub fn get(&self, row: TableRow) -> Option<(Ptr<'_>, TickCells<'_>)> {
+-        (row.as_usize() < self.data.len())
++        (row.index() < self.data.len())
+             // SAFETY: The row is length checked before fetching the pointer. This is being
+             // accessed through a read-only reference to the column.
+             .then(|| unsafe {
+                 (
+-                    self.data.get_unchecked(row.as_usize()),
++                    self.data.get_unchecked(row.index()),
+                     TickCells {
+-                        added: self.added_ticks.get_unchecked(row.as_usize()),
+-                        changed: self.changed_ticks.get_unchecked(row.as_usize()),
++                        added: self.added_ticks.get_unchecked(row.index()),
++                        changed: self.changed_ticks.get_unchecked(row.index()),
+                     },
+                 )
+             })
+@@ -539,10 +530,10 @@ impl Column {
+     /// Returns `None` if `row` is out of bounds.
+     #[inline]
+     pub fn get_data(&self, row: TableRow) -> Option<Ptr<'_>> {
+-        (row.as_usize() < self.data.len()).then(|| {
++        (row.index() < self.data.len()).then(|| {
+             // SAFETY: The row is length checked before fetching the pointer. This is being
+             // accessed through a read-only reference to the column.
+-            unsafe { self.data.get_unchecked(row.as_usize()) }
++            unsafe { self.data.get_unchecked(row.index()) }
+         })
+     }
+ 
+@@ -554,8 +545,8 @@ impl Column {
+     /// - no other mutable reference to the data of the same row can exist at the same time
+     #[inline]
+     pub unsafe fn get_data_unchecked(&self, row: TableRow) -> Ptr<'_> {
+-        debug_assert!(row.as_usize() < self.data.len());
+-        self.data.get_unchecked(row.as_usize())
++        debug_assert!(row.index() < self.data.len());
++        self.data.get_unchecked(row.index())
+     }
+ 
+     /// Fetches a mutable reference to the data at `row`.
+@@ -563,10 +554,10 @@ impl Column {
+     /// Returns `None` if `row` is out of bounds.
+     #[inline]
+     pub fn get_data_mut(&mut self, row: TableRow) -> Option<PtrMut<'_>> {
+-        (row.as_usize() < self.data.len()).then(|| {
++        (row.index() < self.data.len()).then(|| {
+             // SAFETY: The row is length checked before fetching the pointer. This is being
+             // accessed through an exclusive reference to the column.
+-            unsafe { self.data.get_unchecked_mut(row.as_usize()) }
++            unsafe { self.data.get_unchecked_mut(row.index()) }
+         })
+     }
+ 
+@@ -579,7 +570,7 @@ impl Column {
+     /// adhere to the safety invariants of [`UnsafeCell`].
+     #[inline]
+     pub fn get_added_tick(&self, row: TableRow) -> Option<&UnsafeCell<Tick>> {
+-        self.added_ticks.get(row.as_usize())
++        self.added_ticks.get(row.index())
+     }
+ 
+     /// Fetches the "changed" change detection tick for the value at `row`.
+@@ -591,7 +582,7 @@ impl Column {
+     /// adhere to the safety invariants of [`UnsafeCell`].
+     #[inline]
+     pub fn get_changed_tick(&self, row: TableRow) -> Option<&UnsafeCell<Tick>> {
+-        self.changed_ticks.get(row.as_usize())
++        self.changed_ticks.get(row.index())
+     }
+ 
+     /// Fetches the change detection ticks for the value at `row`.
+@@ -599,7 +590,7 @@ impl Column {
+     /// Returns `None` if `row` is out of bounds.
+     #[inline]
+     pub fn get_ticks(&self, row: TableRow) -> Option<ComponentTicks> {
+-        if row.as_usize() < self.data.len() {
++        if row.index() < self.data.len() {
+             // SAFETY: The size of the column has already been checked.
+             Some(unsafe { self.get_ticks_unchecked(row) })
+         } else {
+@@ -614,8 +605,8 @@ impl Column {
+     /// `row` must be within the range `[0, self.len())`.
+     #[inline]
+     pub unsafe fn get_added_tick_unchecked(&self, row: TableRow) -> &UnsafeCell<Tick> {
+-        debug_assert!(row.as_usize() < self.added_ticks.len());
+-        self.added_ticks.get_unchecked(row.as_usize())
++        debug_assert!(row.index() < self.added_ticks.len());
++        self.added_ticks.get_unchecked(row.index())
+     }
+ 
+     /// Fetches the "changed" change detection tick for the value at `row`. Unlike [`Column::get_changed_tick`]
+@@ -625,8 +616,8 @@ impl Column {
+     /// `row` must be within the range `[0, self.len())`.
+     #[inline]
+     pub unsafe fn get_changed_tick_unchecked(&self, row: TableRow) -> &UnsafeCell<Tick> {
+-        debug_assert!(row.as_usize() < self.changed_ticks.len());
+-        self.changed_ticks.get_unchecked(row.as_usize())
++        debug_assert!(row.index() < self.changed_ticks.len());
++        self.changed_ticks.get_unchecked(row.index())
+     }
+ 
+     /// Fetches the change detection ticks for the value at `row`. Unlike [`Column::get_ticks`]
+@@ -636,11 +627,11 @@ impl Column {
+     /// `row` must be within the range `[0, self.len())`.
+     #[inline]
+     pub unsafe fn get_ticks_unchecked(&self, row: TableRow) -> ComponentTicks {
+-        debug_assert!(row.as_usize() < self.added_ticks.len());
+-        debug_assert!(row.as_usize() < self.changed_ticks.len());
++        debug_assert!(row.index() < self.added_ticks.len());
++        debug_assert!(row.index() < self.changed_ticks.len());
+         ComponentTicks {
+-            added: self.added_ticks.get_unchecked(row.as_usize()).read(),
+-            changed: self.changed_ticks.get_unchecked(row.as_usize()).read(),
++            added: self.added_ticks.get_unchecked(row.index()).read(),
++            changed: self.changed_ticks.get_unchecked(row.index()).read(),
+         }
+     }
+ 
+@@ -678,7 +669,7 @@ impl Column {
+     ) -> MaybeLocation<Option<&UnsafeCell<&'static Location<'static>>>> {
+         self.changed_by
+             .as_ref()
+-            .map(|changed_by| changed_by.get(row.as_usize()))
++            .map(|changed_by| changed_by.get(row.index()))
+     }
+ 
+     /// Fetches the calling location that last changed the value at `row`.
+@@ -693,8 +684,8 @@ impl Column {
+         row: TableRow,
+     ) -> MaybeLocation<&UnsafeCell<&'static Location<'static>>> {
+         self.changed_by.as_ref().map(|changed_by| {
+-            debug_assert!(row.as_usize() < changed_by.len());
+-            changed_by.get_unchecked(row.as_usize())
++            debug_assert!(row.index() < changed_by.len());
++            changed_by.get_unchecked(row.index())
+         })
+     }
+ 
+diff --git a/crates/bevy_ecs/src/storage/table/mod.rs b/crates/bevy_ecs/src/storage/table/mod.rs
+index fd8eb410e4f33..cf579de8c751a 100644
+--- a/crates/bevy_ecs/src/storage/table/mod.rs
++++ b/crates/bevy_ecs/src/storage/table/mod.rs
+@@ -16,6 +16,7 @@ use core::{
+     ops::{Index, IndexMut},
+     panic::Location,
+ };
++use nonmax::NonMaxU32;
+ mod column;
+ 
+ /// An opaque unique ID for a [`Table`] within a [`World`].
+@@ -100,39 +101,30 @@ impl TableId {
+ /// [`Archetype::entity_table_row`]: crate::archetype::Archetype::entity_table_row
+ /// [`Archetype::table_id`]: crate::archetype::Archetype::table_id
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub struct TableRow(u32);
++#[repr(transparent)]
++pub struct TableRow(NonMaxU32);
+ 
+ impl TableRow {
+-    pub(crate) const INVALID: TableRow = TableRow(u32::MAX);
++    // TODO: Deprecate in favor of options, since `INVALID` is, technically, valid.
++    pub(crate) const INVALID: TableRow = TableRow(NonMaxU32::MAX);
+ 
+-    /// Creates a `TableRow`.
++    /// Creates a [`TableRow`].
+     #[inline]
+-    pub const fn from_u32(index: u32) -> Self {
++    pub const fn new(index: NonMaxU32) -> Self {
+         Self(index)
+     }
+ 
+-    /// Creates a `TableRow` from a [`usize`] index.
+-    ///
+-    /// # Panics
+-    ///
+-    /// Will panic in debug mode if the provided value does not fit within a [`u32`].
+-    #[inline]
+-    pub const fn from_usize(index: usize) -> Self {
+-        debug_assert!(index as u32 as usize == index);
+-        Self(index as u32)
+-    }
+-
+     /// Gets the index of the row as a [`usize`].
+     #[inline]
+-    pub const fn as_usize(self) -> usize {
++    pub const fn index(self) -> usize {
+         // usize is at least u32 in Bevy
+-        self.0 as usize
++        self.0.get() as usize
+     }
+ 
+     /// Gets the index of the row as a [`usize`].
+     #[inline]
+-    pub const fn as_u32(self) -> u32 {
+-        self.0
++    pub const fn index_u32(self) -> u32 {
++        self.0.get()
+     }
+ }
+ 
+@@ -225,9 +217,9 @@ impl Table {
+     /// # Safety
+     /// `row` must be in-bounds (`row.as_usize()` < `self.len()`)
+     pub(crate) unsafe fn swap_remove_unchecked(&mut self, row: TableRow) -> Option<Entity> {
+-        debug_assert!(row.as_usize() < self.entity_count());
++        debug_assert!(row.index_u32() < self.entity_count());
+         let last_element_index = self.entity_count() - 1;
+-        if row.as_usize() != last_element_index {
++        if row.index_u32() != last_element_index {
+             // Instead of checking this condition on every `swap_remove` call, we
+             // check it here and use `swap_remove_nonoverlapping`.
+             for col in self.columns.values_mut() {
+@@ -237,22 +229,26 @@ impl Table {
+                 // - `row` != `last_element_index`
+                 // - the `len` is kept within `self.entities`, it will update accordingly.
+                 unsafe {
+-                    col.swap_remove_and_drop_unchecked_nonoverlapping(last_element_index, row);
++                    col.swap_remove_and_drop_unchecked_nonoverlapping(
++                        last_element_index as usize,
++                        row,
++                    );
+                 };
+             }
+         } else {
+             // If `row.as_usize()` == `last_element_index` than there's no point in removing the component
+             // at `row`, but we still need to drop it.
+             for col in self.columns.values_mut() {
+-                col.drop_last_component(last_element_index);
++                col.drop_last_component(last_element_index as usize);
+             }
+         }
+-        let is_last = row.as_usize() == last_element_index;
+-        self.entities.swap_remove(row.as_usize());
++        let is_last = row.index_u32() == last_element_index;
++        self.entities.swap_remove(row.index());
+         if is_last {
+             None
+         } else {
+-            Some(self.entities[row.as_usize()])
++            // SAFETY: This was sawp removed and was not last, so it must be in bounds.
++            unsafe { Some(*self.entities.get_unchecked(row.index())) }
+         }
+     }
+ 
+@@ -269,16 +265,21 @@ impl Table {
+         row: TableRow,
+         new_table: &mut Table,
+     ) -> TableMoveResult {
+-        debug_assert!(row.as_usize() < self.entity_count());
++        debug_assert!(row.index_u32() < self.entity_count());
+         let last_element_index = self.entity_count() - 1;
+-        let is_last = row.as_usize() == last_element_index;
+-        let new_row = new_table.allocate(self.entities.swap_remove(row.as_usize()));
++        let is_last = row.index_u32() == last_element_index;
++        let new_row = new_table.allocate(self.entities.swap_remove(row.index()));
+         for (component_id, column) in self.columns.iter_mut() {
+             if let Some(new_column) = new_table.get_column_mut(*component_id) {
+-                new_column.initialize_from_unchecked(column, last_element_index, row, new_row);
++                new_column.initialize_from_unchecked(
++                    column,
++                    last_element_index as usize,
++                    row,
++                    new_row,
++                );
+             } else {
+                 // It's the caller's responsibility to drop these cases.
+-                column.swap_remove_and_forget_unchecked(last_element_index, row);
++                column.swap_remove_and_forget_unchecked(last_element_index as usize, row);
+             }
+         }
+         TableMoveResult {
+@@ -286,7 +287,8 @@ impl Table {
+             swapped_entity: if is_last {
+                 None
+             } else {
+-                Some(self.entities[row.as_usize()])
++                // SAFETY: This was sawp removed and was not last, so it must be in bounds.
++                unsafe { Some(*self.entities.get_unchecked(row.index())) }
+             },
+         }
+     }
+@@ -302,15 +304,20 @@ impl Table {
+         row: TableRow,
+         new_table: &mut Table,
+     ) -> TableMoveResult {
+-        debug_assert!(row.as_usize() < self.entity_count());
++        debug_assert!(row.index_u32() < self.entity_count());
+         let last_element_index = self.entity_count() - 1;
+-        let is_last = row.as_usize() == last_element_index;
+-        let new_row = new_table.allocate(self.entities.swap_remove(row.as_usize()));
++        let is_last = row.index_u32() == last_element_index;
++        let new_row = new_table.allocate(self.entities.swap_remove(row.index()));
+         for (component_id, column) in self.columns.iter_mut() {
+             if let Some(new_column) = new_table.get_column_mut(*component_id) {
+-                new_column.initialize_from_unchecked(column, last_element_index, row, new_row);
++                new_column.initialize_from_unchecked(
++                    column,
++                    last_element_index as usize,
++                    row,
++                    new_row,
++                );
+             } else {
+-                column.swap_remove_and_drop_unchecked(last_element_index, row);
++                column.swap_remove_and_drop_unchecked(last_element_index as usize, row);
+             }
+         }
+         TableMoveResult {
+@@ -318,7 +325,8 @@ impl Table {
+             swapped_entity: if is_last {
+                 None
+             } else {
+-                Some(self.entities[row.as_usize()])
++                // SAFETY: This was sawp removed and was not last, so it must be in bounds.
++                unsafe { Some(*self.entities.get_unchecked(row.index())) }
+             },
+         }
+     }
+@@ -335,22 +343,23 @@ impl Table {
+         row: TableRow,
+         new_table: &mut Table,
+     ) -> TableMoveResult {
+-        debug_assert!(row.as_usize() < self.entity_count());
++        debug_assert!(row.index_u32() < self.entity_count());
+         let last_element_index = self.entity_count() - 1;
+-        let is_last = row.as_usize() == last_element_index;
+-        let new_row = new_table.allocate(self.entities.swap_remove(row.as_usize()));
++        let is_last = row.index_u32() == last_element_index;
++        let new_row = new_table.allocate(self.entities.swap_remove(row.index()));
+         for (component_id, column) in self.columns.iter_mut() {
+             new_table
+                 .get_column_mut(*component_id)
+                 .debug_checked_unwrap()
+-                .initialize_from_unchecked(column, last_element_index, row, new_row);
++                .initialize_from_unchecked(column, last_element_index as usize, row, new_row);
+         }
+         TableMoveResult {
+             new_row,
+             swapped_entity: if is_last {
+                 None
+             } else {
+-                Some(self.entities[row.as_usize()])
++                // SAFETY: This was sawp removed and was not last, so it must be in bounds.
++                unsafe { Some(*self.entities.get_unchecked(row.index())) }
+             },
+         }
+     }
+@@ -365,7 +374,7 @@ impl Table {
+         component_id: ComponentId,
+     ) -> Option<&[UnsafeCell<T>]> {
+         self.get_column(component_id)
+-            .map(|col| col.get_data_slice(self.entity_count()))
++            .map(|col| col.get_data_slice(self.entity_count() as usize))
+     }
+ 
+     /// Get the added ticks of the column matching `component_id` as a slice.
+@@ -375,7 +384,7 @@ impl Table {
+     ) -> Option<&[UnsafeCell<Tick>]> {
+         self.get_column(component_id)
+             // SAFETY: `self.len()` is guaranteed to be the len of the ticks array
+-            .map(|col| unsafe { col.get_added_ticks_slice(self.entity_count()) })
++            .map(|col| unsafe { col.get_added_ticks_slice(self.entity_count() as usize) })
+     }
+ 
+     /// Get the changed ticks of the column matching `component_id` as a slice.
+@@ -385,7 +394,7 @@ impl Table {
+     ) -> Option<&[UnsafeCell<Tick>]> {
+         self.get_column(component_id)
+             // SAFETY: `self.len()` is guaranteed to be the len of the ticks array
+-            .map(|col| unsafe { col.get_changed_ticks_slice(self.entity_count()) })
++            .map(|col| unsafe { col.get_changed_ticks_slice(self.entity_count() as usize) })
+     }
+ 
+     /// Fetches the calling locations that last changed the each component
+@@ -396,7 +405,7 @@ impl Table {
+         MaybeLocation::new_with_flattened(|| {
+             self.get_column(component_id)
+                 // SAFETY: `self.len()` is guaranteed to be the len of the locations array
+-                .map(|col| unsafe { col.get_changed_by_slice(self.entity_count()) })
++                .map(|col| unsafe { col.get_changed_by_slice(self.entity_count() as usize) })
+         })
+     }
+ 
+@@ -406,12 +415,12 @@ impl Table {
+         component_id: ComponentId,
+         row: TableRow,
+     ) -> Option<&UnsafeCell<Tick>> {
+-        (row.as_usize() < self.entity_count()).then_some(
++        (row.index_u32() < self.entity_count()).then_some(
+             // SAFETY: `row.as_usize()` < `len`
+             unsafe {
+                 self.get_column(component_id)?
+                     .changed_ticks
+-                    .get_unchecked(row.as_usize())
++                    .get_unchecked(row.index())
+             },
+         )
+     }
+@@ -422,12 +431,12 @@ impl Table {
+         component_id: ComponentId,
+         row: TableRow,
+     ) -> Option<&UnsafeCell<Tick>> {
+-        (row.as_usize() < self.entity_count()).then_some(
++        (row.index_u32() < self.entity_count()).then_some(
+             // SAFETY: `row.as_usize()` < `len`
+             unsafe {
+                 self.get_column(component_id)?
+                     .added_ticks
+-                    .get_unchecked(row.as_usize())
++                    .get_unchecked(row.index())
+             },
+         )
+     }
+@@ -439,13 +448,13 @@ impl Table {
+         row: TableRow,
+     ) -> MaybeLocation<Option<&UnsafeCell<&'static Location<'static>>>> {
+         MaybeLocation::new_with_flattened(|| {
+-            (row.as_usize() < self.entity_count()).then_some(
++            (row.index_u32() < self.entity_count()).then_some(
+                 // SAFETY: `row.as_usize()` < `len`
+                 unsafe {
+                     self.get_column(component_id)?
+                         .changed_by
+                         .as_ref()
+-                        .map(|changed_by| changed_by.get_unchecked(row.as_usize()))
++                        .map(|changed_by| changed_by.get_unchecked(row.index()))
+                 },
+             )
+         })
+@@ -461,8 +470,8 @@ impl Table {
+         row: TableRow,
+     ) -> Option<ComponentTicks> {
+         self.get_column(component_id).map(|col| ComponentTicks {
+-            added: col.added_ticks.get_unchecked(row.as_usize()).read(),
+-            changed: col.changed_ticks.get_unchecked(row.as_usize()).read(),
++            added: col.added_ticks.get_unchecked(row.index()).read(),
++            changed: col.changed_ticks.get_unchecked(row.index()).read(),
+         })
+     }
+ 
+@@ -499,7 +508,7 @@ impl Table {
+ 
+     /// Reserves `additional` elements worth of capacity within the table.
+     pub(crate) fn reserve(&mut self, additional: usize) {
+-        if self.capacity() - self.entity_count() < additional {
++        if (self.capacity() - self.entity_count() as usize) < additional {
+             let column_cap = self.capacity();
+             self.entities.reserve(additional);
+ 
+@@ -563,10 +572,15 @@ impl Table {
+     /// Allocates space for a new entity
+     ///
+     /// # Safety
+-    /// the allocated row must be written to immediately with valid values in each column
++    ///
++    /// The allocated row must be written to immediately with valid values in each column
+     pub(crate) unsafe fn allocate(&mut self, entity: Entity) -> TableRow {
+         self.reserve(1);
+         let len = self.entity_count();
++        // SAFETY: No entity row may be in more than one table row at once, so there are no duplicates,
++        // and there can not be an entity row of u32::MAX. Therefore, this can not be max either.
++        let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(len)) };
++        let len = len as usize;
+         self.entities.push(entity);
+         for col in self.columns.values_mut() {
+             col.added_ticks
+@@ -580,13 +594,16 @@ impl Table {
+                     changed_by.initialize_unchecked(len, UnsafeCell::new(caller));
+                 });
+         }
+-        TableRow::from_usize(len)
++
++        row
+     }
+ 
+     /// Gets the number of entities currently being stored in the table.
+     #[inline]
+-    pub fn entity_count(&self) -> usize {
+-        self.entities.len()
++    pub fn entity_count(&self) -> u32 {
++        // No entity may have more than one table row, so there are no duplicates,
++        // and there may only ever be u32::MAX entities, so the length never exceeds u32's cappacity.
++        self.entities.len() as u32
+     }
+ 
+     /// Get the drop function for some component that is stored in this table.
+@@ -618,7 +635,7 @@ impl Table {
+ 
+     /// Call [`Tick::check_tick`] on all of the ticks in the [`Table`]
+     pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
+-        let len = self.entity_count();
++        let len = self.entity_count() as usize;
+         for col in self.columns.values_mut() {
+             // SAFETY: `len` is the actual length of the column
+             unsafe { col.check_change_ticks(len, change_tick) };
+@@ -632,7 +649,7 @@ impl Table {
+ 
+     /// Clears all of the stored components in the [`Table`].
+     pub(crate) fn clear(&mut self) {
+-        let len = self.entity_count();
++        let len = self.entity_count() as usize;
+         // We must clear the entities first, because in the drop function causes a panic, it will result in a double free of the columns.
+         self.entities.clear();
+         for column in self.columns.values_mut() {
+@@ -660,7 +677,7 @@ impl Table {
+         self.get_column_mut(component_id)
+             .debug_checked_unwrap()
+             .data
+-            .get_unchecked_mut(row.as_usize())
++            .get_unchecked_mut(row.index())
+             .promote()
+     }
+ 
+@@ -674,7 +691,7 @@ impl Table {
+         row: TableRow,
+     ) -> Option<Ptr<'_>> {
+         self.get_column(component_id)
+-            .map(|col| col.data.get_unchecked(row.as_usize()))
++            .map(|col| col.data.get_unchecked(row.index()))
+     }
+ }
+ 
+@@ -806,7 +823,7 @@ impl IndexMut<TableId> for Tables {
+ 
+ impl Drop for Table {
+     fn drop(&mut self) {
+-        let len = self.entity_count();
++        let len = self.entity_count() as usize;
+         let cap = self.capacity();
+         self.entities.clear();
+         for col in self.columns.values_mut() {
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 87340551af477..e8db530727862 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -31,7 +31,7 @@ pub use identifier::WorldId;
+ pub use spawn_batch::*;
+ 
+ use crate::{
+-    archetype::{ArchetypeId, ArchetypeRow, Archetypes},
++    archetype::{ArchetypeId, Archetypes},
+     bundle::{
+         Bundle, BundleEffect, BundleInfo, BundleInserter, BundleSpawner, Bundles, InsertMode,
+         NoBundleEffect,
+@@ -959,18 +959,8 @@ impl World {
+     pub fn iter_entities(&self) -> impl Iterator<Item = EntityRef<'_>> + '_ {
+         self.archetypes.iter().flat_map(|archetype| {
+             archetype
+-                .entities()
+-                .iter()
+-                .enumerate()
+-                .map(|(archetype_row, archetype_entity)| {
+-                    let entity = archetype_entity.id();
+-                    let location = EntityLocation {
+-                        archetype_id: archetype.id(),
+-                        archetype_row: ArchetypeRow::new(archetype_row),
+-                        table_id: archetype.table_id(),
+-                        table_row: archetype_entity.table_row(),
+-                    };
+-
++                .entities_with_location()
++                .map(|(entity, location)| {
+                     // SAFETY: entity exists and location accurately specifies the archetype where the entity is stored.
+                     let cell = UnsafeEntityCell::new(
+                         self.as_unsafe_world_cell_readonly(),
+@@ -992,18 +982,8 @@ impl World {
+         let world_cell = self.as_unsafe_world_cell();
+         world_cell.archetypes().iter().flat_map(move |archetype| {
+             archetype
+-                .entities()
+-                .iter()
+-                .enumerate()
+-                .map(move |(archetype_row, archetype_entity)| {
+-                    let entity = archetype_entity.id();
+-                    let location = EntityLocation {
+-                        archetype_id: archetype.id(),
+-                        archetype_row: ArchetypeRow::new(archetype_row),
+-                        table_id: archetype.table_id(),
+-                        table_row: archetype_entity.table_row(),
+-                    };
+-
++                .entities_with_location()
++                .map(move |(entity, location)| {
+                     // SAFETY: entity exists and location accurately specifies the archetype where the entity is stored.
+                     let cell = UnsafeEntityCell::new(
+                         world_cell,
+diff --git a/release-content/migration-guides/entity_representation.md b/release-content/migration-guides/entity_representation.md
+index cf7dd8d3d550d..e042f493dae1b 100644
+--- a/release-content/migration-guides/entity_representation.md
++++ b/release-content/migration-guides/entity_representation.md
+@@ -55,3 +55,28 @@ The changes to serialization and the bit format are directly related.
+ Effectively, this means that all serialized and transmuted entities will not work as expected and may crash.
+ To migrate, invert the lower 32 bits of the 64 representation of the entity, and subtract 1 from the upper bits.
+ Again, this is still subject to change, and serialized scenes may break between versions.
++
++### Length Representation
++
++Because the maximum index of an entity is now `NonZeroU32::MAX`, the maximum number of entities (and length of unique entity row collections) is `u32::MAX`.
++As a result, a lot of APIs that returned `usize` have been changed to `u32`.
++
++These include:
++
++- `Archetype::len`
++- `Table::entity_count`
++
++### Other kinds of entity rows
++
++Since the `EntityRow` is a `NonMaxU32`, `TableRow` and `ArchetypeRow` have been given the same treatment.
++They now wrap a `NonMaxU32`, allowing more performance optimizations.
++
++Additionally, they have been given new, standardized interfaces:
++
++- `fn new(NonMaxU32)`
++- `fn index(self) -> usize`
++- `fn index_u32(self) -> u32`
++
++The other interfaces for these types have been removed.
++Although it's not usually recommended to be creating these types manually, if you run into any issues migrating here, please open an issue.
++If all else fails, `TableRow` and `ArchetypeRow` are `repr(transparent)`, allowing careful transmutations.
