@@ -1,0 +1,2787 @@
+diff --git a/benches/benches/bevy_ecs/iteration/heavy_compute.rs b/benches/benches/bevy_ecs/iteration/heavy_compute.rs
+index 3a3e350637236..e057b20a431be 100644
+--- a/benches/benches/bevy_ecs/iteration/heavy_compute.rs
++++ b/benches/benches/bevy_ecs/iteration/heavy_compute.rs
+@@ -45,7 +45,6 @@ pub fn heavy_compute(c: &mut Criterion) {
+ 
+         let mut system = IntoSystem::into_system(sys);
+         system.initialize(&mut world);
+-        system.update_archetype_component_access(world.as_unsafe_world_cell());
+ 
+         b.iter(move || system.run((), &mut world));
+     });
+diff --git a/benches/benches/bevy_ecs/iteration/iter_simple_system.rs b/benches/benches/bevy_ecs/iteration/iter_simple_system.rs
+index 2b6e8287218c2..903ff08194b37 100644
+--- a/benches/benches/bevy_ecs/iteration/iter_simple_system.rs
++++ b/benches/benches/bevy_ecs/iteration/iter_simple_system.rs
+@@ -37,7 +37,6 @@ impl Benchmark {
+ 
+         let mut system = IntoSystem::into_system(query_system);
+         system.initialize(&mut world);
+-        system.update_archetype_component_access(world.as_unsafe_world_cell());
+         Self(world, Box::new(system))
+     }
+ 
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index ffca06f754756..2287c2ee6cab5 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -432,11 +432,6 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+                     }
+                 }
+ 
+-                unsafe fn new_archetype(state: &mut Self::State, archetype: &#path::archetype::Archetype, system_meta: &mut #path::system::SystemMeta) {
+-                    // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-                    unsafe { <#fields_alias::<'_, '_, #punctuated_generic_idents> as #path::system::SystemParam>::new_archetype(&mut state.state, archetype, system_meta) }
+-                }
+-
+                 fn apply(state: &mut Self::State, system_meta: &#path::system::SystemMeta, world: &mut #path::world::World) {
+                     <#fields_alias::<'_, '_, #punctuated_generic_idents> as #path::system::SystemParam>::apply(&mut state.state, system_meta, world);
+                 }
+@@ -447,7 +442,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+ 
+                 #[inline]
+                 unsafe fn validate_param<'w, 's>(
+-                    state: &'s Self::State,
++                    state: &'s mut Self::State,
+                     _system_meta: &#path::system::SystemMeta,
+                     _world: #path::world::unsafe_world_cell::UnsafeWorldCell<'w>,
+                 ) -> Result<(), #path::system::SystemParamValidationError> {
+diff --git a/crates/bevy_ecs/macros/src/world_query.rs b/crates/bevy_ecs/macros/src/world_query.rs
+index 77ee532a505f7..5c4c0bff01860 100644
+--- a/crates/bevy_ecs/macros/src/world_query.rs
++++ b/crates/bevy_ecs/macros/src/world_query.rs
+@@ -92,7 +92,7 @@ pub(crate) fn world_query_impl(
+                 }
+             }
+ 
+-        // SAFETY: `update_component_access` and `update_archetype_component_access` are called on every field
++        // SAFETY: `update_component_access` is called on every field
+         unsafe impl #user_impl_generics #path::query::WorldQuery
+             for #struct_name #user_ty_generics #user_where_clauses {
+ 
+diff --git a/crates/bevy_ecs/src/archetype.rs b/crates/bevy_ecs/src/archetype.rs
+index 516c90a873371..f12cd03a69dbd 100644
+--- a/crates/bevy_ecs/src/archetype.rs
++++ b/crates/bevy_ecs/src/archetype.rs
+@@ -24,7 +24,7 @@ use crate::{
+     component::{ComponentId, Components, RequiredComponentConstructor, StorageType},
+     entity::{Entity, EntityLocation},
+     observer::Observers,
+-    storage::{ImmutableSparseSet, SparseArray, SparseSet, SparseSetIndex, TableId, TableRow},
++    storage::{ImmutableSparseSet, SparseArray, SparseSet, TableId, TableRow},
+ };
+ use alloc::{boxed::Box, vec::Vec};
+ use bevy_platform::collections::HashMap;
+@@ -349,7 +349,6 @@ pub(crate) struct ArchetypeSwapRemoveResult {
+ /// [`Component`]: crate::component::Component
+ struct ArchetypeComponentInfo {
+     storage_type: StorageType,
+-    archetype_component_id: ArchetypeComponentId,
+ }
+ 
+ bitflags::bitflags! {
+@@ -394,14 +393,14 @@ impl Archetype {
+         observers: &Observers,
+         id: ArchetypeId,
+         table_id: TableId,
+-        table_components: impl Iterator<Item = (ComponentId, ArchetypeComponentId)>,
+-        sparse_set_components: impl Iterator<Item = (ComponentId, ArchetypeComponentId)>,
++        table_components: impl Iterator<Item = ComponentId>,
++        sparse_set_components: impl Iterator<Item = ComponentId>,
+     ) -> Self {
+         let (min_table, _) = table_components.size_hint();
+         let (min_sparse, _) = sparse_set_components.size_hint();
+         let mut flags = ArchetypeFlags::empty();
+         let mut archetype_components = SparseSet::with_capacity(min_table + min_sparse);
+-        for (idx, (component_id, archetype_component_id)) in table_components.enumerate() {
++        for (idx, component_id) in table_components.enumerate() {
+             // SAFETY: We are creating an archetype that includes this component so it must exist
+             let info = unsafe { components.get_info_unchecked(component_id) };
+             info.update_archetype_flags(&mut flags);
+@@ -410,7 +409,6 @@ impl Archetype {
+                 component_id,
+                 ArchetypeComponentInfo {
+                     storage_type: StorageType::Table,
+-                    archetype_component_id,
+                 },
+             );
+             // NOTE: the `table_components` are sorted AND they were inserted in the `Table` in the same
+@@ -422,7 +420,7 @@ impl Archetype {
+                 .insert(id, ArchetypeRecord { column: Some(idx) });
+         }
+ 
+-        for (component_id, archetype_component_id) in sparse_set_components {
++        for component_id in sparse_set_components {
+             // SAFETY: We are creating an archetype that includes this component so it must exist
+             let info = unsafe { components.get_info_unchecked(component_id) };
+             info.update_archetype_flags(&mut flags);
+@@ -431,7 +429,6 @@ impl Archetype {
+                 component_id,
+                 ArchetypeComponentInfo {
+                     storage_type: StorageType::SparseSet,
+-                    archetype_component_id,
+                 },
+             );
+             component_index
+@@ -536,16 +533,6 @@ impl Archetype {
+         self.components.len()
+     }
+ 
+-    /// Gets an iterator of all of the components in the archetype, along with
+-    /// their archetype component ID.
+-    pub(crate) fn components_with_archetype_component_id(
+-        &self,
+-    ) -> impl Iterator<Item = (ComponentId, ArchetypeComponentId)> + '_ {
+-        self.components
+-            .iter()
+-            .map(|(component_id, info)| (*component_id, info.archetype_component_id))
+-    }
+-
+     /// Fetches an immutable reference to the archetype's [`Edges`], a cache of
+     /// archetypal relationships.
+     #[inline]
+@@ -664,19 +651,6 @@ impl Archetype {
+             .map(|info| info.storage_type)
+     }
+ 
+-    /// Fetches the corresponding [`ArchetypeComponentId`] for a component in the archetype.
+-    /// Returns `None` if the component is not part of the archetype.
+-    /// This runs in `O(1)` time.
+-    #[inline]
+-    pub fn get_archetype_component_id(
+-        &self,
+-        component_id: ComponentId,
+-    ) -> Option<ArchetypeComponentId> {
+-        self.components
+-            .get(component_id)
+-            .map(|info| info.archetype_component_id)
+-    }
+-
+     /// Clears all entities from the archetype.
+     pub(crate) fn clear_entities(&mut self) {
+         self.entities.clear();
+@@ -774,46 +748,6 @@ struct ArchetypeComponents {
+     sparse_set_components: Box<[ComponentId]>,
+ }
+ 
+-/// An opaque unique joint ID for a [`Component`] in an [`Archetype`] within a [`World`].
+-///
+-/// A component may be present within multiple archetypes, but each component within
+-/// each archetype has its own unique `ArchetypeComponentId`. This is leveraged by the system
+-/// schedulers to opportunistically run multiple systems in parallel that would otherwise
+-/// conflict. For example, `Query<&mut A, With<B>>` and `Query<&mut A, Without<B>>` can run in
+-/// parallel as the matched `ArchetypeComponentId` sets for both queries are disjoint, even
+-/// though `&mut A` on both queries point to the same [`ComponentId`].
+-///
+-/// In SQL terms, these IDs are composite keys on a [many-to-many relationship] between archetypes
+-/// and components. Each component type will have only one [`ComponentId`], but may have many
+-/// [`ArchetypeComponentId`]s, one for every archetype the component is present in. Likewise, each
+-/// archetype will have only one [`ArchetypeId`] but may have many [`ArchetypeComponentId`]s, one
+-/// for each component that belongs to the archetype.
+-///
+-/// Every [`Resource`] is also assigned one of these IDs. As resources do not belong to any
+-/// particular archetype, a resource's ID uniquely identifies it.
+-///
+-/// These IDs are only valid within a given World, and are not globally unique.
+-/// Attempting to use an ID on a world that it wasn't sourced from will
+-/// not point to the same archetype nor the same component.
+-///
+-/// [`Component`]: crate::component::Component
+-/// [`World`]: crate::world::World
+-/// [`Resource`]: crate::resource::Resource
+-/// [many-to-many relationship]: https://en.wikipedia.org/wiki/Many-to-many_(data_model)
+-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+-pub struct ArchetypeComponentId(usize);
+-
+-impl SparseSetIndex for ArchetypeComponentId {
+-    #[inline]
+-    fn sparse_set_index(&self) -> usize {
+-        self.0
+-    }
+-
+-    fn get_sparse_set_index(value: usize) -> Self {
+-        Self(value)
+-    }
+-}
+-
+ /// Maps a [`ComponentId`] to the list of [`Archetypes`]([`Archetype`]) that contain the [`Component`](crate::component::Component),
+ /// along with an [`ArchetypeRecord`] which contains some metadata about how the component is stored in the archetype.
+ pub type ComponentIndex = HashMap<ComponentId, HashMap<ArchetypeId, ArchetypeRecord>>;
+@@ -826,7 +760,6 @@ pub type ComponentIndex = HashMap<ComponentId, HashMap<ArchetypeId, ArchetypeRec
+ /// [module level documentation]: crate::archetype
+ pub struct Archetypes {
+     pub(crate) archetypes: Vec<Archetype>,
+-    archetype_component_count: usize,
+     /// find the archetype id by the archetype's components
+     by_components: HashMap<ArchetypeComponents, ArchetypeId>,
+     /// find all the archetypes that contain a component
+@@ -850,7 +783,6 @@ impl Archetypes {
+             archetypes: Vec::new(),
+             by_components: Default::default(),
+             by_component: Default::default(),
+-            archetype_component_count: 0,
+         };
+         // SAFETY: Empty archetype has no components
+         unsafe {
+@@ -905,22 +837,6 @@ impl Archetypes {
+         }
+     }
+ 
+-    /// Generate and store a new [`ArchetypeComponentId`].
+-    ///
+-    /// This simply increment the counter and return the new value.
+-    ///
+-    /// # Panics
+-    ///
+-    /// On archetype component id overflow.
+-    pub(crate) fn new_archetype_component_id(&mut self) -> ArchetypeComponentId {
+-        let id = ArchetypeComponentId(self.archetype_component_count);
+-        self.archetype_component_count = self
+-            .archetype_component_count
+-            .checked_add(1)
+-            .expect("archetype_component_count overflow");
+-        id
+-    }
+-
+     /// Fetches an immutable reference to an [`Archetype`] using its
+     /// ID. Returns `None` if no corresponding archetype exists.
+     #[inline]
+@@ -972,7 +888,6 @@ impl Archetypes {
+         };
+ 
+         let archetypes = &mut self.archetypes;
+-        let archetype_component_count = &mut self.archetype_component_count;
+         let component_index = &mut self.by_component;
+         *self
+             .by_components
+@@ -983,40 +898,19 @@ impl Archetypes {
+                     sparse_set_components,
+                 } = identity;
+                 let id = ArchetypeId::new(archetypes.len());
+-                let table_start = *archetype_component_count;
+-                *archetype_component_count += table_components.len();
+-                let table_archetype_components =
+-                    (table_start..*archetype_component_count).map(ArchetypeComponentId);
+-                let sparse_start = *archetype_component_count;
+-                *archetype_component_count += sparse_set_components.len();
+-                let sparse_set_archetype_components =
+-                    (sparse_start..*archetype_component_count).map(ArchetypeComponentId);
+                 archetypes.push(Archetype::new(
+                     components,
+                     component_index,
+                     observers,
+                     id,
+                     table_id,
+-                    table_components
+-                        .iter()
+-                        .copied()
+-                        .zip(table_archetype_components),
+-                    sparse_set_components
+-                        .iter()
+-                        .copied()
+-                        .zip(sparse_set_archetype_components),
++                    table_components.iter().copied(),
++                    sparse_set_components.iter().copied(),
+                 ));
+                 id
+             })
+     }
+ 
+-    /// Returns the number of components that are stored in archetypes.
+-    /// Note that if some component `T` is stored in more than one archetype, it will be counted once for each archetype it's present in.
+-    #[inline]
+-    pub fn archetype_components_len(&self) -> usize {
+-        self.archetype_component_count
+-    }
+-
+     /// Clears all entities from all archetypes.
+     pub(crate) fn clear_entities(&mut self) {
+         for archetype in &mut self.archetypes {
+diff --git a/crates/bevy_ecs/src/lib.rs b/crates/bevy_ecs/src/lib.rs
+index d75d9c956c670..d8846b29a1b83 100644
+--- a/crates/bevy_ecs/src/lib.rs
++++ b/crates/bevy_ecs/src/lib.rs
+@@ -1228,7 +1228,6 @@ mod tests {
+             .components()
+             .get_resource_id(TypeId::of::<Num>())
+             .unwrap();
+-        let archetype_component_id = world.storages().resources.get(resource_id).unwrap().id();
+ 
+         assert_eq!(world.resource::<Num>().0, 123);
+         assert!(world.contains_resource::<Num>());
+@@ -1290,14 +1289,6 @@ mod tests {
+             resource_id, current_resource_id,
+             "resource id does not change after removing / re-adding"
+         );
+-
+-        let current_archetype_component_id =
+-            world.storages().resources.get(resource_id).unwrap().id();
+-
+-        assert_eq!(
+-            archetype_component_id, current_archetype_component_id,
+-            "resource archetype component id does not change after removing / re-adding"
+-        );
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_ecs/src/observer/runner.rs b/crates/bevy_ecs/src/observer/runner.rs
+index be7bc4ede2613..520147d4385e9 100644
+--- a/crates/bevy_ecs/src/observer/runner.rs
++++ b/crates/bevy_ecs/src/observer/runner.rs
+@@ -366,13 +366,11 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+     };
+ 
+     // SAFETY:
+-    // - `update_archetype_component_access` is called first
+     // - there are no outstanding references to world except a private component
+     // - system is an `ObserverSystem` so won't mutate world beyond the access of a `DeferredWorld`
+     //   and is never exclusive
+     // - system is the same type erased system from above
+     unsafe {
+-        (*system).update_archetype_component_access(world);
+         match (*system).validate_param_unsafe(world) {
+             Ok(()) => {
+                 if let Err(err) = (*system).run_unsafe(trigger, world) {
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index e3d17cdcadcd2..cffba8cda1689 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -340,7 +340,7 @@ pub type QueryItem<'w, Q> = <Q as QueryData>::Item<'w>;
+ pub type ROQueryItem<'w, D> = QueryItem<'w, <D as QueryData>::ReadOnly>;
+ 
+ /// SAFETY:
+-/// `update_component_access` and `update_archetype_component_access` do nothing.
++/// `update_component_access` does nothing.
+ /// This is sound because `fetch` does not access components.
+ unsafe impl WorldQuery for Entity {
+     type Fetch<'w> = ();
+@@ -412,7 +412,7 @@ unsafe impl QueryData for Entity {
+ unsafe impl ReadOnlyQueryData for Entity {}
+ 
+ /// SAFETY:
+-/// `update_component_access` and `update_archetype_component_access` do nothing.
++/// `update_component_access` does nothing.
+ /// This is sound because `fetch` does not access components.
+ unsafe impl WorldQuery for EntityLocation {
+     type Fetch<'w> = &'w Entities;
+@@ -660,7 +660,7 @@ pub struct EntityFetch<'w> {
+ 
+ /// SAFETY:
+ /// `fetch` accesses all components in a readonly way.
+-/// This is sound because `update_component_access` and `update_archetype_component_access` set read access for all components and panic when appropriate.
++/// This is sound because `update_component_access` sets read access for all components and panic when appropriate.
+ /// Filters are unchanged.
+ unsafe impl<'a> WorldQuery for EntityRef<'a> {
+     type Fetch<'w> = EntityFetch<'w>;
+@@ -1287,7 +1287,7 @@ where
+ }
+ 
+ /// SAFETY:
+-/// `update_component_access` and `update_archetype_component_access` do nothing.
++/// `update_component_access` does nothing.
+ /// This is sound because `fetch` does not access components.
+ unsafe impl WorldQuery for &Archetype {
+     type Fetch<'w> = (&'w Entities, &'w Archetypes);
+@@ -1386,7 +1386,7 @@ impl<T: Component> Copy for ReadFetch<'_, T> {}
+ 
+ /// SAFETY:
+ /// `fetch` accesses a single component in a readonly way.
+-/// This is sound because `update_component_access` and `update_archetype_component_access` add read access for that component and panic when appropriate.
++/// This is sound because `update_component_access` adds read access for that component and panic when appropriate.
+ /// `update_component_access` adds a `With` filter for a component.
+ /// This is sound because `matches_component_set` returns whether the set contains that component.
+ unsafe impl<T: Component> WorldQuery for &T {
+@@ -1409,7 +1409,7 @@ unsafe impl<T: Component> WorldQuery for &T {
+                 || None,
+                 || {
+                     // SAFETY: The underlying type associated with `component_id` is `T`,
+-                    // which we are allowed to access since we registered it in `update_archetype_component_access`.
++                    // which we are allowed to access since we registered it in `update_component_access`.
+                     // Note that we do not actually access any components in this function, we just get a shared
+                     // reference to the sparse set, which is used to access the components in `Self::fetch`.
+                     unsafe { world.storages().sparse_sets.get(component_id) }
+@@ -1553,7 +1553,7 @@ impl<T: Component> Copy for RefFetch<'_, T> {}
+ 
+ /// SAFETY:
+ /// `fetch` accesses a single component in a readonly way.
+-/// This is sound because `update_component_access` and `update_archetype_component_access` add read access for that component and panic when appropriate.
++/// This is sound because `update_component_access` adds read access for that component and panic when appropriate.
+ /// `update_component_access` adds a `With` filter for a component.
+ /// This is sound because `matches_component_set` returns whether the set contains that component.
+ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
+@@ -1576,7 +1576,7 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
+                 || None,
+                 || {
+                     // SAFETY: The underlying type associated with `component_id` is `T`,
+-                    // which we are allowed to access since we registered it in `update_archetype_component_access`.
++                    // which we are allowed to access since we registered it in `update_component_access`.
+                     // Note that we do not actually access any components in this function, we just get a shared
+                     // reference to the sparse set, which is used to access the components in `Self::fetch`.
+                     unsafe { world.storages().sparse_sets.get(component_id) }
+@@ -1752,7 +1752,7 @@ impl<T: Component> Copy for WriteFetch<'_, T> {}
+ 
+ /// SAFETY:
+ /// `fetch` accesses a single component mutably.
+-/// This is sound because `update_component_access` and `update_archetype_component_access` add write access for that component and panic when appropriate.
++/// This is sound because `update_component_access` adds write access for that component and panic when appropriate.
+ /// `update_component_access` adds a `With` filter for a component.
+ /// This is sound because `matches_component_set` returns whether the set contains that component.
+ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
+@@ -1775,7 +1775,7 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
+                 || None,
+                 || {
+                     // SAFETY: The underlying type associated with `component_id` is `T`,
+-                    // which we are allowed to access since we registered it in `update_archetype_component_access`.
++                    // which we are allowed to access since we registered it in `update_component_access`.
+                     // Note that we do not actually access any components in this function, we just get a shared
+                     // reference to the sparse set, which is used to access the components in `Self::fetch`.
+                     unsafe { world.storages().sparse_sets.get(component_id) }
+@@ -1926,7 +1926,7 @@ unsafe impl<'__w, T: Component<Mutability = Mutable>> QueryData for &'__w mut T
+ ///
+ /// SAFETY:
+ /// `fetch` accesses a single component mutably.
+-/// This is sound because `update_component_access` and `update_archetype_component_access` add write access for that component and panic when appropriate.
++/// This is sound because `update_component_access` adds write access for that component and panic when appropriate.
+ /// `update_component_access` adds a `With` filter for a component.
+ /// This is sound because `matches_component_set` returns whether the set contains that component.
+ unsafe impl<'__w, T: Component> WorldQuery for Mut<'__w, T> {
+@@ -2043,7 +2043,7 @@ impl<T: WorldQuery> Clone for OptionFetch<'_, T> {
+ 
+ /// SAFETY:
+ /// `fetch` might access any components that `T` accesses.
+-/// This is sound because `update_component_access` and `update_archetype_component_access` add the same accesses as `T`.
++/// This is sound because `update_component_access` adds the same accesses as `T`.
+ /// Filters are unchanged.
+ unsafe impl<T: WorldQuery> WorldQuery for Option<T> {
+     type Fetch<'w> = OptionFetch<'w, T>;
+@@ -2228,7 +2228,7 @@ impl<T> core::fmt::Debug for Has<T> {
+ }
+ 
+ /// SAFETY:
+-/// `update_component_access` and `update_archetype_component_access` do nothing.
++/// `update_component_access` does nothing.
+ /// This is sound because `fetch` does not access components.
+ unsafe impl<T: Component> WorldQuery for Has<T> {
+     type Fetch<'w> = bool;
+@@ -2406,7 +2406,7 @@ macro_rules! impl_anytuple_fetch {
+         )]
+         /// SAFETY:
+         /// `fetch` accesses are a subset of the subqueries' accesses
+-        /// This is sound because `update_component_access` and `update_archetype_component_access` adds accesses according to the implementations of all the subqueries.
++        /// This is sound because `update_component_access` adds accesses according to the implementations of all the subqueries.
+         /// `update_component_access` replaces the filters with a disjunction where every element is a conjunction of the previous filters and the filters of one of the subqueries.
+         /// This is sound because `matches_component_set` returns a disjunction of the results of the subqueries' implementations.
+         unsafe impl<$($name: WorldQuery),*> WorldQuery for AnyOf<($($name,)*)> {
+@@ -2572,7 +2572,7 @@ all_tuples!(
+ pub(crate) struct NopWorldQuery<D: QueryData>(PhantomData<D>);
+ 
+ /// SAFETY:
+-/// `update_component_access` and `update_archetype_component_access` do nothing.
++/// `update_component_access` does nothing.
+ /// This is sound because `fetch` does not access components.
+ unsafe impl<D: QueryData> WorldQuery for NopWorldQuery<D> {
+     type Fetch<'w> = ();
+@@ -2642,7 +2642,7 @@ unsafe impl<D: QueryData> QueryData for NopWorldQuery<D> {
+ unsafe impl<D: QueryData> ReadOnlyQueryData for NopWorldQuery<D> {}
+ 
+ /// SAFETY:
+-/// `update_component_access` and `update_archetype_component_access` do nothing.
++/// `update_component_access` does nothing.
+ /// This is sound because `fetch` does not access components.
+ unsafe impl<T: ?Sized> WorldQuery for PhantomData<T> {
+     type Fetch<'a> = ();
+diff --git a/crates/bevy_ecs/src/query/filter.rs b/crates/bevy_ecs/src/query/filter.rs
+index 119afe32ab886..eccc819ca7cb3 100644
+--- a/crates/bevy_ecs/src/query/filter.rs
++++ b/crates/bevy_ecs/src/query/filter.rs
+@@ -729,7 +729,7 @@ unsafe impl<T: Component> WorldQuery for Added<T> {
+                 || None,
+                 || {
+                     // SAFETY: The underlying type associated with `component_id` is `T`,
+-                    // which we are allowed to access since we registered it in `update_archetype_component_access`.
++                    // which we are allowed to access since we registered it in `update_component_access`.
+                     // Note that we do not actually access any components' ticks in this function, we just get a shared
+                     // reference to the sparse set, which is used to access the components' ticks in `Self::fetch`.
+                     unsafe { world.storages().sparse_sets.get(id) }
+@@ -955,7 +955,7 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
+                 || None,
+                 || {
+                     // SAFETY: The underlying type associated with `component_id` is `T`,
+-                    // which we are allowed to access since we registered it in `update_archetype_component_access`.
++                    // which we are allowed to access since we registered it in `update_component_access`.
+                     // Note that we do not actually access any components' ticks in this function, we just get a shared
+                     // reference to the sparse set, which is used to access the components' ticks in `Self::fetch`.
+                     unsafe { world.storages().sparse_sets.get(id) }
+diff --git a/crates/bevy_ecs/src/query/mod.rs b/crates/bevy_ecs/src/query/mod.rs
+index c1744cbf24211..eb5e001e4dee6 100644
+--- a/crates/bevy_ecs/src/query/mod.rs
++++ b/crates/bevy_ecs/src/query/mod.rs
+@@ -107,7 +107,7 @@ mod tests {
+     use crate::{
+         archetype::Archetype,
+         component::{Component, ComponentId, Components, Tick},
+-        prelude::{AnyOf, Changed, Entity, Or, QueryState, Res, ResMut, Resource, With, Without},
++        prelude::{AnyOf, Changed, Entity, Or, QueryState, Resource, With, Without},
+         query::{
+             ArchetypeFilter, FilteredAccess, Has, QueryCombinationIter, QueryData,
+             ReadOnlyQueryData, WorldQuery,
+@@ -818,7 +818,6 @@ mod tests {
+ 
+     /// SAFETY:
+     /// `update_component_access` adds resource read access for `R`.
+-    /// `update_archetype_component_access` does nothing, as this accesses no components.
+     unsafe impl WorldQuery for ReadsRData {
+         type Fetch<'w> = ();
+         type State = ComponentId;
+@@ -904,28 +903,4 @@ mod tests {
+         fn system(_q1: Query<ReadsRData, With<A>>, _q2: Query<ReadsRData, Without<A>>) {}
+         assert_is_system(system);
+     }
+-
+-    #[test]
+-    fn read_res_sets_archetype_component_access() {
+-        let mut world = World::new();
+-
+-        fn read_query(_q: Query<ReadsRData, With<A>>) {}
+-        let mut read_query = IntoSystem::into_system(read_query);
+-        read_query.initialize(&mut world);
+-
+-        fn read_res(_r: Res<R>) {}
+-        let mut read_res = IntoSystem::into_system(read_res);
+-        read_res.initialize(&mut world);
+-
+-        fn write_res(_r: ResMut<R>) {}
+-        let mut write_res = IntoSystem::into_system(write_res);
+-        write_res.initialize(&mut world);
+-
+-        assert!(read_query
+-            .archetype_component_access()
+-            .is_compatible(read_res.archetype_component_access()));
+-        assert!(!read_query
+-            .archetype_component_access()
+-            .is_compatible(write_res.archetype_component_access()));
+-    }
+ }
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index 8c74d1a018b4f..836fefbdfd837 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -1,10 +1,10 @@
+ use crate::{
+-    archetype::{Archetype, ArchetypeComponentId, ArchetypeGeneration, ArchetypeId},
++    archetype::{Archetype, ArchetypeGeneration, ArchetypeId},
+     component::{ComponentId, Tick},
+     entity::{Entity, EntityEquivalent, EntitySet, UniqueEntityArray},
+     entity_disabling::DefaultQueryFilters,
+     prelude::FromWorld,
+-    query::{Access, FilteredAccess, QueryCombinationIter, QueryIter, QueryParIter, WorldQuery},
++    query::{FilteredAccess, QueryCombinationIter, QueryIter, QueryParIter, WorldQuery},
+     storage::{SparseSetIndex, TableId},
+     system::Query,
+     world::{unsafe_world_cell::UnsafeWorldCell, World, WorldId},
+@@ -21,8 +21,8 @@ use log::warn;
+ use tracing::Span;
+ 
+ use super::{
+-    ComponentAccessKind, NopWorldQuery, QueryBuilder, QueryData, QueryEntityError, QueryFilter,
+-    QueryManyIter, QueryManyUniqueIter, QuerySingleError, ROQueryItem, ReadOnlyQueryData,
++    NopWorldQuery, QueryBuilder, QueryData, QueryEntityError, QueryFilter, QueryManyIter,
++    QueryManyUniqueIter, QuerySingleError, ROQueryItem, ReadOnlyQueryData,
+ };
+ 
+ /// An ID for either a table or an archetype. Used for Query iteration.
+@@ -175,40 +175,6 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         Some(state)
+     }
+ 
+-    /// Identical to `new`, but it populates the provided `access` with the matched results.
+-    pub(crate) fn new_with_access(
+-        world: &mut World,
+-        access: &mut Access<ArchetypeComponentId>,
+-    ) -> Self {
+-        let mut state = Self::new_uninitialized(world);
+-        for archetype in world.archetypes.iter() {
+-            // SAFETY: The state was just initialized from the `world` above, and the archetypes being added
+-            // come directly from the same world.
+-            unsafe {
+-                if state.new_archetype_internal(archetype) {
+-                    state.update_archetype_component_access(archetype, access);
+-                }
+-            }
+-        }
+-        state.archetype_generation = world.archetypes.generation();
+-
+-        // Resource access is not part of any archetype and must be handled separately
+-        if state.component_access.access().has_read_all_resources() {
+-            access.read_all_resources();
+-        } else {
+-            for component_id in state.component_access.access().resource_reads() {
+-                access.add_resource_read(world.initialize_resource_internal(component_id).id());
+-            }
+-        }
+-
+-        debug_assert!(
+-            !state.component_access.access().has_any_resource_write(),
+-            "Mutable resource access in queries is not allowed"
+-        );
+-
+-        state
+-    }
+-
+     /// Creates a new [`QueryState`] but does not populate it with the matched results from the World yet
+     ///
+     /// `new_archetype` and its variants must be called on all of the World's archetypes before the
+@@ -546,7 +512,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+                 // SAFETY: The validate_world call ensures that the world is the same the QueryState
+                 // was initialized from.
+                 unsafe {
+-                    self.new_archetype_internal(archetype);
++                    self.new_archetype(archetype);
+                 }
+             }
+         } else {
+@@ -581,7 +547,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+                     // SAFETY: The validate_world call ensures that the world is the same the QueryState
+                     // was initialized from.
+                     unsafe {
+-                        self.new_archetype_internal(archetype);
++                        self.new_archetype(archetype);
+                     }
+                 }
+             }
+@@ -613,32 +579,9 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+     /// Update the current [`QueryState`] with information from the provided [`Archetype`]
+     /// (if applicable, i.e. if the archetype has any intersecting [`ComponentId`] with the current [`QueryState`]).
+     ///
+-    /// The passed in `access` will be updated with any new accesses introduced by the new archetype.
+-    ///
+     /// # Safety
+     /// `archetype` must be from the `World` this state was initialized from.
+-    pub unsafe fn new_archetype(
+-        &mut self,
+-        archetype: &Archetype,
+-        access: &mut Access<ArchetypeComponentId>,
+-    ) {
+-        // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from.
+-        let matches = unsafe { self.new_archetype_internal(archetype) };
+-        if matches {
+-            // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from.
+-            unsafe { self.update_archetype_component_access(archetype, access) };
+-        }
+-    }
+-
+-    /// Process the given [`Archetype`] to update internal metadata about the [`Table`](crate::storage::Table)s
+-    /// and [`Archetype`]s that are matched by this query.
+-    ///
+-    /// Returns `true` if the given `archetype` matches the query. Otherwise, returns `false`.
+-    /// If there is no match, then there is no need to update the query's [`FilteredAccess`].
+-    ///
+-    /// # Safety
+-    /// `archetype` must be from the `World` this state was initialized from.
+-    unsafe fn new_archetype_internal(&mut self, archetype: &Archetype) -> bool {
++    pub unsafe fn new_archetype(&mut self, archetype: &Archetype) {
+         if D::matches_component_set(&self.fetch_state, &|id| archetype.contains(id))
+             && F::matches_component_set(&self.filter_state, &|id| archetype.contains(id))
+             && self.matches_component_set(&|id| archetype.contains(id))
+@@ -661,9 +604,6 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+                     });
+                 }
+             }
+-            true
+-        } else {
+-            false
+         }
+     }
+ 
+@@ -680,57 +620,6 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         })
+     }
+ 
+-    /// For the given `archetype`, adds any component accessed used by this query's underlying [`FilteredAccess`] to `access`.
+-    ///
+-    /// The passed in `access` will be updated with any new accesses introduced by the new archetype.
+-    ///
+-    /// # Safety
+-    /// `archetype` must be from the `World` this state was initialized from.
+-    pub unsafe fn update_archetype_component_access(
+-        &mut self,
+-        archetype: &Archetype,
+-        access: &mut Access<ArchetypeComponentId>,
+-    ) {
+-        // As a fast path, we can iterate directly over the components involved
+-        // if the `access` is finite.
+-        if let Ok(iter) = self.component_access.access.try_iter_component_access() {
+-            iter.for_each(|component_access| {
+-                if let Some(id) = archetype.get_archetype_component_id(*component_access.index()) {
+-                    match component_access {
+-                        ComponentAccessKind::Archetypal(_) => {}
+-                        ComponentAccessKind::Shared(_) => {
+-                            access.add_component_read(id);
+-                        }
+-                        ComponentAccessKind::Exclusive(_) => {
+-                            access.add_component_write(id);
+-                        }
+-                    }
+-                }
+-            });
+-
+-            return;
+-        }
+-
+-        for (component_id, archetype_component_id) in
+-            archetype.components_with_archetype_component_id()
+-        {
+-            if self
+-                .component_access
+-                .access
+-                .has_component_read(component_id)
+-            {
+-                access.add_component_read(archetype_component_id);
+-            }
+-            if self
+-                .component_access
+-                .access
+-                .has_component_write(component_id)
+-            {
+-                access.add_component_write(archetype_component_id);
+-            }
+-        }
+-    }
+-
+     /// Use this to transform a [`QueryState`] into a more generic [`QueryState`].
+     /// This can be useful for passing to another function that might take the more general form.
+     /// See [`Query::transmute_lens`](crate::system::Query::transmute_lens) for more details.
+@@ -1516,7 +1405,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         use arrayvec::ArrayVec;
+ 
+         bevy_tasks::ComputeTaskPool::get().scope(|scope| {
+-            // SAFETY: We only access table data that has been registered in `self.archetype_component_access`.
++            // SAFETY: We only access table data that has been registered in `self.component_access`.
+             let tables = unsafe { &world.storages().tables };
+             let archetypes = world.archetypes();
+             let mut batch_queue = ArrayVec::new();
+diff --git a/crates/bevy_ecs/src/schedule/executor/mod.rs b/crates/bevy_ecs/src/schedule/executor/mod.rs
+index a601284fb005a..be91bba2ff9be 100644
+--- a/crates/bevy_ecs/src/schedule/executor/mod.rs
++++ b/crates/bevy_ecs/src/schedule/executor/mod.rs
+@@ -15,7 +15,6 @@ pub use self::multi_threaded::{MainThreadExecutor, MultiThreadedExecutor};
+ use fixedbitset::FixedBitSet;
+ 
+ use crate::{
+-    archetype::ArchetypeComponentId,
+     component::{ComponentId, Tick},
+     error::{BevyError, ErrorContext, Result},
+     prelude::{IntoSystemSet, SystemSet},
+@@ -172,11 +171,6 @@ impl System for ApplyDeferred {
+         const { &FilteredAccessSet::new() }
+     }
+ 
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        // This system accesses no archetype components.
+-        const { &Access::new() }
+-    }
+-
+     fn is_send(&self) -> bool {
+         // Although this system itself does nothing on its own, the system
+         // executor uses it to apply deferred commands. Commands must be allowed
+@@ -230,8 +224,6 @@ impl System for ApplyDeferred {
+ 
+     fn initialize(&mut self, _world: &mut World) {}
+ 
+-    fn update_archetype_component_access(&mut self, _world: UnsafeWorldCell) {}
+-
+     fn check_change_tick(&mut self, _change_tick: Tick) {}
+ 
+     fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+diff --git a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+index 763504eaec422..601c1b6165a57 100644
+--- a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+@@ -460,12 +460,7 @@ impl ExecutorState {
+                 // Therefore, no other reference to this system exists and there is no aliasing.
+                 let system = unsafe { &mut *context.environment.systems[system_index].get() };
+ 
+-                if !self.can_run(
+-                    system_index,
+-                    system,
+-                    conditions,
+-                    context.environment.world_cell,
+-                ) {
++                if !self.can_run(system_index, conditions) {
+                     // NOTE: exclusive systems with ambiguities are susceptible to
+                     // being significantly displaced here (compared to single-threaded order)
+                     // if systems after them in topological order can run
+@@ -476,7 +471,6 @@ impl ExecutorState {
+                 self.ready_systems.remove(system_index);
+ 
+                 // SAFETY: `can_run` returned true, which means that:
+-                // - It must have called `update_archetype_component_access` for each run condition.
+                 // - There can be no systems running whose accesses would conflict with any conditions.
+                 if unsafe {
+                     !self.should_run(
+@@ -510,7 +504,6 @@ impl ExecutorState {
+                 // - Caller ensured no other reference to this system exists.
+                 // - `system_task_metadata[system_index].is_exclusive` is `false`,
+                 //   so `System::is_exclusive` returned `false` when we called it.
+-                // - `can_run` has been called, which calls `update_archetype_component_access` with this system.
+                 // - `can_run` returned true, so no systems with conflicting world access are running.
+                 unsafe {
+                     self.spawn_system_task(context, system_index);
+@@ -522,13 +515,7 @@ impl ExecutorState {
+         self.ready_systems_copy = ready_systems;
+     }
+ 
+-    fn can_run(
+-        &mut self,
+-        system_index: usize,
+-        system: &mut ScheduleSystem,
+-        conditions: &mut Conditions,
+-        world: UnsafeWorldCell,
+-    ) -> bool {
++    fn can_run(&mut self, system_index: usize, conditions: &mut Conditions) -> bool {
+         let system_meta = &self.system_task_metadata[system_index];
+         if system_meta.is_exclusive && self.num_running_systems > 0 {
+             return false;
+@@ -542,17 +529,11 @@ impl ExecutorState {
+         for set_idx in conditions.sets_with_conditions_of_systems[system_index]
+             .difference(&self.evaluated_sets)
+         {
+-            for condition in &mut conditions.set_conditions[set_idx] {
+-                condition.update_archetype_component_access(world);
+-            }
+             if !self.set_condition_conflicting_systems[set_idx].is_disjoint(&self.running_systems) {
+                 return false;
+             }
+         }
+ 
+-        for condition in &mut conditions.system_conditions[system_index] {
+-            condition.update_archetype_component_access(world);
+-        }
+         if !system_meta
+             .condition_conflicting_systems
+             .is_disjoint(&self.running_systems)
+@@ -560,14 +541,12 @@ impl ExecutorState {
+             return false;
+         }
+ 
+-        if !self.skipped_systems.contains(system_index) {
+-            system.update_archetype_component_access(world);
+-            if !system_meta
++        if !self.skipped_systems.contains(system_index)
++            && !system_meta
+                 .conflicting_systems
+                 .is_disjoint(&self.running_systems)
+-            {
+-                return false;
+-            }
++        {
++            return false;
+         }
+ 
+         true
+@@ -577,8 +556,6 @@ impl ExecutorState {
+     /// * `world` must have permission to read any world data required by
+     ///   the system's conditions: this includes conditions for the system
+     ///   itself, and conditions for any of the system's sets.
+-    /// * `update_archetype_component` must have been called with `world`
+-    ///   for the system as well as system and system set's run conditions.
+     unsafe fn should_run(
+         &mut self,
+         system_index: usize,
+@@ -598,7 +575,6 @@ impl ExecutorState {
+             // SAFETY:
+             // - The caller ensures that `world` has permission to read any data
+             //   required by the conditions.
+-            // - `update_archetype_component_access` has been called for each run condition.
+             let set_conditions_met = unsafe {
+                 evaluate_and_fold_conditions(
+                     &mut conditions.set_conditions[set_idx],
+@@ -620,7 +596,6 @@ impl ExecutorState {
+         // SAFETY:
+         // - The caller ensures that `world` has permission to read any data
+         //   required by the conditions.
+-        // - `update_archetype_component_access` has been called for each run condition.
+         let system_conditions_met = unsafe {
+             evaluate_and_fold_conditions(
+                 &mut conditions.system_conditions[system_index],
+@@ -639,7 +614,6 @@ impl ExecutorState {
+             // SAFETY:
+             // - The caller ensures that `world` has permission to read any data
+             //   required by the system.
+-            // - `update_archetype_component_access` has been called for system.
+             let valid_params = match unsafe { system.validate_param_unsafe(world) } {
+                 Ok(()) => true,
+                 Err(e) => {
+@@ -670,8 +644,6 @@ impl ExecutorState {
+     /// - `is_exclusive` must have returned `false` for the specified system.
+     /// - `world` must have permission to access the world data
+     ///   used by the specified system.
+-    /// - `update_archetype_component_access` must have been called with `world`
+-    ///   on the system associated with `system_index`.
+     unsafe fn spawn_system_task(&mut self, context: &Context, system_index: usize) {
+         // SAFETY: this system is not running, no other reference exists
+         let system = unsafe { &mut *context.environment.systems[system_index].get() };
+@@ -686,7 +658,6 @@ impl ExecutorState {
+                 // - The caller ensures that we have permission to
+                 // access the world data used by the system.
+                 // - `is_exclusive` returned false
+-                // - `update_archetype_component_access` has been called.
+                 unsafe {
+                     if let Err(err) = __rust_begin_short_backtrace::run_unsafe(
+                         system,
+@@ -826,8 +797,6 @@ fn apply_deferred(
+ /// # Safety
+ /// - `world` must have permission to read any world data
+ ///   required by `conditions`.
+-/// - `update_archetype_component_access` must have been called
+-///   with `world` for each condition in `conditions`.
+ unsafe fn evaluate_and_fold_conditions(
+     conditions: &mut [BoxedCondition],
+     world: UnsafeWorldCell,
+@@ -843,7 +812,6 @@ unsafe fn evaluate_and_fold_conditions(
+             // SAFETY:
+             // - The caller ensures that `world` has permission to read any data
+             //   required by the condition.
+-            // - `update_archetype_component_access` has been called for condition.
+             match unsafe { condition.validate_param_unsafe(world) } {
+                 Ok(()) => (),
+                 Err(e) => {
+@@ -862,7 +830,6 @@ unsafe fn evaluate_and_fold_conditions(
+             // SAFETY:
+             // - The caller ensures that `world` has permission to read any data
+             //   required by the condition.
+-            // - `update_archetype_component_access` has been called for condition.
+             unsafe { __rust_begin_short_backtrace::readonly_run_unsafe(&mut **condition, world) }
+         })
+         .fold(true, |acc, res| acc && res)
+diff --git a/crates/bevy_ecs/src/storage/resource.rs b/crates/bevy_ecs/src/storage/resource.rs
+index caa0785b799e9..fa58610bdf361 100644
+--- a/crates/bevy_ecs/src/storage/resource.rs
++++ b/crates/bevy_ecs/src/storage/resource.rs
+@@ -1,5 +1,4 @@
+ use crate::{
+-    archetype::ArchetypeComponentId,
+     change_detection::{MaybeLocation, MutUntyped, TicksMut},
+     component::{ComponentId, ComponentTicks, Components, Tick, TickCells},
+     storage::{blob_vec::BlobVec, SparseSet},
+@@ -25,7 +24,6 @@ pub struct ResourceData<const SEND: bool> {
+         expect(dead_code, reason = "currently only used with the std feature")
+     )]
+     type_name: String,
+-    id: ArchetypeComponentId,
+     #[cfg(feature = "std")]
+     origin_thread_id: Option<ThreadId>,
+     changed_by: MaybeLocation<UnsafeCell<&'static Location<'static>>>,
+@@ -100,12 +98,6 @@ impl<const SEND: bool> ResourceData<SEND> {
+         !self.data.is_empty()
+     }
+ 
+-    /// Gets the [`ArchetypeComponentId`] for the resource.
+-    #[inline]
+-    pub fn id(&self) -> ArchetypeComponentId {
+-        self.id
+-    }
+-
+     /// Returns a reference to the resource, if it exists.
+     ///
+     /// # Panics
+@@ -371,7 +363,6 @@ impl<const SEND: bool> Resources<SEND> {
+         &mut self,
+         component_id: ComponentId,
+         components: &Components,
+-        f: impl FnOnce() -> ArchetypeComponentId,
+     ) -> &mut ResourceData<SEND> {
+         self.resources.get_or_insert_with(component_id, || {
+             let component_info = components.get_info(component_id).unwrap();
+@@ -395,7 +386,6 @@ impl<const SEND: bool> Resources<SEND> {
+                 added_ticks: UnsafeCell::new(Tick::new(0)),
+                 changed_ticks: UnsafeCell::new(Tick::new(0)),
+                 type_name: String::from(component_info.name()),
+-                id: f(),
+                 #[cfg(feature = "std")]
+                 origin_thread_id: None,
+                 changed_by: MaybeLocation::caller().map(UnsafeCell::new),
+diff --git a/crates/bevy_ecs/src/system/adapter_system.rs b/crates/bevy_ecs/src/system/adapter_system.rs
+index 5953a43d70736..50dbfad7ea39e 100644
+--- a/crates/bevy_ecs/src/system/adapter_system.rs
++++ b/crates/bevy_ecs/src/system/adapter_system.rs
+@@ -137,13 +137,6 @@ where
+         self.system.component_access_set()
+     }
+ 
+-    #[inline]
+-    fn archetype_component_access(
+-        &self,
+-    ) -> &crate::query::Access<crate::archetype::ArchetypeComponentId> {
+-        self.system.archetype_component_access()
+-    }
+-
+     fn is_send(&self) -> bool {
+         self.system.is_send()
+     }
+@@ -191,11 +184,6 @@ where
+         self.system.initialize(world);
+     }
+ 
+-    #[inline]
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        self.system.update_archetype_component_access(world);
+-    }
+-
+     fn check_change_tick(&mut self, change_tick: crate::component::Tick) {
+         self.system.check_change_tick(change_tick);
+     }
+diff --git a/crates/bevy_ecs/src/system/builder.rs b/crates/bevy_ecs/src/system/builder.rs
+index 441d4d42fc372..898bf8072ca93 100644
+--- a/crates/bevy_ecs/src/system/builder.rs
++++ b/crates/bevy_ecs/src/system/builder.rs
+@@ -456,9 +456,6 @@ macro_rules! impl_param_set_builder_tuple {
+                     system_meta
+                         .component_access_set
+                         .extend($meta.component_access_set);
+-                    system_meta
+-                        .archetype_component_access
+-                        .extend(&$meta.archetype_component_access);
+                 )*
+                 #[allow(
+                     clippy::unused_unit,
+@@ -472,7 +469,7 @@ macro_rules! impl_param_set_builder_tuple {
+ 
+ all_tuples!(impl_param_set_builder_tuple, 1, 8, P, B, meta);
+ 
+-// SAFETY: Relevant parameter ComponentId and ArchetypeComponentId access is applied to SystemMeta. If any ParamState conflicts
++// SAFETY: Relevant parameter ComponentId access is applied to SystemMeta. If any ParamState conflicts
+ // with any prior access, a panic will occur.
+ unsafe impl<'w, 's, P: SystemParam, B: SystemParamBuilder<P>>
+     SystemParamBuilder<ParamSet<'w, 's, Vec<P>>> for ParamSetBuilder<Vec<B>>
+@@ -496,9 +493,6 @@ unsafe impl<'w, 's, P: SystemParam, B: SystemParamBuilder<P>>
+             system_meta
+                 .component_access_set
+                 .extend(meta.component_access_set);
+-            system_meta
+-                .archetype_component_access
+-                .extend(&meta.archetype_component_access);
+         }
+         states
+     }
+@@ -591,7 +585,7 @@ impl<'a> FilteredResourcesParamBuilder<Box<dyn FnOnce(&mut FilteredResourcesBuil
+     }
+ }
+ 
+-// SAFETY: Resource ComponentId and ArchetypeComponentId access is applied to SystemMeta. If this FilteredResources
++// SAFETY: Resource ComponentId access is applied to SystemMeta. If this FilteredResources
+ // conflicts with any prior access, a panic will occur.
+ unsafe impl<'w, 's, T: FnOnce(&mut FilteredResourcesBuilder)>
+     SystemParamBuilder<FilteredResources<'w, 's>> for FilteredResourcesParamBuilder<T>
+@@ -616,15 +610,10 @@ unsafe impl<'w, 's, T: FnOnce(&mut FilteredResourcesBuilder)>
+         if access.has_read_all_resources() {
+             meta.component_access_set
+                 .add_unfiltered_read_all_resources();
+-            meta.archetype_component_access.read_all_resources();
+         } else {
+             for component_id in access.resource_reads_and_writes() {
+                 meta.component_access_set
+                     .add_unfiltered_resource_read(component_id);
+-
+-                let archetype_component_id = world.initialize_resource_internal(component_id).id();
+-                meta.archetype_component_access
+-                    .add_resource_read(archetype_component_id);
+             }
+         }
+ 
+@@ -655,7 +644,7 @@ impl<'a> FilteredResourcesMutParamBuilder<Box<dyn FnOnce(&mut FilteredResourcesM
+     }
+ }
+ 
+-// SAFETY: Resource ComponentId and ArchetypeComponentId access is applied to SystemMeta. If this FilteredResources
++// SAFETY: Resource ComponentId access is applied to SystemMeta. If this FilteredResources
+ // conflicts with any prior access, a panic will occur.
+ unsafe impl<'w, 's, T: FnOnce(&mut FilteredResourcesMutBuilder)>
+     SystemParamBuilder<FilteredResourcesMut<'w, 's>> for FilteredResourcesMutParamBuilder<T>
+@@ -680,30 +669,20 @@ unsafe impl<'w, 's, T: FnOnce(&mut FilteredResourcesMutBuilder)>
+         if access.has_read_all_resources() {
+             meta.component_access_set
+                 .add_unfiltered_read_all_resources();
+-            meta.archetype_component_access.read_all_resources();
+         } else {
+             for component_id in access.resource_reads() {
+                 meta.component_access_set
+                     .add_unfiltered_resource_read(component_id);
+-
+-                let archetype_component_id = world.initialize_resource_internal(component_id).id();
+-                meta.archetype_component_access
+-                    .add_resource_read(archetype_component_id);
+             }
+         }
+ 
+         if access.has_write_all_resources() {
+             meta.component_access_set
+                 .add_unfiltered_write_all_resources();
+-            meta.archetype_component_access.write_all_resources();
+         } else {
+             for component_id in access.resource_writes() {
+                 meta.component_access_set
+                     .add_unfiltered_resource_write(component_id);
+-
+-                let archetype_component_id = world.initialize_resource_internal(component_id).id();
+-                meta.archetype_component_access
+-                    .add_resource_write(archetype_component_id);
+             }
+         }
+ 
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index 9d11de95258a6..0faade39ee307 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -2,7 +2,6 @@ use alloc::{borrow::Cow, format, vec::Vec};
+ use core::marker::PhantomData;
+ 
+ use crate::{
+-    archetype::ArchetypeComponentId,
+     component::{ComponentId, Tick},
+     prelude::World,
+     query::{Access, FilteredAccessSet},
+@@ -115,7 +114,6 @@ pub struct CombinatorSystem<Func, A, B> {
+     b: B,
+     name: Cow<'static, str>,
+     component_access_set: FilteredAccessSet<ComponentId>,
+-    archetype_component_access: Access<ArchetypeComponentId>,
+ }
+ 
+ impl<Func, A, B> CombinatorSystem<Func, A, B> {
+@@ -129,7 +127,6 @@ impl<Func, A, B> CombinatorSystem<Func, A, B> {
+             b,
+             name,
+             component_access_set: FilteredAccessSet::default(),
+-            archetype_component_access: Access::new(),
+         }
+     }
+ }
+@@ -155,10 +152,6 @@ where
+         &self.component_access_set
+     }
+ 
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        &self.archetype_component_access
+-    }
+-
+     fn is_send(&self) -> bool {
+         self.a.is_send() && self.b.is_send()
+     }
+@@ -183,8 +176,6 @@ where
+             // If either system has `is_exclusive()`, then the combined system also has `is_exclusive`.
+             // Since these closures are `!Send + !Sync + !'static`, they can never be called
+             // in parallel, so their world accesses will not conflict with each other.
+-            // Additionally, `update_archetype_component_access` has been called,
+-            // which forwards to the implementations for `self.a` and `self.b`.
+             |input| unsafe { self.a.run_unsafe(input, world) },
+             // SAFETY: See the comment above.
+             |input| unsafe { self.b.run_unsafe(input, world) },
+@@ -221,16 +212,6 @@ where
+             .extend(self.b.component_access_set().clone());
+     }
+ 
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        self.a.update_archetype_component_access(world);
+-        self.b.update_archetype_component_access(world);
+-
+-        self.archetype_component_access
+-            .extend(self.a.archetype_component_access());
+-        self.archetype_component_access
+-            .extend(self.b.archetype_component_access());
+-    }
+-
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         self.a.check_change_tick(change_tick);
+         self.b.check_change_tick(change_tick);
+@@ -350,7 +331,6 @@ pub struct PipeSystem<A, B> {
+     b: B,
+     name: Cow<'static, str>,
+     component_access_set: FilteredAccessSet<ComponentId>,
+-    archetype_component_access: Access<ArchetypeComponentId>,
+ }
+ 
+ impl<A, B> PipeSystem<A, B>
+@@ -366,7 +346,6 @@ where
+             b,
+             name,
+             component_access_set: FilteredAccessSet::default(),
+-            archetype_component_access: Access::new(),
+         }
+     }
+ }
+@@ -392,10 +371,6 @@ where
+         &self.component_access_set
+     }
+ 
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        &self.archetype_component_access
+-    }
+-
+     fn is_send(&self) -> bool {
+         self.a.is_send() && self.b.is_send()
+     }
+@@ -459,16 +434,6 @@ where
+             .extend(self.b.component_access_set().clone());
+     }
+ 
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        self.a.update_archetype_component_access(world);
+-        self.b.update_archetype_component_access(world);
+-
+-        self.archetype_component_access
+-            .extend(self.a.archetype_component_access());
+-        self.archetype_component_access
+-            .extend(self.b.archetype_component_access());
+-    }
+-
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         self.a.check_change_tick(change_tick);
+         self.b.check_change_tick(change_tick);
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index d6322eb733abd..3012a654586e6 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -132,21 +132,6 @@ const _: () = {
+             }
+         }
+ 
+-        unsafe fn new_archetype(
+-            state: &mut Self::State,
+-            archetype: &bevy_ecs::archetype::Archetype,
+-            system_meta: &mut bevy_ecs::system::SystemMeta,
+-        ) {
+-            // SAFETY: Caller guarantees the archetype is from the world used in `init_state`
+-            unsafe {
+-                <__StructFieldsAlias<'_, '_> as bevy_ecs::system::SystemParam>::new_archetype(
+-                    &mut state.state,
+-                    archetype,
+-                    system_meta,
+-                );
+-            };
+-        }
+-
+         fn apply(
+             state: &mut Self::State,
+             system_meta: &bevy_ecs::system::SystemMeta,
+@@ -173,12 +158,12 @@ const _: () = {
+ 
+         #[inline]
+         unsafe fn validate_param(
+-            state: &Self::State,
++            state: &mut Self::State,
+             system_meta: &bevy_ecs::system::SystemMeta,
+             world: UnsafeWorldCell,
+         ) -> Result<(), SystemParamValidationError> {
+             <(Deferred<CommandQueue>, &Entities) as bevy_ecs::system::SystemParam>::validate_param(
+-                &state.state,
++                &mut state.state,
+                 system_meta,
+                 world,
+             )
+diff --git a/crates/bevy_ecs/src/system/exclusive_function_system.rs b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+index 9107993f9542a..8277fcb0f9a80 100644
+--- a/crates/bevy_ecs/src/system/exclusive_function_system.rs
++++ b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+@@ -1,5 +1,4 @@
+ use crate::{
+-    archetype::ArchetypeComponentId,
+     component::{ComponentId, Tick},
+     query::{Access, FilteredAccessSet},
+     schedule::{InternedSystemSet, SystemSet},
+@@ -91,11 +90,6 @@ where
+         &self.system_meta.component_access_set
+     }
+ 
+-    #[inline]
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        &self.system_meta.archetype_component_access
+-    }
+-
+     #[inline]
+     fn is_send(&self) -> bool {
+         // exclusive systems should have access to non-send resources
+@@ -169,8 +163,6 @@ where
+         self.param_state = Some(F::Param::init(world, &mut self.system_meta));
+     }
+ 
+-    fn update_archetype_component_access(&mut self, _world: UnsafeWorldCell) {}
+-
+     #[inline]
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         check_system_change_tick(
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index 5cf3fe2a44cd6..49bcf1cc78845 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -1,5 +1,4 @@
+ use crate::{
+-    archetype::{ArchetypeComponentId, ArchetypeGeneration},
+     component::{ComponentId, Tick},
+     prelude::FromWorld,
+     query::{Access, FilteredAccessSet},
+@@ -28,16 +27,6 @@ pub struct SystemMeta {
+     /// - soundness issues (e.g. multiple [`SystemParam`]s mutably accessing the same component)
+     /// - ambiguities in the schedule (e.g. two systems that have some sort of conflicting access)
+     pub(crate) component_access_set: FilteredAccessSet<ComponentId>,
+-    /// This [`Access`] is used to determine which systems can run in parallel with each other
+-    /// in the multithreaded executor.
+-    ///
+-    /// We use a [`ArchetypeComponentId`] as it is more precise than just checking [`ComponentId`]:
+-    /// for example if you have one system with `Query<&mut T, With<A>>` and one system with `Query<&mut T, With<B>>`
+-    /// they conflict if you just look at the [`ComponentId`] of `T`; but if there are no archetypes with
+-    /// both `A`, `B` and `T` then in practice there's no risk of conflict. By using [`ArchetypeComponentId`]
+-    /// we can be more precise because we can check if the existing archetypes of the [`World`]
+-    /// cause a conflict
+-    pub(crate) archetype_component_access: Access<ArchetypeComponentId>,
+     // NOTE: this must be kept private. making a SystemMeta non-send is irreversible to prevent
+     // SystemParams from overriding each other
+     is_send: bool,
+@@ -54,7 +43,6 @@ impl SystemMeta {
+         let name = core::any::type_name::<T>();
+         Self {
+             name: name.into(),
+-            archetype_component_access: Access::default(),
+             component_access_set: FilteredAccessSet::default(),
+             is_send: true,
+             has_deferred: false,
+@@ -114,37 +102,6 @@ impl SystemMeta {
+         self.has_deferred = true;
+     }
+ 
+-    /// Archetype component access that is used to determine which systems can run in parallel with each other
+-    /// in the multithreaded executor.
+-    ///
+-    /// We use an [`ArchetypeComponentId`] as it is more precise than just checking [`ComponentId`]:
+-    /// for example if you have one system with `Query<&mut A, With<B>`, and one system with `Query<&mut A, Without<B>`,
+-    /// they conflict if you just look at the [`ComponentId`];
+-    /// but no archetype that matches the first query will match the second and vice versa,
+-    /// which means there's no risk of conflict.
+-    #[inline]
+-    pub fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        &self.archetype_component_access
+-    }
+-
+-    /// Returns a mutable reference to the [`Access`] for [`ArchetypeComponentId`].
+-    /// This is used to determine which systems can run in parallel with each other
+-    /// in the multithreaded executor.
+-    ///
+-    /// We use an [`ArchetypeComponentId`] as it is more precise than just checking [`ComponentId`]:
+-    /// for example if you have one system with `Query<&mut A, With<B>`, and one system with `Query<&mut A, Without<B>`,
+-    /// they conflict if you just look at the [`ComponentId`];
+-    /// but no archetype that matches the first query will match the second and vice versa,
+-    /// which means there's no risk of conflict.
+-    ///
+-    /// # Safety
+-    ///
+-    /// No access can be removed from the returned [`Access`].
+-    #[inline]
+-    pub unsafe fn archetype_component_access_mut(&mut self) -> &mut Access<ArchetypeComponentId> {
+-        &mut self.archetype_component_access
+-    }
+-
+     /// Returns a reference to the [`FilteredAccessSet`] for [`ComponentId`].
+     /// Used to check if systems and/or system params have conflicting access.
+     #[inline]
+@@ -260,7 +217,6 @@ pub struct SystemState<Param: SystemParam + 'static> {
+     meta: SystemMeta,
+     param_state: Param::State,
+     world_id: WorldId,
+-    archetype_generation: ArchetypeGeneration,
+ }
+ 
+ // Allow closure arguments to be inferred.
+@@ -318,12 +274,6 @@ all_tuples!(
+ 
+ impl<Param: SystemParam> SystemState<Param> {
+     /// Creates a new [`SystemState`] with default state.
+-    ///
+-    /// ## Note
+-    /// For users of [`SystemState::get_manual`] or [`get_manual_mut`](SystemState::get_manual_mut):
+-    ///
+-    /// `new` does not cache any of the world's archetypes, so you must call [`SystemState::update_archetypes`]
+-    /// manually before calling `get_manual{_mut}`.
+     pub fn new(world: &mut World) -> Self {
+         let mut meta = SystemMeta::new::<Param>();
+         meta.last_run = world.change_tick().relative_to(Tick::MAX);
+@@ -332,7 +282,6 @@ impl<Param: SystemParam> SystemState<Param> {
+             meta,
+             param_state,
+             world_id: world.id(),
+-            archetype_generation: ArchetypeGeneration::initial(),
+         }
+     }
+ 
+@@ -345,7 +294,6 @@ impl<Param: SystemParam> SystemState<Param> {
+             meta,
+             param_state,
+             world_id: world.id(),
+-            archetype_generation: ArchetypeGeneration::initial(),
+         }
+     }
+ 
+@@ -363,7 +311,6 @@ impl<Param: SystemParam> SystemState<Param> {
+                 world_id: self.world_id,
+             }),
+             system_meta: self.meta,
+-            archetype_generation: self.archetype_generation,
+             marker: PhantomData,
+         }
+     }
+@@ -387,19 +334,17 @@ impl<Param: SystemParam> SystemState<Param> {
+         Param: ReadOnlySystemParam,
+     {
+         self.validate_world(world.id());
+-        self.update_archetypes(world);
+         // SAFETY: Param is read-only and doesn't allow mutable access to World.
+         // It also matches the World this SystemState was created with.
+-        unsafe { self.get_unchecked_manual(world.as_unsafe_world_cell_readonly()) }
++        unsafe { self.get_unchecked(world.as_unsafe_world_cell_readonly()) }
+     }
+ 
+     /// Retrieve the mutable [`SystemParam`] values.
+     #[inline]
+     pub fn get_mut<'w, 's>(&'s mut self, world: &'w mut World) -> SystemParamItem<'w, 's, Param> {
+         self.validate_world(world.id());
+-        self.update_archetypes(world);
+         // SAFETY: World is uniquely borrowed and matches the World this SystemState was created with.
+-        unsafe { self.get_unchecked_manual(world.as_unsafe_world_cell()) }
++        unsafe { self.get_unchecked(world.as_unsafe_world_cell()) }
+     }
+ 
+     /// Applies all state queued up for [`SystemParam`] values. For example, this will apply commands queued up
+@@ -415,14 +360,14 @@ impl<Param: SystemParam> SystemState<Param> {
+     /// # Safety
+     ///
+     /// - The passed [`UnsafeWorldCell`] must have read-only access to
+-    ///   world data in `archetype_component_access`.
++    ///   world data in `component_access_set`.
+     /// - `world` must be the same [`World`] that was used to initialize [`state`](SystemParam::init_state).
+     pub unsafe fn validate_param(
+-        state: &Self,
++        state: &mut Self,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Delegated to existing `SystemParam` implementations.
+-        unsafe { Param::validate_param(&state.param_state, &state.meta, world) }
++        unsafe { Param::validate_param(&mut state.param_state, &state.meta, world) }
+     }
+ 
+     /// Returns `true` if `world_id` matches the [`World`] that was used to call [`SystemState::new`].
+@@ -448,89 +393,68 @@ impl<Param: SystemParam> SystemState<Param> {
+         }
+     }
+ 
+-    /// Updates the state's internal view of the [`World`]'s archetypes. If this is not called before fetching the parameters,
+-    /// the results may not accurately reflect what is in the `world`.
+-    ///
+-    /// This is only required if [`SystemState::get_manual`] or [`SystemState::get_manual_mut`] is being called, and it only needs to
+-    /// be called if the `world` has been structurally mutated (i.e. added/removed a component or resource). Users using
+-    /// [`SystemState::get`] or [`SystemState::get_mut`] do not need to call this as it will be automatically called for them.
++    /// Has no effect
+     #[inline]
+-    pub fn update_archetypes(&mut self, world: &World) {
+-        self.update_archetypes_unsafe_world_cell(world.as_unsafe_world_cell_readonly());
+-    }
++    #[deprecated(
++        since = "0.17.0",
++        note = "No longer has any effect.  Calls may be removed."
++    )]
++    pub fn update_archetypes(&mut self, _world: &World) {}
+ 
+-    /// Updates the state's internal view of the `world`'s archetypes. If this is not called before fetching the parameters,
+-    /// the results may not accurately reflect what is in the `world`.
+-    ///
+-    /// This is only required if [`SystemState::get_manual`] or [`SystemState::get_manual_mut`] is being called, and it only needs to
+-    /// be called if the `world` has been structurally mutated (i.e. added/removed a component or resource). Users using
+-    /// [`SystemState::get`] or [`SystemState::get_mut`] do not need to call this as it will be automatically called for them.
+-    ///
+-    /// # Note
+-    ///
+-    /// This method only accesses world metadata.
++    /// Has no effect
+     #[inline]
+-    pub fn update_archetypes_unsafe_world_cell(&mut self, world: UnsafeWorldCell) {
+-        assert_eq!(self.world_id, world.id(), "Encountered a mismatched World. A System cannot be used with Worlds other than the one it was initialized with.");
+-
+-        let archetypes = world.archetypes();
+-        let old_generation =
+-            core::mem::replace(&mut self.archetype_generation, archetypes.generation());
+-
+-        for archetype in &archetypes[old_generation..] {
+-            // SAFETY: The assertion above ensures that the param_state was initialized from `world`.
+-            unsafe { Param::new_archetype(&mut self.param_state, archetype, &mut self.meta) };
+-        }
+-    }
++    #[deprecated(
++        since = "0.17.0",
++        note = "No longer has any effect.  Calls may be removed."
++    )]
++    pub fn update_archetypes_unsafe_world_cell(&mut self, _world: UnsafeWorldCell) {}
+ 
+-    /// Retrieve the [`SystemParam`] values. This can only be called when all parameters are read-only.
+-    /// This will not update the state's view of the world's archetypes automatically nor increment the
+-    /// world's change tick.
+-    ///
+-    /// For this to return accurate results, ensure [`SystemState::update_archetypes`] is called before this
+-    /// function.
+-    ///
+-    /// Users should strongly prefer to use [`SystemState::get`] over this function.
++    /// Identical to [`SystemState::get`].
+     #[inline]
++    #[deprecated(since = "0.17.0", note = "Call `SystemState::get` instead.")]
+     pub fn get_manual<'w, 's>(&'s mut self, world: &'w World) -> SystemParamItem<'w, 's, Param>
+     where
+         Param: ReadOnlySystemParam,
+     {
+-        self.validate_world(world.id());
+-        let change_tick = world.read_change_tick();
+-        // SAFETY: Param is read-only and doesn't allow mutable access to World.
+-        // It also matches the World this SystemState was created with.
+-        unsafe { self.fetch(world.as_unsafe_world_cell_readonly(), change_tick) }
++        self.get(world)
+     }
+ 
+-    /// Retrieve the mutable [`SystemParam`] values.  This will not update the state's view of the world's archetypes
+-    /// automatically nor increment the world's change tick.
+-    ///
+-    /// For this to return accurate results, ensure [`SystemState::update_archetypes`] is called before this
+-    /// function.
+-    ///
+-    /// Users should strongly prefer to use [`SystemState::get_mut`] over this function.
++    /// Identical to [`SystemState::get_mut`].
+     #[inline]
++    #[deprecated(since = "0.17.0", note = "Call `SystemState::get_mut` instead.")]
+     pub fn get_manual_mut<'w, 's>(
+         &'s mut self,
+         world: &'w mut World,
+     ) -> SystemParamItem<'w, 's, Param> {
+-        self.validate_world(world.id());
+-        let change_tick = world.change_tick();
+-        // SAFETY: World is uniquely borrowed and matches the World this SystemState was created with.
+-        unsafe { self.fetch(world.as_unsafe_world_cell(), change_tick) }
++        self.get_mut(world)
+     }
+ 
+-    /// Retrieve the [`SystemParam`] values. This will not update archetypes automatically.
++    /// Identical to [`SystemState::get_unchecked`].
+     ///
+     /// # Safety
+     /// This call might access any of the input parameters in a way that violates Rust's mutability rules. Make sure the data
+     /// access is safe in the context of global [`World`] access. The passed-in [`World`] _must_ be the [`World`] the [`SystemState`] was
+     /// created with.
+     #[inline]
++    #[deprecated(since = "0.17.0", note = "Call `SystemState::get_unchecked` instead.")]
+     pub unsafe fn get_unchecked_manual<'w, 's>(
+         &'s mut self,
+         world: UnsafeWorldCell<'w>,
++    ) -> SystemParamItem<'w, 's, Param> {
++        // SAFETY: Caller ensures safety requirements
++        unsafe { self.get_unchecked(world) }
++    }
++
++    /// Retrieve the [`SystemParam`] values.
++    ///
++    /// # Safety
++    /// This call might access any of the input parameters in a way that violates Rust's mutability rules. Make sure the data
++    /// access is safe in the context of global [`World`] access. The passed-in [`World`] _must_ be the [`World`] the [`SystemState`] was
++    /// created with.
++    #[inline]
++    pub unsafe fn get_unchecked<'w, 's>(
++        &'s mut self,
++        world: UnsafeWorldCell<'w>,
+     ) -> SystemParamItem<'w, 's, Param> {
+         let change_tick = world.increment_change_tick();
+         // SAFETY: The invariants are upheld by the caller.
+@@ -597,7 +521,6 @@ where
+     func: F,
+     state: Option<FunctionSystemState<F::Param>>,
+     system_meta: SystemMeta,
+-    archetype_generation: ArchetypeGeneration,
+     // NOTE: PhantomData<fn()-> T> gives this safe Send/Sync impls
+     marker: PhantomData<fn() -> Marker>,
+ }
+@@ -609,7 +532,7 @@ struct FunctionSystemState<P: SystemParam> {
+     /// The cached state of the system's [`SystemParam`]s.
+     param: P::State,
+     /// The id of the [`World`] this system was initialized with. If the world
+-    /// passed to [`System::update_archetype_component_access`] does not match
++    /// passed to [`System::run_unsafe`] or [`System::validate_param_unsafe`] does not match
+     /// this id, a panic will occur.
+     world_id: WorldId,
+ }
+@@ -637,7 +560,6 @@ where
+             func: self.func.clone(),
+             state: None,
+             system_meta: SystemMeta::new::<F>(),
+-            archetype_generation: ArchetypeGeneration::initial(),
+             marker: PhantomData,
+         }
+     }
+@@ -658,7 +580,6 @@ where
+             func,
+             state: None,
+             system_meta: SystemMeta::new::<F>(),
+-            archetype_generation: ArchetypeGeneration::initial(),
+             marker: PhantomData,
+         }
+     }
+@@ -698,11 +619,6 @@ where
+         &self.system_meta.component_access_set
+     }
+ 
+-    #[inline]
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        &self.system_meta.archetype_component_access
+-    }
+-
+     #[inline]
+     fn is_send(&self) -> bool {
+         self.system_meta.is_send
+@@ -729,14 +645,14 @@ where
+ 
+         let change_tick = world.increment_change_tick();
+ 
+-        let param_state = &mut self.state.as_mut().expect(Self::ERROR_UNINITIALIZED).param;
++        let state = self.state.as_mut().expect(Self::ERROR_UNINITIALIZED);
++        assert_eq!(state.world_id, world.id(), "Encountered a mismatched World. A System cannot be used with Worlds other than the one it was initialized with.");
+         // SAFETY:
+-        // - The caller has invoked `update_archetype_component_access`, which will panic
+-        //   if the world does not match.
++        // - The above assert ensures the world matches.
+         // - All world accesses used by `F::Param` have been registered, so the caller
+         //   will ensure that there are no data access conflicts.
+         let params =
+-            unsafe { F::Param::get_param(param_state, &self.system_meta, world, change_tick) };
++            unsafe { F::Param::get_param(&mut state.param, &self.system_meta, world, change_tick) };
+         let out = self.func.run(input, params);
+         self.system_meta.last_run = change_tick;
+         out
+@@ -759,13 +675,13 @@ where
+         &mut self,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        let param_state = &self.state.as_ref().expect(Self::ERROR_UNINITIALIZED).param;
++        let state = self.state.as_mut().expect(Self::ERROR_UNINITIALIZED);
++        assert_eq!(state.world_id, world.id(), "Encountered a mismatched World. A System cannot be used with Worlds other than the one it was initialized with.");
+         // SAFETY:
+-        // - The caller has invoked `update_archetype_component_access`, which will panic
+-        //   if the world does not match.
++        // - The above assert ensures the world matches.
+         // - All world accesses used by `F::Param` have been registered, so the caller
+         //   will ensure that there are no data access conflicts.
+-        unsafe { F::Param::validate_param(param_state, &self.system_meta, world) }
++        unsafe { F::Param::validate_param(&mut state.param, &self.system_meta, world) }
+     }
+ 
+     #[inline]
+@@ -785,20 +701,6 @@ where
+         self.system_meta.last_run = world.change_tick().relative_to(Tick::MAX);
+     }
+ 
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        let state = self.state.as_mut().expect(Self::ERROR_UNINITIALIZED);
+-        assert_eq!(state.world_id, world.id(), "Encountered a mismatched World. A System cannot be used with Worlds other than the one it was initialized with.");
+-
+-        let archetypes = world.archetypes();
+-        let old_generation =
+-            core::mem::replace(&mut self.archetype_generation, archetypes.generation());
+-
+-        for archetype in &archetypes[old_generation..] {
+-            // SAFETY: The assertion above ensures that the param_state was initialized from `world`.
+-            unsafe { F::Param::new_archetype(&mut state.param, archetype, &mut self.system_meta) };
+-        }
+-    }
+-
+     #[inline]
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         check_system_change_tick(
+diff --git a/crates/bevy_ecs/src/system/mod.rs b/crates/bevy_ecs/src/system/mod.rs
+index a9b02df625610..c3448fb8190b3 100644
+--- a/crates/bevy_ecs/src/system/mod.rs
++++ b/crates/bevy_ecs/src/system/mod.rs
+@@ -402,7 +402,7 @@ mod tests {
+     use std::println;
+ 
+     use crate::{
+-        archetype::{ArchetypeComponentId, Archetypes},
++        archetype::Archetypes,
+         bundle::Bundles,
+         change_detection::DetectChanges,
+         component::{Component, Components},
+@@ -1587,68 +1587,6 @@ mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn update_archetype_component_access_works() {
+-        use std::collections::HashSet;
+-
+-        fn a_not_b_system(_query: Query<&A, Without<B>>) {}
+-
+-        let mut world = World::default();
+-        let mut system = IntoSystem::into_system(a_not_b_system);
+-        let mut expected_ids = HashSet::<ArchetypeComponentId>::new();
+-        let a_id = world.register_component::<A>();
+-
+-        // set up system and verify its access is empty
+-        system.initialize(&mut world);
+-        system.update_archetype_component_access(world.as_unsafe_world_cell());
+-        let archetype_component_access = system.archetype_component_access();
+-        assert!(expected_ids
+-            .iter()
+-            .all(|id| archetype_component_access.has_component_read(*id)));
+-
+-        // add some entities with archetypes that should match and save their ids
+-        expected_ids.insert(
+-            world
+-                .spawn(A)
+-                .archetype()
+-                .get_archetype_component_id(a_id)
+-                .unwrap(),
+-        );
+-        expected_ids.insert(
+-            world
+-                .spawn((A, C))
+-                .archetype()
+-                .get_archetype_component_id(a_id)
+-                .unwrap(),
+-        );
+-
+-        // add some entities with archetypes that should not match
+-        world.spawn((A, B));
+-        world.spawn((B, C));
+-
+-        // update system and verify its accesses are correct
+-        system.update_archetype_component_access(world.as_unsafe_world_cell());
+-        let archetype_component_access = system.archetype_component_access();
+-        assert!(expected_ids
+-            .iter()
+-            .all(|id| archetype_component_access.has_component_read(*id)));
+-
+-        // one more round
+-        expected_ids.insert(
+-            world
+-                .spawn((A, D))
+-                .archetype()
+-                .get_archetype_component_id(a_id)
+-                .unwrap(),
+-        );
+-        world.spawn((A, B, D));
+-        system.update_archetype_component_access(world.as_unsafe_world_cell());
+-        let archetype_component_access = system.archetype_component_access();
+-        assert!(expected_ids
+-            .iter()
+-            .all(|id| archetype_component_access.has_component_read(*id)));
+-    }
+-
+     #[test]
+     fn commands_param_set() {
+         // Regression test for #4676
+diff --git a/crates/bevy_ecs/src/system/observer_system.rs b/crates/bevy_ecs/src/system/observer_system.rs
+index 9bd35c53615ba..d3138151c9750 100644
+--- a/crates/bevy_ecs/src/system/observer_system.rs
++++ b/crates/bevy_ecs/src/system/observer_system.rs
+@@ -2,7 +2,6 @@ use alloc::{borrow::Cow, vec::Vec};
+ use core::marker::PhantomData;
+ 
+ use crate::{
+-    archetype::ArchetypeComponentId,
+     component::{ComponentId, Tick},
+     error::Result,
+     never::Never,
+@@ -127,11 +126,6 @@ where
+         self.observer.component_access_set()
+     }
+ 
+-    #[inline]
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        self.observer.archetype_component_access()
+-    }
+-
+     #[inline]
+     fn is_send(&self) -> bool {
+         self.observer.is_send()
+@@ -180,11 +174,6 @@ where
+         self.observer.initialize(world);
+     }
+ 
+-    #[inline]
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        self.observer.update_archetype_component_access(world);
+-    }
+-
+     #[inline]
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         self.observer.check_change_tick(change_tick);
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index 4c02a092de949..962ff94a2a97e 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -1,7 +1,6 @@
+ use alloc::{borrow::Cow, vec::Vec};
+ 
+ use crate::{
+-    archetype::ArchetypeComponentId,
+     component::{ComponentId, Tick},
+     error::Result,
+     query::{Access, FilteredAccessSet},
+@@ -44,11 +43,6 @@ impl<S: System<In = ()>> System for InfallibleSystemWrapper<S> {
+         self.0.component_access_set()
+     }
+ 
+-    #[inline(always)]
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        self.0.archetype_component_access()
+-    }
+-
+     #[inline]
+     fn is_send(&self) -> bool {
+         self.0.is_send()
+@@ -97,11 +91,6 @@ impl<S: System<In = ()>> System for InfallibleSystemWrapper<S> {
+         self.0.initialize(world);
+     }
+ 
+-    #[inline]
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        self.0.update_archetype_component_access(world);
+-    }
+-
+     #[inline]
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         self.0.check_change_tick(change_tick);
+@@ -177,10 +166,6 @@ where
+         self.system.component_access_set()
+     }
+ 
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        self.system.archetype_component_access()
+-    }
+-
+     fn is_send(&self) -> bool {
+         self.system.is_send()
+     }
+@@ -220,10 +205,6 @@ where
+         self.system.initialize(world);
+     }
+ 
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        self.system.update_archetype_component_access(world);
+-    }
+-
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         self.system.check_change_tick(change_tick);
+     }
+@@ -288,10 +269,6 @@ where
+         self.system.component_access_set()
+     }
+ 
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {
+-        self.system.archetype_component_access()
+-    }
+-
+     fn is_send(&self) -> bool {
+         self.system.is_send()
+     }
+@@ -338,10 +315,6 @@ where
+         }
+     }
+ 
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {
+-        self.system.update_archetype_component_access(world);
+-    }
+-
+     fn check_change_tick(&mut self, change_tick: Tick) {
+         self.system.check_change_tick(change_tick);
+     }
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index ac74ac89d250f..be650588bdeb0 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -7,7 +7,6 @@ use log::warn;
+ use thiserror::Error;
+ 
+ use crate::{
+-    archetype::ArchetypeComponentId,
+     component::{ComponentId, Tick},
+     query::{Access, FilteredAccessSet},
+     schedule::InternedSystemSet,
+@@ -51,8 +50,6 @@ pub trait System: Send + Sync + 'static {
+     /// Returns the system's component [`FilteredAccessSet`].
+     fn component_access_set(&self) -> &FilteredAccessSet<ComponentId>;
+ 
+-    /// Returns the system's archetype component [`Access`].
+-    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId>;
+     /// Returns true if the system is [`Send`].
+     fn is_send(&self) -> bool;
+ 
+@@ -72,13 +69,10 @@ pub trait System: Send + Sync + 'static {
+     /// # Safety
+     ///
+     /// - The caller must ensure that [`world`](UnsafeWorldCell) has permission to access any world data
+-    ///   registered in `archetype_component_access`. There must be no conflicting
++    ///   registered in `component_access_set`. There must be no conflicting
+     ///   simultaneous accesses while the system is running.
+     /// - If [`System::is_exclusive`] returns `true`, then it must be valid to call
+     ///   [`UnsafeWorldCell::world_mut`] on `world`.
+-    /// - The method [`System::update_archetype_component_access`] must be called at some
+-    ///   point before this one, with the same exact [`World`]. If [`System::update_archetype_component_access`]
+-    ///   panics (or otherwise does not return for any reason), this method must not be called.
+     unsafe fn run_unsafe(&mut self, input: SystemIn<'_, Self>, world: UnsafeWorldCell)
+         -> Self::Out;
+ 
+@@ -104,10 +98,8 @@ pub trait System: Send + Sync + 'static {
+         world: &mut World,
+     ) -> Self::Out {
+         let world_cell = world.as_unsafe_world_cell();
+-        self.update_archetype_component_access(world_cell);
+         // SAFETY:
+         // - We have exclusive access to the entire world.
+-        // - `update_archetype_component_access` has been called.
+         unsafe { self.run_unsafe(input, world_cell) }
+     }
+ 
+@@ -134,11 +126,8 @@ pub trait System: Send + Sync + 'static {
+     /// # Safety
+     ///
+     /// - The caller must ensure that [`world`](UnsafeWorldCell) has permission to access any world data
+-    ///   registered in `archetype_component_access`. There must be no conflicting
++    ///   registered in `component_access_set`. There must be no conflicting
+     ///   simultaneous accesses while the system is running.
+-    /// - The method [`System::update_archetype_component_access`] must be called at some
+-    ///   point before this one, with the same exact [`World`]. If [`System::update_archetype_component_access`]
+-    ///   panics (or otherwise does not return for any reason), this method must not be called.
+     unsafe fn validate_param_unsafe(
+         &mut self,
+         world: UnsafeWorldCell,
+@@ -148,23 +137,14 @@ pub trait System: Send + Sync + 'static {
+     /// that runs on exclusive, single-threaded `world` pointer.
+     fn validate_param(&mut self, world: &World) -> Result<(), SystemParamValidationError> {
+         let world_cell = world.as_unsafe_world_cell_readonly();
+-        self.update_archetype_component_access(world_cell);
+         // SAFETY:
+         // - We have exclusive access to the entire world.
+-        // - `update_archetype_component_access` has been called.
+         unsafe { self.validate_param_unsafe(world_cell) }
+     }
+ 
+     /// Initialize the system.
+     fn initialize(&mut self, _world: &mut World);
+ 
+-    /// Update the system's archetype component [`Access`].
+-    ///
+-    /// ## Note for implementers
+-    /// `world` may only be used to access metadata. This can be done in safe code
+-    /// via functions such as [`UnsafeWorldCell::archetypes`].
+-    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell);
+-
+     /// Checks any [`Tick`]s stored on this system and wraps their value if they get too old.
+     ///
+     /// This method must be called periodically to ensure that change detection behaves correctly.
+@@ -210,10 +190,8 @@ pub unsafe trait ReadOnlySystem: System {
+     /// since this system is known not to modify the world.
+     fn run_readonly(&mut self, input: SystemIn<'_, Self>, world: &World) -> Self::Out {
+         let world = world.as_unsafe_world_cell_readonly();
+-        self.update_archetype_component_access(world);
+         // SAFETY:
+         // - We have read-only access to the entire world.
+-        // - `update_archetype_component_access` has been called.
+         unsafe { self.run_unsafe(input, world) }
+     }
+ }
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index f2774116f0178..f15dfac659e57 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -1,6 +1,6 @@
+ pub use crate::change_detection::{NonSendMut, Res, ResMut};
+ use crate::{
+-    archetype::{Archetype, Archetypes},
++    archetype::Archetypes,
+     bundle::Bundles,
+     change_detection::{MaybeLocation, Ticks, TicksMut},
+     component::{ComponentId, ComponentTicks, Components, Tick},
+@@ -224,22 +224,6 @@ pub unsafe trait SystemParam: Sized {
+     /// and creates a new instance of this param's [`State`](SystemParam::State).
+     fn init_state(world: &mut World, system_meta: &mut SystemMeta) -> Self::State;
+ 
+-    /// For the specified [`Archetype`], registers the components accessed by this [`SystemParam`] (if applicable).
+-    ///
+-    /// # Safety
+-    /// `archetype` must be from the [`World`] used to initialize `state` in [`SystemParam::init_state`].
+-    #[inline]
+-    #[expect(
+-        unused_variables,
+-        reason = "The parameters here are intentionally unused by the default implementation; however, putting underscores here will result in the underscores being copied by rust-analyzer's tab completion."
+-    )]
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-    }
+-
+     /// Applies any deferred mutations stored in this [`SystemParam`]'s state.
+     /// This is used to apply [`Commands`] during [`ApplyDeferred`](crate::prelude::ApplyDeferred).
+     ///
+@@ -292,13 +276,12 @@ pub unsafe trait SystemParam: Sized {
+     /// - The passed [`UnsafeWorldCell`] must have read-only access to world data
+     ///   registered in [`init_state`](SystemParam::init_state).
+     /// - `world` must be the same [`World`] that was used to initialize [`state`](SystemParam::init_state).
+-    /// - All `world`'s archetypes have been processed by [`new_archetype`](SystemParam::new_archetype).
+     #[expect(
+         unused_variables,
+         reason = "The parameters here are intentionally unused by the default implementation; however, putting underscores here will result in the underscores being copied by rust-analyzer's tab completion."
+     )]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -312,7 +295,6 @@ pub unsafe trait SystemParam: Sized {
+     /// - The passed [`UnsafeWorldCell`] must have access to any world data registered
+     ///   in [`init_state`](SystemParam::init_state).
+     /// - `world` must be the same [`World`] that was used to initialize [`state`](SystemParam::init_state).
+-    /// - All `world`'s archetypes have been processed by [`new_archetype`](SystemParam::new_archetype).
+     unsafe fn get_param<'world, 'state>(
+         state: &'state mut Self::State,
+         system_meta: &SystemMeta,
+@@ -336,26 +318,18 @@ unsafe impl<'w, 's, D: ReadOnlyQueryData + 'static, F: QueryFilter + 'static> Re
+ {
+ }
+ 
+-// SAFETY: Relevant query ComponentId and ArchetypeComponentId access is applied to SystemMeta. If
++// SAFETY: Relevant query ComponentId access is applied to SystemMeta. If
+ // this Query conflicts with any prior access, a panic will occur.
+ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Query<'_, '_, D, F> {
+     type State = QueryState<D, F>;
+     type Item<'w, 's> = Query<'w, 's, D, F>;
+ 
+     fn init_state(world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
+-        let state = QueryState::new_with_access(world, &mut system_meta.archetype_component_access);
++        let state = QueryState::new(world);
+         init_query_param(world, system_meta, &state);
+         state
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        state.new_archetype(archetype, &mut system_meta.archetype_component_access);
+-    }
+-
+     #[inline]
+     unsafe fn get_param<'w, 's>(
+         state: &'s mut Self::State,
+@@ -367,7 +341,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Qu
+         // so the caller ensures that `world` has permission to access any
+         // world data that the query needs.
+         // The caller ensures the world matches the one used in init_state.
+-        unsafe { state.query_unchecked_manual_with_ticks(world, system_meta.last_run, change_tick) }
++        unsafe { state.query_unchecked_with_ticks(world, system_meta.last_run, change_tick) }
+     }
+ }
+ 
+@@ -409,7 +383,7 @@ fn assert_component_access_compatibility(
+     panic!("error[B0001]: Query<{}, {}> in system {system_name} accesses component(s) {accesses}in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001", ShortName(query_type), ShortName(filter_type));
+ }
+ 
+-// SAFETY: Relevant query ComponentId and ArchetypeComponentId access is applied to SystemMeta. If
++// SAFETY: Relevant query ComponentId access is applied to SystemMeta. If
+ // this Query conflicts with any prior access, a panic will occur.
+ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Single<'a, D, F> {
+     type State = QueryState<D, F>;
+@@ -419,15 +393,6 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam fo
+         Query::init_state(world, system_meta)
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: Delegate to existing `SystemParam` implementations.
+-        unsafe { Query::new_archetype(state, archetype, system_meta) };
+-    }
+-
+     #[inline]
+     unsafe fn get_param<'w, 's>(
+         state: &'s mut Self::State,
+@@ -437,9 +402,8 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam fo
+     ) -> Self::Item<'w, 's> {
+         // SAFETY: State ensures that the components it accesses are not accessible somewhere elsewhere.
+         // The caller ensures the world matches the one used in init_state.
+-        let query = unsafe {
+-            state.query_unchecked_manual_with_ticks(world, system_meta.last_run, change_tick)
+-        };
++        let query =
++            unsafe { state.query_unchecked_with_ticks(world, system_meta.last_run, change_tick) };
+         let single = query
+             .single_inner()
+             .expect("The query was expected to contain exactly one matching entity.");
+@@ -451,7 +415,7 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam fo
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -459,11 +423,7 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam fo
+         // and the query is read only.
+         // The caller ensures the world matches the one used in init_state.
+         let query = unsafe {
+-            state.query_unchecked_manual_with_ticks(
+-                world,
+-                system_meta.last_run,
+-                world.change_tick(),
+-            )
++            state.query_unchecked_with_ticks(world, system_meta.last_run, world.change_tick())
+         };
+         match query.single_inner() {
+             Ok(_) => Ok(()),
+@@ -483,7 +443,7 @@ unsafe impl<'a, D: ReadOnlyQueryData + 'static, F: QueryFilter + 'static> ReadOn
+ {
+ }
+ 
+-// SAFETY: Relevant query ComponentId and ArchetypeComponentId access is applied to SystemMeta. If
++// SAFETY: Relevant query ComponentId access is applied to SystemMeta. If
+ // this Query conflicts with any prior access, a panic will occur.
+ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+     for Populated<'_, '_, D, F>
+@@ -495,15 +455,6 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+         Query::init_state(world, system_meta)
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: Delegate to existing `SystemParam` implementations.
+-        unsafe { Query::new_archetype(state, archetype, system_meta) };
+-    }
+-
+     #[inline]
+     unsafe fn get_param<'w, 's>(
+         state: &'s mut Self::State,
+@@ -518,7 +469,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -526,11 +477,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+         // - We have read-only access to the components accessed by query.
+         // - The caller ensures the world matches the one used in init_state.
+         let query = unsafe {
+-            state.query_unchecked_manual_with_ticks(
+-                world,
+-                system_meta.last_run,
+-                world.change_tick(),
+-            )
++            state.query_unchecked_with_ticks(world, system_meta.last_run, world.change_tick())
+         };
+         if query.is_empty() {
+             Err(SystemParamValidationError::skipped::<Self>(
+@@ -675,7 +622,7 @@ macro_rules! impl_param_set {
+         where $($param: ReadOnlySystemParam,)*
+         { }
+ 
+-        // SAFETY: Relevant parameter ComponentId and ArchetypeComponentId access is applied to SystemMeta. If any ParamState conflicts
++        // SAFETY: Relevant parameter ComponentId access is applied to SystemMeta. If any ParamState conflicts
+         // with any prior access, a panic will occur.
+         unsafe impl<'_w, '_s, $($param: SystemParam,)*> SystemParam for ParamSet<'_w, '_s, ($($param,)*)>
+         {
+@@ -695,7 +642,6 @@ macro_rules! impl_param_set {
+                     // Pretend to add each param to the system alone, see if it conflicts
+                     let mut $system_meta = system_meta.clone();
+                     $system_meta.component_access_set.clear();
+-                    $system_meta.archetype_component_access.clear();
+                     $param::init_state(world, &mut $system_meta);
+                     // The variable is being defined with non_snake_case here
+                     let $param = $param::init_state(world, &mut system_meta.clone());
+@@ -708,18 +654,10 @@ macro_rules! impl_param_set {
+                     system_meta
+                         .component_access_set
+                         .extend($system_meta.component_access_set);
+-                    system_meta
+-                        .archetype_component_access
+-                        .extend(&$system_meta.archetype_component_access);
+                 )*
+                 ($($param,)*)
+             }
+ 
+-            unsafe fn new_archetype(state: &mut Self::State, archetype: &Archetype, system_meta: &mut SystemMeta) {
+-                // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-                unsafe { <($($param,)*) as SystemParam>::new_archetype(state, archetype, system_meta); }
+-            }
+-
+             fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+                 <($($param,)*) as SystemParam>::apply(state, system_meta, world);
+             }
+@@ -730,7 +668,7 @@ macro_rules! impl_param_set {
+ 
+             #[inline]
+             unsafe fn validate_param<'w, 's>(
+-                state: &'s Self::State,
++                state: &'s mut Self::State,
+                 system_meta: &SystemMeta,
+                 world: UnsafeWorldCell<'w>,
+             ) -> Result<(), SystemParamValidationError> {
+@@ -778,7 +716,7 @@ all_tuples_enumerated!(impl_param_set, 1, 8, P, m, p);
+ // SAFETY: Res only reads a single World resource
+ unsafe impl<'a, T: Resource> ReadOnlySystemParam for Res<'a, T> {}
+ 
+-// SAFETY: Res ComponentId and ArchetypeComponentId access is applied to SystemMeta. If this Res
++// SAFETY: Res ComponentId access is applied to SystemMeta. If this Res
+ // conflicts with any prior access, a panic will occur.
+ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+     type State = ComponentId;
+@@ -786,7 +724,6 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+ 
+     fn init_state(world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
+         let component_id = world.components_registrator().register_resource::<T>();
+-        let archetype_component_id = world.initialize_resource_internal(component_id).id();
+ 
+         let combined_access = system_meta.component_access_set.combined_access();
+         assert!(
+@@ -799,16 +736,12 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+             .component_access_set
+             .add_unfiltered_resource_read(component_id);
+ 
+-        system_meta
+-            .archetype_component_access
+-            .add_resource_read(archetype_component_id);
+-
+         component_id
+     }
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        &component_id: &Self::State,
++        &mut component_id: &mut Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -856,7 +789,7 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+     }
+ }
+ 
+-// SAFETY: Res ComponentId and ArchetypeComponentId access is applied to SystemMeta. If this Res
++// SAFETY: Res ComponentId access is applied to SystemMeta. If this Res
+ // conflicts with any prior access, a panic will occur.
+ unsafe impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
+     type State = ComponentId;
+@@ -864,7 +797,6 @@ unsafe impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
+ 
+     fn init_state(world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
+         let component_id = world.components_registrator().register_resource::<T>();
+-        let archetype_component_id = world.initialize_resource_internal(component_id).id();
+ 
+         let combined_access = system_meta.component_access_set.combined_access();
+         if combined_access.has_resource_write(component_id) {
+@@ -880,16 +812,12 @@ unsafe impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
+             .component_access_set
+             .add_unfiltered_resource_write(component_id);
+ 
+-        system_meta
+-            .archetype_component_access
+-            .add_resource_write(archetype_component_id);
+-
+         component_id
+     }
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        &component_id: &Self::State,
++        &mut component_id: &mut Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -945,16 +873,6 @@ unsafe impl SystemParam for &'_ World {
+     type Item<'w, 's> = &'w World;
+ 
+     fn init_state(_world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
+-        let mut access = Access::default();
+-        access.read_all();
+-        if !system_meta
+-            .archetype_component_access
+-            .is_compatible(&access)
+-        {
+-            panic!("&World conflicts with a previous mutable system parameter. Allowing this would break Rust's mutability rules");
+-        }
+-        system_meta.archetype_component_access.extend(&access);
+-
+         let mut filtered_access = FilteredAccess::default();
+ 
+         filtered_access.read_all();
+@@ -995,7 +913,6 @@ unsafe impl<'w> SystemParam for DeferredWorld<'w> {
+             system_meta.name,
+         );
+         system_meta.component_access_set.write_all();
+-        system_meta.archetype_component_access.write_all();
+     }
+ 
+     unsafe fn get_param<'world, 'state>(
+@@ -1426,7 +1343,7 @@ impl<'a, T> From<NonSendMut<'a, T>> for NonSend<'a, T> {
+     }
+ }
+ 
+-// SAFETY: NonSendComponentId and ArchetypeComponentId access is applied to SystemMeta. If this
++// SAFETY: NonSendComponentId access is applied to SystemMeta. If this
+ // NonSend conflicts with any prior access, a panic will occur.
+ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+     type State = ComponentId;
+@@ -1436,7 +1353,6 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+         system_meta.set_non_send();
+ 
+         let component_id = world.components_registrator().register_non_send::<T>();
+-        let archetype_component_id = world.initialize_non_send_internal(component_id).id();
+ 
+         let combined_access = system_meta.component_access_set.combined_access();
+         assert!(
+@@ -1449,16 +1365,12 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+             .component_access_set
+             .add_unfiltered_resource_read(component_id);
+ 
+-        system_meta
+-            .archetype_component_access
+-            .add_resource_read(archetype_component_id);
+-
+         component_id
+     }
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        &component_id: &Self::State,
++        &mut component_id: &mut Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -1504,7 +1416,7 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+     }
+ }
+ 
+-// SAFETY: NonSendMut ComponentId and ArchetypeComponentId access is applied to SystemMeta. If this
++// SAFETY: NonSendMut ComponentId access is applied to SystemMeta. If this
+ // NonSendMut conflicts with any prior access, a panic will occur.
+ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+     type State = ComponentId;
+@@ -1514,7 +1426,6 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+         system_meta.set_non_send();
+ 
+         let component_id = world.components_registrator().register_non_send::<T>();
+-        let archetype_component_id = world.initialize_non_send_internal(component_id).id();
+ 
+         let combined_access = system_meta.component_access_set.combined_access();
+         if combined_access.has_component_write(component_id) {
+@@ -1530,16 +1441,12 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+             .component_access_set
+             .add_unfiltered_resource_write(component_id);
+ 
+-        system_meta
+-            .archetype_component_access
+-            .add_resource_write(archetype_component_id);
+-
+         component_id
+     }
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        &component_id: &Self::State,
++        &mut component_id: &mut Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -1741,15 +1648,6 @@ unsafe impl<T: SystemParam> SystemParam for Option<T> {
+             .map(|()| T::get_param(state, system_meta, world, change_tick))
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-        unsafe { T::new_archetype(state, archetype, system_meta) };
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         T::apply(state, system_meta, world);
+     }
+@@ -1783,15 +1681,6 @@ unsafe impl<T: SystemParam> SystemParam for Result<T, SystemParamValidationError
+             .map(|()| T::get_param(state, system_meta, world, change_tick))
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-        unsafe { T::new_archetype(state, archetype, system_meta) };
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         T::apply(state, system_meta, world);
+     }
+@@ -1869,7 +1758,7 @@ unsafe impl<T: SystemParam> SystemParam for When<T> {
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -1889,15 +1778,6 @@ unsafe impl<T: SystemParam> SystemParam for When<T> {
+         When(T::get_param(state, system_meta, world, change_tick))
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-        unsafe { T::new_archetype(state, archetype, system_meta) };
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         T::apply(state, system_meta, world);
+     }
+@@ -1924,7 +1804,7 @@ unsafe impl<T: SystemParam> SystemParam for Vec<T> {
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -1950,17 +1830,6 @@ unsafe impl<T: SystemParam> SystemParam for Vec<T> {
+             .collect()
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        for state in state {
+-            // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-            unsafe { T::new_archetype(state, archetype, system_meta) };
+-        }
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         for state in state {
+             T::apply(state, system_meta, world);
+@@ -2001,17 +1870,6 @@ unsafe impl<T: SystemParam> SystemParam for ParamSet<'_, '_, Vec<T>> {
+         }
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        for state in state {
+-            // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-            unsafe { T::new_archetype(state, archetype, system_meta) }
+-        }
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         for state in state {
+             T::apply(state, system_meta, world);
+@@ -2086,16 +1944,6 @@ macro_rules! impl_system_param_tuple {
+                 (($($param::init_state(world, system_meta),)*))
+             }
+ 
+-            #[inline]
+-            unsafe fn new_archetype(($($param,)*): &mut Self::State, archetype: &Archetype, system_meta: &mut SystemMeta) {
+-                #[allow(
+-                    unused_unsafe,
+-                    reason = "Zero-length tuples will not run anything in the unsafe block."
+-                )]
+-                // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-                unsafe { $($param::new_archetype($param, archetype, system_meta);)* }
+-            }
+-
+             #[inline]
+             fn apply(($($param,)*): &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+                 $($param::apply($param, system_meta, world);)*
+@@ -2112,7 +1960,7 @@ macro_rules! impl_system_param_tuple {
+ 
+             #[inline]
+             unsafe fn validate_param(
+-                state: &Self::State,
++                state: &mut Self::State,
+                 system_meta: &SystemMeta,
+                 world: UnsafeWorldCell,
+             ) -> Result<(), SystemParamValidationError> {
+@@ -2265,15 +2113,6 @@ unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_,
+         P::init_state(world, system_meta)
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: The caller guarantees that the provided `archetype` matches the World used to initialize `state`.
+-        unsafe { P::new_archetype(state, archetype, system_meta) };
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         P::apply(state, system_meta, world);
+     }
+@@ -2284,7 +2123,7 @@ unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_,
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -2511,12 +2350,6 @@ impl DynSystemParamState {
+ 
+ /// Allows a [`SystemParam::State`] to be used as a trait object for implementing [`DynSystemParam`].
+ trait DynParamState: Sync + Send + Any {
+-    /// For the specified [`Archetype`], registers the components accessed by this [`SystemParam`] (if applicable).a
+-    ///
+-    /// # Safety
+-    /// `archetype` must be from the [`World`] used to initialize `state` in [`SystemParam::init_state`].
+-    unsafe fn new_archetype(&mut self, archetype: &Archetype, system_meta: &mut SystemMeta);
+-
+     /// Applies any deferred mutations stored in this [`SystemParam`]'s state.
+     /// This is used to apply [`Commands`] during [`ApplyDeferred`](crate::prelude::ApplyDeferred).
+     ///
+@@ -2531,7 +2364,7 @@ trait DynParamState: Sync + Send + Any {
+     /// # Safety
+     /// Refer to [`SystemParam::validate_param`].
+     unsafe fn validate_param(
+-        &self,
++        &mut self,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError>;
+@@ -2541,11 +2374,6 @@ trait DynParamState: Sync + Send + Any {
+ struct ParamState<T: SystemParam>(T::State);
+ 
+ impl<T: SystemParam + 'static> DynParamState for ParamState<T> {
+-    unsafe fn new_archetype(&mut self, archetype: &Archetype, system_meta: &mut SystemMeta) {
+-        // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-        unsafe { T::new_archetype(&mut self.0, archetype, system_meta) };
+-    }
+-
+     fn apply(&mut self, system_meta: &SystemMeta, world: &mut World) {
+         T::apply(&mut self.0, system_meta, world);
+     }
+@@ -2555,11 +2383,11 @@ impl<T: SystemParam + 'static> DynParamState for ParamState<T> {
+     }
+ 
+     unsafe fn validate_param(
+-        &self,
++        &mut self,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        T::validate_param(&self.0, system_meta, world)
++        T::validate_param(&mut self.0, system_meta, world)
+     }
+ }
+ 
+@@ -2575,7 +2403,7 @@ unsafe impl SystemParam for DynSystemParam<'_, '_> {
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -2597,15 +2425,6 @@ unsafe impl SystemParam for DynSystemParam<'_, '_> {
+         unsafe { DynSystemParam::new(state.0.as_mut(), world, system_meta.clone(), change_tick) }
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-        unsafe { state.0.new_archetype(archetype, system_meta) };
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         state.0.apply(system_meta, world);
+     }
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index b44e528492ffa..2a97b6a0bb49c 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -2690,12 +2690,9 @@ impl World {
+         component_id: ComponentId,
+     ) -> &mut ResourceData<true> {
+         self.flush_components();
+-        let archetypes = &mut self.archetypes;
+         self.storages
+             .resources
+-            .initialize_with(component_id, &self.components, || {
+-                archetypes.new_archetype_component_id()
+-            })
++            .initialize_with(component_id, &self.components)
+     }
+ 
+     /// # Panics
+@@ -2706,12 +2703,9 @@ impl World {
+         component_id: ComponentId,
+     ) -> &mut ResourceData<false> {
+         self.flush_components();
+-        let archetypes = &mut self.archetypes;
+         self.storages
+             .non_send_resources
+-            .initialize_with(component_id, &self.components, || {
+-                archetypes.new_archetype_component_id()
+-            })
++            .initialize_with(component_id, &self.components)
+     }
+ 
+     /// Empties queued entities and adds them to the empty [`Archetype`](crate::archetype::Archetype).
+diff --git a/crates/bevy_gizmos/src/gizmos.rs b/crates/bevy_gizmos/src/gizmos.rs
+index 06a6a71f1f67a..87af7c4925287 100644
+--- a/crates/bevy_gizmos/src/gizmos.rs
++++ b/crates/bevy_gizmos/src/gizmos.rs
+@@ -205,29 +205,20 @@ where
+         }
+     }
+ 
+-    unsafe fn new_archetype(
+-        state: &mut Self::State,
+-        archetype: &bevy_ecs::archetype::Archetype,
+-        system_meta: &mut SystemMeta,
+-    ) {
+-        // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+-        unsafe {
+-            GizmosState::<Config, Clear>::new_archetype(&mut state.state, archetype, system_meta);
+-        };
+-    }
+-
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+         GizmosState::<Config, Clear>::apply(&mut state.state, system_meta, world);
+     }
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Delegated to existing `SystemParam` implementations.
+-        unsafe { GizmosState::<Config, Clear>::validate_param(&state.state, system_meta, world) }
++        unsafe {
++            GizmosState::<Config, Clear>::validate_param(&mut state.state, system_meta, world)
++        }
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_render/src/extract_param.rs b/crates/bevy_render/src/extract_param.rs
+index f54309847426e..ac6b04ff0fa36 100644
+--- a/crates/bevy_render/src/extract_param.rs
++++ b/crates/bevy_render/src/extract_param.rs
+@@ -81,7 +81,7 @@ where
+ 
+     #[inline]
+     unsafe fn validate_param(
+-        state: &Self::State,
++        state: &mut Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+@@ -97,7 +97,7 @@ where
+         // SAFETY: We provide the main world on which this system state was initialized on.
+         unsafe {
+             SystemState::<P>::validate_param(
+-                &state.state,
++                &mut state.state,
+                 main_world.as_unsafe_world_cell_readonly(),
+             )
+         }
+diff --git a/crates/bevy_render/src/render_phase/draw.rs b/crates/bevy_render/src/render_phase/draw.rs
+index a12d336018508..374dc6b33081c 100644
+--- a/crates/bevy_render/src/render_phase/draw.rs
++++ b/crates/bevy_render/src/render_phase/draw.rs
+@@ -315,7 +315,6 @@ where
+     /// Prepares the render command to be used. This is called once and only once before the phase
+     /// begins. There may be zero or more [`draw`](RenderCommandState::draw) calls following a call to this function.
+     fn prepare(&mut self, world: &'_ World) {
+-        self.state.update_archetypes(world);
+         self.view.update_archetypes(world);
+         self.entity.update_archetypes(world);
+     }
+@@ -328,7 +327,7 @@ where
+         view: Entity,
+         item: &P,
+     ) -> Result<(), DrawError> {
+-        let param = self.state.get_manual(world);
++        let param = self.state.get(world);
+         let view = match self.view.get_manual(world, view) {
+             Ok(view) => view,
+             Err(err) => match err {
+diff --git a/examples/stress_tests/many_components.rs b/examples/stress_tests/many_components.rs
+index 88384dd721b92..59720f3b5a25c 100644
+--- a/examples/stress_tests/many_components.rs
++++ b/examples/stress_tests/many_components.rs
+@@ -158,11 +158,6 @@ fn stress_test(num_entities: u32, num_components: u32, num_systems: u32) {
+         }
+     }
+ 
+-    println!(
+-        "Number of Archetype-Components: {}",
+-        world.archetypes().archetype_components_len()
+-    );
+-
+     // overwrite Update schedule in the app
+     app.add_schedule(schedule);
+     app.add_plugins(MinimalPlugins)
+diff --git a/release-content/migration-guides/remove_archetype_component_id.md b/release-content/migration-guides/remove_archetype_component_id.md
+new file mode 100644
+index 0000000000000..98f85748adaf4
+--- /dev/null
++++ b/release-content/migration-guides/remove_archetype_component_id.md
+@@ -0,0 +1,22 @@
++---
++title: Remove `ArchetypeComponentId`
++pull_requests: [19143]
++---
++
++Scheduling no longer uses `archetype_component_access` or `ArchetypeComponentId`.
++To reduce memory usage and simplify the implementation, all uses of them have been removed.
++Since we no longer need to update access before a system runs, `Query` now updates it state when the system runs instead of ahead of time.
++
++`SystemParam::validate_param` now takes `&mut Self::State` instead of `&Self::State` so that queries can update their state during validation.
++
++The trait methods `System::update_archetype_component_access` and `SystemParam::new_archetype` have been removed.
++They are no longer necessary, so calls to them can be removed.
++If you were implementing the traits manually, move any logic from those methods into `System::validate_param_unsafe`, `System::run_unsafe`, `SystemParam::validate_param`, or `SystemParam::get_param`, which can no longer rely on `update_archetype_component_access` being called first.
++
++The following methods on `SystemState` have been deprecated:
++
++* `update_archetypes` - Remove calls, as they no longer do anything
++* `update_archetypes_unsafe_world_cell` - Remove calls, as they no longer do anything
++* `get_manual` - Replace with `get`, as there is no longer a difference
++* `get_manual_mut` - Replace with `get_mut`, as there is no longer a difference
++* `get_unchecked_mut` - Replace with `get_unchecked`, as there is no longer a difference
