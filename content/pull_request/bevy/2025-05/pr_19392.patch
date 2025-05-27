@@ -1,0 +1,318 @@
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index 6ac974244361a..771eb473fdd94 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -42,16 +42,17 @@ pub use sprite::*;
+ pub use texture_slice::*;
+ 
+ use bevy_app::prelude::*;
+-use bevy_asset::{load_internal_asset, weak_handle, AssetEventSystems, Assets, Handle};
++use bevy_asset::{embedded_asset, AssetEventSystems, Assets};
+ use bevy_core_pipeline::core_2d::{AlphaMask2d, Opaque2d, Transparent2d};
+ use bevy_ecs::prelude::*;
+ use bevy_image::{prelude::*, TextureAtlasPlugin};
+ use bevy_render::{
+     batching::sort_binned_render_phase,
++    load_shader_library,
+     mesh::{Mesh, Mesh2d, MeshAabb},
+     primitives::Aabb,
+     render_phase::AddRenderCommand,
+-    render_resource::{Shader, SpecializedRenderPipelines},
++    render_resource::SpecializedRenderPipelines,
+     view::{NoFrustumCulling, VisibilitySystems},
+     ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+@@ -60,11 +61,6 @@ use bevy_render::{
+ #[derive(Default)]
+ pub struct SpritePlugin;
+ 
+-pub const SPRITE_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("ed996613-54c0-49bd-81be-1c2d1a0d03c2");
+-pub const SPRITE_VIEW_BINDINGS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("43947210-8df6-459a-8f2a-12f350d174cc");
+-
+ /// System set for sprite rendering.
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+ pub enum SpriteSystems {
+@@ -78,18 +74,9 @@ pub type SpriteSystem = SpriteSystems;
+ 
+ impl Plugin for SpritePlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            SPRITE_SHADER_HANDLE,
+-            "render/sprite.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            SPRITE_VIEW_BINDINGS_SHADER_HANDLE,
+-            "render/sprite_view_bindings.wgsl",
+-            Shader::from_wgsl
+-        );
++        load_shader_library!(app, "render/sprite_view_bindings.wgsl");
++
++        embedded_asset!(app, "render/sprite.wgsl");
+ 
+         if !app.is_plugin_added::<TextureAtlasPlugin>() {
+             app.add_plugins(TextureAtlasPlugin);
+diff --git a/crates/bevy_sprite/src/mesh2d/color_material.rs b/crates/bevy_sprite/src/mesh2d/color_material.rs
+index 83b69307769cb..d814cfc384c5b 100644
+--- a/crates/bevy_sprite/src/mesh2d/color_material.rs
++++ b/crates/bevy_sprite/src/mesh2d/color_material.rs
+@@ -1,26 +1,18 @@
+ use crate::{AlphaMode2d, Material2d, Material2dPlugin};
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, weak_handle, Asset, AssetApp, Assets, Handle};
++use bevy_asset::{embedded_asset, embedded_path, Asset, AssetApp, AssetPath, Assets, Handle};
+ use bevy_color::{Alpha, Color, ColorToComponents, LinearRgba};
+ use bevy_image::Image;
+ use bevy_math::{Affine2, Mat3, Vec4};
+ use bevy_reflect::prelude::*;
+ use bevy_render::{render_asset::RenderAssets, render_resource::*, texture::GpuImage};
+ 
+-pub const COLOR_MATERIAL_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("92e0e6e9-ed0b-4db3-89ab-5f65d3678250");
+-
+ #[derive(Default)]
+ pub struct ColorMaterialPlugin;
+ 
+ impl Plugin for ColorMaterialPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            COLOR_MATERIAL_SHADER_HANDLE,
+-            "color_material.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "color_material.wgsl");
+ 
+         app.add_plugins(Material2dPlugin::<ColorMaterial>::default())
+             .register_asset_reflect::<ColorMaterial>();
+@@ -152,7 +144,9 @@ impl AsBindGroupShaderType<ColorMaterialUniform> for ColorMaterial {
+ 
+ impl Material2d for ColorMaterial {
+     fn fragment_shader() -> ShaderRef {
+-        COLOR_MATERIAL_SHADER_HANDLE.into()
++        ShaderRef::Path(
++            AssetPath::from_path_buf(embedded_path!("color_material.wgsl")).with_source("embedded"),
++        )
+     }
+ 
+     fn alpha_mode(&self) -> AlphaMode2d {
+diff --git a/crates/bevy_sprite/src/mesh2d/mesh.rs b/crates/bevy_sprite/src/mesh2d/mesh.rs
+index 3bacc351944f2..a3d9ee3eb23fd 100644
+--- a/crates/bevy_sprite/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite/src/mesh2d/mesh.rs
+@@ -1,5 +1,6 @@
+ use bevy_app::Plugin;
+-use bevy_asset::{load_internal_asset, weak_handle, AssetId, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, Handle};
++use bevy_render::load_shader_library;
+ 
+ use crate::{tonemapping_pipeline_key, Material2dBindGroupId};
+ use bevy_core_pipeline::tonemapping::DebandDither;
+@@ -57,54 +58,15 @@ use tracing::error;
+ #[derive(Default)]
+ pub struct Mesh2dRenderPlugin;
+ 
+-pub const MESH2D_VERTEX_OUTPUT: Handle<Shader> =
+-    weak_handle!("71e279c7-85a0-46ac-9a76-1586cbf506d0");
+-pub const MESH2D_VIEW_TYPES_HANDLE: Handle<Shader> =
+-    weak_handle!("01087b0d-91e9-46ac-8628-dfe19a7d4b83");
+-pub const MESH2D_VIEW_BINDINGS_HANDLE: Handle<Shader> =
+-    weak_handle!("fbdd8b80-503d-4688-bcec-db29ab4620b2");
+-pub const MESH2D_TYPES_HANDLE: Handle<Shader> =
+-    weak_handle!("199f2089-6e99-4348-9bb1-d82816640a7f");
+-pub const MESH2D_BINDINGS_HANDLE: Handle<Shader> =
+-    weak_handle!("a7bd44cc-0580-4427-9a00-721cf386b6e4");
+-pub const MESH2D_FUNCTIONS_HANDLE: Handle<Shader> =
+-    weak_handle!("0d08ff71-68c1-4017-83e2-bfc34d285c51");
+-pub const MESH2D_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("91a7602b-df95-4ea3-9d97-076abcb69d91");
+-
+ impl Plugin for Mesh2dRenderPlugin {
+     fn build(&self, app: &mut bevy_app::App) {
+-        load_internal_asset!(
+-            app,
+-            MESH2D_VERTEX_OUTPUT,
+-            "mesh2d_vertex_output.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            MESH2D_VIEW_TYPES_HANDLE,
+-            "mesh2d_view_types.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            MESH2D_VIEW_BINDINGS_HANDLE,
+-            "mesh2d_view_bindings.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            MESH2D_TYPES_HANDLE,
+-            "mesh2d_types.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            MESH2D_FUNCTIONS_HANDLE,
+-            "mesh2d_functions.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(app, MESH2D_SHADER_HANDLE, "mesh2d.wgsl", Shader::from_wgsl);
++        load_shader_library!(app, "mesh2d_vertex_output.wgsl");
++        load_shader_library!(app, "mesh2d_view_types.wgsl");
++        load_shader_library!(app, "mesh2d_view_bindings.wgsl");
++        load_shader_library!(app, "mesh2d_types.wgsl");
++        load_shader_library!(app, "mesh2d_functions.wgsl");
++
++        embedded_asset!(app, "mesh2d.wgsl");
+ 
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app
+@@ -168,13 +130,10 @@ impl Plugin for Mesh2dRenderPlugin {
+ 
+         // Load the mesh_bindings shader module here as it depends on runtime information about
+         // whether storage buffers are supported, or the maximum uniform buffer binding size.
+-        load_internal_asset!(
+-            app,
+-            MESH2D_BINDINGS_HANDLE,
+-            "mesh2d_bindings.wgsl",
+-            Shader::from_wgsl_with_defs,
+-            mesh_bindings_shader_defs
+-        );
++        load_shader_library!(app, "mesh2d_bindings.wgsl", move |settings| *settings =
++            ShaderSettings {
++                shader_defs: mesh_bindings_shader_defs.clone()
++            });
+     }
+ }
+ 
+@@ -316,6 +275,7 @@ pub fn extract_mesh2d(
+ pub struct Mesh2dPipeline {
+     pub view_layout: BindGroupLayout,
+     pub mesh_layout: BindGroupLayout,
++    pub shader: Handle<Shader>,
+     // This dummy white texture is to be used in place of optional textures
+     pub dummy_white_gpu_image: GpuImage,
+     pub per_object_buffer_batch_size: Option<u32>,
+@@ -397,6 +357,7 @@ impl FromWorld for Mesh2dPipeline {
+             per_object_buffer_batch_size: GpuArrayBuffer::<Mesh2dUniform>::batch_size(
+                 render_device,
+             ),
++            shader: load_embedded_asset!(world, "mesh2d.wgsl"),
+         }
+     }
+ }
+@@ -690,13 +651,13 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
+ 
+         Ok(RenderPipelineDescriptor {
+             vertex: VertexState {
+-                shader: MESH2D_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 entry_point: "vertex".into(),
+                 shader_defs: shader_defs.clone(),
+                 buffers: vec![vertex_buffer_layout],
+             },
+             fragment: Some(FragmentState {
+-                shader: MESH2D_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs,
+                 entry_point: "fragment".into(),
+                 targets: vec![Some(ColorTargetState {
+diff --git a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+index 468a47f6bbf8f..8ffb12a58288c 100644
+--- a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
++++ b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+@@ -4,7 +4,7 @@ use crate::{
+ };
+ use bevy_app::{App, Plugin, PostUpdate, Startup, Update};
+ use bevy_asset::{
+-    load_internal_asset, prelude::AssetChanged, weak_handle, AsAssetId, Asset, AssetApp,
++    embedded_asset, load_embedded_asset, prelude::AssetChanged, AsAssetId, Asset, AssetApp,
+     AssetEventSystems, AssetId, Assets, Handle, UntypedAssetId,
+ };
+ use bevy_color::{Color, ColorToComponents};
+@@ -54,9 +54,6 @@ use bevy_render::{
+ use core::{hash::Hash, ops::Range};
+ use tracing::error;
+ 
+-pub const WIREFRAME_2D_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("2d8a3853-2927-4de2-9dc7-3971e7e40970");
+-
+ /// A [`Plugin`] that draws wireframes for 2D meshes.
+ ///
+ /// Wireframes currently do not work when using webgl or webgpu.
+@@ -81,12 +78,7 @@ impl Wireframe2dPlugin {
+ 
+ impl Plugin for Wireframe2dPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            WIREFRAME_2D_SHADER_HANDLE,
+-            "wireframe2d.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "wireframe2d.wgsl");
+ 
+         app.add_plugins((
+             BinnedRenderPhasePlugin::<Wireframe2dPhaseItem, Mesh2dPipeline>::new(self.debug_flags),
+@@ -339,7 +331,7 @@ impl FromWorld for Wireframe2dPipeline {
+     fn from_world(render_world: &mut World) -> Self {
+         Wireframe2dPipeline {
+             mesh_pipeline: render_world.resource::<Mesh2dPipeline>().clone(),
+-            shader: WIREFRAME_2D_SHADER_HANDLE,
++            shader: load_embedded_asset!(render_world, "wireframe2d.wgsl"),
+         }
+     }
+ }
+diff --git a/crates/bevy_sprite/src/render/mod.rs b/crates/bevy_sprite/src/render/mod.rs
+index a81f9048f992a..7602addc0b793 100644
+--- a/crates/bevy_sprite/src/render/mod.rs
++++ b/crates/bevy_sprite/src/render/mod.rs
+@@ -1,7 +1,7 @@
+ use core::ops::Range;
+ 
+-use crate::{Anchor, ComputedTextureSlices, ScalingMode, Sprite, SPRITE_SHADER_HANDLE};
+-use bevy_asset::{AssetEvent, AssetId, Assets};
++use crate::{Anchor, ComputedTextureSlices, ScalingMode, Sprite};
++use bevy_asset::{load_embedded_asset, AssetEvent, AssetId, Assets, Handle};
+ use bevy_color::{ColorToComponents, LinearRgba};
+ use bevy_core_pipeline::{
+     core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT},
+@@ -47,6 +47,7 @@ use fixedbitset::FixedBitSet;
+ pub struct SpritePipeline {
+     view_layout: BindGroupLayout,
+     material_layout: BindGroupLayout,
++    shader: Handle<Shader>,
+     pub dummy_white_gpu_image: GpuImage,
+ }
+ 
+@@ -124,6 +125,7 @@ impl FromWorld for SpritePipeline {
+             view_layout,
+             material_layout,
+             dummy_white_gpu_image,
++            shader: load_embedded_asset!(world, "sprite.wgsl"),
+         }
+     }
+ }
+@@ -267,13 +269,13 @@ impl SpecializedRenderPipeline for SpritePipeline {
+ 
+         RenderPipelineDescriptor {
+             vertex: VertexState {
+-                shader: SPRITE_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 entry_point: "vertex".into(),
+                 shader_defs: shader_defs.clone(),
+                 buffers: vec![instance_rate_vertex_buffer_layout],
+             },
+             fragment: Some(FragmentState {
+-                shader: SPRITE_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs,
+                 entry_point: "fragment".into(),
+                 targets: vec![Some(ColorTargetState {
