@@ -1,0 +1,912 @@
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs b/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
+index 7e7e6c1af7f4e..172de3c3930cd 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
++++ b/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
+@@ -1,12 +1,12 @@
+ use bevy_app::prelude::*;
+-use bevy_asset::{load_internal_asset, AssetApp, Assets, Handle};
++use bevy_asset::{embedded_asset, AssetApp, Assets, Handle};
+ use bevy_ecs::prelude::*;
+ use bevy_render::{
+     extract_component::ExtractComponentPlugin,
+     render_asset::RenderAssetPlugin,
+     render_graph::RenderGraphApp,
+     render_resource::{
+-        Buffer, BufferDescriptor, BufferUsages, PipelineCache, Shader, SpecializedComputePipelines,
++        Buffer, BufferDescriptor, BufferUsages, PipelineCache, SpecializedComputePipelines,
+     },
+     renderer::RenderDevice,
+     ExtractSchedule, Render, RenderApp, RenderSystems,
+@@ -21,9 +21,7 @@ mod settings;
+ use buffers::{extract_buffers, prepare_buffers, AutoExposureBuffers};
+ pub use compensation_curve::{AutoExposureCompensationCurve, AutoExposureCompensationCurveError};
+ use node::AutoExposureNode;
+-use pipeline::{
+-    AutoExposurePass, AutoExposurePipeline, ViewAutoExposurePipeline, METERING_SHADER_HANDLE,
+-};
++use pipeline::{AutoExposurePass, AutoExposurePipeline, ViewAutoExposurePipeline};
+ pub use settings::AutoExposure;
+ 
+ use crate::{
+@@ -43,12 +41,7 @@ struct AutoExposureResources {
+ 
+ impl Plugin for AutoExposurePlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            METERING_SHADER_HANDLE,
+-            "auto_exposure.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "auto_exposure.wgsl");
+ 
+         app.add_plugins(RenderAssetPlugin::<GpuAutoExposureCompensationCurve>::default())
+             .register_type::<AutoExposureCompensationCurve>()
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs b/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs
+index 06fa118827fe7..28ed6b4ee867c 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs
++++ b/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs
+@@ -1,7 +1,7 @@
+ use super::compensation_curve::{
+     AutoExposureCompensationCurve, AutoExposureCompensationCurveUniform,
+ };
+-use bevy_asset::{prelude::*, weak_handle};
++use bevy_asset::{load_embedded_asset, prelude::*};
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
+ use bevy_render::{
+@@ -44,9 +44,6 @@ pub enum AutoExposurePass {
+     Average,
+ }
+ 
+-pub const METERING_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("05c84384-afa4-41d9-844e-e9cd5e7609af");
+-
+ pub const HISTOGRAM_BIN_COUNT: u64 = 64;
+ 
+ impl FromWorld for AutoExposurePipeline {
+@@ -71,7 +68,7 @@ impl FromWorld for AutoExposurePipeline {
+                     ),
+                 ),
+             ),
+-            histogram_shader: METERING_SHADER_HANDLE.clone(),
++            histogram_shader: load_embedded_asset!(world, "auto_exposure.wgsl"),
+         }
+     }
+ }
+diff --git a/crates/bevy_core_pipeline/src/blit/mod.rs b/crates/bevy_core_pipeline/src/blit/mod.rs
+index 53c54c6d2d7aa..111b6e443b62a 100644
+--- a/crates/bevy_core_pipeline/src/blit/mod.rs
++++ b/crates/bevy_core_pipeline/src/blit/mod.rs
+@@ -1,5 +1,5 @@
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
+ use bevy_ecs::prelude::*;
+ use bevy_render::{
+     render_resource::{
+@@ -12,14 +12,12 @@ use bevy_render::{
+ 
+ use crate::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
+ 
+-pub const BLIT_SHADER_HANDLE: Handle<Shader> = weak_handle!("59be3075-c34e-43e7-bf24-c8fe21a0192e");
+-
+ /// Adds support for specialized "blit pipelines", which can be used to write one texture to another.
+ pub struct BlitPlugin;
+ 
+ impl Plugin for BlitPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(app, BLIT_SHADER_HANDLE, "blit.wgsl", Shader::from_wgsl);
++        embedded_asset!(app, "blit.wgsl");
+ 
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app.allow_ambiguous_resource::<SpecializedRenderPipelines<BlitPipeline>>();
+@@ -40,6 +38,7 @@ impl Plugin for BlitPlugin {
+ pub struct BlitPipeline {
+     pub texture_bind_group: BindGroupLayout,
+     pub sampler: Sampler,
++    pub shader: Handle<Shader>,
+ }
+ 
+ impl FromWorld for BlitPipeline {
+@@ -62,6 +61,7 @@ impl FromWorld for BlitPipeline {
+         BlitPipeline {
+             texture_bind_group,
+             sampler,
++            shader: load_embedded_asset!(render_world, "blit.wgsl"),
+         }
+     }
+ }
+@@ -82,7 +82,7 @@ impl SpecializedRenderPipeline for BlitPipeline {
+             layout: vec![self.texture_bind_group.clone()],
+             vertex: fullscreen_shader_vertex_state(),
+             fragment: Some(FragmentState {
+-                shader: BLIT_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs: vec![],
+                 entry_point: "fs_main".into(),
+                 targets: vec![Some(ColorTargetState {
+diff --git a/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs b/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
+index 544b420bfdb68..88da2db0ccc9c 100644
+--- a/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
++++ b/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
+@@ -1,5 +1,6 @@
+-use super::{Bloom, BLOOM_SHADER_HANDLE, BLOOM_TEXTURE_FORMAT};
++use super::{Bloom, BLOOM_TEXTURE_FORMAT};
+ use crate::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
++use bevy_asset::{load_embedded_asset, Handle};
+ use bevy_ecs::{
+     prelude::{Component, Entity},
+     resource::Resource,
+@@ -26,6 +27,8 @@ pub struct BloomDownsamplingPipeline {
+     /// Layout with a texture, a sampler, and uniforms
+     pub bind_group_layout: BindGroupLayout,
+     pub sampler: Sampler,
++    /// The shader asset handle.
++    pub shader: Handle<Shader>,
+ }
+ 
+ #[derive(PartialEq, Eq, Hash, Clone)]
+@@ -78,6 +81,7 @@ impl FromWorld for BloomDownsamplingPipeline {
+         BloomDownsamplingPipeline {
+             bind_group_layout,
+             sampler,
++            shader: load_embedded_asset!(world, "bloom.wgsl"),
+         }
+     }
+ }
+@@ -120,7 +124,7 @@ impl SpecializedRenderPipeline for BloomDownsamplingPipeline {
+             layout,
+             vertex: fullscreen_shader_vertex_state(),
+             fragment: Some(FragmentState {
+-                shader: BLOOM_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs,
+                 entry_point,
+                 targets: vec![Some(ColorTargetState {
+diff --git a/crates/bevy_core_pipeline/src/bloom/mod.rs b/crates/bevy_core_pipeline/src/bloom/mod.rs
+index cbd87d11bd188..10ffdf9c6376e 100644
+--- a/crates/bevy_core_pipeline/src/bloom/mod.rs
++++ b/crates/bevy_core_pipeline/src/bloom/mod.rs
+@@ -9,7 +9,7 @@ use crate::{
+     core_3d::graph::{Core3d, Node3d},
+ };
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::embedded_asset;
+ use bevy_color::{Gray, LinearRgba};
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_math::{ops, UVec2};
+@@ -36,15 +36,13 @@ use upsampling_pipeline::{
+     prepare_upsampling_pipeline, BloomUpsamplingPipeline, UpsamplingPipelineIds,
+ };
+ 
+-const BLOOM_SHADER_HANDLE: Handle<Shader> = weak_handle!("c9190ddc-573b-4472-8b21-573cab502b73");
+-
+ const BLOOM_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rg11b10Ufloat;
+ 
+ pub struct BloomPlugin;
+ 
+ impl Plugin for BloomPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(app, BLOOM_SHADER_HANDLE, "bloom.wgsl", Shader::from_wgsl);
++        embedded_asset!(app, "bloom.wgsl");
+ 
+         app.register_type::<Bloom>();
+         app.register_type::<BloomPrefilter>();
+diff --git a/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs b/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
+index e4c4ed4a647f9..f381e664a9680 100644
+--- a/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
++++ b/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
+@@ -1,8 +1,8 @@
+ use super::{
+-    downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode, BLOOM_SHADER_HANDLE,
+-    BLOOM_TEXTURE_FORMAT,
++    downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode, BLOOM_TEXTURE_FORMAT,
+ };
+ use crate::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
++use bevy_asset::{load_embedded_asset, Handle};
+ use bevy_ecs::{
+     prelude::{Component, Entity},
+     resource::Resource,
+@@ -27,6 +27,8 @@ pub struct UpsamplingPipelineIds {
+ #[derive(Resource)]
+ pub struct BloomUpsamplingPipeline {
+     pub bind_group_layout: BindGroupLayout,
++    /// The shader asset handle.
++    pub shader: Handle<Shader>,
+ }
+ 
+ #[derive(PartialEq, Eq, Hash, Clone)]
+@@ -54,7 +56,10 @@ impl FromWorld for BloomUpsamplingPipeline {
+             ),
+         );
+ 
+-        BloomUpsamplingPipeline { bind_group_layout }
++        BloomUpsamplingPipeline {
++            bind_group_layout,
++            shader: load_embedded_asset!(world, "bloom.wgsl"),
++        }
+     }
+ }
+ 
+@@ -105,7 +110,7 @@ impl SpecializedRenderPipeline for BloomUpsamplingPipeline {
+             layout: vec![self.bind_group_layout.clone()],
+             vertex: fullscreen_shader_vertex_state(),
+             fragment: Some(FragmentState {
+-                shader: BLOOM_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs: vec![],
+                 entry_point: "upsample".into(),
+                 targets: vec![Some(ColorTargetState {
+diff --git a/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs b/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs
+index 77430e0291d5e..0e9465aafaa75 100644
+--- a/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs
++++ b/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs
+@@ -3,7 +3,7 @@ use crate::{
+     prepass::{DeferredPrepass, ViewPrepassTextures},
+ };
+ use bevy_app::prelude::*;
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset};
+ use bevy_ecs::prelude::*;
+ use bevy_math::UVec2;
+ use bevy_render::{
+@@ -23,18 +23,11 @@ use bevy_render::{
+ 
+ use super::DEFERRED_LIGHTING_PASS_ID_DEPTH_FORMAT;
+ 
+-pub const COPY_DEFERRED_LIGHTING_ID_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("70d91342-1c43-4b20-973f-aa6ce93aa617");
+ pub struct CopyDeferredLightingIdPlugin;
+ 
+ impl Plugin for CopyDeferredLightingIdPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            COPY_DEFERRED_LIGHTING_ID_SHADER_HANDLE,
+-            "copy_deferred_lighting_id.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "copy_deferred_lighting_id.wgsl");
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+@@ -137,6 +130,8 @@ impl FromWorld for CopyDeferredLightingIdPipeline {
+             ),
+         );
+ 
++        let shader = load_embedded_asset!(world, "copy_deferred_lighting_id.wgsl");
++
+         let pipeline_id =
+             world
+                 .resource_mut::<PipelineCache>()
+@@ -145,7 +140,7 @@ impl FromWorld for CopyDeferredLightingIdPipeline {
+                     layout: vec![layout.clone()],
+                     vertex: fullscreen_shader_vertex_state(),
+                     fragment: Some(FragmentState {
+-                        shader: COPY_DEFERRED_LIGHTING_ID_SHADER_HANDLE,
++                        shader,
+                         shader_defs: vec![],
+                         entry_point: "fragment".into(),
+                         targets: vec![],
+diff --git a/crates/bevy_core_pipeline/src/dof/mod.rs b/crates/bevy_core_pipeline/src/dof/mod.rs
+index 5eee57b8bb338..38f5e1e796f8a 100644
+--- a/crates/bevy_core_pipeline/src/dof/mod.rs
++++ b/crates/bevy_core_pipeline/src/dof/mod.rs
+@@ -15,7 +15,7 @@
+ //! [Depth of field]: https://en.wikipedia.org/wiki/Depth_of_field
+ 
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     component::Component,
+@@ -69,8 +69,6 @@ use crate::{
+     fullscreen_vertex_shader::fullscreen_shader_vertex_state,
+ };
+ 
+-const DOF_SHADER_HANDLE: Handle<Shader> = weak_handle!("c3580ddc-2cbc-4535-a02b-9a2959066b52");
+-
+ /// A plugin that adds support for the depth of field effect to Bevy.
+ pub struct DepthOfFieldPlugin;
+ 
+@@ -206,7 +204,7 @@ enum DofPass {
+ 
+ impl Plugin for DepthOfFieldPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(app, DOF_SHADER_HANDLE, "dof.wgsl", Shader::from_wgsl);
++        embedded_asset!(app, "dof.wgsl");
+ 
+         app.register_type::<DepthOfField>();
+         app.register_type::<DepthOfFieldMode>();
+@@ -327,6 +325,8 @@ pub struct DepthOfFieldPipeline {
+     /// The bind group layout shared among all invocations of the depth of field
+     /// shader.
+     global_bind_group_layout: BindGroupLayout,
++    /// The shader asset handle.
++    shader: Handle<Shader>,
+ }
+ 
+ impl ViewNode for DepthOfFieldNode {
+@@ -678,11 +678,13 @@ pub fn prepare_depth_of_field_pipelines(
+         &ViewDepthOfFieldBindGroupLayouts,
+         &Msaa,
+     )>,
++    asset_server: Res<AssetServer>,
+ ) {
+     for (entity, view, depth_of_field, view_bind_group_layouts, msaa) in view_targets.iter() {
+         let dof_pipeline = DepthOfFieldPipeline {
+             view_bind_group_layouts: view_bind_group_layouts.clone(),
+             global_bind_group_layout: global_bind_group_layout.layout.clone(),
++            shader: load_embedded_asset!(asset_server.as_ref(), "dof.wgsl"),
+         };
+ 
+         // We'll need these two flags to create the `DepthOfFieldPipelineKey`s.
+@@ -800,7 +802,7 @@ impl SpecializedRenderPipeline for DepthOfFieldPipeline {
+             depth_stencil: None,
+             multisample: default(),
+             fragment: Some(FragmentState {
+-                shader: DOF_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs,
+                 entry_point: match key.pass {
+                     DofPass::GaussianHorizontal => "gaussian_horizontal".into(),
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/mod.rs b/crates/bevy_core_pipeline/src/motion_blur/mod.rs
+index 331dd2408d363..ecf6432c9f833 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/mod.rs
++++ b/crates/bevy_core_pipeline/src/motion_blur/mod.rs
+@@ -7,7 +7,7 @@ use crate::{
+     prepass::{DepthPrepass, MotionVectorPrepass},
+ };
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::embedded_asset;
+ use bevy_ecs::{
+     component::Component,
+     query::{QueryItem, With},
+@@ -19,7 +19,7 @@ use bevy_render::{
+     camera::Camera,
+     extract_component::{ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin},
+     render_graph::{RenderGraphApp, ViewNodeRunner},
+-    render_resource::{Shader, ShaderType, SpecializedRenderPipelines},
++    render_resource::{ShaderType, SpecializedRenderPipelines},
+     Render, RenderApp, RenderSystems,
+ };
+ 
+@@ -126,19 +126,12 @@ pub struct MotionBlurUniform {
+     _webgl2_padding: bevy_math::Vec2,
+ }
+ 
+-pub const MOTION_BLUR_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("d9ca74af-fa0a-4f11-b0f2-19613b618b93");
+-
+ /// Adds support for per-object motion blur to the app. See [`MotionBlur`] for details.
+ pub struct MotionBlurPlugin;
+ impl Plugin for MotionBlurPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            MOTION_BLUR_SHADER_HANDLE,
+-            "motion_blur.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "motion_blur.wgsl");
++
+         app.add_plugins((
+             ExtractComponentPlugin::<MotionBlur>::default(),
+             UniformComponentPlugin::<MotionBlurUniform>::default(),
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs b/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
+index 4eab4ff7a617f..dfd4bca1033ab 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
++++ b/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
+@@ -1,3 +1,4 @@
++use bevy_asset::{load_embedded_asset, Handle};
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -16,9 +17,9 @@ use bevy_render::{
+         },
+         BindGroupLayout, BindGroupLayoutEntries, CachedRenderPipelineId, ColorTargetState,
+         ColorWrites, FragmentState, MultisampleState, PipelineCache, PrimitiveState,
+-        RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderDefVal,
+-        ShaderStages, ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines,
+-        TextureFormat, TextureSampleType,
++        RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, Shader,
++        ShaderDefVal, ShaderStages, ShaderType, SpecializedRenderPipeline,
++        SpecializedRenderPipelines, TextureFormat, TextureSampleType,
+     },
+     renderer::RenderDevice,
+     view::{ExtractedView, Msaa, ViewTarget},
+@@ -26,17 +27,18 @@ use bevy_render::{
+ 
+ use crate::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
+ 
+-use super::{MotionBlurUniform, MOTION_BLUR_SHADER_HANDLE};
++use super::MotionBlurUniform;
+ 
+ #[derive(Resource)]
+ pub struct MotionBlurPipeline {
+     pub(crate) sampler: Sampler,
+     pub(crate) layout: BindGroupLayout,
+     pub(crate) layout_msaa: BindGroupLayout,
++    pub(crate) shader: Handle<Shader>,
+ }
+ 
+ impl MotionBlurPipeline {
+-    pub(crate) fn new(render_device: &RenderDevice) -> Self {
++    pub(crate) fn new(render_device: &RenderDevice, shader: Handle<Shader>) -> Self {
+         let mb_layout = &BindGroupLayoutEntries::sequential(
+             ShaderStages::FRAGMENT,
+             (
+@@ -82,6 +84,7 @@ impl MotionBlurPipeline {
+             sampler,
+             layout,
+             layout_msaa,
++            shader,
+         }
+     }
+ }
+@@ -89,7 +92,9 @@ impl MotionBlurPipeline {
+ impl FromWorld for MotionBlurPipeline {
+     fn from_world(render_world: &mut bevy_ecs::world::World) -> Self {
+         let render_device = render_world.resource::<RenderDevice>().clone();
+-        MotionBlurPipeline::new(&render_device)
++
++        let shader = load_embedded_asset!(render_world, "motion_blur.wgsl");
++        MotionBlurPipeline::new(&render_device, shader)
+     }
+ }
+ 
+@@ -125,7 +130,7 @@ impl SpecializedRenderPipeline for MotionBlurPipeline {
+             layout,
+             vertex: fullscreen_shader_vertex_state(),
+             fragment: Some(FragmentState {
+-                shader: MOTION_BLUR_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs,
+                 entry_point: "fragment".into(),
+                 targets: vec![Some(ColorTargetState {
+diff --git a/crates/bevy_core_pipeline/src/oit/mod.rs b/crates/bevy_core_pipeline/src/oit/mod.rs
+index 673bbc5a8b9e6..3ae95d71ccf12 100644
+--- a/crates/bevy_core_pipeline/src/oit/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/mod.rs
+@@ -1,7 +1,6 @@
+ //! Order Independent Transparency (OIT) for 3d rendering. See [`OrderIndependentTransparencyPlugin`] for more details.
+ 
+ use bevy_app::prelude::*;
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
+ use bevy_ecs::{component::*, prelude::*};
+ use bevy_math::UVec2;
+ use bevy_platform::collections::HashSet;
+@@ -10,10 +9,9 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+     camera::{Camera, ExtractedCamera},
+     extract_component::{ExtractComponent, ExtractComponentPlugin},
++    load_shader_library,
+     render_graph::{RenderGraphApp, ViewNodeRunner},
+-    render_resource::{
+-        BufferUsages, BufferVec, DynamicUniformBuffer, Shader, ShaderType, TextureUsages,
+-    },
++    render_resource::{BufferUsages, BufferVec, DynamicUniformBuffer, ShaderType, TextureUsages},
+     renderer::{RenderDevice, RenderQueue},
+     view::Msaa,
+     Render, RenderApp, RenderSystems,
+@@ -33,10 +31,6 @@ use crate::core_3d::{
+ /// Module that defines the necessary systems to resolve the OIT buffer and render it to the screen.
+ pub mod resolve;
+ 
+-/// Shader handle for the shader that draws the transparent meshes to the OIT layers buffer.
+-pub const OIT_DRAW_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("0cd3c764-39b8-437b-86b4-4e45635fc03d");
+-
+ /// Used to identify which camera will use OIT to render transparent meshes
+ /// and to configure OIT.
+ // TODO consider supporting multiple OIT techniques like WBOIT, Moment Based OIT,
+@@ -105,12 +99,7 @@ impl Component for OrderIndependentTransparencySettings {
+ pub struct OrderIndependentTransparencyPlugin;
+ impl Plugin for OrderIndependentTransparencyPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            OIT_DRAW_SHADER_HANDLE,
+-            "oit_draw.wgsl",
+-            Shader::from_wgsl
+-        );
++        load_shader_library!(app, "oit_draw.wgsl");
+ 
+         app.add_plugins((
+             ExtractComponentPlugin::<OrderIndependentTransparencySettings>::default(),
+diff --git a/crates/bevy_core_pipeline/src/oit/resolve/mod.rs b/crates/bevy_core_pipeline/src/oit/resolve/mod.rs
+index 0e5102c954e10..fe62d0c9b1aac 100644
+--- a/crates/bevy_core_pipeline/src/oit/resolve/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/resolve/mod.rs
+@@ -3,7 +3,7 @@ use crate::{
+     oit::OrderIndependentTransparencySettings,
+ };
+ use bevy_app::Plugin;
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
+ use bevy_derive::Deref;
+ use bevy_ecs::{
+     entity::{EntityHashMap, EntityHashSet},
+@@ -16,7 +16,7 @@ use bevy_render::{
+         BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, BlendComponent,
+         BlendState, CachedRenderPipelineId, ColorTargetState, ColorWrites, DownlevelFlags,
+         FragmentState, MultisampleState, PipelineCache, PrimitiveState, RenderPipelineDescriptor,
+-        Shader, ShaderDefVal, ShaderStages, TextureFormat,
++        ShaderDefVal, ShaderStages, TextureFormat,
+     },
+     renderer::{RenderAdapter, RenderDevice},
+     view::{ExtractedView, ViewTarget, ViewUniform, ViewUniforms},
+@@ -26,10 +26,6 @@ use tracing::warn;
+ 
+ use super::OitBuffers;
+ 
+-/// Shader handle for the shader that sorts the OIT layers, blends the colors based on depth and renders them to the screen.
+-pub const OIT_RESOLVE_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("562d2917-eb06-444d-9ade-41de76b0f5ae");
+-
+ /// Contains the render node used to run the resolve pass.
+ pub mod node;
+ 
+@@ -40,12 +36,7 @@ pub const OIT_REQUIRED_STORAGE_BUFFERS: u32 = 2;
+ pub struct OitResolvePlugin;
+ impl Plugin for OitResolvePlugin {
+     fn build(&self, app: &mut bevy_app::App) {
+-        load_internal_asset!(
+-            app,
+-            OIT_RESOLVE_SHADER_HANDLE,
+-            "oit_resolve.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "oit_resolve.wgsl");
+     }
+ 
+     fn finish(&self, app: &mut bevy_app::App) {
+@@ -165,6 +156,7 @@ pub fn queue_oit_resolve_pipeline(
+         ),
+         With<OrderIndependentTransparencySettings>,
+     >,
++    asset_server: Res<AssetServer>,
+     // Store the key with the id to make the clean up logic easier.
+     // This also means it will always replace the entry if the key changes so nothing to clean up.
+     mut cached_pipeline_id: Local<EntityHashMap<(OitResolvePipelineKey, CachedRenderPipelineId)>>,
+@@ -184,7 +176,7 @@ pub fn queue_oit_resolve_pipeline(
+             }
+         }
+ 
+-        let desc = specialize_oit_resolve_pipeline(key, &resolve_pipeline);
++        let desc = specialize_oit_resolve_pipeline(key, &resolve_pipeline, &asset_server);
+ 
+         let pipeline_id = pipeline_cache.queue_render_pipeline(desc);
+         commands.entity(e).insert(OitResolvePipelineId(pipeline_id));
+@@ -202,6 +194,7 @@ pub fn queue_oit_resolve_pipeline(
+ fn specialize_oit_resolve_pipeline(
+     key: OitResolvePipelineKey,
+     resolve_pipeline: &OitResolvePipeline,
++    asset_server: &AssetServer,
+ ) -> RenderPipelineDescriptor {
+     let format = if key.hdr {
+         ViewTarget::TEXTURE_FORMAT_HDR
+@@ -217,7 +210,7 @@ fn specialize_oit_resolve_pipeline(
+         ],
+         fragment: Some(FragmentState {
+             entry_point: "fragment".into(),
+-            shader: OIT_RESOLVE_SHADER_HANDLE,
++            shader: load_embedded_asset!(asset_server, "oit_resolve.wgsl"),
+             shader_defs: vec![ShaderDefVal::UInt(
+                 "LAYER_COUNT".into(),
+                 key.layer_count as u32,
+diff --git a/crates/bevy_core_pipeline/src/post_process/mod.rs b/crates/bevy_core_pipeline/src/post_process/mod.rs
+index fddac95066002..1ab03c5dfa486 100644
+--- a/crates/bevy_core_pipeline/src/post_process/mod.rs
++++ b/crates/bevy_core_pipeline/src/post_process/mod.rs
+@@ -3,7 +3,7 @@
+ //! Currently, this consists only of chromatic aberration.
+ 
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, weak_handle, Assets, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, weak_handle, Assets, Handle};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     component::Component,
+@@ -20,6 +20,7 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+     camera::Camera,
+     extract_component::{ExtractComponent, ExtractComponentPlugin},
++    load_shader_library,
+     render_asset::{RenderAssetUsages, RenderAssets},
+     render_graph::{
+         NodeRunError, RenderGraphApp as _, RenderGraphContext, ViewNode, ViewNodeRunner,
+@@ -46,13 +47,6 @@ use crate::{
+     fullscreen_vertex_shader,
+ };
+ 
+-/// The handle to the built-in postprocessing shader `post_process.wgsl`.
+-const POST_PROCESSING_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("5e8e627a-7531-484d-a988-9a38acb34e52");
+-/// The handle to the chromatic aberration shader `chromatic_aberration.wgsl`.
+-const CHROMATIC_ABERRATION_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("e598550e-71c3-4f5a-ba29-aebc3f88c7b5");
+-
+ /// The handle to the default chromatic aberration lookup texture.
+ ///
+ /// This is just a 3x1 image consisting of one red pixel, one green pixel, and
+@@ -136,6 +130,8 @@ pub struct PostProcessingPipeline {
+     source_sampler: Sampler,
+     /// Specifies how to sample the chromatic aberration gradient.
+     chromatic_aberration_lut_sampler: Sampler,
++    /// The shader asset handle.
++    shader: Handle<Shader>,
+ }
+ 
+ /// A key that uniquely identifies a built-in postprocessing pipeline.
+@@ -188,18 +184,9 @@ pub struct PostProcessingNode;
+ 
+ impl Plugin for PostProcessingPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            POST_PROCESSING_SHADER_HANDLE,
+-            "post_process.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            CHROMATIC_ABERRATION_SHADER_HANDLE,
+-            "chromatic_aberration.wgsl",
+-            Shader::from_wgsl
+-        );
++        load_shader_library!(app, "chromatic_aberration.wgsl");
++
++        embedded_asset!(app, "post_process.wgsl");
+ 
+         // Load the default chromatic aberration LUT.
+         let mut assets = app.world_mut().resource_mut::<Assets<_>>();
+@@ -321,6 +308,7 @@ impl FromWorld for PostProcessingPipeline {
+             bind_group_layout,
+             source_sampler,
+             chromatic_aberration_lut_sampler,
++            shader: load_embedded_asset!(world, "post_process.wgsl"),
+         }
+     }
+ }
+@@ -334,7 +322,7 @@ impl SpecializedRenderPipeline for PostProcessingPipeline {
+             layout: vec![self.bind_group_layout.clone()],
+             vertex: fullscreen_vertex_shader::fullscreen_shader_vertex_state(),
+             fragment: Some(FragmentState {
+-                shader: POST_PROCESSING_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs: vec![],
+                 entry_point: "fragment_main".into(),
+                 targets: vec![Some(ColorTargetState {
+diff --git a/crates/bevy_core_pipeline/src/skybox/mod.rs b/crates/bevy_core_pipeline/src/skybox/mod.rs
+index ede50d6d8fce6..cb75df2053402 100644
+--- a/crates/bevy_core_pipeline/src/skybox/mod.rs
++++ b/crates/bevy_core_pipeline/src/skybox/mod.rs
+@@ -1,5 +1,5 @@
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
+ use bevy_ecs::{
+     prelude::{Component, Entity},
+     query::{QueryItem, With},
+@@ -28,25 +28,18 @@ use bevy_render::{
+     Render, RenderApp, RenderSystems,
+ };
+ use bevy_transform::components::Transform;
+-use prepass::{SkyboxPrepassPipeline, SKYBOX_PREPASS_SHADER_HANDLE};
++use prepass::SkyboxPrepassPipeline;
+ 
+ use crate::{core_3d::CORE_3D_DEPTH_FORMAT, prepass::PreviousViewUniforms};
+ 
+-const SKYBOX_SHADER_HANDLE: Handle<Shader> = weak_handle!("a66cf9cc-cab8-47f8-ac32-db82fdc4f29b");
+-
+ pub mod prepass;
+ 
+ pub struct SkyboxPlugin;
+ 
+ impl Plugin for SkyboxPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(app, SKYBOX_SHADER_HANDLE, "skybox.wgsl", Shader::from_wgsl);
+-        load_internal_asset!(
+-            app,
+-            SKYBOX_PREPASS_SHADER_HANDLE,
+-            "skybox_prepass.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "skybox.wgsl");
++        embedded_asset!(app, "skybox_prepass.wgsl");
+ 
+         app.register_type::<Skybox>().add_plugins((
+             ExtractComponentPlugin::<Skybox>::default(),
+@@ -76,9 +69,10 @@ impl Plugin for SkyboxPlugin {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
++        let shader = load_embedded_asset!(render_app.world(), "skybox.wgsl");
+         let render_device = render_app.world().resource::<RenderDevice>().clone();
+         render_app
+-            .insert_resource(SkyboxPipeline::new(&render_device))
++            .insert_resource(SkyboxPipeline::new(&render_device, shader))
+             .init_resource::<SkyboxPrepassPipeline>();
+     }
+ }
+@@ -158,10 +152,11 @@ pub struct SkyboxUniforms {
+ #[derive(Resource)]
+ struct SkyboxPipeline {
+     bind_group_layout: BindGroupLayout,
++    shader: Handle<Shader>,
+ }
+ 
+ impl SkyboxPipeline {
+-    fn new(render_device: &RenderDevice) -> Self {
++    fn new(render_device: &RenderDevice, shader: Handle<Shader>) -> Self {
+         Self {
+             bind_group_layout: render_device.create_bind_group_layout(
+                 "skybox_bind_group_layout",
+@@ -176,6 +171,7 @@ impl SkyboxPipeline {
+                     ),
+                 ),
+             ),
++            shader,
+         }
+     }
+ }
+@@ -196,7 +192,7 @@ impl SpecializedRenderPipeline for SkyboxPipeline {
+             layout: vec![self.bind_group_layout.clone()],
+             push_constant_ranges: Vec::new(),
+             vertex: VertexState {
+-                shader: SKYBOX_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs: Vec::new(),
+                 entry_point: "skybox_vertex".into(),
+                 buffers: Vec::new(),
+@@ -224,7 +220,7 @@ impl SpecializedRenderPipeline for SkyboxPipeline {
+                 alpha_to_coverage_enabled: false,
+             },
+             fragment: Some(FragmentState {
+-                shader: SKYBOX_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs: Vec::new(),
+                 entry_point: "skybox_fragment".into(),
+                 targets: vec![Some(ColorTargetState {
+diff --git a/crates/bevy_core_pipeline/src/skybox/prepass.rs b/crates/bevy_core_pipeline/src/skybox/prepass.rs
+index 658660bbc62ff..a027f69f9374a 100644
+--- a/crates/bevy_core_pipeline/src/skybox/prepass.rs
++++ b/crates/bevy_core_pipeline/src/skybox/prepass.rs
+@@ -1,6 +1,6 @@
+ //! Adds motion vector support to skyboxes. See [`SkyboxPrepassPipeline`] for details.
+ 
+-use bevy_asset::{weak_handle, Handle};
++use bevy_asset::{load_embedded_asset, Handle};
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -30,9 +30,6 @@ use crate::{
+     Skybox,
+ };
+ 
+-pub const SKYBOX_PREPASS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("7a292435-bfe6-4ed9-8d30-73bf7aa673b0");
+-
+ /// This pipeline writes motion vectors to the prepass for all [`Skybox`]es.
+ ///
+ /// This allows features like motion blur and TAA to work correctly on the skybox. Without this, for
+@@ -41,6 +38,7 @@ pub const SKYBOX_PREPASS_SHADER_HANDLE: Handle<Shader> =
+ #[derive(Resource)]
+ pub struct SkyboxPrepassPipeline {
+     bind_group_layout: BindGroupLayout,
++    shader: Handle<Shader>,
+ }
+ 
+ /// Used to specialize the [`SkyboxPrepassPipeline`].
+@@ -75,6 +73,7 @@ impl FromWorld for SkyboxPrepassPipeline {
+                     ),
+                 ),
+             ),
++            shader: load_embedded_asset!(world, "skybox_prepass.wgsl"),
+         }
+     }
+ }
+@@ -102,7 +101,7 @@ impl SpecializedRenderPipeline for SkyboxPrepassPipeline {
+                 alpha_to_coverage_enabled: false,
+             },
+             fragment: Some(FragmentState {
+-                shader: SKYBOX_PREPASS_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs: vec![],
+                 entry_point: "fragment".into(),
+                 targets: prepass_target_descriptors(key.normal_prepass, true, false),
+diff --git a/crates/bevy_core_pipeline/src/tonemapping/mod.rs b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+index f546ef54d3586..9ea94e165ad6f 100644
+--- a/crates/bevy_core_pipeline/src/tonemapping/mod.rs
++++ b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+@@ -1,6 +1,6 @@
+ use crate::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
+ use bevy_app::prelude::*;
+-use bevy_asset::{load_internal_asset, weak_handle, Assets, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, Assets, Handle};
+ use bevy_ecs::prelude::*;
+ use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+@@ -8,6 +8,7 @@ use bevy_render::{
+     camera::Camera,
+     extract_component::{ExtractComponent, ExtractComponentPlugin},
+     extract_resource::{ExtractResource, ExtractResourcePlugin},
++    load_shader_library,
+     render_asset::{RenderAssetUsages, RenderAssets},
+     render_resource::{
+         binding_types::{sampler, texture_2d, texture_3d, uniform_buffer},
+@@ -27,15 +28,6 @@ mod node;
+ use bevy_utils::default;
+ pub use node::TonemappingNode;
+ 
+-const TONEMAPPING_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("e239c010-c25c-42a1-b4e8-08818764d667");
+-
+-const TONEMAPPING_SHARED_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("61dbc544-4b30-4ca9-83bd-4751b5cfb1b1");
+-
+-const TONEMAPPING_LUT_BINDINGS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("d50e3a70-c85e-4725-a81e-72fc83281145");
+-
+ /// 3D LUT (look up table) textures used for tonemapping
+ #[derive(Resource, Clone, ExtractResource)]
+ pub struct TonemappingLuts {
+@@ -48,24 +40,10 @@ pub struct TonemappingPlugin;
+ 
+ impl Plugin for TonemappingPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            TONEMAPPING_SHADER_HANDLE,
+-            "tonemapping.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            TONEMAPPING_SHARED_SHADER_HANDLE,
+-            "tonemapping_shared.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            TONEMAPPING_LUT_BINDINGS_SHADER_HANDLE,
+-            "lut_bindings.wgsl",
+-            Shader::from_wgsl
+-        );
++        load_shader_library!(app, "tonemapping_shared.wgsl");
++        load_shader_library!(app, "lut_bindings.wgsl");
++
++        embedded_asset!(app, "tonemapping.wgsl");
+ 
+         if !app.world().is_resource_added::<TonemappingLuts>() {
+             let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+@@ -134,6 +112,7 @@ impl Plugin for TonemappingPlugin {
+ pub struct TonemappingPipeline {
+     texture_bind_group: BindGroupLayout,
+     sampler: Sampler,
++    shader: Handle<Shader>,
+ }
+ 
+ /// Optionally enables a tonemapping shader that attempts to map linear input stimulus into a perceptually uniform image for a given [`Camera`] entity.
+@@ -296,7 +275,7 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
+             layout: vec![self.texture_bind_group.clone()],
+             vertex: fullscreen_shader_vertex_state(),
+             fragment: Some(FragmentState {
+-                shader: TONEMAPPING_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 shader_defs,
+                 entry_point: "fragment".into(),
+                 targets: vec![Some(ColorTargetState {
+@@ -340,6 +319,7 @@ impl FromWorld for TonemappingPipeline {
+         TonemappingPipeline {
+             texture_bind_group: tonemap_texture_bind_group,
+             sampler,
++            shader: load_embedded_asset!(render_world, "tonemapping.wgsl"),
+         }
+     }
+ }
