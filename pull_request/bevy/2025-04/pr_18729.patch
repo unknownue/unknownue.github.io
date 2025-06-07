@@ -1,0 +1,155 @@
+diff --git a/crates/bevy_window/src/window.rs b/crates/bevy_window/src/window.rs
+index e09e254d40015..31ff212ebecb8 100644
+--- a/crates/bevy_window/src/window.rs
++++ b/crates/bevy_window/src/window.rs
+@@ -443,6 +443,17 @@ pub struct Window {
+     ///
+     /// [`WindowAttributesExtIOS::with_prefers_status_bar_hidden`]: https://docs.rs/winit/latest/x86_64-apple-darwin/winit/platform/ios/trait.WindowAttributesExtIOS.html#tymethod.with_prefers_status_bar_hidden
+     pub prefers_status_bar_hidden: bool,
++    /// Sets screen edges for which you want your gestures to take precedence
++    /// over the system gestures.
++    ///
++    /// Corresponds to [`WindowAttributesExtIOS::with_preferred_screen_edges_deferring_system_gestures`].
++    ///
++    /// # Platform-specific
++    ///
++    /// - Only used on iOS.
++    ///
++    /// [`WindowAttributesExtIOS::with_preferred_screen_edges_deferring_system_gestures`]: https://docs.rs/winit/latest/x86_64-apple-darwin/winit/platform/ios/trait.WindowAttributesExtIOS.html#tymethod.with_preferred_screen_edges_deferring_system_gestures
++    pub preferred_screen_edges_deferring_system_gestures: ScreenEdge,
+ }
+ 
+ impl Default for Window {
+@@ -487,6 +498,7 @@ impl Default for Window {
+             titlebar_show_buttons: true,
+             prefers_home_indicator_hidden: false,
+             prefers_status_bar_hidden: false,
++            preferred_screen_edges_deferring_system_gestures: Default::default(),
+         }
+     }
+ }
+@@ -1444,6 +1456,31 @@ impl Default for EnabledButtons {
+ #[derive(Component, Default)]
+ pub struct ClosingWindow;
+ 
++/// The edges of a screen. Corresponds to [`winit::platform::ios::ScreenEdge`].
++///
++/// # Platform-specific
++///
++/// - Only used on iOS.
++///
++/// [`winit::platform::ios::ScreenEdge`]: https://docs.rs/winit/latest/x86_64-apple-darwin/winit/platform/ios/struct.ScreenEdge.html
++#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Reflect)]
++#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
++pub enum ScreenEdge {
++    #[default]
++    /// No edge.
++    None,
++    /// The top edge of the screen.
++    Top,
++    /// The left edge of the screen.
++    Left,
++    /// The bottom edge of the screen.
++    Bottom,
++    /// The right edge of the screen.
++    Right,
++    /// All edges of the screen.
++    All,
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/bevy_winit/src/converters.rs b/crates/bevy_winit/src/converters.rs
+index ba41c6253474d..3de27162a4520 100644
+--- a/crates/bevy_winit/src/converters.rs
++++ b/crates/bevy_winit/src/converters.rs
+@@ -10,6 +10,9 @@ use bevy_window::SystemCursorIcon;
+ use bevy_window::{EnabledButtons, WindowLevel, WindowTheme};
+ use winit::keyboard::{Key, NamedKey, NativeKey};
+ 
++#[cfg(target_os = "ios")]
++use bevy_window::ScreenEdge;
++
+ pub fn convert_keyboard_input(
+     keyboard_input: &winit::event::KeyEvent,
+     window: Entity,
+@@ -718,3 +721,16 @@ pub fn convert_resize_direction(resize_direction: CompassOctant) -> winit::windo
+         CompassOctant::SouthEast => winit::window::ResizeDirection::SouthEast,
+     }
+ }
++
++#[cfg(target_os = "ios")]
++/// Converts a [`bevy_window::ScreenEdge`] to a [`winit::platform::ios::ScreenEdge`].
++pub(crate) fn convert_screen_edge(edge: ScreenEdge) -> winit::platform::ios::ScreenEdge {
++    match edge {
++        ScreenEdge::None => winit::platform::ios::ScreenEdge::NONE,
++        ScreenEdge::Top => winit::platform::ios::ScreenEdge::TOP,
++        ScreenEdge::Bottom => winit::platform::ios::ScreenEdge::BOTTOM,
++        ScreenEdge::Left => winit::platform::ios::ScreenEdge::LEFT,
++        ScreenEdge::Right => winit::platform::ios::ScreenEdge::RIGHT,
++        ScreenEdge::All => winit::platform::ios::ScreenEdge::ALL,
++    }
++}
+diff --git a/crates/bevy_winit/src/system.rs b/crates/bevy_winit/src/system.rs
+index f4ed1a59a3028..32925db26b6eb 100644
+--- a/crates/bevy_winit/src/system.rs
++++ b/crates/bevy_winit/src/system.rs
+@@ -568,6 +568,16 @@ pub(crate) fn changed_windows(
+             if window.prefers_status_bar_hidden != cache.window.prefers_status_bar_hidden {
+                 winit_window.set_prefers_status_bar_hidden(window.prefers_status_bar_hidden);
+             }
++            if window.preferred_screen_edges_deferring_system_gestures
++                != cache
++                    .window
++                    .preferred_screen_edges_deferring_system_gestures
++            {
++                use crate::converters::convert_screen_edge;
++                let preferred_edge =
++                    convert_screen_edge(window.preferred_screen_edges_deferring_system_gestures);
++                winit_window.set_preferred_screen_edges_deferring_system_gestures(preferred_edge);
++            }
+         }
+         cache.window = window.clone();
+     }
+diff --git a/crates/bevy_winit/src/winit_windows.rs b/crates/bevy_winit/src/winit_windows.rs
+index 119da10fe1bb3..b1d4b3d7b6459 100644
+--- a/crates/bevy_winit/src/winit_windows.rs
++++ b/crates/bevy_winit/src/winit_windows.rs
+@@ -145,7 +145,14 @@ impl WinitWindows {
+ 
+         #[cfg(target_os = "ios")]
+         {
++            use crate::converters::convert_screen_edge;
+             use winit::platform::ios::WindowAttributesExtIOS;
++
++            let preferred_edge =
++                convert_screen_edge(window.preferred_screen_edges_deferring_system_gestures);
++
++            winit_window_attributes = winit_window_attributes
++                .with_preferred_screen_edges_deferring_system_gestures(preferred_edge);
+             winit_window_attributes = winit_window_attributes
+                 .with_prefers_home_indicator_hidden(window.prefers_home_indicator_hidden);
+             winit_window_attributes = winit_window_attributes
+diff --git a/examples/mobile/src/lib.rs b/examples/mobile/src/lib.rs
+index c5df6ee3c7b56..ba93268e86a93 100644
+--- a/examples/mobile/src/lib.rs
++++ b/examples/mobile/src/lib.rs
+@@ -5,7 +5,7 @@ use bevy::{
+     input::{gestures::RotationGesture, touch::TouchPhase},
+     log::{Level, LogPlugin},
+     prelude::*,
+-    window::{AppLifecycle, WindowMode},
++    window::{AppLifecycle, ScreenEdge, WindowMode},
+     winit::WinitSettings,
+ };
+ 
+@@ -34,6 +34,8 @@ pub fn main() {
+                     prefers_home_indicator_hidden: true,
+                     // Only has an effect on iOS
+                     prefers_status_bar_hidden: true,
++                    // Only has an effect on iOS
++                    preferred_screen_edges_deferring_system_gestures: ScreenEdge::Bottom,
+                     ..default()
+                 }),
+                 ..default()
