@@ -1,0 +1,448 @@
+diff --git a/crates/bevy_ecs/src/schedule/executor/mod.rs b/crates/bevy_ecs/src/schedule/executor/mod.rs
+index cb6f3dcf8f111..b73ffdfd33928 100644
+--- a/crates/bevy_ecs/src/schedule/executor/mod.rs
++++ b/crates/bevy_ecs/src/schedule/executor/mod.rs
+@@ -20,7 +20,7 @@ use crate::{
+     prelude::{IntoSystemSet, SystemSet},
+     query::{Access, FilteredAccessSet},
+     schedule::{BoxedCondition, InternedSystemSet, NodeId, SystemTypeSet},
+-    system::{ScheduleSystem, System, SystemIn, SystemParamValidationError},
++    system::{ScheduleSystem, System, SystemIn, SystemParamValidationError, SystemStateFlags},
+     world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, World},
+ };
+ 
+@@ -171,26 +171,9 @@ impl System for ApplyDeferred {
+         const { &FilteredAccessSet::new() }
+     }
+ 
+-    fn is_send(&self) -> bool {
+-        // Although this system itself does nothing on its own, the system
+-        // executor uses it to apply deferred commands. Commands must be allowed
+-        // to access non-send resources, so this system must be non-send for
+-        // scheduling purposes.
+-        false
+-    }
+-
+-    fn is_exclusive(&self) -> bool {
+-        // This system is labeled exclusive because it is used by the system
+-        // executor to find places where deferred commands should be applied,
+-        // and commands can only be applied with exclusive access to the world.
+-        true
+-    }
+-
+-    fn has_deferred(&self) -> bool {
+-        // This system itself doesn't have any commands to apply, but when it
+-        // is pulled from the schedule to be ran, the executor will apply
+-        // deferred commands from other systems.
+-        false
++    fn flags(&self) -> SystemStateFlags {
++        // non-send , exclusive , no deferred
++        SystemStateFlags::NON_SEND | SystemStateFlags::EXCLUSIVE
+     }
+ 
+     unsafe fn run_unsafe(
+diff --git a/crates/bevy_ecs/src/system/adapter_system.rs b/crates/bevy_ecs/src/system/adapter_system.rs
+index f728a4e9074b1..062fbb3d5b2cb 100644
+--- a/crates/bevy_ecs/src/system/adapter_system.rs
++++ b/crates/bevy_ecs/src/system/adapter_system.rs
+@@ -137,16 +137,9 @@ where
+         self.system.component_access_set()
+     }
+ 
+-    fn is_send(&self) -> bool {
+-        self.system.is_send()
+-    }
+-
+-    fn is_exclusive(&self) -> bool {
+-        self.system.is_exclusive()
+-    }
+-
+-    fn has_deferred(&self) -> bool {
+-        self.system.has_deferred()
++    #[inline]
++    fn flags(&self) -> super::SystemStateFlags {
++        self.system.flags()
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index 29a87e93ceb34..18de14126338f 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -152,16 +152,9 @@ where
+         &self.component_access_set
+     }
+ 
+-    fn is_send(&self) -> bool {
+-        self.a.is_send() && self.b.is_send()
+-    }
+-
+-    fn is_exclusive(&self) -> bool {
+-        self.a.is_exclusive() || self.b.is_exclusive()
+-    }
+-
+-    fn has_deferred(&self) -> bool {
+-        self.a.has_deferred() || self.b.has_deferred()
++    #[inline]
++    fn flags(&self) -> super::SystemStateFlags {
++        self.a.flags() | self.b.flags()
+     }
+ 
+     unsafe fn run_unsafe(
+@@ -378,16 +371,9 @@ where
+         &self.component_access_set
+     }
+ 
+-    fn is_send(&self) -> bool {
+-        self.a.is_send() && self.b.is_send()
+-    }
+-
+-    fn is_exclusive(&self) -> bool {
+-        self.a.is_exclusive() || self.b.is_exclusive()
+-    }
+-
+-    fn has_deferred(&self) -> bool {
+-        self.a.has_deferred() || self.b.has_deferred()
++    #[inline]
++    fn flags(&self) -> super::SystemStateFlags {
++        self.a.flags() | self.b.flags()
+     }
+ 
+     unsafe fn run_unsafe(
+diff --git a/crates/bevy_ecs/src/system/exclusive_function_system.rs b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+index 0920fd1e1f163..f7e362a6709b9 100644
+--- a/crates/bevy_ecs/src/system/exclusive_function_system.rs
++++ b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+@@ -13,7 +13,7 @@ use alloc::{borrow::Cow, vec, vec::Vec};
+ use core::marker::PhantomData;
+ use variadics_please::all_tuples;
+ 
+-use super::SystemParamValidationError;
++use super::{SystemParamValidationError, SystemStateFlags};
+ 
+ /// A function system that runs with exclusive [`World`] access.
+ ///
+@@ -98,22 +98,12 @@ where
+     }
+ 
+     #[inline]
+-    fn is_send(&self) -> bool {
+-        // exclusive systems should have access to non-send resources
++    fn flags(&self) -> SystemStateFlags {
++        // non-send , exclusive , no deferred
+         // the executor runs exclusive systems on the main thread, so this
+         // field reflects that constraint
+-        false
+-    }
+-
+-    #[inline]
+-    fn is_exclusive(&self) -> bool {
+-        true
+-    }
+-
+-    #[inline]
+-    fn has_deferred(&self) -> bool {
+         // exclusive systems have no deferred system params
+-        false
++        SystemStateFlags::NON_SEND | SystemStateFlags::EXCLUSIVE
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index af26e81d2f658..d257a9f0799fe 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -17,7 +17,9 @@ use variadics_please::all_tuples;
+ #[cfg(feature = "trace")]
+ use tracing::{info_span, Span};
+ 
+-use super::{IntoSystem, ReadOnlySystem, SystemParamBuilder, SystemParamValidationError};
++use super::{
++    IntoSystem, ReadOnlySystem, SystemParamBuilder, SystemParamValidationError, SystemStateFlags,
++};
+ 
+ /// The metadata of a [`System`].
+ #[derive(Clone)]
+@@ -29,8 +31,7 @@ pub struct SystemMeta {
+     pub(crate) component_access_set: FilteredAccessSet<ComponentId>,
+     // NOTE: this must be kept private. making a SystemMeta non-send is irreversible to prevent
+     // SystemParams from overriding each other
+-    is_send: bool,
+-    has_deferred: bool,
++    flags: SystemStateFlags,
+     pub(crate) last_run: Tick,
+     #[cfg(feature = "trace")]
+     pub(crate) system_span: Span,
+@@ -44,8 +45,7 @@ impl SystemMeta {
+         Self {
+             name: name.into(),
+             component_access_set: FilteredAccessSet::default(),
+-            is_send: true,
+-            has_deferred: false,
++            flags: SystemStateFlags::empty(),
+             last_run: Tick::new(0),
+             #[cfg(feature = "trace")]
+             system_span: info_span!("system", name = name),
+@@ -78,7 +78,7 @@ impl SystemMeta {
+     /// Returns true if the system is [`Send`].
+     #[inline]
+     pub fn is_send(&self) -> bool {
+-        self.is_send
++        !self.flags.intersects(SystemStateFlags::NON_SEND)
+     }
+ 
+     /// Sets the system to be not [`Send`].
+@@ -86,20 +86,20 @@ impl SystemMeta {
+     /// This is irreversible.
+     #[inline]
+     pub fn set_non_send(&mut self) {
+-        self.is_send = false;
++        self.flags |= SystemStateFlags::NON_SEND;
+     }
+ 
+     /// Returns true if the system has deferred [`SystemParam`]'s
+     #[inline]
+     pub fn has_deferred(&self) -> bool {
+-        self.has_deferred
++        self.flags.intersects(SystemStateFlags::DEFERRED)
+     }
+ 
+     /// Marks the system as having deferred buffers like [`Commands`](`super::Commands`)
+     /// This lets the scheduler insert [`ApplyDeferred`](`crate::prelude::ApplyDeferred`) systems automatically.
+     #[inline]
+     pub fn set_has_deferred(&mut self) {
+-        self.has_deferred = true;
++        self.flags |= SystemStateFlags::DEFERRED;
+     }
+ 
+     /// Returns a reference to the [`FilteredAccessSet`] for [`ComponentId`].
+@@ -631,18 +631,8 @@ where
+     }
+ 
+     #[inline]
+-    fn is_send(&self) -> bool {
+-        self.system_meta.is_send
+-    }
+-
+-    #[inline]
+-    fn is_exclusive(&self) -> bool {
+-        false
+-    }
+-
+-    #[inline]
+-    fn has_deferred(&self) -> bool {
+-        self.system_meta.has_deferred
++    fn flags(&self) -> SystemStateFlags {
++        self.system_meta.flags
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/system/observer_system.rs b/crates/bevy_ecs/src/system/observer_system.rs
+index c0ac5e8de094c..b123301a08401 100644
+--- a/crates/bevy_ecs/src/system/observer_system.rs
++++ b/crates/bevy_ecs/src/system/observer_system.rs
+@@ -127,18 +127,8 @@ where
+     }
+ 
+     #[inline]
+-    fn is_send(&self) -> bool {
+-        self.observer.is_send()
+-    }
+-
+-    #[inline]
+-    fn is_exclusive(&self) -> bool {
+-        self.observer.is_exclusive()
+-    }
+-
+-    #[inline]
+-    fn has_deferred(&self) -> bool {
+-        self.observer.has_deferred()
++    fn flags(&self) -> super::SystemStateFlags {
++        self.observer.flags()
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index 26fdbdbe0f013..17bd3f46de8a7 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -8,7 +8,7 @@ use crate::{
+     world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, FromWorld, World},
+ };
+ 
+-use super::{IntoSystem, SystemParamValidationError};
++use super::{IntoSystem, SystemParamValidationError, SystemStateFlags};
+ 
+ /// A wrapper system to change a system that returns `()` to return `Ok(())` to make it into a [`ScheduleSystem`]
+ pub struct InfallibleSystemWrapper<S: System<In = ()>>(S);
+@@ -44,18 +44,8 @@ impl<S: System<In = ()>> System for InfallibleSystemWrapper<S> {
+     }
+ 
+     #[inline]
+-    fn is_send(&self) -> bool {
+-        self.0.is_send()
+-    }
+-
+-    #[inline]
+-    fn is_exclusive(&self) -> bool {
+-        self.0.is_exclusive()
+-    }
+-
+-    #[inline]
+-    fn has_deferred(&self) -> bool {
+-        self.0.has_deferred()
++    fn flags(&self) -> SystemStateFlags {
++        self.0.flags()
+     }
+ 
+     #[inline]
+@@ -172,16 +162,9 @@ where
+         self.system.component_access_set()
+     }
+ 
+-    fn is_send(&self) -> bool {
+-        self.system.is_send()
+-    }
+-
+-    fn is_exclusive(&self) -> bool {
+-        self.system.is_exclusive()
+-    }
+-
+-    fn has_deferred(&self) -> bool {
+-        self.system.has_deferred()
++    #[inline]
++    fn flags(&self) -> SystemStateFlags {
++        self.system.flags()
+     }
+ 
+     unsafe fn run_unsafe(
+@@ -281,16 +264,9 @@ where
+         self.system.component_access_set()
+     }
+ 
+-    fn is_send(&self) -> bool {
+-        self.system.is_send()
+-    }
+-
+-    fn is_exclusive(&self) -> bool {
+-        self.system.is_exclusive()
+-    }
+-
+-    fn has_deferred(&self) -> bool {
+-        self.system.has_deferred()
++    #[inline]
++    fn flags(&self) -> SystemStateFlags {
++        self.system.flags()
+     }
+ 
+     unsafe fn run_unsafe(
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index edb2ead9cd481..211152f3d877c 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -2,6 +2,7 @@
+     clippy::module_inception,
+     reason = "This instance of module inception is being discussed; see #17353."
+ )]
++use bitflags::bitflags;
+ use core::fmt::Debug;
+ use log::warn;
+ use thiserror::Error;
+@@ -19,6 +20,18 @@ use core::any::TypeId;
+ 
+ use super::{IntoSystem, SystemParamValidationError};
+ 
++bitflags! {
++    /// Bitflags representing system states and requirements.
++    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
++    pub struct SystemStateFlags: u8 {
++        /// Set if system cannot be sent across threads
++        const NON_SEND       = 1 << 0;
++        /// Set if system requires exclusive World access
++        const EXCLUSIVE      = 1 << 1;
++        /// Set if system has deferred buffers.
++        const DEFERRED       = 1 << 2;
++    }
++}
+ /// An ECS system that can be added to a [`Schedule`](crate::schedule::Schedule)
+ ///
+ /// Systems are functions with all arguments implementing
+@@ -50,14 +63,26 @@ pub trait System: Send + Sync + 'static {
+     /// Returns the system's component [`FilteredAccessSet`].
+     fn component_access_set(&self) -> &FilteredAccessSet<ComponentId>;
+ 
++    /// Returns the [`SystemStateFlags`] of the system.
++    fn flags(&self) -> SystemStateFlags;
++
+     /// Returns true if the system is [`Send`].
+-    fn is_send(&self) -> bool;
++    #[inline]
++    fn is_send(&self) -> bool {
++        !self.flags().intersects(SystemStateFlags::NON_SEND)
++    }
+ 
+     /// Returns true if the system must be run exclusively.
+-    fn is_exclusive(&self) -> bool;
++    #[inline]
++    fn is_exclusive(&self) -> bool {
++        self.flags().intersects(SystemStateFlags::EXCLUSIVE)
++    }
+ 
+     /// Returns true if system has deferred buffers.
+-    fn has_deferred(&self) -> bool;
++    #[inline]
++    fn has_deferred(&self) -> bool {
++        self.flags().intersects(SystemStateFlags::DEFERRED)
++    }
+ 
+     /// Runs the system with the given input in the world. Unlike [`System::run`], this function
+     /// can be called in parallel with other systems and may break Rust's aliasing rules
+diff --git a/release-content/migration-guides/unified_system_state_flag.md b/release-content/migration-guides/unified_system_state_flag.md
+new file mode 100644
+index 0000000000000..c21c683078e35
+--- /dev/null
++++ b/release-content/migration-guides/unified_system_state_flag.md
+@@ -0,0 +1,43 @@
++---
++title: Unified system state flag
++pull_requests: [19506]
++---
++
++Now the system have a unified `SystemStateFlags` to represent its different states.
++
++If your code previously looked like this:
++
++```rust
++impl System for MyCustomSystem {
++    // ...
++
++    fn is_send(&self) -> bool {
++        false
++    }
++
++    fn is_exclusive(&self) -> bool {
++        true
++    }
++
++    fn has_deferred(&self) -> bool {
++        false
++    }
++
++    // ....
++}
++```
++
++You should migrate it to:
++
++```rust
++impl System for MyCustomSystem{
++  // ...
++
++  fn flags(&self) -> SystemStateFlags {
++    // non-send , exclusive , no deferred
++    SystemStateFlags::NON_SEND | SystemStateFlags::EXCLUSIVE
++  }
++
++  // ...
++}
++```
