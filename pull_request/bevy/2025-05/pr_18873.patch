@@ -1,0 +1,953 @@
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/settings.rs b/crates/bevy_core_pipeline/src/auto_exposure/settings.rs
+index cf6fdd4e24d81..ae359a8a01dd4 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/settings.rs
++++ b/crates/bevy_core_pipeline/src/auto_exposure/settings.rs
+@@ -5,7 +5,7 @@ use bevy_asset::Handle;
+ use bevy_ecs::{prelude::Component, reflect::ReflectComponent};
+ use bevy_image::Image;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::extract_component::ExtractComponent;
++use bevy_render::{extract_component::ExtractComponent, view::Hdr};
+ use bevy_utils::default;
+ 
+ /// Component that enables auto exposure for an HDR-enabled 2d or 3d camera.
+@@ -25,6 +25,7 @@ use bevy_utils::default;
+ /// **Auto Exposure requires compute shaders and is not compatible with WebGL2.**
+ #[derive(Component, Clone, Reflect, ExtractComponent)]
+ #[reflect(Component, Default, Clone)]
++#[require(Hdr)]
+ pub struct AutoExposure {
+     /// The range of exposure values for the histogram.
+     ///
+diff --git a/crates/bevy_core_pipeline/src/bloom/settings.rs b/crates/bevy_core_pipeline/src/bloom/settings.rs
+index f6ee8dbd1e358..195c2eb4c0b53 100644
+--- a/crates/bevy_core_pipeline/src/bloom/settings.rs
++++ b/crates/bevy_core_pipeline/src/bloom/settings.rs
+@@ -1,8 +1,12 @@
+ use super::downsampling_pipeline::BloomUniforms;
+-use bevy_ecs::{prelude::Component, query::QueryItem, reflect::ReflectComponent};
++use bevy_ecs::{
++    prelude::Component,
++    query::{QueryItem, With},
++    reflect::ReflectComponent,
++};
+ use bevy_math::{AspectRatio, URect, UVec4, Vec2, Vec4};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::{extract_component::ExtractComponent, prelude::Camera};
++use bevy_render::{extract_component::ExtractComponent, prelude::Camera, view::Hdr};
+ 
+ /// Applies a bloom effect to an HDR-enabled 2d or 3d camera.
+ ///
+@@ -26,6 +30,7 @@ use bevy_render::{extract_component::ExtractComponent, prelude::Camera};
+ /// used in Bevy as well as a visualization of the curve's respective scattering profile.
+ #[derive(Component, Reflect, Clone)]
+ #[reflect(Component, Default, Clone)]
++#[require(Hdr)]
+ pub struct Bloom {
+     /// Controls the baseline of how much the image is scattered (default: 0.15).
+     ///
+@@ -219,7 +224,7 @@ pub enum BloomCompositeMode {
+ impl ExtractComponent for Bloom {
+     type QueryData = (&'static Self, &'static Camera);
+ 
+-    type QueryFilter = ();
++    type QueryFilter = With<Hdr>;
+     type Out = (Self, BloomUniforms);
+ 
+     fn extract_component((bloom, camera): QueryItem<'_, Self::QueryData>) -> Option<Self::Out> {
+@@ -228,9 +233,8 @@ impl ExtractComponent for Bloom {
+             camera.physical_viewport_size(),
+             camera.physical_target_size(),
+             camera.is_active,
+-            camera.hdr,
+         ) {
+-            (Some(URect { min: origin, .. }), Some(size), Some(target_size), true, true)
++            (Some(URect { min: origin, .. }), Some(size), Some(target_size), true)
+                 if size.x != 0 && size.y != 0 =>
+             {
+                 let threshold = bloom.prefilter.threshold;
+diff --git a/crates/bevy_pbr/src/atmosphere/mod.rs b/crates/bevy_pbr/src/atmosphere/mod.rs
+index 773852499e461..12a1f381dbf45 100644
+--- a/crates/bevy_pbr/src/atmosphere/mod.rs
++++ b/crates/bevy_pbr/src/atmosphere/mod.rs
+@@ -50,6 +50,7 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+     extract_component::UniformComponentPlugin,
+     render_resource::{DownlevelFlags, ShaderType, SpecializedRenderPipelines},
++    view::Hdr,
+ };
+ use bevy_render::{
+     extract_component::{ExtractComponent, ExtractComponentPlugin},
+@@ -246,7 +247,7 @@ impl Plugin for AtmospherePlugin {
+ /// from the planet's surface, ozone only exists in a band centered at a fairly
+ /// high altitude.
+ #[derive(Clone, Component, Reflect, ShaderType)]
+-#[require(AtmosphereSettings)]
++#[require(AtmosphereSettings, Hdr)]
+ #[reflect(Clone, Default)]
+ pub struct Atmosphere {
+     /// Radius of the planet
+diff --git a/crates/bevy_pbr/src/atmosphere/resources.rs b/crates/bevy_pbr/src/atmosphere/resources.rs
+index b872916619830..9f6e4801da161 100644
+--- a/crates/bevy_pbr/src/atmosphere/resources.rs
++++ b/crates/bevy_pbr/src/atmosphere/resources.rs
+@@ -325,7 +325,6 @@ pub(crate) struct RenderSkyPipelineId(pub CachedRenderPipelineId);
+ #[derive(Copy, Clone, Hash, PartialEq, Eq)]
+ pub(crate) struct RenderSkyPipelineKey {
+     pub msaa_samples: u32,
+-    pub hdr: bool,
+     pub dual_source_blending: bool,
+ }
+ 
+@@ -338,9 +337,6 @@ impl SpecializedRenderPipeline for RenderSkyBindGroupLayouts {
+         if key.msaa_samples > 1 {
+             shader_defs.push("MULTISAMPLED".into());
+         }
+-        if key.hdr {
+-            shader_defs.push("TONEMAP_IN_SHADER".into());
+-        }
+         if key.dual_source_blending {
+             shader_defs.push("DUAL_SOURCE_BLENDING".into());
+         }
+@@ -394,20 +390,19 @@ impl SpecializedRenderPipeline for RenderSkyBindGroupLayouts {
+ }
+ 
+ pub(super) fn queue_render_sky_pipelines(
+-    views: Query<(Entity, &Camera, &Msaa), With<Atmosphere>>,
++    views: Query<(Entity, &Msaa), (With<Camera>, With<Atmosphere>)>,
+     pipeline_cache: Res<PipelineCache>,
+     layouts: Res<RenderSkyBindGroupLayouts>,
+     mut specializer: ResMut<SpecializedRenderPipelines<RenderSkyBindGroupLayouts>>,
+     render_device: Res<RenderDevice>,
+     mut commands: Commands,
+ ) {
+-    for (entity, camera, msaa) in &views {
++    for (entity, msaa) in &views {
+         let id = specializer.specialize(
+             &pipeline_cache,
+             &layouts,
+             RenderSkyPipelineKey {
+                 msaa_samples: msaa.samples(),
+-                hdr: camera.hdr,
+                 dual_source_blending: render_device
+                     .features()
+                     .contains(WgpuFeatures::DUAL_SOURCE_BLENDING),
+diff --git a/crates/bevy_render/src/camera/camera.rs b/crates/bevy_render/src/camera/camera.rs
+index 95218b7a593cd..2828486fd4d68 100644
+--- a/crates/bevy_render/src/camera/camera.rs
++++ b/crates/bevy_render/src/camera/camera.rs
+@@ -13,7 +13,7 @@ use crate::{
+     sync_world::{RenderEntity, SyncToRenderWorld},
+     texture::GpuImage,
+     view::{
+-        ColorGrading, ExtractedView, ExtractedWindows, Msaa, NoIndirectDrawing, RenderLayers,
++        ColorGrading, ExtractedView, ExtractedWindows, Hdr, Msaa, NoIndirectDrawing, RenderLayers,
+         RenderVisibleEntities, RetainedViewEntity, ViewUniformOffset, Visibility, VisibleEntities,
+     },
+     Extract,
+@@ -356,9 +356,6 @@ pub struct Camera {
+     pub computed: ComputedCameraValues,
+     /// The "target" that this camera will render to.
+     pub target: RenderTarget,
+-    /// If this is set to `true`, the camera will use an intermediate "high dynamic range" render texture.
+-    /// This allows rendering with a wider range of lighting values.
+-    pub hdr: bool,
+     // todo: reflect this when #6042 lands
+     /// The [`CameraOutputMode`] for this camera.
+     #[reflect(ignore, clone)]
+@@ -389,7 +386,6 @@ impl Default for Camera {
+             computed: Default::default(),
+             target: Default::default(),
+             output_mode: Default::default(),
+-            hdr: false,
+             msaa_writeback: true,
+             clear_color: Default::default(),
+             sub_camera_view: None,
+@@ -1101,6 +1097,7 @@ pub fn extract_cameras(
+             &GlobalTransform,
+             &VisibleEntities,
+             &Frustum,
++            Has<Hdr>,
+             Option<&ColorGrading>,
+             Option<&Exposure>,
+             Option<&TemporalJitter>,
+@@ -1122,6 +1119,7 @@ pub fn extract_cameras(
+         transform,
+         visible_entities,
+         frustum,
++        hdr,
+         color_grading,
+         exposure,
+         temporal_jitter,
+@@ -1200,14 +1198,14 @@ pub fn extract_cameras(
+                     exposure: exposure
+                         .map(Exposure::exposure)
+                         .unwrap_or_else(|| Exposure::default().exposure()),
+-                    hdr: camera.hdr,
++                    hdr,
+                 },
+                 ExtractedView {
+                     retained_view_entity: RetainedViewEntity::new(main_entity.into(), None, 0),
+                     clip_from_view: camera.clip_from_view(),
+                     world_from_view: *transform,
+                     clip_from_world: None,
+-                    hdr: camera.hdr,
++                    hdr,
+                     viewport: UVec4::new(
+                         viewport_origin.x,
+                         viewport_origin.y,
+diff --git a/crates/bevy_render/src/view/mod.rs b/crates/bevy_render/src/view/mod.rs
+index 2f80e5f94bdb6..9f7ae3e637e58 100644
+--- a/crates/bevy_render/src/view/mod.rs
++++ b/crates/bevy_render/src/view/mod.rs
+@@ -114,6 +114,7 @@ impl Plugin for ViewPlugin {
+             .register_type::<OcclusionCulling>()
+             // NOTE: windows.is_changed() handles cases where a window was resized
+             .add_plugins((
++                ExtractComponentPlugin::<Hdr>::default(),
+                 ExtractComponentPlugin::<Msaa>::default(),
+                 ExtractComponentPlugin::<OcclusionCulling>::default(),
+                 VisibilityPlugin,
+@@ -199,6 +200,16 @@ impl Msaa {
+     }
+ }
+ 
++/// If this component is added to a camera, the camera will use an intermediate "high dynamic range" render texture.
++/// This allows rendering with a wider range of lighting values. However, this does *not* affect
++/// whether the camera will render with hdr display output (which bevy does not support currently)
++/// and only affects the intermediate render texture.
++#[derive(
++    Component, Default, Copy, Clone, ExtractComponent, Reflect, PartialEq, Eq, Hash, Debug,
++)]
++#[reflect(Component, Default, PartialEq, Hash, Debug)]
++pub struct Hdr;
++
+ /// An identifier for a view that is stable across frames.
+ ///
+ /// We can't use [`Entity`] for this because render world entities aren't
+diff --git a/crates/bevy_ui/src/render/mod.rs b/crates/bevy_ui/src/render/mod.rs
+index 8b0d6bad879fe..ecf66cbce9c37 100644
+--- a/crates/bevy_ui/src/render/mod.rs
++++ b/crates/bevy_ui/src/render/mod.rs
+@@ -28,7 +28,7 @@ use bevy_render::render_phase::ViewSortedRenderPhases;
+ use bevy_render::renderer::RenderContext;
+ use bevy_render::sync_world::MainEntity;
+ use bevy_render::texture::TRANSPARENT_IMAGE_HANDLE;
+-use bevy_render::view::RetainedViewEntity;
++use bevy_render::view::{Hdr, RetainedViewEntity};
+ use bevy_render::{
+     camera::Camera,
+     render_asset::RenderAssets,
+@@ -629,6 +629,7 @@ pub fn extract_ui_camera_view(
+                 Entity,
+                 RenderEntity,
+                 &Camera,
++                Has<Hdr>,
+                 Option<&UiAntiAlias>,
+                 Option<&BoxShadowSamples>,
+             ),
+@@ -639,7 +640,7 @@ pub fn extract_ui_camera_view(
+ ) {
+     live_entities.clear();
+ 
+-    for (main_entity, render_entity, camera, ui_anti_alias, shadow_samples) in &query {
++    for (main_entity, render_entity, camera, hdr, ui_anti_alias, shadow_samples) in &query {
+         // ignore inactive cameras
+         if !camera.is_active {
+             commands
+@@ -675,7 +676,7 @@ pub fn extract_ui_camera_view(
+                             UI_CAMERA_FAR + UI_CAMERA_TRANSFORM_OFFSET,
+                         ),
+                         clip_from_world: None,
+-                        hdr: camera.hdr,
++                        hdr,
+                         viewport: UVec4::from((
+                             physical_viewport_rect.min,
+                             physical_viewport_rect.size(),
+diff --git a/examples/2d/bloom_2d.rs b/examples/2d/bloom_2d.rs
+index fd90210d6fbc7..9d9be1e5c7f10 100644
+--- a/examples/2d/bloom_2d.rs
++++ b/examples/2d/bloom_2d.rs
+@@ -25,7 +25,6 @@ fn setup(
+     commands.spawn((
+         Camera2d,
+         Camera {
+-            hdr: true, // 1. HDR is required for bloom
+             clear_color: ClearColorConfig::Custom(Color::BLACK),
+             ..default()
+         },
+diff --git a/examples/3d/anti_aliasing.rs b/examples/3d/anti_aliasing.rs
+index e29574588c71f..1f693ce23886a 100644
+--- a/examples/3d/anti_aliasing.rs
++++ b/examples/3d/anti_aliasing.rs
+@@ -17,6 +17,7 @@ use bevy::{
+         camera::TemporalJitter,
+         render_asset::RenderAssetUsages,
+         render_resource::{Extent3d, TextureDimension, TextureFormat},
++        view::Hdr,
+     },
+ };
+ 
+@@ -300,10 +301,7 @@ fn setup(
+     // Camera
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
++        Hdr,
+         Transform::from_xyz(0.7, 0.7, 1.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
+         ContrastAdaptiveSharpening {
+             enabled: false,
+diff --git a/examples/3d/atmosphere.rs b/examples/3d/atmosphere.rs
+index 53c5c91dfa687..edc6d04dab7b0 100644
+--- a/examples/3d/atmosphere.rs
++++ b/examples/3d/atmosphere.rs
+@@ -20,11 +20,6 @@ fn main() {
+ fn setup_camera_fog(mut commands: Commands) {
+     commands.spawn((
+         Camera3d::default(),
+-        // HDR is required for atmospheric scattering to be properly applied to the scene
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Transform::from_xyz(-1.2, 0.15, 0.0).looking_at(Vec3::Y * 0.1, Vec3::Y),
+         // This is the component that enables atmospheric scattering for a camera
+         Atmosphere::EARTH,
+@@ -36,7 +31,7 @@ fn setup_camera_fog(mut commands: Commands) {
+             scene_units_to_m: 1e+4,
+             ..Default::default()
+         },
+-        // The directional light illuminance  used in this scene
++        // The directional light illuminance used in this scene
+         // (the one recommended for use with this feature) is
+         // quite bright, so raising the exposure compensation helps
+         // bring the scene to a nicer brightness range.
+diff --git a/examples/3d/auto_exposure.rs b/examples/3d/auto_exposure.rs
+index 79fece61c8e36..62c875dc5dc8a 100644
+--- a/examples/3d/auto_exposure.rs
++++ b/examples/3d/auto_exposure.rs
+@@ -40,10 +40,6 @@ fn setup(
+ 
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Transform::from_xyz(1.0, 0.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+         AutoExposure {
+             metering_mask: metering_mask.clone(),
+diff --git a/examples/3d/blend_modes.rs b/examples/3d/blend_modes.rs
+index 830acfdb34160..95fe522cf0ba8 100644
+--- a/examples/3d/blend_modes.rs
++++ b/examples/3d/blend_modes.rs
+@@ -10,7 +10,7 @@
+ //! | `Spacebar`         | Toggle Unlit                        |
+ //! | `C`                | Randomize Colors                    |
+ 
+-use bevy::{color::palettes::css::ORANGE, prelude::*};
++use bevy::{color::palettes::css::ORANGE, prelude::*, render::view::Hdr};
+ use rand::random;
+ 
+ fn main() {
+@@ -149,6 +149,7 @@ fn setup(
+     commands.spawn((
+         Camera3d::default(),
+         Transform::from_xyz(0.0, 2.5, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
++        Hdr,
+         // Unfortunately, MSAA and HDR are not supported simultaneously under WebGL.
+         // Since this example uses HDR, we must disable MSAA for Wasm builds, at least
+         // until WebGPU is ready and no longer behind a feature flag in Web browsers.
+@@ -249,13 +250,23 @@ impl Default for ExampleState {
+ fn example_control_system(
+     mut materials: ResMut<Assets<StandardMaterial>>,
+     controllable: Query<(&MeshMaterial3d<StandardMaterial>, &ExampleControls)>,
+-    camera: Single<(&mut Camera, &mut Transform, &GlobalTransform), With<Camera3d>>,
++    camera: Single<
++        (
++            Entity,
++            &mut Camera,
++            &mut Transform,
++            &GlobalTransform,
++            Has<Hdr>,
++        ),
++        With<Camera3d>,
++    >,
+     mut labels: Query<(&mut Node, &ExampleLabel)>,
+     mut display: Single<&mut Text, With<ExampleDisplay>>,
+     labeled: Query<&GlobalTransform>,
+     mut state: Local<ExampleState>,
+     time: Res<Time>,
+     input: Res<ButtonInput<KeyCode>>,
++    mut commands: Commands,
+ ) {
+     if input.pressed(KeyCode::ArrowUp) {
+         state.alpha = (state.alpha + time.delta_secs()).min(1.0);
+@@ -289,10 +300,14 @@ fn example_control_system(
+         }
+     }
+ 
+-    let (mut camera, mut camera_transform, camera_global_transform) = camera.into_inner();
++    let (entity, camera, mut camera_transform, camera_global_transform, hdr) = camera.into_inner();
+ 
+     if input.just_pressed(KeyCode::KeyH) {
+-        camera.hdr = !camera.hdr;
++        if hdr {
++            commands.entity(entity).remove::<Hdr>();
++        } else {
++            commands.entity(entity).insert(Hdr);
++        }
+     }
+ 
+     let rotation = if input.pressed(KeyCode::ArrowLeft) {
+@@ -318,7 +333,7 @@ fn example_control_system(
+ 
+     display.0 = format!(
+         "  HDR: {}\nAlpha: {:.2}",
+-        if camera.hdr { "ON " } else { "OFF" },
++        if hdr { "ON " } else { "OFF" },
+         state.alpha
+     );
+ }
+diff --git a/examples/3d/bloom_3d.rs b/examples/3d/bloom_3d.rs
+index fd87928283a70..113fb95b1b3cc 100644
+--- a/examples/3d/bloom_3d.rs
++++ b/examples/3d/bloom_3d.rs
+@@ -29,17 +29,16 @@ fn setup_scene(
+     commands.spawn((
+         Camera3d::default(),
+         Camera {
+-            hdr: true, // 1. HDR is required for bloom
+             clear_color: ClearColorConfig::Custom(Color::BLACK),
+             ..default()
+         },
+-        Tonemapping::TonyMcMapface, // 2. Using a tonemapper that desaturates to white is recommended
++        Tonemapping::TonyMcMapface, // 1. Using a tonemapper that desaturates to white is recommended
+         Transform::from_xyz(-2.0, 2.5, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+-        Bloom::NATURAL, // 3. Enable bloom for the camera
++        Bloom::NATURAL, // 2. Enable bloom for the camera
+     ));
+ 
+     let material_emissive1 = materials.add(StandardMaterial {
+-        emissive: LinearRgba::rgb(0.0, 0.0, 150.0), // 4. Put something bright in a dark environment to see the effect
++        emissive: LinearRgba::rgb(0.0, 0.0, 150.0), // 3. Put something bright in a dark environment to see the effect
+         ..default()
+     });
+     let material_emissive2 = materials.add(StandardMaterial {
+diff --git a/examples/3d/clearcoat.rs b/examples/3d/clearcoat.rs
+index c04b12d5814ed..9337906c37f87 100644
+--- a/examples/3d/clearcoat.rs
++++ b/examples/3d/clearcoat.rs
+@@ -25,6 +25,7 @@ use bevy::{
+     image::ImageLoaderSettings,
+     math::vec3,
+     prelude::*,
++    render::view::Hdr,
+ };
+ 
+ /// The size of each sphere.
+@@ -191,10 +192,7 @@ fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
+     commands
+         .spawn((
+             Camera3d::default(),
+-            Camera {
+-                hdr: true,
+-                ..default()
+-            },
++            Hdr,
+             Projection::Perspective(PerspectiveProjection {
+                 fov: 27.0 / 180.0 * PI,
+                 ..default()
+diff --git a/examples/3d/color_grading.rs b/examples/3d/color_grading.rs
+index 0b2616c1879b5..735efb9ef1563 100644
+--- a/examples/3d/color_grading.rs
++++ b/examples/3d/color_grading.rs
+@@ -9,7 +9,7 @@ use bevy::{
+     ecs::system::EntityCommands,
+     pbr::CascadeShadowConfigBuilder,
+     prelude::*,
+-    render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
++    render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, Hdr},
+ };
+ use std::fmt::Display;
+ 
+@@ -334,10 +334,7 @@ fn add_text<'a>(
+ fn add_camera(commands: &mut Commands, asset_server: &AssetServer, color_grading: ColorGrading) {
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
++        Hdr,
+         Transform::from_xyz(0.7, 0.7, 1.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
+         color_grading,
+         DistanceFog {
+diff --git a/examples/3d/deferred_rendering.rs b/examples/3d/deferred_rendering.rs
+index d6e58fe5058a8..6f51cff8c20ec 100644
+--- a/examples/3d/deferred_rendering.rs
++++ b/examples/3d/deferred_rendering.rs
+@@ -33,11 +33,6 @@ fn setup(
+ ) {
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            // Deferred both supports both hdr: true and hdr: false
+-            hdr: false,
+-            ..default()
+-        },
+         Transform::from_xyz(0.7, 0.7, 1.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
+         // MSAA needs to be off for Deferred rendering
+         Msaa::Off,
+diff --git a/examples/3d/depth_of_field.rs b/examples/3d/depth_of_field.rs
+index d6ca77bbde0ca..1ecfb3e247bfb 100644
+--- a/examples/3d/depth_of_field.rs
++++ b/examples/3d/depth_of_field.rs
+@@ -73,10 +73,6 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
+     let mut camera = commands.spawn((
+         Camera3d::default(),
+         Transform::from_xyz(0.0, 4.5, 8.25).looking_at(Vec3::ZERO, Vec3::Y),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Tonemapping::TonyMcMapface,
+         Bloom::NATURAL,
+     ));
+diff --git a/examples/3d/fog_volumes.rs b/examples/3d/fog_volumes.rs
+index 68fc6d0ea783e..63804ee9dea82 100644
+--- a/examples/3d/fog_volumes.rs
++++ b/examples/3d/fog_volumes.rs
+@@ -9,6 +9,7 @@ use bevy::{
+     math::vec3,
+     pbr::{FogVolume, VolumetricFog, VolumetricLight},
+     prelude::*,
++    render::view::Hdr,
+ };
+ 
+ /// Entry point.
+@@ -58,10 +59,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     commands.spawn((
+         Camera3d::default(),
+         Transform::from_xyz(-0.75, 1.0, 2.0).looking_at(vec3(0.0, 0.0, 0.0), Vec3::Y),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
++        Hdr,
+         VolumetricFog {
+             // Make this relatively high in order to increase the fog quality.
+             step_count: 64,
+diff --git a/examples/3d/mesh_ray_cast.rs b/examples/3d/mesh_ray_cast.rs
+index 85985f75a900a..8093a873a728e 100644
+--- a/examples/3d/mesh_ray_cast.rs
++++ b/examples/3d/mesh_ray_cast.rs
+@@ -104,10 +104,6 @@ fn setup(
+     // Camera
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Transform::from_xyz(1.5, 1.5, 1.5).looking_at(Vec3::ZERO, Vec3::Y),
+         Tonemapping::TonyMcMapface,
+         Bloom::default(),
+diff --git a/examples/3d/post_processing.rs b/examples/3d/post_processing.rs
+index 54a9e9089f163..e539d94b3093c 100644
+--- a/examples/3d/post_processing.rs
++++ b/examples/3d/post_processing.rs
+@@ -6,6 +6,7 @@ use std::f32::consts::PI;
+ 
+ use bevy::{
+     core_pipeline::post_process::ChromaticAberration, pbr::CascadeShadowConfigBuilder, prelude::*,
++    render::view::Hdr,
+ };
+ 
+ /// The number of units per frame to add to or subtract from intensity when the
+@@ -60,10 +61,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
+ fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
++        Hdr,
+         Transform::from_xyz(0.7, 0.7, 1.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
+         DistanceFog {
+             color: Color::srgb_u8(43, 44, 47),
+diff --git a/examples/3d/reflection_probes.rs b/examples/3d/reflection_probes.rs
+index e2e3ea60b4f99..6b2db9d39ca2c 100644
+--- a/examples/3d/reflection_probes.rs
++++ b/examples/3d/reflection_probes.rs
+@@ -6,7 +6,7 @@
+ //!
+ //! Reflection probes don't work on WebGL 2 or WebGPU.
+ 
+-use bevy::{core_pipeline::Skybox, prelude::*};
++use bevy::{core_pipeline::Skybox, prelude::*, render::view::Hdr};
+ 
+ use std::{
+     f32::consts::PI,
+@@ -105,11 +105,8 @@ fn spawn_scene(commands: &mut Commands, asset_server: &AssetServer) {
+ fn spawn_camera(commands: &mut Commands) {
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Transform::from_xyz(-6.483, 0.325, 4.381).looking_at(Vec3::ZERO, Vec3::Y),
++        Hdr,
+     ));
+ }
+ 
+diff --git a/examples/3d/rotate_environment_map.rs b/examples/3d/rotate_environment_map.rs
+index 68ecceeccf7de..71a4fd751315c 100644
+--- a/examples/3d/rotate_environment_map.rs
++++ b/examples/3d/rotate_environment_map.rs
+@@ -7,6 +7,7 @@ use bevy::{
+     core_pipeline::{tonemapping::Tonemapping::AcesFitted, Skybox},
+     image::ImageLoaderSettings,
+     prelude::*,
++    render::view::Hdr,
+ };
+ 
+ /// Entry point.
+@@ -95,10 +96,7 @@ fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
+     commands
+         .spawn((
+             Camera3d::default(),
+-            Camera {
+-                hdr: true,
+-                ..default()
+-            },
++            Hdr,
+             Projection::Perspective(PerspectiveProjection {
+                 fov: 27.0 / 180.0 * PI,
+                 ..default()
+diff --git a/examples/3d/scrolling_fog.rs b/examples/3d/scrolling_fog.rs
+index f65b4131701cd..3438417fb4bf6 100644
+--- a/examples/3d/scrolling_fog.rs
++++ b/examples/3d/scrolling_fog.rs
+@@ -49,10 +49,6 @@ fn setup(
+     commands.spawn((
+         Camera3d::default(),
+         Transform::from_xyz(0.0, 2.0, 0.0).looking_at(Vec3::new(-5.0, 3.5, -6.0), Vec3::Y),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Msaa::Off,
+         TemporalAntiAliasing::default(),
+         Bloom::default(),
+diff --git a/examples/3d/specular_tint.rs b/examples/3d/specular_tint.rs
+index 5dc362b9c12e6..148f11ba5caf6 100644
+--- a/examples/3d/specular_tint.rs
++++ b/examples/3d/specular_tint.rs
+@@ -2,7 +2,7 @@
+ 
+ use std::f32::consts::PI;
+ 
+-use bevy::{color::palettes::css::WHITE, core_pipeline::Skybox, prelude::*};
++use bevy::{color::palettes::css::WHITE, core_pipeline::Skybox, prelude::*, render::view::Hdr};
+ 
+ /// The camera rotation speed in radians per frame.
+ const ROTATION_SPEED: f32 = 0.005;
+@@ -82,10 +82,7 @@ fn setup(
+     // Spawns a camera.
+     commands.spawn((
+         Transform::from_xyz(-2.0, 0.0, 3.5).looking_at(Vec3::ZERO, Vec3::Y),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
++        Hdr,
+         Camera3d::default(),
+         Skybox {
+             image: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
+diff --git a/examples/3d/spotlight.rs b/examples/3d/spotlight.rs
+index c92843404ef37..3885f47e65fbf 100644
+--- a/examples/3d/spotlight.rs
++++ b/examples/3d/spotlight.rs
+@@ -7,6 +7,7 @@ use bevy::{
+     math::ops,
+     pbr::NotShadowCaster,
+     prelude::*,
++    render::view::Hdr,
+ };
+ use rand::{Rng, SeedableRng};
+ use rand_chacha::ChaCha8Rng;
+@@ -119,10 +120,7 @@ fn setup(
+     // camera
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
++        Hdr,
+         Transform::from_xyz(-4.0, 5.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+     ));
+ 
+diff --git a/examples/3d/ssao.rs b/examples/3d/ssao.rs
+index d036fb805dd03..b33ab42090233 100644
+--- a/examples/3d/ssao.rs
++++ b/examples/3d/ssao.rs
+@@ -5,7 +5,7 @@ use bevy::{
+     math::ops,
+     pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel},
+     prelude::*,
+-    render::camera::TemporalJitter,
++    render::{camera::TemporalJitter, view::Hdr},
+ };
+ use std::f32::consts::PI;
+ 
+@@ -28,11 +28,8 @@ fn setup(
+ ) {
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Transform::from_xyz(-2.0, 2.0, -2.0).looking_at(Vec3::ZERO, Vec3::Y),
++        Hdr,
+         Msaa::Off,
+         ScreenSpaceAmbientOcclusion::default(),
+         TemporalAntiAliasing::default(),
+diff --git a/examples/3d/ssr.rs b/examples/3d/ssr.rs
+index a4d2c1b742c0f..9deb9ee2c2eed 100644
+--- a/examples/3d/ssr.rs
++++ b/examples/3d/ssr.rs
+@@ -16,7 +16,10 @@ use bevy::{
+         DefaultOpaqueRendererMethod, ExtendedMaterial, MaterialExtension, ScreenSpaceReflections,
+     },
+     prelude::*,
+-    render::render_resource::{AsBindGroup, ShaderRef, ShaderType},
++    render::{
++        render_resource::{AsBindGroup, ShaderRef, ShaderType},
++        view::Hdr,
++    },
+ };
+ 
+ /// This example uses a shader source file from the assets subdirectory
+@@ -227,10 +230,7 @@ fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
+         .spawn((
+             Camera3d::default(),
+             Transform::from_translation(vec3(-1.25, 2.25, 4.5)).looking_at(Vec3::ZERO, Vec3::Y),
+-            Camera {
+-                hdr: true,
+-                ..default()
+-            },
++            Hdr,
+             Msaa::Off,
+         ))
+         .insert(EnvironmentMapLight {
+diff --git a/examples/3d/tonemapping.rs b/examples/3d/tonemapping.rs
+index 66b7d76ce950f..0808776e2be7b 100644
+--- a/examples/3d/tonemapping.rs
++++ b/examples/3d/tonemapping.rs
+@@ -9,7 +9,7 @@ use bevy::{
+     reflect::TypePath,
+     render::{
+         render_resource::{AsBindGroup, ShaderRef},
+-        view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
++        view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, Hdr},
+     },
+ };
+ use std::f32::consts::PI;
+@@ -65,10 +65,7 @@ fn setup(
+     // camera
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
++        Hdr,
+         camera_transform.0,
+         DistanceFog {
+             color: Color::srgb_u8(43, 44, 47),
+diff --git a/examples/3d/transmission.rs b/examples/3d/transmission.rs
+index e4df69b3d96fa..36a78b1a6237d 100644
+--- a/examples/3d/transmission.rs
++++ b/examples/3d/transmission.rs
+@@ -31,7 +31,7 @@ use bevy::{
+     prelude::*,
+     render::{
+         camera::{Exposure, TemporalJitter},
+-        view::{ColorGrading, ColorGradingGlobal},
++        view::{ColorGrading, ColorGradingGlobal, Hdr},
+     },
+ };
+ 
+@@ -303,10 +303,6 @@ fn setup(
+     // Camera
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            hdr: true,
+-            ..default()
+-        },
+         Transform::from_xyz(1.0, 1.8, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
+         ColorGrading {
+             global: ColorGradingGlobal {
+@@ -387,11 +383,11 @@ fn example_control_system(
+     camera: Single<
+         (
+             Entity,
+-            &mut Camera,
+             &mut Camera3d,
+             &mut Transform,
+             Option<&DepthPrepass>,
+             Option<&TemporalJitter>,
++            Has<Hdr>,
+         ),
+         With<Camera3d>,
+     >,
+@@ -458,17 +454,15 @@ fn example_control_system(
+         }
+     }
+ 
+-    let (
+-        camera_entity,
+-        mut camera,
+-        mut camera_3d,
+-        mut camera_transform,
+-        depth_prepass,
+-        temporal_jitter,
+-    ) = camera.into_inner();
++    let (camera_entity, mut camera_3d, mut camera_transform, depth_prepass, temporal_jitter, hdr) =
++        camera.into_inner();
+ 
+     if input.just_pressed(KeyCode::KeyH) {
+-        camera.hdr = !camera.hdr;
++        if hdr {
++            commands.entity(camera_entity).remove::<Hdr>();
++        } else {
++            commands.entity(camera_entity).insert(Hdr);
++        }
+     }
+ 
+     #[cfg(any(feature = "webgpu", not(target_arch = "wasm32")))]
+@@ -571,7 +565,7 @@ fn example_control_system(
+         state.ior,
+         state.perceptual_roughness,
+         state.reflectance,
+-        if camera.hdr { "ON " } else { "OFF" },
++        if hdr { "ON " } else { "OFF" },
+         if cfg!(any(feature = "webgpu", not(target_arch = "wasm32"))) {
+             if depth_prepass.is_some() {
+                 "ON "
+diff --git a/examples/3d/volumetric_fog.rs b/examples/3d/volumetric_fog.rs
+index 9cfef624c6594..1d13e333c9d31 100644
+--- a/examples/3d/volumetric_fog.rs
++++ b/examples/3d/volumetric_fog.rs
+@@ -65,10 +65,6 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
+     commands
+         .spawn((
+             Camera3d::default(),
+-            Camera {
+-                hdr: true,
+-                ..default()
+-            },
+             Transform::from_xyz(-1.7, 1.5, 4.5).looking_at(vec3(-1.5, 1.7, 3.5), Vec3::Y),
+             Tonemapping::TonyMcMapface,
+             Bloom::default(),
+diff --git a/examples/animation/animation_events.rs b/examples/animation/animation_events.rs
+index 177fa2f47f300..6e292c4e6de28 100644
+--- a/examples/animation/animation_events.rs
++++ b/examples/animation/animation_events.rs
+@@ -44,7 +44,6 @@ fn setup(
+         Camera2d,
+         Camera {
+             clear_color: ClearColorConfig::Custom(BLACK.into()),
+-            hdr: true,
+             ..Default::default()
+         },
+         Bloom {
+diff --git a/examples/camera/2d_top_down_camera.rs b/examples/camera/2d_top_down_camera.rs
+index 98bf0bcaf4180..2ab89c8c3872a 100644
+--- a/examples/camera/2d_top_down_camera.rs
++++ b/examples/camera/2d_top_down_camera.rs
+@@ -61,14 +61,7 @@ fn setup_instructions(mut commands: Commands) {
+ }
+ 
+ fn setup_camera(mut commands: Commands) {
+-    commands.spawn((
+-        Camera2d,
+-        Camera {
+-            hdr: true, // HDR is required for the bloom effect
+-            ..default()
+-        },
+-        Bloom::NATURAL,
+-    ));
++    commands.spawn((Camera2d, Bloom::NATURAL));
+ }
+ 
+ /// Update the camera position by tracking the player.
+diff --git a/examples/math/sampling_primitives.rs b/examples/math/sampling_primitives.rs
+index 446f6c911fe06..8a227123ab84a 100644
+--- a/examples/math/sampling_primitives.rs
++++ b/examples/math/sampling_primitives.rs
+@@ -340,7 +340,6 @@ fn setup(
+     commands.spawn((
+         Camera3d::default(),
+         Camera {
+-            hdr: true, // HDR is required for bloom
+             clear_color: ClearColorConfig::Custom(SKY_COLOR),
+             ..default()
+         },
+diff --git a/examples/testbed/2d.rs b/examples/testbed/2d.rs
+index 7d80aae91f8d3..7daddf1568a2c 100644
+--- a/examples/testbed/2d.rs
++++ b/examples/testbed/2d.rs
+@@ -121,10 +121,6 @@ mod bloom {
+     ) {
+         commands.spawn((
+             Camera2d,
+-            Camera {
+-                hdr: true,
+-                ..default()
+-            },
+             Tonemapping::TonyMcMapface,
+             Bloom::default(),
+             DespawnOnExitState(super::Scene::Bloom),
+diff --git a/examples/testbed/3d.rs b/examples/testbed/3d.rs
+index dff29d06cab9d..4fa7f0525e66a 100644
+--- a/examples/testbed/3d.rs
++++ b/examples/testbed/3d.rs
+@@ -155,10 +155,6 @@ mod bloom {
+     ) {
+         commands.spawn((
+             Camera3d::default(),
+-            Camera {
+-                hdr: true,
+-                ..default()
+-            },
+             Tonemapping::TonyMcMapface,
+             Transform::from_xyz(-2.0, 2.5, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+             Bloom::NATURAL,
+diff --git a/release-content/migration-guides/camera_restructure.md b/release-content/migration-guides/camera_restructure.md
+new file mode 100644
+index 0000000000000..a7904bcf63f3d
+--- /dev/null
++++ b/release-content/migration-guides/camera_restructure.md
+@@ -0,0 +1,12 @@
++---
++title: Camera Restructure
++pull_requests: [18873]
++---
++
++As part of the rendering crate reorganization, we've been working to simplify Bevy `Camera`s:
++
++- `Camera.hdr` has been split out into a new marker component, `Hdr`
++  - before: `commands.spawn((Camera3d, Camera { hdr: true, ..default() });`
++  - after: `commands.spawn((Camera3d, Hdr));`
++  - rendering effects can now `#[require(Hdr)]` if they only function with an HDR camera.
++    This is currently implemented for `Bloom`, `AutoExposure`, and `Atmosphere`
