@@ -1,0 +1,213 @@
+diff --git a/crates/bevy_ecs/macros/src/component.rs b/crates/bevy_ecs/macros/src/component.rs
+index 00268cb680050..d8052f331e0b6 100644
+--- a/crates/bevy_ecs/macros/src/component.rs
++++ b/crates/bevy_ecs/macros/src/component.rs
+@@ -94,9 +94,11 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
+ 
+     let map_entities = map_entities(
+         &ast.data,
++        &bevy_ecs_path,
+         Ident::new("this", Span::call_site()),
+         relationship.is_some(),
+         relationship_target.is_some(),
++        attrs.map_entities
+     ).map(|map_entities_impl| quote! {
+         fn map_entities<M: #bevy_ecs_path::entity::EntityMapper>(this: &mut Self, mapper: &mut M) {
+             use #bevy_ecs_path::entity::MapEntities;
+@@ -305,10 +307,19 @@ const ENTITIES: &str = "entities";
+ 
+ pub(crate) fn map_entities(
+     data: &Data,
++    bevy_ecs_path: &Path,
+     self_ident: Ident,
+     is_relationship: bool,
+     is_relationship_target: bool,
++    map_entities_attr: Option<MapEntitiesAttributeKind>,
+ ) -> Option<TokenStream2> {
++    if let Some(map_entities_override) = map_entities_attr {
++        let map_entities_tokens = map_entities_override.to_token_stream(bevy_ecs_path);
++        return Some(quote!(
++            #map_entities_tokens(#self_ident, mapper)
++        ));
++    }
++
+     match data {
+         Data::Struct(DataStruct { fields, .. }) => {
+             let mut map = Vec::with_capacity(fields.len());
+@@ -396,6 +407,7 @@ pub const ON_INSERT: &str = "on_insert";
+ pub const ON_REPLACE: &str = "on_replace";
+ pub const ON_REMOVE: &str = "on_remove";
+ pub const ON_DESPAWN: &str = "on_despawn";
++pub const MAP_ENTITIES: &str = "map_entities";
+ 
+ pub const IMMUTABLE: &str = "immutable";
+ pub const CLONE_BEHAVIOR: &str = "clone_behavior";
+@@ -450,6 +462,56 @@ impl Parse for HookAttributeKind {
+     }
+ }
+ 
++#[derive(Debug)]
++pub(super) enum MapEntitiesAttributeKind {
++    /// expressions like function or struct names
++    ///
++    /// structs will throw compile errors on the code generation so this is safe
++    Path(ExprPath),
++    /// When no value is specified
++    Default,
++}
++
++impl MapEntitiesAttributeKind {
++    fn from_expr(value: Expr) -> Result<Self> {
++        match value {
++            Expr::Path(path) => Ok(Self::Path(path)),
++            // throw meaningful error on all other expressions
++            _ => Err(syn::Error::new(
++                value.span(),
++                [
++                    "Not supported in this position, please use one of the following:",
++                    "- path to function",
++                    "- nothing to default to MapEntities implementation",
++                ]
++                .join("\n"),
++            )),
++        }
++    }
++
++    fn to_token_stream(&self, bevy_ecs_path: &Path) -> TokenStream2 {
++        match self {
++            MapEntitiesAttributeKind::Path(path) => path.to_token_stream(),
++            MapEntitiesAttributeKind::Default => {
++                quote!(
++                   <Self as #bevy_ecs_path::entity::MapEntities>::map_entities
++                )
++            }
++        }
++    }
++}
++
++impl Parse for MapEntitiesAttributeKind {
++    fn parse(input: syn::parse::ParseStream) -> Result<Self> {
++        if input.peek(Token![=]) {
++            input.parse::<Token![=]>()?;
++            input.parse::<Expr>().and_then(Self::from_expr)
++        } else {
++            Ok(Self::Default)
++        }
++    }
++}
++
+ struct Attrs {
+     storage: StorageTy,
+     requires: Option<Punctuated<Require, Comma>>,
+@@ -462,6 +524,7 @@ struct Attrs {
+     relationship_target: Option<RelationshipTarget>,
+     immutable: bool,
+     clone_behavior: Option<Expr>,
++    map_entities: Option<MapEntitiesAttributeKind>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -501,6 +564,7 @@ fn parse_component_attr(ast: &DeriveInput) -> Result<Attrs> {
+         relationship_target: None,
+         immutable: false,
+         clone_behavior: None,
++        map_entities: None,
+     };
+ 
+     let mut require_paths = HashSet::new();
+@@ -539,6 +603,9 @@ fn parse_component_attr(ast: &DeriveInput) -> Result<Attrs> {
+                 } else if nested.path.is_ident(CLONE_BEHAVIOR) {
+                     attrs.clone_behavior = Some(nested.value()?.parse()?);
+                     Ok(())
++                } else if nested.path.is_ident(MAP_ENTITIES) {
++                    attrs.map_entities = Some(nested.input.parse::<MapEntitiesAttributeKind>()?);
++                    Ok(())
+                 } else {
+                     Err(nested.error("Unsupported attribute"))
+                 }
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index 114aff642b58c..04d7a8942e3a9 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -194,9 +194,11 @@ pub fn derive_map_entities(input: TokenStream) -> TokenStream {
+ 
+     let map_entities_impl = map_entities(
+         &ast.data,
++        &ecs_path,
+         Ident::new("self", Span::call_site()),
+         false,
+         false,
++        None,
+     );
+ 
+     let struct_name = &ast.ident;
+diff --git a/crates/bevy_ecs/src/component.rs b/crates/bevy_ecs/src/component.rs
+index 80e60a88600c0..d33deeeb63dbb 100644
+--- a/crates/bevy_ecs/src/component.rs
++++ b/crates/bevy_ecs/src/component.rs
+@@ -576,6 +576,65 @@ pub trait Component: Send + Sync + 'static {
+     ///     items: Vec<Option<Entity>>
+     /// }
+     /// ```
++    ///
++    /// You might need more specialized logic. A likely cause of this is your component contains collections of entities that
++    /// don't implement [`MapEntities`](crate::entity::MapEntities). In that case, you can annotate your component with
++    /// `#[component(map_entities)]`. Using this attribute, you must implement `MapEntities` for the
++    /// component itself, and this method will simply call that implementation.
++    ///
++    /// ```
++    /// # use bevy_ecs::{component::Component, entity::{Entity, MapEntities, EntityMapper}};
++    /// # use std::collections::HashMap;
++    /// #[derive(Component)]
++    /// #[component(map_entities)]
++    /// struct Inventory {
++    ///     items: HashMap<Entity, usize>
++    /// }
++    ///
++    /// impl MapEntities for Inventory {
++    ///   fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {
++    ///      self.items = self.items
++    ///          .drain()
++    ///          .map(|(id, count)|(entity_mapper.get_mapped(id), count))
++    ///          .collect();
++    ///   }
++    /// }
++    /// # let a = Entity::from_bits(0x1_0000_0001);
++    /// # let b = Entity::from_bits(0x1_0000_0002);
++    /// # let mut inv = Inventory { items: Default::default() };
++    /// # inv.items.insert(a, 10);
++    /// # <Inventory as Component>::map_entities(&mut inv, &mut (a,b));
++    /// # assert_eq!(inv.items.get(&b), Some(&10));
++    /// ````
++    ///
++    /// Alternatively, you can specify the path to a function with `#[component(map_entities = function_path)]`, similar to component hooks.
++    /// In this case, the inputs of the function should mirror the inputs to this method, with the second parameter being generic.
++    ///
++    /// ```
++    /// # use bevy_ecs::{component::Component, entity::{Entity, MapEntities, EntityMapper}};
++    /// # use std::collections::HashMap;
++    /// #[derive(Component)]
++    /// #[component(map_entities = map_the_map)]
++    /// // Also works: map_the_map::<M> or map_the_map::<_>
++    /// struct Inventory {
++    ///     items: HashMap<Entity, usize>
++    /// }
++    ///
++    /// fn map_the_map<M: EntityMapper>(inv: &mut Inventory, entity_mapper: &mut M) {
++    ///    inv.items = inv.items
++    ///        .drain()
++    ///        .map(|(id, count)|(entity_mapper.get_mapped(id), count))
++    ///        .collect();
++    /// }
++    /// # let a = Entity::from_bits(0x1_0000_0001);
++    /// # let b = Entity::from_bits(0x1_0000_0002);
++    /// # let mut inv = Inventory { items: Default::default() };
++    /// # inv.items.insert(a, 10);
++    /// # <Inventory as Component>::map_entities(&mut inv, &mut (a,b));
++    /// # assert_eq!(inv.items.get(&b), Some(&10));
++    /// ````
++    ///
++    /// You can use the turbofish (`::<A,B,C>`) to specify parameters when a function is generic, using either M or _ for the type of the mapper parameter.
+     #[inline]
+     fn map_entities<E: EntityMapper>(_this: &mut Self, _mapper: &mut E) {}
+ }
