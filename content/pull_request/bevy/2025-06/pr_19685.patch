@@ -1,0 +1,277 @@
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index 4262d43eb750d..bbcb13a9082da 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -156,8 +156,24 @@ impl DefaultGltfImageSampler {
+ pub struct GltfPlugin {
+     /// The default image sampler to lay glTF sampler data on top of.
+     ///
+-    /// Can be modified with [`DefaultGltfImageSampler`] resource.
++    /// Can be modified with the [`DefaultGltfImageSampler`] resource.
+     pub default_sampler: ImageSamplerDescriptor,
++
++    /// Whether to convert glTF coordinates to Bevy's coordinate system by default.
++    /// If set to `true`, the loader will convert the coordinate system of loaded glTF assets to Bevy's coordinate system
++    /// such that objects looking forward in glTF will also look forward in Bevy.
++    ///
++    /// The exact coordinate system conversion is as follows:
++    /// - glTF:
++    ///   - forward: Z
++    ///   - up: Y
++    ///   - right: -X
++    /// - Bevy:
++    ///   - forward: -Z
++    ///   - up: Y
++    ///   - right: X
++    pub convert_coordinates: bool,
++
+     /// Registry for custom vertex attributes.
+     ///
+     /// To specify, use [`GltfPlugin::add_custom_vertex_attribute`].
+@@ -169,6 +185,7 @@ impl Default for GltfPlugin {
+         GltfPlugin {
+             default_sampler: ImageSamplerDescriptor::linear(),
+             custom_vertex_attributes: HashMap::default(),
++            convert_coordinates: false,
+         }
+     }
+ }
+@@ -219,10 +236,12 @@ impl Plugin for GltfPlugin {
+         let default_sampler_resource = DefaultGltfImageSampler::new(&self.default_sampler);
+         let default_sampler = default_sampler_resource.get_internal();
+         app.insert_resource(default_sampler_resource);
++
+         app.register_asset_loader(GltfLoader {
+             supported_compressed_formats,
+             custom_vertex_attributes: self.custom_vertex_attributes.clone(),
+             default_sampler,
++            default_convert_coordinates: self.convert_coordinates,
+         });
+     }
+ }
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index 5e0f752e5017c..a326af0526678 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -151,6 +151,20 @@ pub struct GltfLoader {
+     pub custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
+     /// Arc to default [`ImageSamplerDescriptor`].
+     pub default_sampler: Arc<Mutex<ImageSamplerDescriptor>>,
++    /// Whether to convert glTF coordinates to Bevy's coordinate system by default.
++    /// If set to `true`, the loader will convert the coordinate system of loaded glTF assets to Bevy's coordinate system
++    /// such that objects looking forward in glTF will also look forward in Bevy.
++    ///
++    /// The exact coordinate system conversion is as follows:
++    /// - glTF:
++    ///   - forward: Z
++    ///   - up: Y
++    ///   - right: -X
++    /// - Bevy:
++    ///   - forward: -Z
++    ///   - up: Y
++    ///   - right: X
++    pub default_convert_coordinates: bool,
+ }
+ 
+ /// Specifies optional settings for processing gltfs at load time. By default, all recognized contents of
+@@ -188,11 +202,16 @@ pub struct GltfLoaderSettings {
+     pub include_source: bool,
+     /// Overrides the default sampler. Data from sampler node is added on top of that.
+     ///
+-    /// If None, uses global default which is stored in `DefaultGltfImageSampler` resource.
++    /// If None, uses the global default which is stored in the [`DefaultGltfImageSampler`](crate::DefaultGltfImageSampler) resource.
+     pub default_sampler: Option<ImageSamplerDescriptor>,
+     /// If true, the loader will ignore sampler data from gltf and use the default sampler.
+     pub override_sampler: bool,
+-    /// If true, the loader will convert glTF coordinates to Bevy's coordinate system.
++    /// Overrides the default glTF coordinate conversion setting.
++    ///
++    /// If set to `Some(true)`, the loader will convert the coordinate system of loaded glTF assets to Bevy's coordinate system
++    /// such that objects looking forward in glTF will also look forward in Bevy.
++    ///
++    /// The exact coordinate system conversion is as follows:
+     /// - glTF:
+     ///   - forward: Z
+     ///   - up: Y
+@@ -201,7 +220,9 @@ pub struct GltfLoaderSettings {
+     ///   - forward: -Z
+     ///   - up: Y
+     ///   - right: X
+-    pub convert_coordinates: bool,
++    ///
++    /// If `None`, uses the global default set by [`GltfPlugin::convert_coordinates`](crate::GltfPlugin::convert_coordinates).
++    pub convert_coordinates: Option<bool>,
+ }
+ 
+ impl Default for GltfLoaderSettings {
+@@ -214,7 +235,7 @@ impl Default for GltfLoaderSettings {
+             include_source: false,
+             default_sampler: None,
+             override_sampler: false,
+-            convert_coordinates: false,
++            convert_coordinates: None,
+         }
+     }
+ }
+@@ -274,6 +295,11 @@ async fn load_gltf<'a, 'b, 'c>(
+         paths
+     };
+ 
++    let convert_coordinates = match settings.convert_coordinates {
++        Some(convert_coordinates) => convert_coordinates,
++        None => loader.default_convert_coordinates,
++    };
++
+     #[cfg(feature = "bevy_animation")]
+     let (animations, named_animations, animation_roots) = {
+         use bevy_animation::{animated_field, animation_curves::*, gltf_curves::*, VariableCurve};
+@@ -318,7 +344,7 @@ async fn load_gltf<'a, 'b, 'c>(
+                             let translations: Vec<Vec3> = tr
+                                 .map(Vec3::from)
+                                 .map(|verts| {
+-                                    if settings.convert_coordinates {
++                                    if convert_coordinates {
+                                         Vec3::convert_coordinates(verts)
+                                     } else {
+                                         verts
+@@ -375,7 +401,7 @@ async fn load_gltf<'a, 'b, 'c>(
+                                 .into_f32()
+                                 .map(Quat::from_array)
+                                 .map(|quat| {
+-                                    if settings.convert_coordinates {
++                                    if convert_coordinates {
+                                         Quat::convert_coordinates(quat)
+                                     } else {
+                                         quat
+@@ -663,7 +689,7 @@ async fn load_gltf<'a, 'b, 'c>(
+                     accessor,
+                     &buffer_data,
+                     &loader.custom_vertex_attributes,
+-                    settings.convert_coordinates,
++                    convert_coordinates,
+                 ) {
+                     Ok((attribute, values)) => mesh.insert_attribute(attribute, values),
+                     Err(err) => warn!("{}", err),
+@@ -786,7 +812,7 @@ async fn load_gltf<'a, 'b, 'c>(
+                 .map(|mats| {
+                     mats.map(|mat| Mat4::from_cols_array_2d(&mat))
+                         .map(|mat| {
+-                            if settings.convert_coordinates {
++                            if convert_coordinates {
+                                 mat.convert_coordinates()
+                             } else {
+                                 mat
+@@ -875,7 +901,7 @@ async fn load_gltf<'a, 'b, 'c>(
+             &node,
+             children,
+             mesh,
+-            node_transform(&node, settings.convert_coordinates),
++            node_transform(&node, convert_coordinates),
+             skin,
+             node.extras().as_deref().map(GltfExtras::from),
+         );
+@@ -926,6 +952,7 @@ async fn load_gltf<'a, 'b, 'c>(
+                         #[cfg(feature = "bevy_animation")]
+                         None,
+                         &gltf.document,
++                        convert_coordinates,
+                     );
+                     if result.is_err() {
+                         err = Some(result);
+@@ -1345,9 +1372,10 @@ fn load_node(
+     #[cfg(feature = "bevy_animation")] animation_roots: &HashSet<usize>,
+     #[cfg(feature = "bevy_animation")] mut animation_context: Option<AnimationContext>,
+     document: &Document,
++    convert_coordinates: bool,
+ ) -> Result<(), GltfError> {
+     let mut gltf_error = None;
+-    let transform = node_transform(gltf_node, settings.convert_coordinates);
++    let transform = node_transform(gltf_node, convert_coordinates);
+     let world_transform = *parent_transform * transform;
+     // according to https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#instantiation,
+     // if the determinant of the transform is negative we must invert the winding order of
+@@ -1616,6 +1644,7 @@ fn load_node(
+                 #[cfg(feature = "bevy_animation")]
+                 animation_context.clone(),
+                 document,
++                convert_coordinates,
+             ) {
+                 gltf_error = Some(err);
+                 return;
+diff --git a/crates/bevy_gltf/src/vertex_attributes.rs b/crates/bevy_gltf/src/vertex_attributes.rs
+index 2620d608a0c85..5d6ce9eb3ee07 100644
+--- a/crates/bevy_gltf/src/vertex_attributes.rs
++++ b/crates/bevy_gltf/src/vertex_attributes.rs
+@@ -141,12 +141,21 @@ impl<'a> VertexAttributeIter<'a> {
+             VertexAttributeIter::F32x2(it) => Ok(Values::Float32x2(it.collect())),
+             VertexAttributeIter::U32x2(it) => Ok(Values::Uint32x2(it.collect())),
+             VertexAttributeIter::F32x3(it) => Ok(if convert_coordinates {
++                // The following f32x3 values need to be converted to the correct coordinate system
++                // - Positions
++                // - Normals
++                //
++                // See <https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#meshes-overview>
+                 Values::Float32x3(it.map(ConvertCoordinates::convert_coordinates).collect())
+             } else {
+                 Values::Float32x3(it.collect())
+             }),
+             VertexAttributeIter::U32x3(it) => Ok(Values::Uint32x3(it.collect())),
+             VertexAttributeIter::F32x4(it) => Ok(if convert_coordinates {
++                // The following f32x4 values need to be converted to the correct coordinate system
++                // - Tangents
++                //
++                // See <https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#meshes-overview>
+                 Values::Float32x4(it.map(ConvertCoordinates::convert_coordinates).collect())
+             } else {
+                 Values::Float32x4(it.collect())
+diff --git a/release-content/release-notes/convert-coordinates.md b/release-content/release-notes/convert-coordinates.md
+index 22e69fd4efe78..957508e15b3f4 100644
+--- a/release-content/release-notes/convert-coordinates.md
++++ b/release-content/release-notes/convert-coordinates.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Allow importing glTFs with a corrected coordinate system
+ authors: ["@janhohenheim"]
+-pull_requests: [19633]
++pull_requests: [19633, 19685]
+ ---
+ 
+ glTF uses the following coordinate system:
+@@ -24,17 +24,34 @@ Long-term, we'd like to fix our glTF imports to use the correct coordinate syste
+ But changing the import behavior would mean that *all* imported glTFs of *all* users would suddenly look different, breaking their scenes!
+ Not to mention that any bugs in the conversion code would be incredibly frustating for users.
+ 
+-This is why we are now gradually rolling out support for corrected glTF imports. Starting now you can opt into the new behavior by setting the `GltfLoaderSettings`:
++This is why we are now gradually rolling out support for corrected glTF imports. Starting now you can opt into the new behavior by setting `convert_coordinates` on `GltfPlugin`:
+ 
+ ```rust
+ // old behavior, ignores glTF's coordinate system
++App::new()
++    .add_plugins(DefaultPlugins)
++    .run();
++
++// new behavior, converts the coordinate system of all glTF assets into Bevy's coordinate system
++App::new()
++    .add_plugins(DefaultPlugins.set(GltfPlugin {
++        convert_coordinates: true,
++        ..default()
++    }))
++    .run();
++```
++
++You can also control this on a per-asset-level:
++
++```rust
++// Use the global default
+ let handle = asset_server.load("fox.gltf#Scene0");
+ 
+-// new behavior, converts glTF's coordinate system into Bevy's coordinate system
++// Manually opt in or out of coordinate conversion for an individual asset
+ let handle = asset_server.load_with_settings(
+     "fox.gltf#Scene0",
+     |settings: &mut GltfLoaderSettings| {
+-        settings.convert_coordinates = true;
++        settings.convert_coordinates = Some(true);
+     },
+ );
+ ```
