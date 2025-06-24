@@ -1,0 +1,400 @@
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/compensation_curve.rs b/crates/bevy_core_pipeline/src/auto_exposure/compensation_curve.rs
+index e2ffe1a6c4459..8b6d2593c95f4 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/compensation_curve.rs
++++ b/crates/bevy_core_pipeline/src/auto_exposure/compensation_curve.rs
+@@ -196,6 +196,7 @@ impl RenderAsset for GpuAutoExposureCompensationCurve {
+         source: Self::SourceAsset,
+         _: AssetId<Self::SourceAsset>,
+         (render_device, render_queue): &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
+     ) -> Result<Self, bevy_render::render_asset::PrepareAssetError<Self::SourceAsset>> {
+         let texture = render_device.create_texture_with_data(
+             render_queue,
+diff --git a/crates/bevy_core_pipeline/src/tonemapping/mod.rs b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+index 0c1045b8d83df..7453b2bf19869 100644
+--- a/crates/bevy_core_pipeline/src/tonemapping/mod.rs
++++ b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+@@ -464,5 +464,6 @@ pub fn lut_placeholder() -> Image {
+         sampler: ImageSampler::Default,
+         texture_view_descriptor: None,
+         asset_usage: RenderAssetUsages::RENDER_WORLD,
++        copy_on_resize: false,
+     }
+ }
+diff --git a/crates/bevy_gizmos/src/lib.rs b/crates/bevy_gizmos/src/lib.rs
+index 5804729e06a3c..f9512bc7ab5f7 100755
+--- a/crates/bevy_gizmos/src/lib.rs
++++ b/crates/bevy_gizmos/src/lib.rs
+@@ -554,6 +554,7 @@ impl RenderAsset for GpuLineGizmo {
+         gizmo: Self::SourceAsset,
+         _: AssetId<Self::SourceAsset>,
+         render_device: &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         let list_position_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+             usage: BufferUsages::VERTEX,
+diff --git a/crates/bevy_image/src/image.rs b/crates/bevy_image/src/image.rs
+index e7548bb2bd9b2..a2157357ed9fc 100644
+--- a/crates/bevy_image/src/image.rs
++++ b/crates/bevy_image/src/image.rs
+@@ -356,6 +356,8 @@ pub struct Image {
+     pub sampler: ImageSampler,
+     pub texture_view_descriptor: Option<TextureViewDescriptor<Option<&'static str>>>,
+     pub asset_usage: RenderAssetUsages,
++    /// Whether this image should be copied on the GPU when resized.
++    pub copy_on_resize: bool,
+ }
+ 
+ /// Used in [`Image`], this determines what image sampler to use when rendering. The default setting,
+@@ -747,12 +749,15 @@ impl Image {
+                 label: None,
+                 mip_level_count: 1,
+                 sample_count: 1,
+-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
++                usage: TextureUsages::TEXTURE_BINDING
++                    | TextureUsages::COPY_DST
++                    | TextureUsages::COPY_SRC,
+                 view_formats: &[],
+             },
+             sampler: ImageSampler::Default,
+             texture_view_descriptor: None,
+             asset_usage,
++            copy_on_resize: false,
+         }
+     }
+ 
+@@ -887,13 +892,15 @@ impl Image {
+     /// When growing, the new space is filled with 0. When shrinking, the image is clipped.
+     ///
+     /// For faster resizing when keeping pixel data intact is not important, use [`Image::resize`].
+-    pub fn resize_in_place(&mut self, new_size: Extent3d) -> Result<(), ResizeError> {
++    pub fn resize_in_place(&mut self, new_size: Extent3d) {
+         let old_size = self.texture_descriptor.size;
+         let pixel_size = self.texture_descriptor.format.pixel_size();
+         let byte_len = self.texture_descriptor.format.pixel_size() * new_size.volume();
++        self.texture_descriptor.size = new_size;
+ 
+         let Some(ref mut data) = self.data else {
+-            return Err(ResizeError::ImageWithoutData);
++            self.copy_on_resize = true;
++            return;
+         };
+ 
+         let mut new: Vec<u8> = vec![0; byte_len];
+@@ -923,10 +930,6 @@ impl Image {
+         }
+ 
+         self.data = Some(new);
+-
+-        self.texture_descriptor.size = new_size;
+-
+-        Ok(())
+     }
+ 
+     /// Takes a 2D image containing vertically stacked images of the same size, and reinterprets
+@@ -1591,14 +1594,6 @@ pub enum TextureError {
+     IncompleteCubemap,
+ }
+ 
+-/// An error that occurs when an image cannot be resized.
+-#[derive(Error, Debug)]
+-pub enum ResizeError {
+-    /// Failed to resize an Image because it has no data.
+-    #[error("resize method requires cpu-side image data but none was present")]
+-    ImageWithoutData,
+-}
+-
+ /// The type of a raw image buffer.
+ #[derive(Debug)]
+ pub enum ImageType<'a> {
+@@ -1822,13 +1817,11 @@ mod test {
+         }
+ 
+         // Grow image
+-        image
+-            .resize_in_place(Extent3d {
+-                width: 4,
+-                height: 4,
+-                depth_or_array_layers: 1,
+-            })
+-            .unwrap();
++        image.resize_in_place(Extent3d {
++            width: 4,
++            height: 4,
++            depth_or_array_layers: 1,
++        });
+ 
+         // After growing, the test pattern should be the same.
+         assert!(matches!(
+@@ -1849,13 +1842,11 @@ mod test {
+         ));
+ 
+         // Shrink
+-        image
+-            .resize_in_place(Extent3d {
+-                width: 1,
+-                height: 1,
+-                depth_or_array_layers: 1,
+-            })
+-            .unwrap();
++        image.resize_in_place(Extent3d {
++            width: 1,
++            height: 1,
++            depth_or_array_layers: 1,
++        });
+ 
+         // Images outside of the new dimensions should be clipped
+         assert!(image.get_color_at(1, 1).is_err());
+@@ -1898,13 +1889,11 @@ mod test {
+         }
+ 
+         // Grow image
+-        image
+-            .resize_in_place(Extent3d {
+-                width: 4,
+-                height: 4,
+-                depth_or_array_layers: LAYERS + 1,
+-            })
+-            .unwrap();
++        image.resize_in_place(Extent3d {
++            width: 4,
++            height: 4,
++            depth_or_array_layers: LAYERS + 1,
++        });
+ 
+         // After growing, the test pattern should be the same.
+         assert!(matches!(
+@@ -1929,13 +1918,11 @@ mod test {
+         }
+ 
+         // Shrink
+-        image
+-            .resize_in_place(Extent3d {
+-                width: 1,
+-                height: 1,
+-                depth_or_array_layers: 1,
+-            })
+-            .unwrap();
++        image.resize_in_place(Extent3d {
++            width: 1,
++            height: 1,
++            depth_or_array_layers: 1,
++        });
+ 
+         // Images outside of the new dimensions should be clipped
+         assert!(image.get_color_at_3d(1, 1, 0).is_err());
+@@ -1944,13 +1931,11 @@ mod test {
+         assert!(image.get_color_at_3d(0, 0, 1).is_err());
+ 
+         // Grow layers
+-        image
+-            .resize_in_place(Extent3d {
+-                width: 1,
+-                height: 1,
+-                depth_or_array_layers: 2,
+-            })
+-            .unwrap();
++        image.resize_in_place(Extent3d {
++            width: 1,
++            height: 1,
++            depth_or_array_layers: 2,
++        });
+ 
+         // Pixels in the newly added layer should be zeroes.
+         assert!(matches!(
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index af11db1ba6d93..d17599c106862 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -1410,6 +1410,7 @@ impl<M: Material> RenderAsset for PreparedMaterial<M> {
+             alpha_mask_deferred_draw_functions,
+             material_param,
+         ): &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         let draw_opaque_pbr = opaque_draw_functions.read().id::<DrawMaterial<M>>();
+         let draw_alpha_mask_pbr = alpha_mask_draw_functions.read().id::<DrawMaterial<M>>();
+diff --git a/crates/bevy_pbr/src/wireframe.rs b/crates/bevy_pbr/src/wireframe.rs
+index e42e1309eca00..b710141ea3cf7 100644
+--- a/crates/bevy_pbr/src/wireframe.rs
++++ b/crates/bevy_pbr/src/wireframe.rs
+@@ -474,6 +474,7 @@ impl RenderAsset for RenderWireframeMaterial {
+         source_asset: Self::SourceAsset,
+         _asset_id: AssetId<Self::SourceAsset>,
+         _param: &mut SystemParamItem<Self::Param>,
++        _previous_asset: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         Ok(RenderWireframeMaterial {
+             color: source_asset.color.to_linear().to_f32_array(),
+diff --git a/crates/bevy_render/src/mesh/mod.rs b/crates/bevy_render/src/mesh/mod.rs
+index d15468376f918..c981e75ceed35 100644
+--- a/crates/bevy_render/src/mesh/mod.rs
++++ b/crates/bevy_render/src/mesh/mod.rs
+@@ -209,6 +209,7 @@ impl RenderAsset for RenderMesh {
+         mesh: Self::SourceAsset,
+         _: AssetId<Self::SourceAsset>,
+         (images, mesh_vertex_buffer_layouts): &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         let morph_targets = match mesh.morph_targets() {
+             Some(mt) => {
+diff --git a/crates/bevy_render/src/render_asset.rs b/crates/bevy_render/src/render_asset.rs
+index 1fa5758ca33ed..0a5ad3e4ece41 100644
+--- a/crates/bevy_render/src/render_asset.rs
++++ b/crates/bevy_render/src/render_asset.rs
+@@ -73,6 +73,7 @@ pub trait RenderAsset: Send + Sync + 'static + Sized {
+         source_asset: Self::SourceAsset,
+         asset_id: AssetId<Self::SourceAsset>,
+         param: &mut SystemParamItem<Self::Param>,
++        previous_asset: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>>;
+ 
+     /// Called whenever the [`RenderAsset::SourceAsset`] has been removed.
+@@ -355,7 +356,8 @@ pub fn prepare_assets<A: RenderAsset>(
+             0
+         };
+ 
+-        match A::prepare_asset(extracted_asset, id, &mut param) {
++        let previous_asset = render_assets.get(id);
++        match A::prepare_asset(extracted_asset, id, &mut param, previous_asset) {
+             Ok(prepared_asset) => {
+                 render_assets.insert(id, prepared_asset);
+                 bpf.write_bytes(write_bytes);
+@@ -382,7 +384,7 @@ pub fn prepare_assets<A: RenderAsset>(
+         // we remove previous here to ensure that if we are updating the asset then
+         // any users will not see the old asset after a new asset is extracted,
+         // even if the new asset is not yet ready or we are out of bytes to write.
+-        render_assets.remove(id);
++        let previous_asset = render_assets.remove(id);
+ 
+         let write_bytes = if let Some(size) = A::byte_len(&extracted_asset) {
+             if bpf.exhausted() {
+@@ -394,7 +396,7 @@ pub fn prepare_assets<A: RenderAsset>(
+             0
+         };
+ 
+-        match A::prepare_asset(extracted_asset, id, &mut param) {
++        match A::prepare_asset(extracted_asset, id, &mut param, previous_asset.as_ref()) {
+             Ok(prepared_asset) => {
+                 render_assets.insert(id, prepared_asset);
+                 bpf.write_bytes(write_bytes);
+diff --git a/crates/bevy_render/src/storage.rs b/crates/bevy_render/src/storage.rs
+index 0046b4e6ac2bc..6084271fee27c 100644
+--- a/crates/bevy_render/src/storage.rs
++++ b/crates/bevy_render/src/storage.rs
+@@ -116,6 +116,7 @@ impl RenderAsset for GpuShaderStorageBuffer {
+         source_asset: Self::SourceAsset,
+         _: AssetId<Self::SourceAsset>,
+         render_device: &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         match source_asset.data {
+             Some(data) => {
+diff --git a/crates/bevy_render/src/texture/gpu_image.rs b/crates/bevy_render/src/texture/gpu_image.rs
+index 551bd3ee02e09..1337df5e0021b 100644
+--- a/crates/bevy_render/src/texture/gpu_image.rs
++++ b/crates/bevy_render/src/texture/gpu_image.rs
+@@ -7,6 +7,7 @@ use bevy_asset::AssetId;
+ use bevy_ecs::system::{lifetimeless::SRes, SystemParamItem};
+ use bevy_image::{Image, ImageSampler};
+ use bevy_math::{AspectRatio, UVec2};
++use tracing::warn;
+ use wgpu::{Extent3d, TextureFormat, TextureViewDescriptor};
+ 
+ /// The GPU-representation of an [`Image`].
+@@ -44,6 +45,7 @@ impl RenderAsset for GpuImage {
+         image: Self::SourceAsset,
+         _: AssetId<Self::SourceAsset>,
+         (render_device, render_queue, default_sampler): &mut SystemParamItem<Self::Param>,
++        previous_asset: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         let texture = if let Some(ref data) = image.data {
+             render_device.create_texture_with_data(
+@@ -54,7 +56,38 @@ impl RenderAsset for GpuImage {
+                 data,
+             )
+         } else {
+-            render_device.create_texture(&image.texture_descriptor)
++            let new_texture = render_device.create_texture(&image.texture_descriptor);
++            if image.copy_on_resize {
++                if let Some(previous) = previous_asset {
++                    let mut command_encoder =
++                        render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
++                            label: Some("copy_image_on_resize"),
++                        });
++                    let copy_size = Extent3d {
++                        width: image.texture_descriptor.size.width.min(previous.size.width),
++                        height: image
++                            .texture_descriptor
++                            .size
++                            .height
++                            .min(previous.size.height),
++                        depth_or_array_layers: image
++                            .texture_descriptor
++                            .size
++                            .depth_or_array_layers
++                            .min(previous.size.depth_or_array_layers),
++                    };
++
++                    command_encoder.copy_texture_to_texture(
++                        previous.texture.as_image_copy(),
++                        new_texture.as_image_copy(),
++                        copy_size,
++                    );
++                    render_queue.submit([command_encoder.finish()]);
++                } else {
++                    warn!("No previous asset to copy from for image: {:?}", image);
++                }
++            }
++            new_texture
+         };
+ 
+         let texture_view = texture.create_view(
+diff --git a/crates/bevy_sprite/src/mesh2d/material.rs b/crates/bevy_sprite/src/mesh2d/material.rs
+index 3f76b516cdd3f..fa784bd9afcc0 100644
+--- a/crates/bevy_sprite/src/mesh2d/material.rs
++++ b/crates/bevy_sprite/src/mesh2d/material.rs
+@@ -967,6 +967,7 @@ impl<M: Material2d> RenderAsset for PreparedMaterial2d<M> {
+             transparent_draw_functions,
+             material_param,
+         ): &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         match material.as_bind_group(&pipeline.material2d_layout, render_device, material_param) {
+             Ok(prepared) => {
+diff --git a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+index 03de94be1cd4f..e30c5b1f6cc3b 100644
+--- a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
++++ b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+@@ -473,6 +473,7 @@ impl RenderAsset for RenderWireframeMaterial {
+         source_asset: Self::SourceAsset,
+         _asset_id: AssetId<Self::SourceAsset>,
+         _param: &mut SystemParamItem<Self::Param>,
++        _previous_asset: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         Ok(RenderWireframeMaterial {
+             color: source_asset.color.to_linear().to_f32_array(),
+diff --git a/crates/bevy_sprite/src/tilemap_chunk/mod.rs b/crates/bevy_sprite/src/tilemap_chunk/mod.rs
+index 6ca4b7f77a589..8b4ce755f6f84 100644
+--- a/crates/bevy_sprite/src/tilemap_chunk/mod.rs
++++ b/crates/bevy_sprite/src/tilemap_chunk/mod.rs
+@@ -211,6 +211,7 @@ fn make_chunk_image(size: &UVec2, indices: &[Option<u16>]) -> Image {
+         sampler: ImageSampler::nearest(),
+         texture_view_descriptor: None,
+         asset_usage: RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
++        copy_on_resize: false,
+     }
+ }
+ 
+diff --git a/crates/bevy_ui/src/render/ui_material_pipeline.rs b/crates/bevy_ui/src/render/ui_material_pipeline.rs
+index 3ad4f4ea6a940..5d2201e6090f3 100644
+--- a/crates/bevy_ui/src/render/ui_material_pipeline.rs
++++ b/crates/bevy_ui/src/render/ui_material_pipeline.rs
+@@ -581,6 +581,7 @@ impl<M: UiMaterial> RenderAsset for PreparedUiMaterial<M> {
+         material: Self::SourceAsset,
+         _: AssetId<Self::SourceAsset>,
+         (render_device, pipeline, material_param): &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+         match material.as_bind_group(&pipeline.ui_layout, render_device, material_param) {
+             Ok(prepared) => Ok(PreparedUiMaterial {
