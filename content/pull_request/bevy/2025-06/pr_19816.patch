@@ -1,0 +1,173 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 19a2afc8e84c4..d8a9255c520ef 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -561,6 +561,11 @@ web = ["bevy_internal/web"]
+ # Enable hotpatching of Bevy systems
+ hotpatching = ["bevy_internal/hotpatching"]
+ 
++# Enable converting glTF coordinates to Bevy's coordinate system by default. This will be Bevy's default behavior starting in 0.18.
++gltf_convert_coordinates_default = [
++  "bevy_internal/gltf_convert_coordinates_default",
++]
++
+ # Enable collecting debug information about systems and components to help with diagnostics
+ debug = ["bevy_internal/debug"]
+ 
+diff --git a/crates/bevy_gltf/Cargo.toml b/crates/bevy_gltf/Cargo.toml
+index c46b74b7ca270..36e9508f4c9e4 100644
+--- a/crates/bevy_gltf/Cargo.toml
++++ b/crates/bevy_gltf/Cargo.toml
+@@ -15,6 +15,7 @@ pbr_multi_layer_material_textures = [
+ ]
+ pbr_anisotropy_texture = ["bevy_pbr/pbr_anisotropy_texture"]
+ pbr_specular_textures = ["bevy_pbr/pbr_specular_textures"]
++gltf_convert_coordinates_default = []
+ 
+ [dependencies]
+ # bevy
+@@ -64,8 +65,6 @@ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0.140"
+ smallvec = "1.11"
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
+-
+-[dev-dependencies]
+ bevy_log = { path = "../bevy_log", version = "0.17.0-dev" }
+ 
+ [lints]
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index bbcb13a9082da..6b90a4d99bcac 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -185,7 +185,7 @@ impl Default for GltfPlugin {
+         GltfPlugin {
+             default_sampler: ImageSamplerDescriptor::linear(),
+             custom_vertex_attributes: HashMap::default(),
+-            convert_coordinates: false,
++            convert_coordinates: cfg!(feature = "gltf_convert_coordinates_default"),
+         }
+     }
+ }
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index a326af0526678..3e4c38453240c 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -2,6 +2,7 @@ mod extensions;
+ mod gltf_ext;
+ 
+ use alloc::sync::Arc;
++use bevy_log::warn_once;
+ use std::{
+     io::Error,
+     path::{Path, PathBuf},
+@@ -297,7 +298,18 @@ async fn load_gltf<'a, 'b, 'c>(
+ 
+     let convert_coordinates = match settings.convert_coordinates {
+         Some(convert_coordinates) => convert_coordinates,
+-        None => loader.default_convert_coordinates,
++        None => {
++            let convert_by_default = loader.default_convert_coordinates;
++            if !convert_by_default && !cfg!(feature = "gltf_convert_coordinates_default") {
++                warn_once!(
++                    "Starting from Bevy 0.18, by default all imported glTF models will be rotated by 180 degrees around the Y axis to align with Bevy's coordinate system. \
++                    You are currently importing glTF files using the old behavior. Consider opting-in to the new import behavior by enabling the `gltf_convert_coordinates_default` feature. \
++                    If you encounter any issues please file a bug! \
++                    If you want to continue using the old behavior going forward (even when the default changes in 0.18), manually set the corresponding option in the `GltfPlugin` or `GltfLoaderSettings`. See the migration guide for more details."
++                );
++            }
++            convert_by_default
++        }
+     };
+ 
+     #[cfg(feature = "bevy_animation")]
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 5e5c95f3ec16b..402ff45060b43 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -355,6 +355,10 @@ web = [
+ 
+ hotpatching = ["bevy_app/hotpatching", "bevy_ecs/hotpatching"]
+ 
++gltf_convert_coordinates_default = [
++  "bevy_gltf?/gltf_convert_coordinates_default",
++]
++
+ debug = ["bevy_utils/debug"]
+ 
+ [dependencies]
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 0f9bdc507a75e..fc385775096c9 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -89,6 +89,7 @@ The default feature set enables most of the expected features of a game engine,
+ |ghost_nodes|Experimental support for nodes that are ignored for UI layouting|
+ |gif|GIF image format support|
+ |glam_assert|Enable assertions to check the validity of parameters passed to glam|
++|gltf_convert_coordinates_default|Enable converting glTF coordinates to Bevy's coordinate system by default. This will be Bevy's default behavior starting in 0.18.|
+ |hotpatching|Enable hotpatching of Bevy systems|
+ |ico|ICO image format support|
+ |jpeg|JPEG image format support|
+diff --git a/release-content/release-notes/convert-coordinates.md b/release-content/migration-guides/convert-coordinates.md
+similarity index 58%
+rename from release-content/release-notes/convert-coordinates.md
+rename to release-content/migration-guides/convert-coordinates.md
+index 957508e15b3f4..85ab80ed2053e 100644
+--- a/release-content/release-notes/convert-coordinates.md
++++ b/release-content/migration-guides/convert-coordinates.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Allow importing glTFs with a corrected coordinate system
+ authors: ["@janhohenheim"]
+-pull_requests: [19633, 19685]
++pull_requests: [19633, 19685, 19816]
+ ---
+ 
+ glTF uses the following coordinate system:
+@@ -24,7 +24,27 @@ Long-term, we'd like to fix our glTF imports to use the correct coordinate syste
+ But changing the import behavior would mean that *all* imported glTFs of *all* users would suddenly look different, breaking their scenes!
+ Not to mention that any bugs in the conversion code would be incredibly frustating for users.
+ 
+-This is why we are now gradually rolling out support for corrected glTF imports. Starting now you can opt into the new behavior by setting `convert_coordinates` on `GltfPlugin`:
++This is why we are now gradually rolling out support for corrected glTF imports. You will now be greeted by the following warning when using the old behavior:
++
++> Starting from Bevy 0.18, by default all imported glTF models will be rotated by 180 degrees around the Y axis to align with Bevy's coordinate system.
++> You are currently importing glTF files using the old behavior. Consider opting-in to the new import behavior by enabling the `gltf_convert_coordinates_default` feature.
++> If you encounter any issues please file a bug!
++> If you want to continue using the old behavior going forward (even when the default changes in 0.18), manually set the corresponding option in the `GltfPlugin` or `GltfLoaderSettings`.
++> See the migration guide for more details.
++
++As the warning says, you can opt into the new behavior by enabling the `gltf_convert_coordinates_default` feature in your `Cargo.toml`:
++
++```toml
++# old behavior, ignores glTF's coordinate system
++[dependencies]
++bevy = "0.17.0"
++
++# new behavior, converts the coordinate system of all glTF assets into Bevy's coordinate system
++[dependencies]
++bevy = { version = "0.17.0", features = ["gltf_convert_coordinates_default"] }
++```
++
++If you prefer, you can also do this in code by setting `convert_coordinates` on `GltfPlugin`:
+ 
+ ```rust
+ // old behavior, ignores glTF's coordinate system
+@@ -41,6 +61,9 @@ App::new()
+     .run();
+ ```
+ 
++If you want to continue using the old behavior in the future, you can silence the warning by enabling the `gltf_convert_coordinates_default` feature
++and explicitly setting `convert_coordinates: false` on `GltfPlugin`.
++
+ You can also control this on a per-asset-level:
+ 
+ ```rust
+@@ -56,7 +79,7 @@ let handle = asset_server.load_with_settings(
+ );
+ ```
+ 
+-Afterwards, your scene will be oriented such that your modeling software's forward direction correctly corresponds to Bevy's forward direction.
++After opting into the new behavior, your scene will be oriented such that your modeling software's forward direction correctly corresponds to Bevy's forward direction.
+ 
+ For example, Blender assumes -Y to be forward, so exporting the following model to glTF and loading it in Bevy with the new settings will ensure everything is
+ oriented the right way across all programs in your pipeline:
