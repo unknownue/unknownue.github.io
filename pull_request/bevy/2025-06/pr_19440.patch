@@ -1,0 +1,932 @@
+diff --git a/crates/bevy_ecs/README.md b/crates/bevy_ecs/README.md
+index c2fdc53d05408..de95c4508cdda 100644
+--- a/crates/bevy_ecs/README.md
++++ b/crates/bevy_ecs/README.md
+@@ -340,8 +340,8 @@ let mut world = World::new();
+ let entity = world.spawn_empty().id();
+ 
+ world.add_observer(|trigger: Trigger<Explode>, mut commands: Commands| {
+-    println!("Entity {} goes BOOM!", trigger.target());
+-    commands.entity(trigger.target()).despawn();
++    println!("Entity {} goes BOOM!", trigger.target().unwrap());
++    commands.entity(trigger.target().unwrap()).despawn();
+ });
+ 
+ world.flush();
+diff --git a/crates/bevy_ecs/src/bundle.rs b/crates/bevy_ecs/src/bundle.rs
+index e3e54c092f644..7fc7f95351dd6 100644
+--- a/crates/bevy_ecs/src/bundle.rs
++++ b/crates/bevy_ecs/src/bundle.rs
+@@ -1133,7 +1133,7 @@ impl<'w> BundleInserter<'w> {
+                 if archetype.has_replace_observer() {
+                     deferred_world.trigger_observers(
+                         ON_REPLACE,
+-                        entity,
++                        Some(entity),
+                         archetype_after_insert.iter_existing(),
+                         caller,
+                     );
+@@ -1318,7 +1318,7 @@ impl<'w> BundleInserter<'w> {
+             if new_archetype.has_add_observer() {
+                 deferred_world.trigger_observers(
+                     ON_ADD,
+-                    entity,
++                    Some(entity),
+                     archetype_after_insert.iter_added(),
+                     caller,
+                 );
+@@ -1336,7 +1336,7 @@ impl<'w> BundleInserter<'w> {
+                     if new_archetype.has_insert_observer() {
+                         deferred_world.trigger_observers(
+                             ON_INSERT,
+-                            entity,
++                            Some(entity),
+                             archetype_after_insert.iter_inserted(),
+                             caller,
+                         );
+@@ -1355,7 +1355,7 @@ impl<'w> BundleInserter<'w> {
+                     if new_archetype.has_insert_observer() {
+                         deferred_world.trigger_observers(
+                             ON_INSERT,
+-                            entity,
++                            Some(entity),
+                             archetype_after_insert.iter_added(),
+                             caller,
+                         );
+@@ -1499,7 +1499,7 @@ impl<'w> BundleRemover<'w> {
+             if self.old_archetype.as_ref().has_replace_observer() {
+                 deferred_world.trigger_observers(
+                     ON_REPLACE,
+-                    entity,
++                    Some(entity),
+                     bundle_components_in_archetype(),
+                     caller,
+                 );
+@@ -1514,7 +1514,7 @@ impl<'w> BundleRemover<'w> {
+             if self.old_archetype.as_ref().has_remove_observer() {
+                 deferred_world.trigger_observers(
+                     ON_REMOVE,
+-                    entity,
++                    Some(entity),
+                     bundle_components_in_archetype(),
+                     caller,
+                 );
+@@ -1757,7 +1757,7 @@ impl<'w> BundleSpawner<'w> {
+             if archetype.has_add_observer() {
+                 deferred_world.trigger_observers(
+                     ON_ADD,
+-                    entity,
++                    Some(entity),
+                     bundle_info.iter_contributed_components(),
+                     caller,
+                 );
+@@ -1772,7 +1772,7 @@ impl<'w> BundleSpawner<'w> {
+             if archetype.has_insert_observer() {
+                 deferred_world.trigger_observers(
+                     ON_INSERT,
+-                    entity,
++                    Some(entity),
+                     bundle_info.iter_contributed_components(),
+                     caller,
+                 );
+diff --git a/crates/bevy_ecs/src/observer/mod.rs b/crates/bevy_ecs/src/observer/mod.rs
+index 767dc7ec95d37..ed5a8b176f64a 100644
+--- a/crates/bevy_ecs/src/observer/mod.rs
++++ b/crates/bevy_ecs/src/observer/mod.rs
+@@ -68,7 +68,7 @@ impl<'w, E, B: Bundle> Trigger<'w, E, B> {
+     }
+ 
+     /// Returns the [`Entity`] that was targeted by the `event` that triggered this observer. It may
+-    /// be [`Entity::PLACEHOLDER`].
++    /// be [`None`] if the trigger is not for a particular entity.
+     ///
+     /// Observable events can target specific entities. When those events fire, they will trigger
+     /// any observers on the targeted entities. In this case, the `target()` and `observer()` are
+@@ -81,7 +81,7 @@ impl<'w, E, B: Bundle> Trigger<'w, E, B> {
+     ///
+     /// This is an important distinction: the entity reacting to an event is not always the same as
+     /// the entity triggered by the event.
+-    pub fn target(&self) -> Entity {
++    pub fn target(&self) -> Option<Entity> {
+         self.trigger.target
+     }
+ 
+@@ -341,7 +341,7 @@ pub struct ObserverTrigger {
+     /// The [`ComponentId`]s the trigger targeted.
+     components: SmallVec<[ComponentId; 2]>,
+     /// The entity the trigger targeted.
+-    pub target: Entity,
++    pub target: Option<Entity>,
+     /// The location of the source code that triggered the observer.
+     pub caller: MaybeLocation,
+ }
+@@ -416,7 +416,7 @@ impl Observers {
+     pub(crate) fn invoke<T>(
+         mut world: DeferredWorld,
+         event_type: ComponentId,
+-        target: Entity,
++        target: Option<Entity>,
+         components: impl Iterator<Item = ComponentId> + Clone,
+         data: &mut T,
+         propagate: &mut bool,
+@@ -455,8 +455,8 @@ impl Observers {
+         observers.map.iter().for_each(&mut trigger_observer);
+ 
+         // Trigger entity observers listening for this kind of trigger
+-        if target != Entity::PLACEHOLDER {
+-            if let Some(map) = observers.entity_observers.get(&target) {
++        if let Some(target_entity) = target {
++            if let Some(map) = observers.entity_observers.get(&target_entity) {
+                 map.iter().for_each(&mut trigger_observer);
+             }
+         }
+@@ -469,8 +469,8 @@ impl Observers {
+                     .iter()
+                     .for_each(&mut trigger_observer);
+ 
+-                if target != Entity::PLACEHOLDER {
+-                    if let Some(map) = component_observers.entity_map.get(&target) {
++                if let Some(target_entity) = target {
++                    if let Some(map) = component_observers.entity_map.get(&target_entity) {
+                         map.iter().for_each(&mut trigger_observer);
+                     }
+                 }
+@@ -695,7 +695,7 @@ impl World {
+             unsafe {
+                 world.trigger_observers_with_data::<_, E::Traversal>(
+                     event_id,
+-                    Entity::PLACEHOLDER,
++                    None,
+                     targets.components(),
+                     event_data,
+                     false,
+@@ -708,7 +708,7 @@ impl World {
+                 unsafe {
+                     world.trigger_observers_with_data::<_, E::Traversal>(
+                         event_id,
+-                        target_entity,
++                        Some(target_entity),
+                         targets.components(),
+                         event_data,
+                         E::AUTO_PROPAGATE,
+@@ -999,20 +999,20 @@ mod tests {
+         world.add_observer(
+             |obs: Trigger<OnAdd, A>, mut res: ResMut<Order>, mut commands: Commands| {
+                 res.observed("add_a");
+-                commands.entity(obs.target()).insert(B);
++                commands.entity(obs.target().unwrap()).insert(B);
+             },
+         );
+         world.add_observer(
+             |obs: Trigger<OnRemove, A>, mut res: ResMut<Order>, mut commands: Commands| {
+                 res.observed("remove_a");
+-                commands.entity(obs.target()).remove::<B>();
++                commands.entity(obs.target().unwrap()).remove::<B>();
+             },
+         );
+ 
+         world.add_observer(
+             |obs: Trigger<OnAdd, B>, mut res: ResMut<Order>, mut commands: Commands| {
+                 res.observed("add_b");
+-                commands.entity(obs.target()).remove::<A>();
++                commands.entity(obs.target().unwrap()).remove::<A>();
+             },
+         );
+         world.add_observer(|_: Trigger<OnRemove, B>, mut res: ResMut<Order>| {
+@@ -1181,7 +1181,7 @@ mod tests {
+         };
+         world.spawn_empty().observe(system);
+         world.add_observer(move |obs: Trigger<EventA>, mut res: ResMut<Order>| {
+-            assert_eq!(obs.target(), Entity::PLACEHOLDER);
++            assert_eq!(obs.target(), None);
+             res.observed("event_a");
+         });
+ 
+@@ -1208,7 +1208,7 @@ mod tests {
+             .observe(|_: Trigger<EventA>, mut res: ResMut<Order>| res.observed("a_1"))
+             .id();
+         world.add_observer(move |obs: Trigger<EventA>, mut res: ResMut<Order>| {
+-            assert_eq!(obs.target(), entity);
++            assert_eq!(obs.target().unwrap(), entity);
+             res.observed("a_2");
+         });
+ 
+@@ -1628,7 +1628,7 @@ mod tests {
+ 
+         world.add_observer(
+             |trigger: Trigger<EventPropagating>, query: Query<&A>, mut res: ResMut<Order>| {
+-                if query.get(trigger.target()).is_ok() {
++                if query.get(trigger.target().unwrap()).is_ok() {
+                     res.observed("event");
+                 }
+             },
+@@ -1651,7 +1651,7 @@ mod tests {
+     fn observer_modifies_relationship() {
+         fn on_add(trigger: Trigger<OnAdd, A>, mut commands: Commands) {
+             commands
+-                .entity(trigger.target())
++                .entity(trigger.target().unwrap())
+                 .with_related_entities::<crate::hierarchy::ChildOf>(|rsc| {
+                     rsc.spawn_empty();
+                 });
+diff --git a/crates/bevy_ecs/src/observer/runner.rs b/crates/bevy_ecs/src/observer/runner.rs
+index 520147d4385e9..bae40ad3aeba3 100644
+--- a/crates/bevy_ecs/src/observer/runner.rs
++++ b/crates/bevy_ecs/src/observer/runner.rs
+@@ -123,8 +123,8 @@ pub type ObserverRunner = fn(DeferredWorld, ObserverTrigger, PtrMut, propagate:
+ /// struct Explode;
+ ///
+ /// world.add_observer(|trigger: Trigger<Explode>, mut commands: Commands| {
+-///     println!("Entity {} goes BOOM!", trigger.target());
+-///     commands.entity(trigger.target()).despawn();
++///     println!("Entity {} goes BOOM!", trigger.target().unwrap());
++///     commands.entity(trigger.target().unwrap()).despawn();
+ /// });
+ ///
+ /// world.flush();
+@@ -157,7 +157,7 @@ pub type ObserverRunner = fn(DeferredWorld, ObserverTrigger, PtrMut, propagate:
+ /// # struct Explode;
+ /// world.entity_mut(e1).observe(|trigger: Trigger<Explode>, mut commands: Commands| {
+ ///     println!("Boom!");
+-///     commands.entity(trigger.target()).despawn();
++///     commands.entity(trigger.target().unwrap()).despawn();
+ /// });
+ ///
+ /// world.entity_mut(e2).observe(|trigger: Trigger<Explode>, mut commands: Commands| {
+diff --git a/crates/bevy_ecs/src/world/deferred_world.rs b/crates/bevy_ecs/src/world/deferred_world.rs
+index 02c12fe6a3560..5a20046b2fda3 100644
+--- a/crates/bevy_ecs/src/world/deferred_world.rs
++++ b/crates/bevy_ecs/src/world/deferred_world.rs
+@@ -23,7 +23,7 @@ use super::{unsafe_world_cell::UnsafeWorldCell, Mut, World, ON_INSERT, ON_REPLAC
+ ///
+ /// This means that in order to add entities, for example, you will need to use commands instead of the world directly.
+ pub struct DeferredWorld<'w> {
+-    // SAFETY: Implementors must not use this reference to make structural changes
++    // SAFETY: Implementers must not use this reference to make structural changes
+     world: UnsafeWorldCell<'w>,
+ }
+ 
+@@ -157,7 +157,7 @@ impl<'w> DeferredWorld<'w> {
+             if archetype.has_replace_observer() {
+                 self.trigger_observers(
+                     ON_REPLACE,
+-                    entity,
++                    Some(entity),
+                     [component_id].into_iter(),
+                     MaybeLocation::caller(),
+                 );
+@@ -197,7 +197,7 @@ impl<'w> DeferredWorld<'w> {
+             if archetype.has_insert_observer() {
+                 self.trigger_observers(
+                     ON_INSERT,
+-                    entity,
++                    Some(entity),
+                     [component_id].into_iter(),
+                     MaybeLocation::caller(),
+                 );
+@@ -738,7 +738,7 @@ impl<'w> DeferredWorld<'w> {
+     pub(crate) unsafe fn trigger_observers(
+         &mut self,
+         event: ComponentId,
+-        target: Entity,
++        target: Option<Entity>,
+         components: impl Iterator<Item = ComponentId> + Clone,
+         caller: MaybeLocation,
+     ) {
+@@ -761,7 +761,7 @@ impl<'w> DeferredWorld<'w> {
+     pub(crate) unsafe fn trigger_observers_with_data<E, T>(
+         &mut self,
+         event: ComponentId,
+-        mut target: Entity,
++        target: Option<Entity>,
+         components: impl Iterator<Item = ComponentId> + Clone,
+         data: &mut E,
+         mut propagate: bool,
+@@ -769,18 +769,20 @@ impl<'w> DeferredWorld<'w> {
+     ) where
+         T: Traversal<E>,
+     {
++        Observers::invoke::<_>(
++            self.reborrow(),
++            event,
++            target,
++            components.clone(),
++            data,
++            &mut propagate,
++            caller,
++        );
++        let Some(mut target) = target else { return };
++
+         loop {
+-            Observers::invoke::<_>(
+-                self.reborrow(),
+-                event,
+-                target,
+-                components.clone(),
+-                data,
+-                &mut propagate,
+-                caller,
+-            );
+             if !propagate {
+-                break;
++                return;
+             }
+             if let Some(traverse_to) = self
+                 .get_entity(target)
+@@ -792,6 +794,15 @@ impl<'w> DeferredWorld<'w> {
+             } else {
+                 break;
+             }
++            Observers::invoke::<_>(
++                self.reborrow(),
++                event,
++                Some(target),
++                components.clone(),
++                data,
++                &mut propagate,
++                caller,
++            );
+         }
+     }
+ 
+diff --git a/crates/bevy_ecs/src/world/entity_ref.rs b/crates/bevy_ecs/src/world/entity_ref.rs
+index aa3e66ca143a3..2b1c88a983c8b 100644
+--- a/crates/bevy_ecs/src/world/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_ref.rs
+@@ -2369,7 +2369,7 @@ impl<'w> EntityWorldMut<'w> {
+             if archetype.has_despawn_observer() {
+                 deferred_world.trigger_observers(
+                     ON_DESPAWN,
+-                    self.entity,
++                    Some(self.entity),
+                     archetype.components(),
+                     caller,
+                 );
+@@ -2383,7 +2383,7 @@ impl<'w> EntityWorldMut<'w> {
+             if archetype.has_replace_observer() {
+                 deferred_world.trigger_observers(
+                     ON_REPLACE,
+-                    self.entity,
++                    Some(self.entity),
+                     archetype.components(),
+                     caller,
+                 );
+@@ -2398,7 +2398,7 @@ impl<'w> EntityWorldMut<'w> {
+             if archetype.has_remove_observer() {
+                 deferred_world.trigger_observers(
+                     ON_REMOVE,
+-                    self.entity,
++                    Some(self.entity),
+                     archetype.components(),
+                     caller,
+                 );
+@@ -5726,7 +5726,9 @@ mod tests {
+         let entity = world
+             .spawn_empty()
+             .observe(|trigger: Trigger<TestEvent>, mut commands: Commands| {
+-                commands.entity(trigger.target()).insert(TestComponent(0));
++                commands
++                    .entity(trigger.target().unwrap())
++                    .insert(TestComponent(0));
+             })
+             .id();
+ 
+@@ -5746,7 +5748,7 @@ mod tests {
+         let mut world = World::new();
+         world.add_observer(
+             |trigger: Trigger<OnAdd, TestComponent>, mut commands: Commands| {
+-                commands.entity(trigger.target()).despawn();
++                commands.entity(trigger.target().unwrap()).despawn();
+             },
+         );
+         let entity = world.spawn_empty().id();
+diff --git a/crates/bevy_input_focus/src/lib.rs b/crates/bevy_input_focus/src/lib.rs
+index 44ff0ef645895..8a3ab75a53ed4 100644
+--- a/crates/bevy_input_focus/src/lib.rs
++++ b/crates/bevy_input_focus/src/lib.rs
+@@ -394,7 +394,7 @@ mod tests {
+         trigger: Trigger<FocusedInput<KeyboardInput>>,
+         mut query: Query<&mut GatherKeyboardEvents>,
+     ) {
+-        if let Ok(mut gather) = query.get_mut(trigger.target()) {
++        if let Ok(mut gather) = query.get_mut(trigger.target().unwrap()) {
+             if let Key::Character(c) = &trigger.input.logical_key {
+                 gather.0.push_str(c.as_str());
+             }
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index f57ba9adf343e..d7a87ff071eb5 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -552,7 +552,7 @@ pub(crate) fn add_light_view_entities(
+     trigger: Trigger<OnAdd, (ExtractedDirectionalLight, ExtractedPointLight)>,
+     mut commands: Commands,
+ ) {
+-    if let Ok(mut v) = commands.get_entity(trigger.target()) {
++    if let Ok(mut v) = commands.get_entity(trigger.target().unwrap()) {
+         v.insert(LightViewEntities::default());
+     }
+ }
+@@ -562,7 +562,7 @@ pub(crate) fn extracted_light_removed(
+     trigger: Trigger<OnRemove, (ExtractedDirectionalLight, ExtractedPointLight)>,
+     mut commands: Commands,
+ ) {
+-    if let Ok(mut v) = commands.get_entity(trigger.target()) {
++    if let Ok(mut v) = commands.get_entity(trigger.target().unwrap()) {
+         v.try_remove::<LightViewEntities>();
+     }
+ }
+@@ -572,7 +572,7 @@ pub(crate) fn remove_light_view_entities(
+     query: Query<&LightViewEntities>,
+     mut commands: Commands,
+ ) {
+-    if let Ok(entities) = query.get(trigger.target()) {
++    if let Ok(entities) = query.get(trigger.target().unwrap()) {
+         for v in entities.0.values() {
+             for e in v.iter().copied() {
+                 if let Ok(mut v) = commands.get_entity(e) {
+diff --git a/crates/bevy_picking/src/lib.rs b/crates/bevy_picking/src/lib.rs
+index 53387e84c8d1f..70a57145818c9 100644
+--- a/crates/bevy_picking/src/lib.rs
++++ b/crates/bevy_picking/src/lib.rs
+@@ -55,13 +55,13 @@
+ //!         // Spawn your entity here, e.g. a Mesh.
+ //!         // When dragged, mutate the `Transform` component on the dragged target entity:
+ //!         .observe(|trigger: Trigger<Pointer<Drag>>, mut transforms: Query<&mut Transform>| {
+-//!             let mut transform = transforms.get_mut(trigger.target()).unwrap();
++//!             let mut transform = transforms.get_mut(trigger.target().unwrap()).unwrap();
+ //!             let drag = trigger.event();
+ //!             transform.rotate_local_y(drag.delta.x / 50.0);
+ //!         })
+ //!         .observe(|trigger: Trigger<Pointer<Click>>, mut commands: Commands| {
+-//!             println!("Entity {} goes BOOM!", trigger.target());
+-//!             commands.entity(trigger.target()).despawn();
++//!             println!("Entity {} goes BOOM!", trigger.target().unwrap());
++//!             commands.entity(trigger.target().unwrap()).despawn();
+ //!         })
+ //!         .observe(|trigger: Trigger<Pointer<Over>>, mut events: EventWriter<Greeting>| {
+ //!             events.write(Greeting);
+diff --git a/crates/bevy_render/src/sync_world.rs b/crates/bevy_render/src/sync_world.rs
+index f6c2f8759369d..90613451dd5e0 100644
+--- a/crates/bevy_render/src/sync_world.rs
++++ b/crates/bevy_render/src/sync_world.rs
+@@ -94,14 +94,14 @@ impl Plugin for SyncWorldPlugin {
+         app.init_resource::<PendingSyncEntity>();
+         app.add_observer(
+             |trigger: Trigger<OnAdd, SyncToRenderWorld>, mut pending: ResMut<PendingSyncEntity>| {
+-                pending.push(EntityRecord::Added(trigger.target()));
++                pending.push(EntityRecord::Added(trigger.target().unwrap()));
+             },
+         );
+         app.add_observer(
+             |trigger: Trigger<OnRemove, SyncToRenderWorld>,
+              mut pending: ResMut<PendingSyncEntity>,
+              query: Query<&RenderEntity>| {
+-                if let Ok(e) = query.get(trigger.target()) {
++                if let Ok(e) = query.get(trigger.target().unwrap()) {
+                     pending.push(EntityRecord::Removed(*e));
+                 };
+             },
+@@ -512,14 +512,14 @@ mod tests {
+ 
+         main_world.add_observer(
+             |trigger: Trigger<OnAdd, SyncToRenderWorld>, mut pending: ResMut<PendingSyncEntity>| {
+-                pending.push(EntityRecord::Added(trigger.target()));
++                pending.push(EntityRecord::Added(trigger.target().unwrap()));
+             },
+         );
+         main_world.add_observer(
+             |trigger: Trigger<OnRemove, SyncToRenderWorld>,
+              mut pending: ResMut<PendingSyncEntity>,
+              query: Query<&RenderEntity>| {
+-                if let Ok(e) = query.get(trigger.target()) {
++                if let Ok(e) = query.get(trigger.target().unwrap()) {
+                     pending.push(EntityRecord::Removed(*e));
+                 };
+             },
+diff --git a/crates/bevy_scene/src/scene_spawner.rs b/crates/bevy_scene/src/scene_spawner.rs
+index 3bf8ca9f64c44..c8b430c643046 100644
+--- a/crates/bevy_scene/src/scene_spawner.rs
++++ b/crates/bevy_scene/src/scene_spawner.rs
+@@ -704,7 +704,7 @@ mod tests {
+             .expect("Failed to run dynamic scene builder system.")
+     }
+ 
+-    fn observe_trigger(app: &mut App, scene_id: InstanceId, scene_entity: Entity) {
++    fn observe_trigger(app: &mut App, scene_id: InstanceId, scene_entity: Option<Entity>) {
+         // Add observer
+         app.world_mut().add_observer(
+             move |trigger: Trigger<SceneInstanceReady>,
+@@ -756,7 +756,7 @@ mod tests {
+             .unwrap();
+ 
+         // Check trigger.
+-        observe_trigger(&mut app, scene_id, Entity::PLACEHOLDER);
++        observe_trigger(&mut app, scene_id, None);
+     }
+ 
+     #[test]
+@@ -775,7 +775,7 @@ mod tests {
+             .unwrap();
+ 
+         // Check trigger.
+-        observe_trigger(&mut app, scene_id, Entity::PLACEHOLDER);
++        observe_trigger(&mut app, scene_id, None);
+     }
+ 
+     #[test]
+@@ -799,7 +799,7 @@ mod tests {
+             .unwrap();
+ 
+         // Check trigger.
+-        observe_trigger(&mut app, scene_id, scene_entity);
++        observe_trigger(&mut app, scene_id, Some(scene_entity));
+     }
+ 
+     #[test]
+@@ -823,7 +823,7 @@ mod tests {
+             .unwrap();
+ 
+         // Check trigger.
+-        observe_trigger(&mut app, scene_id, scene_entity);
++        observe_trigger(&mut app, scene_id, Some(scene_entity));
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_winit/src/cursor.rs b/crates/bevy_winit/src/cursor.rs
+index bdca3f85851ec..63c8a2bb2d41c 100644
+--- a/crates/bevy_winit/src/cursor.rs
++++ b/crates/bevy_winit/src/cursor.rs
+@@ -194,7 +194,7 @@ fn update_cursors(
+ fn on_remove_cursor_icon(trigger: Trigger<OnRemove, CursorIcon>, mut commands: Commands) {
+     // Use `try_insert` to avoid panic if the window is being destroyed.
+     commands
+-        .entity(trigger.target())
++        .entity(trigger.target().unwrap())
+         .try_insert(PendingCursor(Some(CursorSource::System(
+             convert_system_cursor_icon(SystemCursorIcon::Default),
+         ))));
+diff --git a/examples/3d/edit_material_on_gltf.rs b/examples/3d/edit_material_on_gltf.rs
+index f9de5842a92fe..029ec6bf1e5ac 100644
+--- a/examples/3d/edit_material_on_gltf.rs
++++ b/examples/3d/edit_material_on_gltf.rs
+@@ -65,12 +65,12 @@ fn change_material(
+     mut asset_materials: ResMut<Assets<StandardMaterial>>,
+ ) {
+     // Get the `ColorOverride` of the entity, if it does not have a color override, skip
+-    let Ok(color_override) = color_override.get(trigger.target()) else {
++    let Ok(color_override) = color_override.get(trigger.target().unwrap()) else {
+         return;
+     };
+ 
+     // Iterate over all children recursively
+-    for descendants in children.iter_descendants(trigger.target()) {
++    for descendants in children.iter_descendants(trigger.target().unwrap()) {
+         // Get the material of the descendant
+         if let Some(material) = mesh_materials
+             .get(descendants)
+diff --git a/examples/animation/animated_mesh.rs b/examples/animation/animated_mesh.rs
+index ecea86fb178a7..d2c4fd8443d01 100644
+--- a/examples/animation/animated_mesh.rs
++++ b/examples/animation/animated_mesh.rs
+@@ -70,12 +70,12 @@ fn play_animation_when_ready(
+ ) {
+     // The entity we spawned in `setup_mesh_and_animation` is the trigger's target.
+     // Start by finding the AnimationToPlay component we added to that entity.
+-    if let Ok(animation_to_play) = animations_to_play.get(trigger.target()) {
++    if let Ok(animation_to_play) = animations_to_play.get(trigger.target().unwrap()) {
+         // The SceneRoot component will have spawned the scene as a hierarchy
+         // of entities parented to our entity. Since the asset contained a skinned
+         // mesh and animations, it will also have spawned an animation player
+         // component. Search our entity's descendants to find the animation player.
+-        for child in children.iter_descendants(trigger.target()) {
++        for child in children.iter_descendants(trigger.target().unwrap()) {
+             if let Ok(mut player) = players.get_mut(child) {
+                 // Tell the animation player to start the animation and keep
+                 // repeating it.
+diff --git a/examples/animation/animated_mesh_events.rs b/examples/animation/animated_mesh_events.rs
+index 2048f573fd704..c0f261752eedf 100644
+--- a/examples/animation/animated_mesh_events.rs
++++ b/examples/animation/animated_mesh_events.rs
+@@ -47,7 +47,10 @@ fn observe_on_step(
+     transforms: Query<&GlobalTransform>,
+     mut seeded_rng: ResMut<SeededRng>,
+ ) {
+-    let translation = transforms.get(trigger.target()).unwrap().translation();
++    let translation = transforms
++        .get(trigger.target().unwrap())
++        .unwrap()
++        .translation();
+     // Spawn a bunch of particles.
+     for _ in 0..14 {
+         let horizontal = seeded_rng.0.r#gen::<Dir2>() * seeded_rng.0.gen_range(8.0..12.0);
+diff --git a/examples/ecs/entity_disabling.rs b/examples/ecs/entity_disabling.rs
+index 86cf8e9d6cf3a..f9cebede22f2a 100644
+--- a/examples/ecs/entity_disabling.rs
++++ b/examples/ecs/entity_disabling.rs
+@@ -40,7 +40,7 @@ fn disable_entities_on_click(
+     valid_query: Query<&DisableOnClick>,
+     mut commands: Commands,
+ ) {
+-    let clicked_entity = trigger.target();
++    let clicked_entity = trigger.target().unwrap();
+     // Windows and text are entities and can be clicked!
+     // We definitely don't want to disable the window itself,
+     // because that would cause the app to close!
+diff --git a/examples/ecs/observer_propagation.rs b/examples/ecs/observer_propagation.rs
+index 1acf5efa90378..6793364a29df9 100644
+--- a/examples/ecs/observer_propagation.rs
++++ b/examples/ecs/observer_propagation.rs
+@@ -78,14 +78,14 @@ fn attack_armor(entities: Query<Entity, With<Armor>>, mut commands: Commands) {
+ }
+ 
+ fn attack_hits(trigger: Trigger<Attack>, name: Query<&Name>) {
+-    if let Ok(name) = name.get(trigger.target()) {
++    if let Ok(name) = name.get(trigger.target().unwrap()) {
+         info!("Attack hit {}", name);
+     }
+ }
+ 
+ /// A callback placed on [`Armor`], checking if it absorbed all the [`Attack`] damage.
+ fn block_attack(mut trigger: Trigger<Attack>, armor: Query<(&Armor, &Name)>) {
+-    let (armor, name) = armor.get(trigger.target()).unwrap();
++    let (armor, name) = armor.get(trigger.target().unwrap()).unwrap();
+     let attack = trigger.event_mut();
+     let damage = attack.damage.saturating_sub(**armor);
+     if damage > 0 {
+@@ -110,14 +110,14 @@ fn take_damage(
+     mut app_exit: EventWriter<AppExit>,
+ ) {
+     let attack = trigger.event();
+-    let (mut hp, name) = hp.get_mut(trigger.target()).unwrap();
++    let (mut hp, name) = hp.get_mut(trigger.target().unwrap()).unwrap();
+     **hp = hp.saturating_sub(attack.damage);
+ 
+     if **hp > 0 {
+         info!("{} has {:.1} HP", name, hp.0);
+     } else {
+         warn!("💀 {} has died a gruesome death", name);
+-        commands.entity(trigger.target()).despawn();
++        commands.entity(trigger.target().unwrap()).despawn();
+         app_exit.write(AppExit::Success);
+     }
+ 
+diff --git a/examples/ecs/observers.rs b/examples/ecs/observers.rs
+index 41a2e5dd07ec8..d7bf067d4c834 100644
+--- a/examples/ecs/observers.rs
++++ b/examples/ecs/observers.rs
+@@ -117,12 +117,16 @@ fn on_add_mine(
+     query: Query<&Mine>,
+     mut index: ResMut<SpatialIndex>,
+ ) {
+-    let mine = query.get(trigger.target()).unwrap();
++    let mine = query.get(trigger.target().unwrap()).unwrap();
+     let tile = (
+         (mine.pos.x / CELL_SIZE).floor() as i32,
+         (mine.pos.y / CELL_SIZE).floor() as i32,
+     );
+-    index.map.entry(tile).or_default().insert(trigger.target());
++    index
++        .map
++        .entry(tile)
++        .or_default()
++        .insert(trigger.target().unwrap());
+ }
+ 
+ // Remove despawned mines from our index
+@@ -131,19 +135,19 @@ fn on_remove_mine(
+     query: Query<&Mine>,
+     mut index: ResMut<SpatialIndex>,
+ ) {
+-    let mine = query.get(trigger.target()).unwrap();
++    let mine = query.get(trigger.target().unwrap()).unwrap();
+     let tile = (
+         (mine.pos.x / CELL_SIZE).floor() as i32,
+         (mine.pos.y / CELL_SIZE).floor() as i32,
+     );
+     index.map.entry(tile).and_modify(|set| {
+-        set.remove(&trigger.target());
++        set.remove(&trigger.target().unwrap());
+     });
+ }
+ 
+ fn explode_mine(trigger: Trigger<Explode>, query: Query<&Mine>, mut commands: Commands) {
+     // If a triggered event is targeting a specific entity you can access it with `.target()`
+-    let id = trigger.target();
++    let id = trigger.target().unwrap();
+     let Ok(mut entity) = commands.get_entity(id) else {
+         return;
+     };
+diff --git a/examples/ecs/removal_detection.rs b/examples/ecs/removal_detection.rs
+index 782576aae02ff..f60452f4eaffb 100644
+--- a/examples/ecs/removal_detection.rs
++++ b/examples/ecs/removal_detection.rs
+@@ -50,7 +50,7 @@ fn remove_component(
+ 
+ fn react_on_removal(trigger: Trigger<OnRemove, MyComponent>, mut query: Query<&mut Sprite>) {
+     // The `OnRemove` trigger was automatically called on the `Entity` that had its `MyComponent` removed.
+-    let entity = trigger.target();
++    let entity = trigger.target().unwrap();
+     if let Ok(mut sprite) = query.get_mut(entity) {
+         sprite.color = Color::srgb(0.5, 1., 1.);
+     }
+diff --git a/examples/no_std/library/src/lib.rs b/examples/no_std/library/src/lib.rs
+index c8aa35d799e73..ec767b763d5ad 100644
+--- a/examples/no_std/library/src/lib.rs
++++ b/examples/no_std/library/src/lib.rs
+@@ -127,7 +127,10 @@ fn tick_timers(
+ }
+ 
+ fn unwrap<B: Bundle>(trigger: Trigger<Unwrap>, world: &mut World) {
+-    if let Ok(mut target) = world.get_entity_mut(trigger.target()) {
++    if let Some(mut target) = trigger
++        .target()
++        .and_then(|target| world.get_entity_mut(target).ok())
++    {
+         if let Some(DelayedComponent(bundle)) = target.take::<DelayedComponent<B>>() {
+             target.insert(bundle);
+         }
+diff --git a/examples/picking/debug_picking.rs b/examples/picking/debug_picking.rs
+index 4213775ba7d14..5461d9e4c99e2 100644
+--- a/examples/picking/debug_picking.rs
++++ b/examples/picking/debug_picking.rs
+@@ -48,13 +48,13 @@ fn setup_scene(
+         .observe(on_click_spawn_cube)
+         .observe(
+             |out: Trigger<Pointer<Out>>, mut texts: Query<&mut TextColor>| {
+-                let mut text_color = texts.get_mut(out.target()).unwrap();
++                let mut text_color = texts.get_mut(out.target().unwrap()).unwrap();
+                 text_color.0 = Color::WHITE;
+             },
+         )
+         .observe(
+             |over: Trigger<Pointer<Over>>, mut texts: Query<&mut TextColor>| {
+-                let mut color = texts.get_mut(over.target()).unwrap();
++                let mut color = texts.get_mut(over.target().unwrap()).unwrap();
+                 color.0 = bevy::color::palettes::tailwind::CYAN_400.into();
+             },
+         );
+@@ -102,7 +102,7 @@ fn on_click_spawn_cube(
+ }
+ 
+ fn on_drag_rotate(drag: Trigger<Pointer<Drag>>, mut transforms: Query<&mut Transform>) {
+-    if let Ok(mut transform) = transforms.get_mut(drag.target()) {
++    if let Ok(mut transform) = transforms.get_mut(drag.target().unwrap()) {
+         transform.rotate_y(drag.delta.x * 0.02);
+         transform.rotate_x(drag.delta.y * 0.02);
+     }
+diff --git a/examples/picking/mesh_picking.rs b/examples/picking/mesh_picking.rs
+index 3c0d3bf09f10f..4c247aa62a606 100644
+--- a/examples/picking/mesh_picking.rs
++++ b/examples/picking/mesh_picking.rs
+@@ -164,7 +164,7 @@ fn update_material_on<E>(
+     // versions of this observer, each triggered by a different event and with a different hardcoded
+     // material. Instead, the event type is a generic, and the material is passed in.
+     move |trigger, mut query| {
+-        if let Ok(mut material) = query.get_mut(trigger.target()) {
++        if let Ok(mut material) = query.get_mut(trigger.target().unwrap()) {
+             material.0 = new_material.clone();
+         }
+     }
+@@ -191,7 +191,7 @@ fn rotate(mut query: Query<&mut Transform, With<Shape>>, time: Res<Time>) {
+ 
+ /// An observer to rotate an entity when it is dragged
+ fn rotate_on_drag(drag: Trigger<Pointer<Drag>>, mut transforms: Query<&mut Transform>) {
+-    let mut transform = transforms.get_mut(drag.target()).unwrap();
++    let mut transform = transforms.get_mut(drag.target().unwrap()).unwrap();
+     transform.rotate_y(drag.delta.x * 0.02);
+     transform.rotate_x(drag.delta.y * 0.02);
+ }
+diff --git a/examples/picking/simple_picking.rs b/examples/picking/simple_picking.rs
+index 19b6297ccd59b..1ecf816a78325 100644
+--- a/examples/picking/simple_picking.rs
++++ b/examples/picking/simple_picking.rs
+@@ -27,13 +27,13 @@ fn setup_scene(
+         .observe(on_click_spawn_cube)
+         .observe(
+             |out: Trigger<Pointer<Out>>, mut texts: Query<&mut TextColor>| {
+-                let mut text_color = texts.get_mut(out.target()).unwrap();
++                let mut text_color = texts.get_mut(out.target().unwrap()).unwrap();
+                 text_color.0 = Color::WHITE;
+             },
+         )
+         .observe(
+             |over: Trigger<Pointer<Over>>, mut texts: Query<&mut TextColor>| {
+-                let mut color = texts.get_mut(over.target()).unwrap();
++                let mut color = texts.get_mut(over.target().unwrap()).unwrap();
+                 color.0 = bevy::color::palettes::tailwind::CYAN_400.into();
+             },
+         );
+@@ -80,7 +80,7 @@ fn on_click_spawn_cube(
+ }
+ 
+ fn on_drag_rotate(drag: Trigger<Pointer<Drag>>, mut transforms: Query<&mut Transform>) {
+-    if let Ok(mut transform) = transforms.get_mut(drag.target()) {
++    if let Ok(mut transform) = transforms.get_mut(drag.target().unwrap()) {
+         transform.rotate_y(drag.delta.x * 0.02);
+         transform.rotate_x(drag.delta.y * 0.02);
+     }
+diff --git a/examples/picking/sprite_picking.rs b/examples/picking/sprite_picking.rs
+index 83ff5f3bd1b16..99403e9192958 100644
+--- a/examples/picking/sprite_picking.rs
++++ b/examples/picking/sprite_picking.rs
+@@ -152,7 +152,7 @@ fn setup_atlas(
+ // An observer listener that changes the target entity's color.
+ fn recolor_on<E: Debug + Clone + Reflect>(color: Color) -> impl Fn(Trigger<E>, Query<&mut Sprite>) {
+     move |ev, mut sprites| {
+-        let Ok(mut sprite) = sprites.get_mut(ev.target()) else {
++        let Ok(mut sprite) = sprites.get_mut(ev.target().unwrap()) else {
+             return;
+         };
+         sprite.color = color;
+diff --git a/examples/testbed/3d.rs b/examples/testbed/3d.rs
+index 2a0f6c8d9cc3c..7203a332462c8 100644
+--- a/examples/testbed/3d.rs
++++ b/examples/testbed/3d.rs
+@@ -281,7 +281,7 @@ mod animation {
+         animation: Res<Animation>,
+         mut players: Query<(Entity, &mut AnimationPlayer)>,
+     ) {
+-        for child in children.iter_descendants(trigger.target()) {
++        for child in children.iter_descendants(trigger.target().unwrap()) {
+             if let Ok((entity, mut player)) = players.get_mut(child) {
+                 let mut transitions = AnimationTransitions::new();
+                 transitions
+diff --git a/examples/ui/directional_navigation.rs b/examples/ui/directional_navigation.rs
+index 41b0a4b012c0a..a570846fa73dc 100644
+--- a/examples/ui/directional_navigation.rs
++++ b/examples/ui/directional_navigation.rs
+@@ -70,7 +70,7 @@ fn universal_button_click_behavior(
+     mut trigger: Trigger<Pointer<Click>>,
+     mut button_query: Query<(&mut BackgroundColor, &mut ResetTimer)>,
+ ) {
+-    let button_entity = trigger.target();
++    let button_entity = trigger.target().unwrap();
+     if let Ok((mut color, mut reset_timer)) = button_query.get_mut(button_entity) {
+         // This would be a great place to play a little sound effect too!
+         color.0 = PRESSED_BUTTON.into();
+diff --git a/examples/ui/scroll.rs b/examples/ui/scroll.rs
+index 5cf44df55355c..535e351c16475 100644
+--- a/examples/ui/scroll.rs
++++ b/examples/ui/scroll.rs
+@@ -93,7 +93,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                                     mut commands: Commands
+                                 | {
+                                     if trigger.event().button == PointerButton::Primary {
+-                                        commands.entity(trigger.target()).despawn();
++                                        commands.entity(trigger.target().unwrap()).despawn();
+                                     }
+                                 });
+                             }
+diff --git a/examples/ui/tab_navigation.rs b/examples/ui/tab_navigation.rs
+index 25e43cf0be429..b93ccf107fc28 100644
+--- a/examples/ui/tab_navigation.rs
++++ b/examples/ui/tab_navigation.rs
+@@ -142,7 +142,7 @@ fn setup(mut commands: Commands) {
+                                 .observe(
+                                     |mut trigger: Trigger<Pointer<Click>>,
+                                     mut focus: ResMut<InputFocus>| {
+-                                        focus.0 = Some(trigger.target());
++                                        focus.0 = Some(trigger.target().unwrap());
+                                         trigger.propagate(false);
+                                     },
+                                 );
+diff --git a/examples/ui/viewport_node.rs b/examples/ui/viewport_node.rs
+index 60caf7ec214ec..cfd8aabd59aa9 100644
+--- a/examples/ui/viewport_node.rs
++++ b/examples/ui/viewport_node.rs
+@@ -91,7 +91,7 @@ fn test(
+ 
+ fn on_drag_viewport(drag: Trigger<Pointer<Drag>>, mut node_query: Query<&mut Node>) {
+     if matches!(drag.button, PointerButton::Secondary) {
+-        let mut node = node_query.get_mut(drag.target()).unwrap();
++        let mut node = node_query.get_mut(drag.target().unwrap()).unwrap();
+ 
+         if let (Val::Px(top), Val::Px(left)) = (node.top, node.left) {
+             node.left = Val::Px(left + drag.delta.x);
+@@ -102,7 +102,7 @@ fn on_drag_viewport(drag: Trigger<Pointer<Drag>>, mut node_query: Query<&mut Nod
+ 
+ fn on_drag_cuboid(drag: Trigger<Pointer<Drag>>, mut transform_query: Query<&mut Transform>) {
+     if matches!(drag.button, PointerButton::Primary) {
+-        let mut transform = transform_query.get_mut(drag.target()).unwrap();
++        let mut transform = transform_query.get_mut(drag.target().unwrap()).unwrap();
+         transform.rotate_y(drag.delta.x * 0.02);
+         transform.rotate_x(drag.delta.y * 0.02);
+     }
+diff --git a/release-content/migration-guides/observer_triggers.md b/release-content/migration-guides/observer_triggers.md
+new file mode 100644
+index 0000000000000..bc243f77ada1d
+--- /dev/null
++++ b/release-content/migration-guides/observer_triggers.md
+@@ -0,0 +1,12 @@
++---
++title: Observer Triggers
++pull_requests: [19440]
++---
++
++Observers may be triggered on particular entities or globally.
++Previously, a global trigger would claim to trigger on a particular `Entity`, `Entity::PLACEHOLDER`.
++For correctness and transparency, triggers have been changed to `Option<Entity>`.
++
++`Trigger::target` now returns `Option<Entity>` and `ObserverTrigger::target` is now of type `Option<Entity>`.
++If you were checking for `Entity::PLACEHOLDER`, migrate to handling the `None` case.
++If you were not checking for `Entity::PLACEHOLDER`, migrate to unwrapping, as `Entity::PLACEHOLDER` would have caused a panic before, at a later point.
