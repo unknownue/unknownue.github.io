@@ -20,7 +20,8 @@
 2. Settings → Secrets and variables → Actions
 3. Add the same `DISPATCH_TOKEN` secret
 4. Go to Settings → Pages
-5. Under "Source", select "GitHub Actions"
+5. Under "Source", select "Deploy from a branch"
+6. Select "gh-pages" branch and "/ (root)" folder
 
 ### Step 3: Test the Setup
 1. Go to `bevy_prototype_codex` → Actions tab
@@ -37,10 +38,27 @@
 
 The system is now fully automated:
 
-- **Push code** to `bevy_prototype_codex` → Automatic WASM build and deploy to GitHub Pages
-- **Manual trigger** → Run workflows manually
-- **Weekly builds** → Automatic updates every Sunday
-- **No git commits** → Generated files are deployed directly to GitHub Pages
+- **Push code** to `bevy_prototype_codex` → Automatic WASM build and deploy via Zola
+- **Update blog content** (`content/posts/`, `content/pull_request/`) → Automatic blog rebuild with WASM projects
+- **Manual trigger** → Run workflows manually for both WASM and blog
+- **Weekly builds** → Automatic WASM updates every Sunday
+- **No main branch pollution** → Generated files are deployed to gh-pages branch only
+
+## 🔄 Workflow Trigger Logic
+
+The system uses two separate workflows that complement each other:
+
+### WASM Build Workflow (`build_bevy_prototype_codex.yml`)
+- **Triggered by**: External `wasm-build-trigger` event, manual trigger, weekly schedule
+- **Generates**: `content/projects/` and `static/assets/` files 
+- **Deployment**: Direct to gh-pages branch via Zola
+
+### Blog Build Workflow (`build_blog.yml`)  
+- **Triggered by**: Changes to `content/posts/`, `content/pull_request/`, templates, styles
+- **Restores**: Existing WASM projects from gh-pages before building
+- **Deployment**: Complete site rebuild including preserved WASM files
+
+This ensures both workflows can run independently without conflicting.
 
 ## 🔧 Common Issues
 
@@ -61,8 +79,8 @@ The system is now fully automated:
 
 - **Build status**: Check Actions tabs in both repositories
 - **Build logs**: Click on workflow runs for detailed information
-- **Deployment status**: Check workflow summary for GitHub Pages deployment URL
-- **Generated files**: Files are deployed directly to GitHub Pages (not in git)
+- **Deployment status**: Check workflow summary and gh-pages branch
+- **Generated files**: Files are deployed to gh-pages branch (not in main branch)
 
 ## 🎯 Next Steps
 
