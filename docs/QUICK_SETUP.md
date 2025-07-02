@@ -15,6 +15,13 @@
 4. Name: `DISPATCH_TOKEN`
 5. Value: Your GitHub token from Step 1
 
+### Step 2.5: Configure Target Repository  
+1. Go to `unknownue.github.io` repository
+2. Settings → Secrets and variables → Actions
+3. Add the same `DISPATCH_TOKEN` secret
+4. Go to Settings → Pages
+5. Under "Source", select "GitHub Actions"
+
 ### Step 3: Test the Setup
 1. Go to `bevy_prototype_codex` → Actions tab
 2. Select "Trigger WASM Build" workflow
@@ -24,15 +31,16 @@
 ### Step 4: Verify Results
 1. Go to `unknownue.github.io` → Actions tab
 2. You should see "Auto Build and Deploy WASM Projects" running
-3. Check the commit history for auto-generated commits
+3. Check the workflow summary for deployment status and generated files
 
 ## ✅ You're Done!
 
 The system is now fully automated:
 
-- **Push code** to `bevy_prototype_codex` → Automatic WASM build
+- **Push code** to `bevy_prototype_codex` → Automatic WASM build and deploy to GitHub Pages
 - **Manual trigger** → Run workflows manually
 - **Weekly builds** → Automatic updates every Sunday
+- **No git commits** → Generated files are deployed directly to GitHub Pages
 
 ## 🔧 Common Issues
 
@@ -53,7 +61,8 @@ The system is now fully automated:
 
 - **Build status**: Check Actions tabs in both repositories
 - **Build logs**: Click on workflow runs for detailed information
-- **Generated files**: Check `content/projects/` in target repository
+- **Deployment status**: Check workflow summary for GitHub Pages deployment URL
+- **Generated files**: Files are deployed directly to GitHub Pages (not in git)
 
 ## 🎯 Next Steps
 
