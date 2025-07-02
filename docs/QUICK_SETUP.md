@@ -39,6 +39,7 @@ The system is now fully automated:
 ### "Repository not found" error
 - Check if your GitHub token has access to both repositories
 - Verify the token has `repo` and `workflow` permissions
+- For private repositories, ensure `DISPATCH_TOKEN` is configured correctly
 
 ### Build timeouts
 - Rust compilation can take 10+ minutes initially
