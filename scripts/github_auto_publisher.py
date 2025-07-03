@@ -78,7 +78,8 @@ class GitHubAutoPublisher:
                 'path': bin_config['path'],
                 'display_name': metadata.get('name', binary_name.replace('_', ' ').title()),
                 'description': metadata.get('description', '{} application'.format(binary_name)),
-                'tags': self.generate_tags(binary_name, metadata)
+                'tags': self.generate_tags(binary_name, metadata),
+                'readme': metadata.get('readme')  # Get readme path from metadata
             }
             binaries.append(binary_info)
         
@@ -162,6 +163,41 @@ class GitHubAutoPublisher:
         finally:
             os.chdir(original_cwd)
     
+    def load_readme_content(self, binary_info):
+        """Load README.md content for a binary"""
+        source_repo = self.config['PATHS']['source_repo']
+        binary_name = binary_info['name']
+        binary_path = binary_info['path']
+        
+        # Try different possible README locations
+        readme_paths = []
+        
+        # First priority: check if readme path is specified in metadata
+        if binary_info.get('readme'):
+            readme_paths.append(os.path.join(source_repo, binary_info['readme']))
+        
+        # Fallback: Get the directory containing the binary file
+        binary_dir = os.path.dirname(binary_path)
+        if binary_dir:
+            readme_paths.append(os.path.join(source_repo, binary_dir, 'README.md'))
+        
+        # Fallback: Try app directory with binary name
+        readme_paths.append(os.path.join(source_repo, 'app', binary_name, 'README.md'))
+        
+        for readme_path in readme_paths:
+            if os.path.exists(readme_path):
+                try:
+                    with open(readme_path, 'r', encoding='utf-8') as f:
+                        content = f.read().strip()
+                    if content:  # Only return if content is not empty
+                        print("      ✓ Loaded README from: {}".format(os.path.relpath(readme_path, source_repo)))
+                        return content
+                except Exception as e:
+                    print("      ⚠ Error reading README {}: {}".format(readme_path, e))
+        
+        print("      ⚠ No README found for {}, using default description".format(binary_name))
+        return None
+
     def create_project_structure(self, binary_info):
         """Create project directory structure for a binary"""
         target_repo = self.config['PATHS']['target_repo']
@@ -169,6 +205,9 @@ class GitHubAutoPublisher:
         
         project_dir = os.path.join(target_repo, 'content', 'projects', binary_name)
         os.makedirs(project_dir, exist_ok=True)
+        
+        # Load README content
+        readme_content = self.load_readme_content(binary_info)
         
         # Create _index.md
         index_content = '''+++
@@ -187,6 +226,11 @@ template = "project_section.html"
         current_date = datetime.datetime.now().strftime('%Y-%m-%d')
         tags_str = ', '.join(['"{}"'.format(tag) for tag in binary_info['tags']])
         
+        # Use README content if available, otherwise use description
+        content_text = readme_content if readme_content else "## {}\n\n{}".format(
+            binary_info['display_name'], binary_info['description']
+        )
+        
         content_md = '''+++
 title = "{}"
 date = {}
@@ -197,8 +241,6 @@ draft = false
 tags = [{}]
 +++
 
-## {}
-
 {}
 
 {{{{ wasm_viewer(path="app.js", id="{}-demo") }}}} 
@@ -208,8 +250,7 @@ tags = [{}]
             current_date,
             binary_info['description'],
             tags_str,
-            binary_info['display_name'],
-            binary_info['description'],
+            content_text,
             binary_name
         )
         

@@ -87,5 +87,3 @@ This ensures both workflows can run independently without conflicting.
 1. **Customize triggers**: Edit `paths` in trigger workflow to monitor different files
 2. **Add notifications**: Configure GitHub notifications for build status
 3. **Optimize builds**: Add caching for faster compilation times
-
-For detailed configuration, see [AUTOMATED_WASM_BUILD.md](./AUTOMATED_WASM_BUILD.md) 
