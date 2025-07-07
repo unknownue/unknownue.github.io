@@ -1,0 +1,283 @@
+diff --git a/crates/bevy_reflect/compile_fail/tests/reflect_remote/invalid_definition_fail.rs b/crates/bevy_reflect/compile_fail/tests/reflect_remote/invalid_definition_fail.rs
+index d691c824ccac9..67135669f5e4f 100644
+--- a/crates/bevy_reflect/compile_fail/tests/reflect_remote/invalid_definition_fail.rs
++++ b/crates/bevy_reflect/compile_fail/tests/reflect_remote/invalid_definition_fail.rs
+@@ -9,6 +9,7 @@ mod structs {
+ 
+     #[reflect_remote(external_crate::TheirStruct)]
+     //~^ ERROR: `?` operator has incompatible types
++    //~| ERROR: mismatched types
+     struct MyStruct {
+         // Reason: Should be `u32`
+         pub value: bool,
+@@ -25,6 +26,7 @@ mod tuple_structs {
+ 
+     #[reflect_remote(external_crate::TheirStruct)]
+     //~^ ERROR: `?` operator has incompatible types
++    //~| ERROR: mismatched types
+     struct MyStruct(
+         // Reason: Should be `u32`
+         pub bool,
+@@ -48,6 +50,7 @@ mod enums {
+     //~| ERROR: variant `enums::external_crate::TheirStruct::Unit` has no field named `0`
+     //~| ERROR: `?` operator has incompatible types
+     //~| ERROR: `?` operator has incompatible types
++    //~| ERROR: mismatched types
+     enum MyStruct {
+         // Reason: Should be unit variant
+         Unit(i32),
+@@ -57,6 +60,7 @@ mod enums {
+         // Reason: Should be `usize`
+         Struct { value: String },
+         //~^ ERROR: mismatched types
++        //~| ERROR: mismatched types
+     }
+ }
+ 
+diff --git a/crates/bevy_reflect/compile_fail/tests/reflect_remote/nested_fail.rs b/crates/bevy_reflect/compile_fail/tests/reflect_remote/nested_fail.rs
+index 457f1f75e5f52..391258ccc6507 100644
+--- a/crates/bevy_reflect/compile_fail/tests/reflect_remote/nested_fail.rs
++++ b/crates/bevy_reflect/compile_fail/tests/reflect_remote/nested_fail.rs
+@@ -26,8 +26,8 @@ mod incorrect_inner_type {
+     //~| ERROR: `TheirInner<T>` does not implement `PartialReflect` so cannot be introspected
+     //~| ERROR: `TheirInner<T>` does not implement `PartialReflect` so cannot be introspected
+     //~| ERROR: `TheirInner<T>` does not implement `TypePath` so cannot provide dynamic type path information
+-    //~| ERROR: `TheirInner<T>` does not implement `TypePath` so cannot provide dynamic type path information
+     //~| ERROR: `?` operator has incompatible types
++    //~| ERROR: mismatched types
+     struct MyOuter<T: FromReflect + GetTypeRegistration> {
+         // Reason: Should not use `MyInner<T>` directly
+         pub inner: MyInner<T>,
+diff --git a/crates/bevy_reflect/compile_fail/tests/reflect_remote/type_mismatch_fail.rs b/crates/bevy_reflect/compile_fail/tests/reflect_remote/type_mismatch_fail.rs
+index 1983442ab7d3a..e3c894e6d5fa3 100644
+--- a/crates/bevy_reflect/compile_fail/tests/reflect_remote/type_mismatch_fail.rs
++++ b/crates/bevy_reflect/compile_fail/tests/reflect_remote/type_mismatch_fail.rs
+@@ -77,6 +77,7 @@ mod enums {
+ 
+     #[reflect_remote(external_crate::TheirBar)]
+     //~^ ERROR: `?` operator has incompatible types
++    //~| ERROR: mismatched types
+     enum MyBar {
+         // Reason: Should use `i32`
+         Value(u32),
+diff --git a/crates/bevy_reflect/derive/src/derive_data.rs b/crates/bevy_reflect/derive/src/derive_data.rs
+index 9af7acda76614..3f6532a408dcd 100644
+--- a/crates/bevy_reflect/derive/src/derive_data.rs
++++ b/crates/bevy_reflect/derive/src/derive_data.rs
+@@ -722,18 +722,7 @@ impl<'a> ReflectStruct<'a> {
+                         }
+                     } else {
+                         quote! {
+-                            #bevy_reflect_path::PartialReflect::reflect_clone(#accessor)?
+-                                .take()
+-                                .map_err(|value| #bevy_reflect_path::ReflectCloneError::FailedDowncast {
+-                                    expected: #bevy_reflect_path::__macro_exports::alloc_utils::Cow::Borrowed(
+-                                        <#field_ty as #bevy_reflect_path::TypePath>::type_path()
+-                                    ),
+-                                    received: #bevy_reflect_path::__macro_exports::alloc_utils::Cow::Owned(
+-                                        #bevy_reflect_path::__macro_exports::alloc_utils::ToString::to_string(
+-                                            #bevy_reflect_path::DynamicTypePath::reflect_type_path(&*value)
+-                                        )
+-                                    ),
+-                                })?
++                            <#field_ty as #bevy_reflect_path::PartialReflect>::reflect_clone_and_take(#accessor)?
+                         }
+                     };
+ 
+diff --git a/crates/bevy_reflect/derive/src/enum_utility.rs b/crates/bevy_reflect/derive/src/enum_utility.rs
+index 5571b861a6a81..e61fa0c984df0 100644
+--- a/crates/bevy_reflect/derive/src/enum_utility.rs
++++ b/crates/bevy_reflect/derive/src/enum_utility.rs
+@@ -321,9 +321,7 @@ impl<'a> VariantBuilder for ReflectCloneVariantBuilder<'a> {
+ 
+     fn construct_field(&self, field: VariantField) -> TokenStream {
+         let bevy_reflect_path = self.reflect_enum.meta().bevy_reflect_path();
+-
+         let field_ty = field.field.reflected_type();
+-
+         let alias = field.alias;
+         let alias = match &field.field.attrs.remote {
+             Some(wrapper_ty) => {
+@@ -337,18 +335,7 @@ impl<'a> VariantBuilder for ReflectCloneVariantBuilder<'a> {
+         match &field.field.attrs.clone {
+             CloneBehavior::Default => {
+                 quote! {
+-                    #bevy_reflect_path::PartialReflect::reflect_clone(#alias)?
+-                        .take()
+-                        .map_err(|value| #bevy_reflect_path::ReflectCloneError::FailedDowncast {
+-                            expected: #bevy_reflect_path::__macro_exports::alloc_utils::Cow::Borrowed(
+-                                <#field_ty as #bevy_reflect_path::TypePath>::type_path()
+-                            ),
+-                            received: #bevy_reflect_path::__macro_exports::alloc_utils::Cow::Owned(
+-                                #bevy_reflect_path::__macro_exports::alloc_utils::ToString::to_string(
+-                                    #bevy_reflect_path::DynamicTypePath::reflect_type_path(&*value)
+-                                )
+-                            ),
+-                        })?
++                    <#field_ty as #bevy_reflect_path::PartialReflect>::reflect_clone_and_take(#alias)?
+                 }
+             }
+             CloneBehavior::Trait => {
+diff --git a/crates/bevy_reflect/src/impls/alloc/collections/btree/map.rs b/crates/bevy_reflect/src/impls/alloc/collections/btree/map.rs
+index df68b425f6914..d5559a2985abd 100644
+--- a/crates/bevy_reflect/src/impls/alloc/collections/btree/map.rs
++++ b/crates/bevy_reflect/src/impls/alloc/collections/btree/map.rs
+@@ -9,7 +9,6 @@ use crate::{
+     type_registry::{FromType, GetTypeRegistration, ReflectFromPtr, TypeRegistration},
+     utility::GenericTypeInfoCell,
+ };
+-use alloc::borrow::Cow;
+ use alloc::vec::Vec;
+ use bevy_platform::prelude::*;
+ use bevy_reflect_derive::impl_type_path;
+@@ -144,21 +143,8 @@ where
+     fn reflect_clone(&self) -> Result<Box<dyn Reflect>, ReflectCloneError> {
+         let mut map = Self::new();
+         for (key, value) in self.iter() {
+-            let key =
+-                key.reflect_clone()?
+-                    .take()
+-                    .map_err(|_| ReflectCloneError::FailedDowncast {
+-                        expected: Cow::Borrowed(<Self as TypePath>::type_path()),
+-                        received: Cow::Owned(key.reflect_type_path().to_string()),
+-                    })?;
+-            let value =
+-                value
+-                    .reflect_clone()?
+-                    .take()
+-                    .map_err(|_| ReflectCloneError::FailedDowncast {
+-                        expected: Cow::Borrowed(<Self as TypePath>::type_path()),
+-                        received: Cow::Owned(value.reflect_type_path().to_string()),
+-                    })?;
++            let key = key.reflect_clone_and_take()?;
++            let value = value.reflect_clone_and_take()?;
+             map.insert(key, value);
+         }
+ 
+diff --git a/crates/bevy_reflect/src/impls/macros/list.rs b/crates/bevy_reflect/src/impls/macros/list.rs
+index 72e05ba10f9de..81a27047cb687 100644
+--- a/crates/bevy_reflect/src/impls/macros/list.rs
++++ b/crates/bevy_reflect/src/impls/macros/list.rs
+@@ -113,14 +113,7 @@ macro_rules! impl_reflect_for_veclike {
+                 fn reflect_clone(&self) -> Result<bevy_platform::prelude::Box<dyn $crate::reflect::Reflect>, $crate::error::ReflectCloneError> {
+                     Ok(bevy_platform::prelude::Box::new(
+                         self.iter()
+-                            .map(|value| {
+-                                value.reflect_clone()?.take().map_err(|_| {
+-                                    $crate::error::ReflectCloneError::FailedDowncast {
+-                                        expected: alloc::borrow::Cow::Borrowed(<T as $crate::type_path::TypePath>::type_path()),
+-                                        received: alloc::borrow::Cow::Owned(alloc::string::ToString::to_string(value.reflect_type_path())),
+-                                    }
+-                                })
+-                            })
++                            .map(|value| value.reflect_clone_and_take())
+                             .collect::<Result<Self, $crate::error::ReflectCloneError>>()?,
+                     ))
+                 }
+diff --git a/crates/bevy_reflect/src/impls/macros/map.rs b/crates/bevy_reflect/src/impls/macros/map.rs
+index d356ddba587a2..e87bb314b5a18 100644
+--- a/crates/bevy_reflect/src/impls/macros/map.rs
++++ b/crates/bevy_reflect/src/impls/macros/map.rs
+@@ -146,18 +146,8 @@ macro_rules! impl_reflect_for_hashmap {
+                 fn reflect_clone(&self) -> Result<bevy_platform::prelude::Box<dyn $crate::reflect::Reflect>, $crate::error::ReflectCloneError> {
+                     let mut map = Self::with_capacity_and_hasher(self.len(), S::default());
+                     for (key, value) in self.iter() {
+-                        let key = key.reflect_clone()?.take().map_err(|_| {
+-                            $crate::error::ReflectCloneError::FailedDowncast {
+-                                expected: alloc::borrow::Cow::Borrowed(<K as $crate::type_path::TypePath>::type_path()),
+-                                received: alloc::borrow::Cow::Owned(alloc::string::ToString::to_string(key.reflect_type_path())),
+-                            }
+-                        })?;
+-                        let value = value.reflect_clone()?.take().map_err(|_| {
+-                            $crate::error::ReflectCloneError::FailedDowncast {
+-                                expected: alloc::borrow::Cow::Borrowed(<V as $crate::type_path::TypePath>::type_path()),
+-                                received: alloc::borrow::Cow::Owned(alloc::string::ToString::to_string(value.reflect_type_path())),
+-                            }
+-                        })?;
++                        let key = key.reflect_clone_and_take()?;
++                        let value = value.reflect_clone_and_take()?;
+                         map.insert(key, value);
+                     }
+ 
+diff --git a/crates/bevy_reflect/src/impls/macros/set.rs b/crates/bevy_reflect/src/impls/macros/set.rs
+index 599ec1c0c8481..844b904cdec4c 100644
+--- a/crates/bevy_reflect/src/impls/macros/set.rs
++++ b/crates/bevy_reflect/src/impls/macros/set.rs
+@@ -129,12 +129,7 @@ macro_rules! impl_reflect_for_hashset {
+                 fn reflect_clone(&self) -> Result<bevy_platform::prelude::Box<dyn $crate::reflect::Reflect>, $crate::error::ReflectCloneError> {
+                     let mut set = Self::with_capacity_and_hasher(self.len(), S::default());
+                     for value in self.iter() {
+-                        let value = value.reflect_clone()?.take().map_err(|_| {
+-                            $crate::error::ReflectCloneError::FailedDowncast {
+-                                expected: alloc::borrow::Cow::Borrowed(<V as $crate::type_path::TypePath>::type_path()),
+-                                received: alloc::borrow::Cow::Owned(alloc::string::ToString::to_string(value.reflect_type_path())),
+-                            }
+-                        })?;
++                        let value = value.reflect_clone_and_take()?;
+                         set.insert(value);
+                     }
+ 
+diff --git a/crates/bevy_reflect/src/impls/smallvec.rs b/crates/bevy_reflect/src/impls/smallvec.rs
+index 561111a901a05..86b7284381c39 100644
+--- a/crates/bevy_reflect/src/impls/smallvec.rs
++++ b/crates/bevy_reflect/src/impls/smallvec.rs
+@@ -4,7 +4,7 @@ use crate::{
+     ReflectMut, ReflectOwned, ReflectRef, TypeInfo, TypeParamInfo, TypePath, TypeRegistration,
+     Typed,
+ };
+-use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
++use alloc::{boxed::Box, vec::Vec};
+ use bevy_reflect::ReflectCloneError;
+ use bevy_reflect_derive::impl_type_path;
+ use core::any::Any;
+@@ -137,16 +137,11 @@ where
+ 
+     fn reflect_clone(&self) -> Result<Box<dyn Reflect>, ReflectCloneError> {
+         Ok(Box::new(
+-            self.iter()
+-                .map(|value| {
+-                    value
+-                        .reflect_clone()?
+-                        .take()
+-                        .map_err(|_| ReflectCloneError::FailedDowncast {
+-                            expected: Cow::Borrowed(<T::Item as TypePath>::type_path()),
+-                            received: Cow::Owned(value.reflect_type_path().to_string()),
+-                        })
+-                })
++            // `(**self)` avoids getting `SmallVec<T> as List::iter`, which
++            // would give us the wrong item type.
++            (**self)
++                .iter()
++                .map(PartialReflect::reflect_clone_and_take)
+                 .collect::<Result<Self, ReflectCloneError>>()?,
+         ))
+     }
+diff --git a/crates/bevy_reflect/src/reflect.rs b/crates/bevy_reflect/src/reflect.rs
+index 1bd1795066a55..ffe9be54fef1f 100644
+--- a/crates/bevy_reflect/src/reflect.rs
++++ b/crates/bevy_reflect/src/reflect.rs
+@@ -313,6 +313,24 @@ where
+         })
+     }
+ 
++    /// For a type implementing [`PartialReflect`], combines `reflect_clone` and
++    /// `take` in a useful fashion, automatically constructing an appropriate
++    /// [`ReflectCloneError`] if the downcast fails.
++    ///
++    /// This is an associated function, rather than a method, because methods
++    /// with generic types prevent dyn-compatibility.
++    fn reflect_clone_and_take<T: 'static>(&self) -> Result<T, ReflectCloneError>
++    where
++        Self: TypePath + Sized,
++    {
++        self.reflect_clone()?
++            .take()
++            .map_err(|_| ReflectCloneError::FailedDowncast {
++                expected: Cow::Borrowed(<Self as TypePath>::type_path()),
++                received: Cow::Owned(self.reflect_type_path().to_string()),
++            })
++    }
++
+     /// Returns a hash of the value (which includes the type).
+     ///
+     /// If the underlying type does not support hashing, returns `None`.

@@ -4,6 +4,6 @@ sort_by = "date"
 template = "pull_request.html"
 
 [extra]
-all_labels = ["A-Assets", "A-Camera", "A-Cross-Cutting", "A-ECS", "A-Reflection", "A-Rendering", "A-UI", "C-Bug", "C-Code-Quality", "C-Dependencies", "C-Docs", "C-Performance", "C-Usability", "D-Complex", "D-Macros", "D-Modest", "D-Straightforward", "D-Trivial", "O-WebGL2", "P-Crash", "S-Needs-Design", "X-Blessed", "X-Contentious"]
-unique_pr_count = 33
+all_labels = ["A-Animation", "A-Assets", "A-Audio", "A-Build-System", "A-Camera", "A-Cross-Cutting", "A-ECS", "A-Math", "A-Picking", "A-Reflection", "A-Rendering", "A-States", "A-UI", "A-Utils", "C-Bug", "C-Code-Quality", "C-Dependencies", "C-Docs", "C-Examples", "C-Performance", "C-Testing", "C-Usability", "D-Complex", "D-Macros", "D-Modest", "D-Straightforward", "D-Trivial", "O-WebGL2", "P-Crash", "S-Needs-Design", "X-Blessed", "X-Contentious"]
+unique_pr_count = 48
 +++
