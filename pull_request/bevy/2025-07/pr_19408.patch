@@ -1,0 +1,691 @@
+diff --git a/crates/bevy_anti_aliasing/src/smaa/mod.rs b/crates/bevy_anti_aliasing/src/smaa/mod.rs
+index d18e17da09984..33a916e489a96 100644
+--- a/crates/bevy_anti_aliasing/src/smaa/mod.rs
++++ b/crates/bevy_anti_aliasing/src/smaa/mod.rs
+@@ -30,9 +30,7 @@
+ //!
+ //! [SMAA]: https://www.iryoku.com/smaa/
+ use bevy_app::{App, Plugin};
+-#[cfg(feature = "smaa_luts")]
+-use bevy_asset::load_internal_binary_asset;
+-use bevy_asset::{embedded_asset, load_embedded_asset, uuid_handle, AssetServer, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+ #[cfg(not(feature = "smaa_luts"))]
+ use bevy_core_pipeline::tonemapping::lut_placeholder;
+ use bevy_core_pipeline::{
+@@ -79,13 +77,6 @@ use bevy_render::{
+ };
+ use bevy_utils::prelude::default;
+ 
+-/// The handle of the area LUT, a KTX2 format texture that SMAA uses internally.
+-const SMAA_AREA_LUT_TEXTURE_HANDLE: Handle<Image> =
+-    uuid_handle!("569c4d67-c7fa-4958-b1af-0836023603c0");
+-/// The handle of the search LUT, a KTX2 format texture that SMAA uses internally.
+-const SMAA_SEARCH_LUT_TEXTURE_HANDLE: Handle<Image> =
+-    uuid_handle!("43b97515-252e-4c8a-b9af-f2fc528a1c27");
+-
+ /// Adds support for subpixel morphological antialiasing, or SMAA.
+ pub struct SmaaPlugin;
+ 
+@@ -125,6 +116,14 @@ pub enum SmaaPreset {
+     Ultra,
+ }
+ 
++#[derive(Resource)]
++struct SmaaLuts {
++    /// The handle of the area LUT, a KTX2 format texture that SMAA uses internally.
++    area_lut: Handle<Image>,
++    /// The handle of the search LUT, a KTX2 format texture that SMAA uses internally.
++    search_lut: Handle<Image>,
++}
++
+ /// A render world resource that holds all render pipeline data needed for SMAA.
+ ///
+ /// There are three separate passes, so we need three separate pipelines.
+@@ -292,49 +291,26 @@ impl Plugin for SmaaPlugin {
+         // Load the shader.
+         embedded_asset!(app, "smaa.wgsl");
+ 
+-        // Load the two lookup textures. These are compressed textures in KTX2
+-        // format.
+-        #[cfg(feature = "smaa_luts")]
+-        load_internal_binary_asset!(
+-            app,
+-            SMAA_AREA_LUT_TEXTURE_HANDLE,
+-            "SMAAAreaLUT.ktx2",
+-            |bytes, _: String| Image::from_buffer(
+-                bytes,
+-                bevy_image::ImageType::Format(bevy_image::ImageFormat::Ktx2),
+-                bevy_image::CompressedImageFormats::NONE,
+-                false,
+-                bevy_image::ImageSampler::Default,
+-                bevy_asset::RenderAssetUsages::RENDER_WORLD,
+-            )
+-            .expect("Failed to load SMAA area LUT")
+-        );
+-
+         #[cfg(feature = "smaa_luts")]
+-        load_internal_binary_asset!(
+-            app,
+-            SMAA_SEARCH_LUT_TEXTURE_HANDLE,
+-            "SMAASearchLUT.ktx2",
+-            |bytes, _: String| Image::from_buffer(
+-                bytes,
+-                bevy_image::ImageType::Format(bevy_image::ImageFormat::Ktx2),
+-                bevy_image::CompressedImageFormats::NONE,
+-                false,
+-                bevy_image::ImageSampler::Default,
+-                bevy_asset::RenderAssetUsages::RENDER_WORLD,
+-            )
+-            .expect("Failed to load SMAA search LUT")
+-        );
+-
+-        #[cfg(not(feature = "smaa_luts"))]
+-        app.world_mut()
+-            .resource_mut::<bevy_asset::Assets<Image>>()
+-            .insert(SMAA_AREA_LUT_TEXTURE_HANDLE.id(), lut_placeholder());
+-
++        let smaa_luts = {
++            // Load the two lookup textures. These are compressed textures in KTX2 format.
++            embedded_asset!(app, "SMAAAreaLUT.ktx2");
++            embedded_asset!(app, "SMAASearchLUT.ktx2");
++
++            SmaaLuts {
++                area_lut: load_embedded_asset!(app, "SMAAAreaLUT.ktx2"),
++                search_lut: load_embedded_asset!(app, "SMAASearchLUT.ktx2"),
++            }
++        };
+         #[cfg(not(feature = "smaa_luts"))]
+-        app.world_mut()
+-            .resource_mut::<bevy_asset::Assets<Image>>()
+-            .insert(SMAA_SEARCH_LUT_TEXTURE_HANDLE.id(), lut_placeholder());
++        let smaa_luts = {
++            let mut images = app.world_mut().resource_mut::<bevy_asset::Assets<Image>>();
++            let handle = images.add(lut_placeholder());
++            SmaaLuts {
++                area_lut: handle.clone(),
++                search_lut: handle.clone(),
++            }
++        };
+ 
+         app.add_plugins(ExtractComponentPlugin::<Smaa>::default())
+             .register_type::<Smaa>();
+@@ -344,6 +320,7 @@ impl Plugin for SmaaPlugin {
+         };
+ 
+         render_app
++            .insert_resource(smaa_luts)
+             .init_resource::<SmaaSpecializedRenderPipelines>()
+             .init_resource::<SmaaInfoUniformBuffer>()
+             .add_systems(RenderStartup, init_smaa_pipelines)
+@@ -747,13 +724,14 @@ fn prepare_smaa_bind_groups(
+     mut commands: Commands,
+     render_device: Res<RenderDevice>,
+     smaa_pipelines: Res<SmaaPipelines>,
++    smaa_luts: Res<SmaaLuts>,
+     images: Res<RenderAssets<GpuImage>>,
+     view_targets: Query<(Entity, &SmaaTextures), (With<ExtractedView>, With<Smaa>)>,
+ ) {
+     // Fetch the two lookup textures. These are bundled in this library.
+     let (Some(search_texture), Some(area_texture)) = (
+-        images.get(&SMAA_SEARCH_LUT_TEXTURE_HANDLE),
+-        images.get(&SMAA_AREA_LUT_TEXTURE_HANDLE),
++        images.get(&smaa_luts.search_lut),
++        images.get(&smaa_luts.area_lut),
+     ) else {
+         return;
+     };
+diff --git a/crates/bevy_asset/src/handle.rs b/crates/bevy_asset/src/handle.rs
+index b9a20a7af8d9d..838c618d8ed1b 100644
+--- a/crates/bevy_asset/src/handle.rs
++++ b/crates/bevy_asset/src/handle.rs
+@@ -492,8 +492,8 @@ impl<A: Asset> TryFrom<UntypedHandle> for Handle<A> {
+ ///
+ /// ```
+ /// # use bevy_asset::{Handle, uuid_handle};
+-/// # type Shader = ();
+-/// const SHADER: Handle<Shader> = uuid_handle!("1347c9b7-c46a-48e7-b7b8-023a354b7cac");
++/// # type Image = ();
++/// const IMAGE: Handle<Image> = uuid_handle!("1347c9b7-c46a-48e7-b7b8-023a354b7cac");
+ /// ```
+ #[macro_export]
+ macro_rules! uuid_handle {
+diff --git a/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs b/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs
+index 17337433107e0..2080efdabb97b 100644
+--- a/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs
++++ b/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs
+@@ -12,7 +12,7 @@ use crate::core_3d::{
+     prepare_core_3d_depth_textures,
+ };
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{load_internal_asset, uuid_handle, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     component::Component,
+@@ -51,8 +51,8 @@ use bitflags::bitflags;
+ use tracing::debug;
+ 
+ /// Identifies the `downsample_depth.wgsl` shader.
+-pub const DOWNSAMPLE_DEPTH_SHADER_HANDLE: Handle<Shader> =
+-    uuid_handle!("a09a149e-5922-4fa4-9170-3c1a13065364");
++#[derive(Resource, Deref)]
++pub struct DownsampleDepthShader(Handle<Shader>);
+ 
+ /// The maximum number of mip levels that we can produce.
+ ///
+@@ -69,18 +69,16 @@ pub struct MipGenerationPlugin;
+ 
+ impl Plugin for MipGenerationPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            DOWNSAMPLE_DEPTH_SHADER_HANDLE,
+-            "downsample_depth.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "downsample_depth.wgsl");
++
++        let downsample_depth_shader = load_embedded_asset!(app, "downsample_depth.wgsl");
+ 
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+ 
+         render_app
++            .insert_resource(DownsampleDepthShader(downsample_depth_shader))
+             .init_resource::<SpecializedComputePipelines<DownsampleDepthPipeline>>()
+             .add_render_graph_node::<DownsampleDepthNode>(Core3d, Node3d::EarlyDownsampleDepth)
+             .add_render_graph_node::<DownsampleDepthNode>(Core3d, Node3d::LateDownsampleDepth)
+@@ -294,17 +292,21 @@ pub struct DownsampleDepthPipeline {
+     bind_group_layout: BindGroupLayout,
+     /// A handle that identifies the compiled shader.
+     pipeline_id: Option<CachedComputePipelineId>,
++    /// The shader asset handle.
++    shader: Handle<Shader>,
+ }
+ 
+ impl DownsampleDepthPipeline {
+-    /// Creates a new [`DownsampleDepthPipeline`] from a bind group layout.
++    /// Creates a new [`DownsampleDepthPipeline`] from a bind group layout and the downsample
++    /// shader.
+     ///
+     /// This doesn't actually specialize the pipeline; that must be done
+     /// afterward.
+-    fn new(bind_group_layout: BindGroupLayout) -> DownsampleDepthPipeline {
++    fn new(bind_group_layout: BindGroupLayout, shader: Handle<Shader>) -> DownsampleDepthPipeline {
+         DownsampleDepthPipeline {
+             bind_group_layout,
+             pipeline_id: None,
++            shader,
+         }
+     }
+ }
+@@ -335,6 +337,7 @@ fn create_downsample_depth_pipelines(
+     pipeline_cache: Res<PipelineCache>,
+     mut specialized_compute_pipelines: ResMut<SpecializedComputePipelines<DownsampleDepthPipeline>>,
+     gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
++    downsample_depth_shader: Res<DownsampleDepthShader>,
+     mut has_run: Local<bool>,
+ ) {
+     // Only run once.
+@@ -368,10 +371,22 @@ fn create_downsample_depth_pipelines(
+ 
+     // Initialize the pipelines.
+     let mut downsample_depth_pipelines = DownsampleDepthPipelines {
+-        first: DownsampleDepthPipeline::new(standard_bind_group_layout.clone()),
+-        second: DownsampleDepthPipeline::new(standard_bind_group_layout.clone()),
+-        first_multisample: DownsampleDepthPipeline::new(multisampled_bind_group_layout.clone()),
+-        second_multisample: DownsampleDepthPipeline::new(multisampled_bind_group_layout.clone()),
++        first: DownsampleDepthPipeline::new(
++            standard_bind_group_layout.clone(),
++            downsample_depth_shader.0.clone(),
++        ),
++        second: DownsampleDepthPipeline::new(
++            standard_bind_group_layout.clone(),
++            downsample_depth_shader.0.clone(),
++        ),
++        first_multisample: DownsampleDepthPipeline::new(
++            multisampled_bind_group_layout.clone(),
++            downsample_depth_shader.0.clone(),
++        ),
++        second_multisample: DownsampleDepthPipeline::new(
++            multisampled_bind_group_layout.clone(),
++            downsample_depth_shader.0.clone(),
++        ),
+         sampler,
+     };
+ 
+@@ -491,7 +506,7 @@ impl SpecializedComputePipeline for DownsampleDepthPipeline {
+                 stages: ShaderStages::COMPUTE,
+                 range: 0..4,
+             }],
+-            shader: DOWNSAMPLE_DEPTH_SHADER_HANDLE,
++            shader: self.shader.clone(),
+             shader_defs,
+             entry_point: Some(if key.contains(DownsampleDepthPipelineKey::SECOND_PHASE) {
+                 "downsample_depth_second".into()
+diff --git a/crates/bevy_core_pipeline/src/post_process/mod.rs b/crates/bevy_core_pipeline/src/post_process/mod.rs
+index 0077cebdf597b..ce77fc1a7508c 100644
+--- a/crates/bevy_core_pipeline/src/post_process/mod.rs
++++ b/crates/bevy_core_pipeline/src/post_process/mod.rs
+@@ -3,7 +3,7 @@
+ //! Currently, this consists only of chromatic aberration.
+ 
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{embedded_asset, load_embedded_asset, uuid_handle, Assets, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, Assets, Handle};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     component::Component,
+@@ -47,13 +47,6 @@ use crate::{
+     FullscreenShader,
+ };
+ 
+-/// The handle to the default chromatic aberration lookup texture.
+-///
+-/// This is just a 3x1 image consisting of one red pixel, one green pixel, and
+-/// one blue pixel, in that order.
+-const DEFAULT_CHROMATIC_ABERRATION_LUT_HANDLE: Handle<Image> =
+-    uuid_handle!("dc3e3307-40a1-49bb-be6d-e0634e8836b2");
+-
+ /// The default chromatic aberration intensity amount, in a fraction of the
+ /// window size.
+ const DEFAULT_CHROMATIC_ABERRATION_INTENSITY: f32 = 0.02;
+@@ -68,6 +61,9 @@ const DEFAULT_CHROMATIC_ABERRATION_MAX_SAMPLES: u32 = 8;
+ static DEFAULT_CHROMATIC_ABERRATION_LUT_DATA: [u8; 12] =
+     [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255];
+ 
++#[derive(Resource)]
++struct DefaultChromaticAberrationLut(Handle<Image>);
++
+ /// A plugin that implements a built-in postprocessing stack with some common
+ /// effects.
+ ///
+@@ -96,14 +92,14 @@ pub struct PostProcessingPlugin;
+ pub struct ChromaticAberration {
+     /// The lookup texture that determines the color gradient.
+     ///
+-    /// By default, this is a 3×1 texel texture consisting of one red pixel, one
+-    /// green pixel, and one blue texel, in that order. This recreates the most
+-    /// typical chromatic aberration pattern. However, you can change it to
+-    /// achieve different artistic effects.
++    /// By default (if None), this is a 3×1 texel texture consisting of one red
++    /// pixel, one green pixel, and one blue texel, in that order. This
++    /// recreates the most typical chromatic aberration pattern. However, you
++    /// can change it to achieve different artistic effects.
+     ///
+     /// The texture is always sampled in its vertical center, so it should
+     /// ordinarily have a height of 1 texel.
+-    pub color_lut: Handle<Image>,
++    pub color_lut: Option<Handle<Image>>,
+ 
+     /// The size of the streaks around the edges of objects, as a fraction of
+     /// the window size.
+@@ -192,20 +188,17 @@ impl Plugin for PostProcessingPlugin {
+ 
+         // Load the default chromatic aberration LUT.
+         let mut assets = app.world_mut().resource_mut::<Assets<_>>();
+-        assets.insert(
+-            DEFAULT_CHROMATIC_ABERRATION_LUT_HANDLE.id(),
+-            Image::new(
+-                Extent3d {
+-                    width: 3,
+-                    height: 1,
+-                    depth_or_array_layers: 1,
+-                },
+-                TextureDimension::D2,
+-                DEFAULT_CHROMATIC_ABERRATION_LUT_DATA.to_vec(),
+-                TextureFormat::Rgba8UnormSrgb,
+-                RenderAssetUsages::RENDER_WORLD,
+-            ),
+-        );
++        let default_lut = assets.add(Image::new(
++            Extent3d {
++                width: 3,
++                height: 1,
++                depth_or_array_layers: 1,
++            },
++            TextureDimension::D2,
++            DEFAULT_CHROMATIC_ABERRATION_LUT_DATA.to_vec(),
++            TextureFormat::Rgba8UnormSrgb,
++            RenderAssetUsages::RENDER_WORLD,
++        ));
+ 
+         app.register_type::<ChromaticAberration>();
+         app.add_plugins(ExtractComponentPlugin::<ChromaticAberration>::default());
+@@ -215,6 +208,7 @@ impl Plugin for PostProcessingPlugin {
+         };
+ 
+         render_app
++            .insert_resource(DefaultChromaticAberrationLut(default_lut))
+             .init_resource::<SpecializedRenderPipelines<PostProcessingPipeline>>()
+             .init_resource::<PostProcessingUniformBuffers>()
+             .add_systems(
+@@ -258,7 +252,7 @@ impl Plugin for PostProcessingPlugin {
+ impl Default for ChromaticAberration {
+     fn default() -> Self {
+         Self {
+-            color_lut: DEFAULT_CHROMATIC_ABERRATION_LUT_HANDLE,
++            color_lut: None,
+             intensity: DEFAULT_CHROMATIC_ABERRATION_INTENSITY,
+             max_samples: DEFAULT_CHROMATIC_ABERRATION_MAX_SAMPLES,
+         }
+@@ -357,6 +351,7 @@ impl ViewNode for PostProcessingNode {
+         let post_processing_pipeline = world.resource::<PostProcessingPipeline>();
+         let post_processing_uniform_buffers = world.resource::<PostProcessingUniformBuffers>();
+         let gpu_image_assets = world.resource::<RenderAssets<GpuImage>>();
++        let default_lut = world.resource::<DefaultChromaticAberrationLut>();
+ 
+         // We need a render pipeline to be prepared.
+         let Some(pipeline) = pipeline_cache.get_render_pipeline(**pipeline_id) else {
+@@ -364,8 +359,12 @@ impl ViewNode for PostProcessingNode {
+         };
+ 
+         // We need the chromatic aberration LUT to be present.
+-        let Some(chromatic_aberration_lut) = gpu_image_assets.get(&chromatic_aberration.color_lut)
+-        else {
++        let Some(chromatic_aberration_lut) = gpu_image_assets.get(
++            chromatic_aberration
++                .color_lut
++                .as_ref()
++                .unwrap_or(&default_lut.0),
++        ) else {
+             return Ok(());
+         };
+ 
+diff --git a/crates/bevy_pbr/src/meshlet/pipelines.rs b/crates/bevy_pbr/src/meshlet/pipelines.rs
+index 6ac22f0fbaf0f..0fe9905d3231a 100644
+--- a/crates/bevy_pbr/src/meshlet/pipelines.rs
++++ b/crates/bevy_pbr/src/meshlet/pipelines.rs
+@@ -1,7 +1,7 @@
+ use super::resource_manager::ResourceManager;
+ use bevy_asset::{load_embedded_asset, Handle};
+ use bevy_core_pipeline::{
+-    core_3d::CORE_3D_DEPTH_FORMAT, experimental::mip_generation::DOWNSAMPLE_DEPTH_SHADER_HANDLE,
++    core_3d::CORE_3D_DEPTH_FORMAT, experimental::mip_generation::DownsampleDepthShader,
+     FullscreenShader,
+ };
+ use bevy_ecs::{
+@@ -84,6 +84,7 @@ impl FromWorld for MeshletPipelines {
+             .remap_1d_to_2d_dispatch_bind_group_layout
+             .clone();
+ 
++        let downsample_depth_shader = (*world.resource::<DownsampleDepthShader>()).clone();
+         let vertex_state = world.resource::<FullscreenShader>().to_vertex_state();
+         let fill_counts_layout = resource_manager.fill_counts_bind_group_layout.clone();
+ 
+@@ -230,7 +231,7 @@ impl FromWorld for MeshletPipelines {
+                         stages: ShaderStages::COMPUTE,
+                         range: 0..4,
+                     }],
+-                    shader: DOWNSAMPLE_DEPTH_SHADER_HANDLE,
++                    shader: downsample_depth_shader.clone(),
+                     shader_defs: vec![
+                         "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".into(),
+                         "MESHLET".into(),
+@@ -248,7 +249,7 @@ impl FromWorld for MeshletPipelines {
+                         stages: ShaderStages::COMPUTE,
+                         range: 0..4,
+                     }],
+-                    shader: DOWNSAMPLE_DEPTH_SHADER_HANDLE,
++                    shader: downsample_depth_shader.clone(),
+                     shader_defs: vec![
+                         "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".into(),
+                         "MESHLET".into(),
+@@ -266,7 +267,7 @@ impl FromWorld for MeshletPipelines {
+                         stages: ShaderStages::COMPUTE,
+                         range: 0..4,
+                     }],
+-                    shader: DOWNSAMPLE_DEPTH_SHADER_HANDLE,
++                    shader: downsample_depth_shader.clone(),
+                     shader_defs: vec!["MESHLET".into()],
+                     entry_point: Some("downsample_depth_first".into()),
+                     ..default()
+@@ -281,7 +282,7 @@ impl FromWorld for MeshletPipelines {
+                         stages: ShaderStages::COMPUTE,
+                         range: 0..4,
+                     }],
+-                    shader: DOWNSAMPLE_DEPTH_SHADER_HANDLE,
++                    shader: downsample_depth_shader,
+                     shader_defs: vec!["MESHLET".into()],
+                     entry_point: Some("downsample_depth_second".into()),
+                     zero_initialize_workgroup_memory: false,
+diff --git a/crates/bevy_pbr/src/volumetric_fog/mod.rs b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+index a4099aeb62083..e28412d7bd60b 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/mod.rs
++++ b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+@@ -30,12 +30,12 @@
+ //! [Henyey-Greenstein phase function]: https://www.pbr-book.org/4ed/Volume_Scattering/Phase_Functions#TheHenyeyndashGreensteinPhaseFunction
+ 
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{embedded_asset, Assets};
++use bevy_asset::{embedded_asset, Assets, Handle};
+ use bevy_core_pipeline::core_3d::{
+     graph::{Core3d, Node3d},
+     prepare_core_3d_depth_textures,
+ };
+-use bevy_ecs::schedule::IntoScheduleConfigs as _;
++use bevy_ecs::{resource::Resource, schedule::IntoScheduleConfigs as _};
+ use bevy_light::FogVolume;
+ use bevy_math::{
+     primitives::{Cuboid, Plane3d},
+@@ -48,9 +48,7 @@ use bevy_render::{
+     sync_component::SyncComponentPlugin,
+     ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+-use render::{
+-    VolumetricFogNode, VolumetricFogPipeline, VolumetricFogUniformBuffer, CUBE_MESH, PLANE_MESH,
+-};
++use render::{VolumetricFogNode, VolumetricFogPipeline, VolumetricFogUniformBuffer};
+ 
+ use crate::graph::NodePbr;
+ 
+@@ -59,13 +57,19 @@ pub mod render;
+ /// A plugin that implements volumetric fog.
+ pub struct VolumetricFogPlugin;
+ 
++#[derive(Resource)]
++pub struct FogAssets {
++    plane_mesh: Handle<Mesh>,
++    cube_mesh: Handle<Mesh>,
++}
++
+ impl Plugin for VolumetricFogPlugin {
+     fn build(&self, app: &mut App) {
+         embedded_asset!(app, "volumetric_fog.wgsl");
+ 
+         let mut meshes = app.world_mut().resource_mut::<Assets<Mesh>>();
+-        meshes.insert(&PLANE_MESH, Plane3d::new(Vec3::Z, Vec2::ONE).mesh().into());
+-        meshes.insert(&CUBE_MESH, Cuboid::new(1.0, 1.0, 1.0).mesh().into());
++        let plane_mesh = meshes.add(Plane3d::new(Vec3::Z, Vec2::ONE).mesh());
++        let cube_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0).mesh());
+ 
+         app.add_plugins(SyncComponentPlugin::<FogVolume>::default());
+ 
+@@ -74,6 +78,10 @@ impl Plugin for VolumetricFogPlugin {
+         };
+ 
+         render_app
++            .insert_resource(FogAssets {
++                plane_mesh,
++                cube_mesh,
++            })
+             .init_resource::<SpecializedRenderPipelines<VolumetricFogPipeline>>()
+             .init_resource::<VolumetricFogUniformBuffer>()
+             .add_systems(ExtractSchedule, render::extract_volumetric_fog)
+diff --git a/crates/bevy_pbr/src/volumetric_fog/render.rs b/crates/bevy_pbr/src/volumetric_fog/render.rs
+index feb04a29837f7..f24550a456d55 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/render.rs
++++ b/crates/bevy_pbr/src/volumetric_fog/render.rs
+@@ -2,7 +2,7 @@
+ 
+ use core::array;
+ 
+-use bevy_asset::{load_embedded_asset, uuid_handle, AssetId, Handle};
++use bevy_asset::{load_embedded_asset, AssetId, Handle};
+ use bevy_color::ColorToComponents as _;
+ use bevy_core_pipeline::{
+     core_3d::Camera3d,
+@@ -54,6 +54,8 @@ use crate::{
+     VolumetricLight,
+ };
+ 
++use super::FogAssets;
++
+ bitflags! {
+     /// Flags that describe the bind group layout used to render volumetric fog.
+     #[derive(Clone, Copy, PartialEq)]
+@@ -77,20 +79,6 @@ bitflags! {
+     }
+ }
+ 
+-/// The plane mesh, which is used to render a fog volume that the camera is
+-/// inside.
+-///
+-/// This mesh is simply stretched to the size of the framebuffer, as when the
+-/// camera is inside a fog volume it's essentially a full-screen effect.
+-pub const PLANE_MESH: Handle<Mesh> = uuid_handle!("92523617-c708-4fd0-b42f-ceb4300c930b");
+-
+-/// The cube mesh, which is used to render a fog volume that the camera is
+-/// outside.
+-///
+-/// Note that only the front faces of this cuboid will be rasterized in
+-/// hardware. The back faces will be calculated in the shader via raytracing.
+-pub const CUBE_MESH: Handle<Mesh> = uuid_handle!("4a1dd661-2d91-4377-a17a-a914e21e277e");
+-
+ /// The total number of bind group layouts.
+ ///
+ /// This is the total number of combinations of all
+@@ -370,6 +358,7 @@ impl ViewNode for VolumetricFogNode {
+             return Ok(());
+         };
+ 
++        let fog_assets = world.resource::<FogAssets>();
+         let render_meshes = world.resource::<RenderAssets<RenderMesh>>();
+ 
+         for view_fog_volume in view_fog_volumes.iter() {
+@@ -377,9 +366,9 @@ impl ViewNode for VolumetricFogNode {
+             // otherwise, pick the plane mesh. In the latter case we'll be
+             // effectively rendering a full-screen quad.
+             let mesh_handle = if view_fog_volume.exterior {
+-                CUBE_MESH.clone()
++                fog_assets.cube_mesh.clone()
+             } else {
+-                PLANE_MESH.clone()
++                fog_assets.plane_mesh.clone()
+             };
+ 
+             let Some(vertex_buffer_slice) = mesh_allocator.mesh_vertex_slice(&mesh_handle.id())
+@@ -615,6 +604,7 @@ pub fn prepare_volumetric_fog_pipelines(
+     pipeline_cache: Res<PipelineCache>,
+     mut pipelines: ResMut<SpecializedRenderPipelines<VolumetricFogPipeline>>,
+     volumetric_lighting_pipeline: Res<VolumetricFogPipeline>,
++    fog_assets: Res<FogAssets>,
+     view_targets: Query<
+         (
+             Entity,
+@@ -629,7 +619,7 @@ pub fn prepare_volumetric_fog_pipelines(
+     >,
+     meshes: Res<RenderAssets<RenderMesh>>,
+ ) {
+-    let Some(plane_mesh) = meshes.get(&PLANE_MESH) else {
++    let Some(plane_mesh) = meshes.get(&fog_assets.plane_mesh) else {
+         // There's an off chance that the mesh won't be prepared yet if `RenderAssetBytesPerFrame` limiting is in use.
+         return;
+     };
+diff --git a/examples/2d/mesh2d_manual.rs b/examples/2d/mesh2d_manual.rs
+index 7012e61d92179..58ec9b5cebcb0 100644
+--- a/examples/2d/mesh2d_manual.rs
++++ b/examples/2d/mesh2d_manual.rs
+@@ -6,7 +6,6 @@
+ //! [`Material2d`]: bevy::sprite::Material2d
+ 
+ use bevy::{
+-    asset::uuid_handle,
+     color::palettes::basic::YELLOW,
+     core_pipeline::core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT},
+     math::{ops, FloatOrd},
+@@ -129,12 +128,16 @@ pub struct ColoredMesh2d;
+ pub struct ColoredMesh2dPipeline {
+     /// This pipeline wraps the standard [`Mesh2dPipeline`]
+     mesh2d_pipeline: Mesh2dPipeline,
++    /// The shader asset handle.
++    shader: Handle<Shader>,
+ }
+ 
+ impl FromWorld for ColoredMesh2dPipeline {
+     fn from_world(world: &mut World) -> Self {
+         Self {
+             mesh2d_pipeline: Mesh2dPipeline::from_world(world),
++            // Get the shader from the shader resource we inserted in the plugin.
++            shader: world.resource::<ColoredMesh2dShader>().0.clone(),
+         }
+     }
+ }
+@@ -164,14 +167,14 @@ impl SpecializedRenderPipeline for ColoredMesh2dPipeline {
+         RenderPipelineDescriptor {
+             vertex: VertexState {
+                 // Use our custom shader
+-                shader: COLORED_MESH2D_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 // Use our custom vertex buffer
+                 buffers: vec![vertex_layout],
+                 ..default()
+             },
+             fragment: Some(FragmentState {
+                 // Use our custom shader
+-                shader: COLORED_MESH2D_SHADER_HANDLE,
++                shader: self.shader.clone(),
+                 targets: vec![Some(ColorTargetState {
+                     format,
+                     blend: Some(BlendState::ALPHA_BLENDING),
+@@ -278,9 +281,10 @@ fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {
+ /// Plugin that renders [`ColoredMesh2d`]s
+ pub struct ColoredMesh2dPlugin;
+ 
+-/// Handle to the custom shader with a unique random ID
+-pub const COLORED_MESH2D_SHADER_HANDLE: Handle<Shader> =
+-    uuid_handle!("f48b148f-7373-4638-9900-392b3b3ccc66");
++/// A resource holding the shader asset handle for the pipeline to take. There are many ways to get
++/// the shader into the pipeline - this is just one option.
++#[derive(Resource)]
++struct ColoredMesh2dShader(Handle<Shader>);
+ 
+ /// Our custom pipeline needs its own instance storage
+ #[derive(Resource, Deref, DerefMut, Default)]
+@@ -290,15 +294,16 @@ impl Plugin for ColoredMesh2dPlugin {
+     fn build(&self, app: &mut App) {
+         // Load our custom shader
+         let mut shaders = app.world_mut().resource_mut::<Assets<Shader>>();
+-        shaders.insert(
+-            &COLORED_MESH2D_SHADER_HANDLE,
+-            Shader::from_wgsl(COLORED_MESH2D_SHADER, file!()),
+-        );
++        // Here, we construct and add the shader asset manually. There are many ways to load this
++        // shader, including `embedded_asset`/`load_embedded_asset`.
++        let shader = shaders.add(Shader::from_wgsl(COLORED_MESH2D_SHADER, file!()));
++
+         app.add_plugins(SyncComponentPlugin::<ColoredMesh2d>::default());
+ 
+         // Register our custom draw function, and add our render systems
+         app.get_sub_app_mut(RenderApp)
+             .unwrap()
++            .insert_resource(ColoredMesh2dShader(shader))
+             .add_render_command::<Transparent2d, DrawColoredMesh2d>()
+             .init_resource::<SpecializedRenderPipelines<ColoredMesh2dPipeline>>()
+             .init_resource::<RenderColoredMesh2dInstances>()
+diff --git a/release-content/migration-guides/chromatic_aberration_option.md b/release-content/migration-guides/chromatic_aberration_option.md
+new file mode 100644
+index 0000000000000..3fa1aa4ccd7cd
+--- /dev/null
++++ b/release-content/migration-guides/chromatic_aberration_option.md
+@@ -0,0 +1,8 @@
++---
++title: ChromaticAberration LUT is now Option
++pull_requests: [19408]
++---
++
++The `ChromaticAberration` component `color_lut` field use to be a regular `Handle<Image>`. Now, it
++is an `Option<Handle<Image>>` which falls back to the default image when `None`. For users assigning
++a custom LUT, just wrap the value in `Some`.

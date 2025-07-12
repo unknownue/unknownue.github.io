@@ -1,0 +1,384 @@
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index a770a83bca132..652ed311e2036 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -2238,18 +2238,12 @@ impl ShadowPassNode {
+         world: &'w World,
+         is_late: bool,
+     ) -> Result<(), NodeRunError> {
+-        let diagnostics = render_context.diagnostic_recorder();
+-
+-        let view_entity = graph.view_entity();
+-
+         let Some(shadow_render_phases) = world.get_resource::<ViewBinnedRenderPhases<Shadow>>()
+         else {
+             return Ok(());
+         };
+ 
+-        let time_span = diagnostics.time_span(render_context.command_encoder(), "shadows");
+-
+-        if let Ok(view_lights) = self.main_view_query.get_manual(world, view_entity) {
++        if let Ok(view_lights) = self.main_view_query.get_manual(world, graph.view_entity()) {
+             for view_light_entity in view_lights.lights.iter().copied() {
+                 let Ok((view_light, extracted_light_view, occlusion_culling)) =
+                     self.view_light_query.get_manual(world, view_light_entity)
+@@ -2306,8 +2300,6 @@ impl ShadowPassNode {
+             }
+         }
+ 
+-        time_span.end(render_context.command_encoder());
+-
+         Ok(())
+     }
+ }
+diff --git a/crates/bevy_render/Cargo.toml b/crates/bevy_render/Cargo.toml
+index 9a7f8e51bd690..18dd5bb0945c0 100644
+--- a/crates/bevy_render/Cargo.toml
++++ b/crates/bevy_render/Cargo.toml
+@@ -42,7 +42,7 @@ spirv_shader_passthrough = ["wgpu/spirv"]
+ statically-linked-dxc = ["wgpu/static-dxc"]
+ 
+ trace = ["profiling"]
+-tracing-tracy = []
++tracing-tracy = ["dep:tracy-client"]
+ ci_limits = []
+ webgl = ["wgpu/webgl"]
+ webgpu = ["wgpu/webgpu"]
+@@ -110,6 +110,7 @@ smallvec = { version = "1.11", features = ["const_new"] }
+ offset-allocator = "0.2"
+ variadics_please = "1.1"
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
++tracy-client = { version = "0.18.0", optional = true }
+ indexmap = { version = "2" }
+ fixedbitset = { version = "0.5" }
+ bitflags = "2"
+diff --git a/crates/bevy_render/src/diagnostic/internal.rs b/crates/bevy_render/src/diagnostic/internal.rs
+index 8445ebe54d250..8d82eed5d605c 100644
+--- a/crates/bevy_render/src/diagnostic/internal.rs
++++ b/crates/bevy_render/src/diagnostic/internal.rs
+@@ -12,10 +12,10 @@ use bevy_platform_support::time::Instant;
+ use std::sync::Mutex;
+ use wgpu::{
+     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePass, Features, MapMode,
+-    PipelineStatisticsTypes, QuerySet, QuerySetDescriptor, QueryType, Queue, RenderPass,
++    PipelineStatisticsTypes, QuerySet, QuerySetDescriptor, QueryType, RenderPass,
+ };
+ 
+-use crate::renderer::{RenderDevice, WgpuWrapper};
++use crate::renderer::{RenderAdapterInfo, RenderDevice, RenderQueue, WgpuWrapper};
+ 
+ use super::RecordDiagnostics;
+ 
+@@ -32,6 +32,8 @@ struct DiagnosticsRecorderInternal {
+     current_frame: Mutex<FrameData>,
+     submitted_frames: Vec<FrameData>,
+     finished_frames: Vec<FrameData>,
++    #[cfg(feature = "tracing-tracy")]
++    tracy_gpu_context: tracy_client::GpuContext,
+ }
+ 
+ /// Records diagnostics into [`QuerySet`]'s keeping track of the mapping between
+@@ -41,21 +43,31 @@ pub struct DiagnosticsRecorder(WgpuWrapper<DiagnosticsRecorderInternal>);
+ 
+ impl DiagnosticsRecorder {
+     /// Creates the new `DiagnosticsRecorder`.
+-    pub fn new(device: &RenderDevice, queue: &Queue) -> DiagnosticsRecorder {
++    pub fn new(
++        adapter_info: &RenderAdapterInfo,
++        device: &RenderDevice,
++        queue: &RenderQueue,
++    ) -> DiagnosticsRecorder {
+         let features = device.features();
+ 
+-        let timestamp_period_ns = if features.contains(Features::TIMESTAMP_QUERY) {
+-            queue.get_timestamp_period()
+-        } else {
+-            0.0
+-        };
++        #[cfg(feature = "tracing-tracy")]
++        let tracy_gpu_context =
++            super::tracy_gpu::new_tracy_gpu_context(adapter_info, device, queue);
++        let _ = adapter_info; // Prevent unused variable warnings when tracing-tracy is not enabled
+ 
+         DiagnosticsRecorder(WgpuWrapper::new(DiagnosticsRecorderInternal {
+-            timestamp_period_ns,
++            timestamp_period_ns: queue.get_timestamp_period(),
+             features,
+-            current_frame: Mutex::new(FrameData::new(device, features)),
++            current_frame: Mutex::new(FrameData::new(
++                device,
++                features,
++                #[cfg(feature = "tracing-tracy")]
++                tracy_gpu_context.clone(),
++            )),
+             submitted_frames: Vec::new(),
+             finished_frames: Vec::new(),
++            #[cfg(feature = "tracing-tracy")]
++            tracy_gpu_context,
+         }))
+     }
+ 
+@@ -86,7 +98,7 @@ impl DiagnosticsRecorder {
+ 
+     /// Copies data from [`QuerySet`]'s to a [`Buffer`], after which it can be downloaded to CPU.
+     ///
+-    /// Should be called before [`DiagnosticsRecorder::finish_frame`]
++    /// Should be called before [`DiagnosticsRecorder::finish_frame`].
+     pub fn resolve(&mut self, encoder: &mut CommandEncoder) {
+         self.current_frame_mut().resolve(encoder);
+     }
+@@ -102,6 +114,9 @@ impl DiagnosticsRecorder {
+         device: &RenderDevice,
+         callback: impl FnOnce(RenderDiagnostics) + Send + Sync + 'static,
+     ) {
++        #[cfg(feature = "tracing-tracy")]
++        let tracy_gpu_context = self.0.tracy_gpu_context.clone();
++
+         let internal = &mut self.0;
+         internal
+             .current_frame
+@@ -112,7 +127,12 @@ impl DiagnosticsRecorder {
+         // reuse one of the finished frames, if we can
+         let new_frame = match internal.finished_frames.pop() {
+             Some(frame) => frame,
+-            None => FrameData::new(device, internal.features),
++            None => FrameData::new(
++                device,
++                internal.features,
++                #[cfg(feature = "tracing-tracy")]
++                tracy_gpu_context,
++            ),
+         };
+ 
+         let old_frame = core::mem::replace(
+@@ -169,10 +189,16 @@ struct FrameData {
+     closed_spans: Vec<SpanRecord>,
+     is_mapped: Arc<AtomicBool>,
+     callback: Option<Box<dyn FnOnce(RenderDiagnostics) + Send + Sync + 'static>>,
++    #[cfg(feature = "tracing-tracy")]
++    tracy_gpu_context: tracy_client::GpuContext,
+ }
+ 
+ impl FrameData {
+-    fn new(device: &RenderDevice, features: Features) -> FrameData {
++    fn new(
++        device: &RenderDevice,
++        features: Features,
++        #[cfg(feature = "tracing-tracy")] tracy_gpu_context: tracy_client::GpuContext,
++    ) -> FrameData {
+         let wgpu_device = device.wgpu_device();
+         let mut buffer_size = 0;
+ 
+@@ -237,6 +263,8 @@ impl FrameData {
+             closed_spans: Vec::new(),
+             is_mapped: Arc::new(AtomicBool::new(false)),
+             callback: None,
++            #[cfg(feature = "tracing-tracy")]
++            tracy_gpu_context,
+         }
+     }
+ 
+@@ -502,6 +530,19 @@ impl FrameData {
+                 let end = timestamps[end as usize] as f64;
+                 let value = (end - begin) * (timestamp_period_ns as f64) / 1e6;
+ 
++                #[cfg(feature = "tracing-tracy")]
++                {
++                    // Calling span_alloc() and end_zone() here instead of in open_span() and close_span() means that tracy does not know where each GPU command was recorded on the CPU timeline.
++                    // Unfortunately we must do it this way, because tracy does not play nicely with multithreaded command recording. The start/end pairs would get all mixed up.
++                    // The GPU spans themselves are still accurate though, and it's probably safe to assume that each GPU span in frame N belongs to the corresponding CPU render node span from frame N-1.
++                    let name = &self.path_components[span.path_range.clone()].join("/");
++                    let mut tracy_gpu_span =
++                        self.tracy_gpu_context.span_alloc(name, "", "", 0).unwrap();
++                    tracy_gpu_span.end_zone();
++                    tracy_gpu_span.upload_timestamp_start(begin as i64);
++                    tracy_gpu_span.upload_timestamp_end(end as i64);
++                }
++
+                 diagnostics.push(RenderDiagnostic {
+                     path: self.diagnostic_path(&span.path_range, "elapsed_gpu"),
+                     suffix: "ms",
+diff --git a/crates/bevy_render/src/diagnostic/mod.rs b/crates/bevy_render/src/diagnostic/mod.rs
+index 09b6052c10ebe..7f046036a9be5 100644
+--- a/crates/bevy_render/src/diagnostic/mod.rs
++++ b/crates/bevy_render/src/diagnostic/mod.rs
+@@ -3,13 +3,15 @@
+ //! For more info, see [`RenderDiagnosticsPlugin`].
+ 
+ pub(crate) mod internal;
++#[cfg(feature = "tracing-tracy")]
++mod tracy_gpu;
+ 
+ use alloc::{borrow::Cow, sync::Arc};
+ use core::marker::PhantomData;
+ 
+ use bevy_app::{App, Plugin, PreUpdate};
+ 
+-use crate::RenderApp;
++use crate::{renderer::RenderAdapterInfo, RenderApp};
+ 
+ use self::internal::{
+     sync_diagnostics, DiagnosticsRecorder, Pass, RenderDiagnosticsMutex, WriteTimestamp,
+@@ -20,8 +22,8 @@ use super::{RenderDevice, RenderQueue};
+ /// Enables collecting render diagnostics, such as CPU/GPU elapsed time per render pass,
+ /// as well as pipeline statistics (number of primitives, number of shader invocations, etc).
+ ///
+-/// To access the diagnostics, you can use [`DiagnosticsStore`](bevy_diagnostic::DiagnosticsStore) resource,
+-/// or add [`LogDiagnosticsPlugin`](bevy_diagnostic::LogDiagnosticsPlugin).
++/// To access the diagnostics, you can use the [`DiagnosticsStore`](bevy_diagnostic::DiagnosticsStore) resource,
++/// add [`LogDiagnosticsPlugin`](bevy_diagnostic::LogDiagnosticsPlugin), or use [Tracy](https://github.com/bevyengine/bevy/blob/main/docs/profiling.md#tracy-renderqueue).
+ ///
+ /// To record diagnostics in your own passes:
+ ///  1. First, obtain the diagnostic recorder using [`RenderContext::diagnostic_recorder`](crate::renderer::RenderContext::diagnostic_recorder).
+@@ -62,9 +64,10 @@ impl Plugin for RenderDiagnosticsPlugin {
+             return;
+         };
+ 
++        let adapter_info = render_app.world().resource::<RenderAdapterInfo>();
+         let device = render_app.world().resource::<RenderDevice>();
+         let queue = render_app.world().resource::<RenderQueue>();
+-        render_app.insert_resource(DiagnosticsRecorder::new(device, queue));
++        render_app.insert_resource(DiagnosticsRecorder::new(adapter_info, device, queue));
+     }
+ }
+ 
+diff --git a/crates/bevy_render/src/diagnostic/tracy_gpu.rs b/crates/bevy_render/src/diagnostic/tracy_gpu.rs
+new file mode 100644
+index 0000000000000..c059b8baa5d00
+--- /dev/null
++++ b/crates/bevy_render/src/diagnostic/tracy_gpu.rs
+@@ -0,0 +1,67 @@
++use crate::renderer::{RenderAdapterInfo, RenderDevice, RenderQueue};
++use tracy_client::{Client, GpuContext, GpuContextType};
++use wgpu::{
++    Backend, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Maintain, MapMode,
++    QuerySetDescriptor, QueryType, QUERY_SIZE,
++};
++
++pub fn new_tracy_gpu_context(
++    adapter_info: &RenderAdapterInfo,
++    device: &RenderDevice,
++    queue: &RenderQueue,
++) -> GpuContext {
++    let tracy_gpu_backend = match adapter_info.backend {
++        Backend::Vulkan => GpuContextType::Vulkan,
++        Backend::Dx12 => GpuContextType::Direct3D12,
++        Backend::Gl => GpuContextType::OpenGL,
++        Backend::Metal | Backend::BrowserWebGpu | Backend::Empty => GpuContextType::Invalid,
++    };
++
++    let tracy_client = Client::running().unwrap();
++    tracy_client
++        .new_gpu_context(
++            Some("RenderQueue"),
++            tracy_gpu_backend,
++            initial_timestamp(device, queue),
++            queue.get_timestamp_period(),
++        )
++        .unwrap()
++}
++
++// Code copied from https://github.com/Wumpf/wgpu-profiler/blob/f9de342a62cb75f50904a98d11dd2bbeb40ceab8/src/tracy.rs
++fn initial_timestamp(device: &RenderDevice, queue: &RenderQueue) -> i64 {
++    let query_set = device.wgpu_device().create_query_set(&QuerySetDescriptor {
++        label: None,
++        ty: QueryType::Timestamp,
++        count: 1,
++    });
++
++    let resolve_buffer = device.create_buffer(&BufferDescriptor {
++        label: None,
++        size: QUERY_SIZE as _,
++        usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
++        mapped_at_creation: false,
++    });
++
++    let map_buffer = device.create_buffer(&BufferDescriptor {
++        label: None,
++        size: QUERY_SIZE as _,
++        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
++        mapped_at_creation: false,
++    });
++
++    let mut timestamp_encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
++    timestamp_encoder.write_timestamp(&query_set, 0);
++    timestamp_encoder.resolve_query_set(&query_set, 0..1, &resolve_buffer, 0);
++    // Workaround for https://github.com/gfx-rs/wgpu/issues/6406
++    // TODO when that bug is fixed, merge these encoders together again
++    let mut copy_encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
++    copy_encoder.copy_buffer_to_buffer(&resolve_buffer, 0, &map_buffer, 0, QUERY_SIZE as _);
++    queue.submit([timestamp_encoder.finish(), copy_encoder.finish()]);
++
++    map_buffer.slice(..).map_async(MapMode::Read, |_| ());
++    device.poll(Maintain::Wait);
++
++    let view = map_buffer.slice(..).get_mapped_range();
++    i64::from_le_bytes((*view).try_into().unwrap())
++}
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index a75a7eb87c63a..55aed78ca7716 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -408,6 +408,8 @@ impl Plugin for RenderPlugin {
+             StoragePlugin,
+             GpuReadbackPlugin::default(),
+             OcclusionCullingPlugin,
++            #[cfg(feature = "tracing-tracy")]
++            diagnostic::RenderDiagnosticsPlugin,
+         ));
+ 
+         app.init_resource::<RenderAssetBytesPerFrame>();
+diff --git a/docs/profiling.md b/docs/profiling.md
+index 6d7c37a8e9772..ef6a46a60811c 100644
+--- a/docs/profiling.md
++++ b/docs/profiling.md
+@@ -9,6 +9,8 @@
+   - [Chrome tracing format](#chrome-tracing-format)
+   - [Perf flame graph](#perf-flame-graph)
+ - [GPU runtime](#gpu-runtime)
++  - [Vendor tools](#vendor-tools)
++  - [Tracy RenderQueue](#tracy-renderqueue)
+ - [Compile time](#compile-time)
+ 
+ ## CPU runtime
+@@ -124,6 +126,16 @@ After closing your app, an interactive `svg` file will be produced:
+ 
+ ## GPU runtime
+ 
++First, a quick note on how GPU programming works. GPUs are essentially separate computers with their own compiler, scheduler, memory (for discrete GPUs), etc. You do not simply call functions to have the GPU perform work - instead, you communicate with them by sending data back and forth over the PCIe bus, via the GPU driver.
++
++Specifically, you record a list of tasks (commands) for the GPU to perform into a CommandBuffer, and then submit that on a Queue to the GPU. At some point in the future, the GPU will receive the commands and execute them.
++
++In terms of where your app is spending time doing graphics work, it might manifest as a CPU bottleneck (extracting to the render world, wgpu resource tracking, recording commands to a CommandBuffer, or GPU driver code), as a GPU bottleneck (the GPU actually running your commands), or even as a data transfer bottleneck (uploading new assets or other data to the GPU over the PCIe bus).
++
++Graphics related work is not all CPU work or all GPU work, but a mix of both, and you should find the bottleneck and profile using the appropriate tool for each case.
++
++### Vendor tools
++
+ If CPU profiling has shown that GPU work is the bottleneck, it's time to profile the GPU.
+ 
+ For profiling GPU work, you should use the tool corresponding to your GPU's vendor:
+@@ -135,15 +147,18 @@ For profiling GPU work, you should use the tool corresponding to your GPU's vend
+ 
+ Note that while RenderDoc is a great debugging tool, it is _not_ a profiler, and should not be used for this purpose.
+ 
+-### Graphics work
++### Tracy RenderQueue
+ 
+-Finally, a quick note on how GPU programming works. GPUs are essentially separate computers with their own compiler, scheduler, memory (for discrete GPUs), etc. You do not simply call functions to have the GPU perform work - instead, you communicate with them by sending data back and forth over the PCIe bus, via the GPU driver.
++While it doesn't provide as much detail as vendor-specific tooling, Tracy can also be used to coarsely measure GPU performance.
+ 
+-Specifically, you record a list of tasks (commands) for the GPU to perform into a CommandBuffer, and then submit that on a Queue to the GPU. At some point in the future, the GPU will receive the commands and execute them.
++When you compile with Bevy's `trace_tracy` feature, GPU spans will show up in a separate row at the top of Tracy, labeled as `RenderQueue`.
+ 
+-In terms of where your app is spending time doing graphics work, it might manifest as a CPU bottleneck (extracting to the render world, wgpu resource tracking, recording commands to a CommandBuffer, or GPU driver code), or it might manifest as a GPU bottleneck (the GPU actually running your commands).
++> [!NOTE]
++> Due to dynamic clock speeds, GPU timings will have large frame-to-frame variance, unless you use an external tool to lock your GPU clocks to base speeds. When measuring GPU performance via Tracy, only look at the MTPC column of Tracy's statistics panel, or the span distribution/median, and not at any individual frame data.
++<!-- markdownlint-disable MD028 -->
+ 
+-Graphics related work is not all CPU work or all GPU work, but a mix of both, and you should find the bottleneck and profile using the appropriate tool for each case.
++> [!NOTE]
++> Unlike ECS systems, Bevy will not automatically add GPU profiling spans. You will need to add GPU timing spans yourself for any custom rendering work. See the [`RenderDiagnosticsPlugin`](https://docs.rs/bevy/latest/bevy/render/diagnostic/struct.RenderDiagnosticsPlugin.html) docs for more details.
+ 
+ ## Compile time
+ 
