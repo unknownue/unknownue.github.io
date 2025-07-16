@@ -1,0 +1,218 @@
+diff --git a/crates/bevy_ecs/src/event/registry.rs b/crates/bevy_ecs/src/event/registry.rs
+index 3a69a11e4ed38..9fc5b21d5b669 100644
+--- a/crates/bevy_ecs/src/event/registry.rs
++++ b/crates/bevy_ecs/src/event/registry.rs
+@@ -12,7 +12,7 @@ struct RegisteredEvent {
+     event_key: EventKey,
+     // Required to flush the secondary buffer and drop events even if left unchanged.
+     previously_updated: bool,
+-    // SAFETY: The component ID and the function must be used to fetch the Events<T> resource
++    // SAFETY: The `EventKey`'s component ID and the function must be used to fetch the Events<T> resource
+     // of the same type initialized in `register_event`, or improper type casts will occur.
+     update: unsafe fn(MutUntyped),
+ }
+diff --git a/crates/bevy_ecs/src/observer/distributed_storage.rs b/crates/bevy_ecs/src/observer/distributed_storage.rs
+index 10961d4de7c46..042661a690ddf 100644
+--- a/crates/bevy_ecs/src/observer/distributed_storage.rs
++++ b/crates/bevy_ecs/src/observer/distributed_storage.rs
+@@ -248,7 +248,7 @@ impl Observer {
+                 world.commands().queue(move |world: &mut World| {
+                     let entity = hook_context.entity;
+                     if let Some(mut observe) = world.get_mut::<Observer>(entity) {
+-                        if observe.descriptor.events.is_empty() {
++                        if observe.descriptor.event_keys.is_empty() {
+                             return;
+                         }
+                         if observe.error_handler.is_none() {
+@@ -286,13 +286,13 @@ impl Observer {
+         self
+     }
+ 
+-    /// Observe the given `event`. This will cause the [`Observer`] to run whenever an event with the given [`ComponentId`]
++    /// Observe the given `event_key`. This will cause the [`Observer`] to run whenever an event with the given [`EventKey`]
+     /// is triggered.
+     /// # Safety
+-    /// The type of the `event` [`EventKey`] _must_ match the actual value
++    /// The type of the `event_key` [`EventKey`] _must_ match the actual value
+     /// of the event passed into the observer system.
+-    pub unsafe fn with_event(mut self, event: EventKey) -> Self {
+-        self.descriptor.events.push(event);
++    pub unsafe fn with_event_key(mut self, event_key: EventKey) -> Self {
++        self.descriptor.event_keys.push(event_key);
+         self
+     }
+ 
+@@ -349,8 +349,8 @@ impl Component for Observer {
+ /// This information is stored inside of the [`Observer`] component,
+ #[derive(Default, Clone)]
+ pub struct ObserverDescriptor {
+-    /// The events the observer is watching.
+-    pub(super) events: Vec<EventKey>,
++    /// The event keys the observer is watching.
++    pub(super) event_keys: Vec<EventKey>,
+ 
+     /// The components the observer is watching.
+     pub(super) components: Vec<ComponentId>,
+@@ -360,12 +360,12 @@ pub struct ObserverDescriptor {
+ }
+ 
+ impl ObserverDescriptor {
+-    /// Add the given `events` to the descriptor.
++    /// Add the given `event_keys` to the descriptor.
+     /// # Safety
+-    /// The type of each [`EventKey`] in `events` _must_ match the actual value
++    /// The type of each [`EventKey`] in `event_keys` _must_ match the actual value
+     /// of the event passed into the observer.
+-    pub unsafe fn with_events(mut self, events: Vec<EventKey>) -> Self {
+-        self.events = events;
++    pub unsafe fn with_event_keys(mut self, event_keys: Vec<EventKey>) -> Self {
++        self.event_keys = event_keys;
+         self
+     }
+ 
+@@ -381,9 +381,9 @@ impl ObserverDescriptor {
+         self
+     }
+ 
+-    /// Returns the `events` that the observer is watching.
+-    pub fn events(&self) -> &[EventKey] {
+-        &self.events
++    /// Returns the `event_keys` that the observer is watching.
++    pub fn event_keys(&self) -> &[EventKey] {
++        &self.event_keys
+     }
+ 
+     /// Returns the `components` that the observer is watching.
+@@ -416,7 +416,7 @@ fn hook_on_add<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+             components.push(id);
+         });
+         if let Some(mut observer) = world.get_mut::<Observer>(entity) {
+-            observer.descriptor.events.push(event_key);
++            observer.descriptor.event_keys.push(event_key);
+             observer.descriptor.components.extend(components);
+ 
+             let system: &mut dyn Any = observer.system.as_mut();
+diff --git a/crates/bevy_ecs/src/observer/entity_cloning.rs b/crates/bevy_ecs/src/observer/entity_cloning.rs
+index 1bdf2f0cd0b60..6c75bbd8a4320 100644
+--- a/crates/bevy_ecs/src/observer/entity_cloning.rs
++++ b/crates/bevy_ecs/src/observer/entity_cloning.rs
+@@ -43,7 +43,7 @@ fn component_clone_observed_by(_source: &SourceComponent, ctx: &mut ComponentClo
+                 .get_mut::<Observer>(observer_entity)
+                 .expect("Source observer entity must have Observer");
+             observer_state.descriptor.entities.push(target);
+-            let event_keys = observer_state.descriptor.events.clone();
++            let event_keys = observer_state.descriptor.event_keys.clone();
+             let components = observer_state.descriptor.components.clone();
+             for event_key in event_keys {
+                 let observers = world.observers.get_observers_mut(event_key);
+diff --git a/crates/bevy_ecs/src/observer/mod.rs b/crates/bevy_ecs/src/observer/mod.rs
+index 312edc9b497e6..574f6ca257dea 100644
+--- a/crates/bevy_ecs/src/observer/mod.rs
++++ b/crates/bevy_ecs/src/observer/mod.rs
+@@ -379,7 +379,7 @@ impl World {
+         };
+         let descriptor = &observer_state.descriptor;
+ 
+-        for &event_key in &descriptor.events {
++        for &event_key in &descriptor.event_keys {
+             let cache = observers.get_observers_mut(event_key);
+ 
+             if descriptor.components.is_empty() && descriptor.entities.is_empty() {
+@@ -430,7 +430,7 @@ impl World {
+         let archetypes = &mut self.archetypes;
+         let observers = &mut self.observers;
+ 
+-        for &event_key in &descriptor.events {
++        for &event_key in &descriptor.event_keys {
+             let cache = observers.get_observers_mut(event_key);
+             if descriptor.components.is_empty() && descriptor.entities.is_empty() {
+                 cache.global_observers.remove(&entity);
+@@ -741,7 +741,7 @@ mod tests {
+                 Observer::new(|_: On<Add, A>, mut res: ResMut<Order>| {
+                     res.observed("add/remove");
+                 })
+-                .with_event(on_remove)
++                .with_event_key(on_remove)
+             },
+         );
+ 
+@@ -1015,7 +1015,7 @@ mod tests {
+             Observer::with_dynamic_runner(|mut world, _trigger, _ptr, _propagate| {
+                 world.resource_mut::<Order>().observed("event_a");
+             })
+-            .with_event(event_a)
++            .with_event_key(event_a)
+         };
+         world.spawn(observe);
+ 
+diff --git a/crates/bevy_ecs/src/observer/system_param.rs b/crates/bevy_ecs/src/observer/system_param.rs
+index 0b711c4309ee5..6e165ccd6df67 100644
+--- a/crates/bevy_ecs/src/observer/system_param.rs
++++ b/crates/bevy_ecs/src/observer/system_param.rs
+@@ -181,7 +181,7 @@ impl<'w, E, B: Bundle> DerefMut for On<'w, E, B> {
+ pub struct ObserverTrigger {
+     /// The [`Entity`] of the observer handling the trigger.
+     pub observer: Entity,
+-    /// The [`Event`] the trigger targeted.
++    /// The [`EventKey`] the trigger targeted.
+     pub event_key: EventKey,
+     /// The [`ComponentId`]s the trigger targeted.
+     pub components: SmallVec<[ComponentId; 2]>,
+diff --git a/crates/bevy_ecs/src/world/deferred_world.rs b/crates/bevy_ecs/src/world/deferred_world.rs
+index 64f1fa409f9aa..3b146d2c0589c 100644
+--- a/crates/bevy_ecs/src/world/deferred_world.rs
++++ b/crates/bevy_ecs/src/world/deferred_world.rs
+@@ -781,18 +781,18 @@ impl<'w> DeferredWorld<'w> {
+     /// Triggers all event observers for [`ComponentId`] in target.
+     ///
+     /// # Safety
+-    /// Caller must ensure observers listening for `event` can accept ZST pointers
++    /// Caller must ensure observers listening for `event_key` can accept ZST pointers
+     #[inline]
+     pub(crate) unsafe fn trigger_observers(
+         &mut self,
+-        event: EventKey,
++        event_key: EventKey,
+         target: Option<Entity>,
+         components: impl Iterator<Item = ComponentId> + Clone,
+         caller: MaybeLocation,
+     ) {
+         Observers::invoke::<_>(
+             self.reborrow(),
+-            event,
++            event_key,
+             target,
+             target,
+             components,
+@@ -805,11 +805,11 @@ impl<'w> DeferredWorld<'w> {
+     /// Triggers all event observers for [`ComponentId`] in target.
+     ///
+     /// # Safety
+-    /// Caller must ensure `E` is accessible as the type represented by `event`
++    /// Caller must ensure `E` is accessible as the type represented by `event_key`
+     #[inline]
+     pub(crate) unsafe fn trigger_observers_with_data<E, T>(
+         &mut self,
+-        event: EventKey,
++        event_key: EventKey,
+         current_target: Option<Entity>,
+         original_target: Option<Entity>,
+         components: impl Iterator<Item = ComponentId> + Clone,
+@@ -821,7 +821,7 @@ impl<'w> DeferredWorld<'w> {
+     {
+         Observers::invoke::<_>(
+             self.reborrow(),
+-            event,
++            event_key,
+             current_target,
+             original_target,
+             components.clone(),
+@@ -849,7 +849,7 @@ impl<'w> DeferredWorld<'w> {
+             }
+             Observers::invoke::<_>(
+                 self.reborrow(),
+-                event,
++                event_key,
+                 Some(current_target),
+                 original_target,
+                 components.clone(),
