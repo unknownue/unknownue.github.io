@@ -1,0 +1,210 @@
+diff --git a/crates/bevy_pbr/src/cluster.rs b/crates/bevy_pbr/src/cluster.rs
+index 9c47859debc2d..f3d242a512fcc 100644
+--- a/crates/bevy_pbr/src/cluster.rs
++++ b/crates/bevy_pbr/src/cluster.rs
+@@ -150,14 +150,13 @@ pub struct ViewClusterBindings {
+     buffers: ViewClusterBuffers,
+ }
+ 
+-impl FromWorld for GlobalClusterableObjectMeta {
+-    fn from_world(world: &mut World) -> Self {
+-        Self::new(
+-            world
+-                .resource::<RenderDevice>()
+-                .get_supported_read_only_binding_type(CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT),
+-        )
+-    }
++pub fn init_global_clusterable_object_meta(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++) {
++    commands.insert_resource(GlobalClusterableObjectMeta::new(
++        render_device.get_supported_read_only_binding_type(CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT),
++    ));
+ }
+ 
+ impl GlobalClusterableObjectMeta {
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index 45aa6297d2998..f5d84fb8e8427 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -146,7 +146,7 @@ use bevy_render::{
+     render_graph::RenderGraph,
+     render_resource::ShaderRef,
+     sync_component::SyncComponentPlugin,
+-    ExtractSchedule, Render, RenderApp, RenderDebugFlags, RenderSystems,
++    ExtractSchedule, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
+ };
+ 
+ use std::path::PathBuf;
+@@ -279,6 +279,14 @@ impl Plugin for PbrPlugin {
+ 
+         // Extract the required data from the main world
+         render_app
++            .add_systems(
++                RenderStartup,
++                (
++                    init_shadow_samplers,
++                    init_global_clusterable_object_meta,
++                    init_fallback_bindless_resources,
++                ),
++            )
+             .add_systems(
+                 ExtractSchedule,
+                 (
+@@ -323,12 +331,6 @@ impl Plugin for PbrPlugin {
+             return;
+         };
+ 
+-        // Extract the required data from the main world
+-        render_app
+-            .init_resource::<ShadowSamplers>()
+-            .init_resource::<GlobalClusterableObjectMeta>()
+-            .init_resource::<FallbackBindlessResources>();
+-
+         let global_cluster_settings = make_global_cluster_settings(render_app.world());
+         app.insert_resource(global_cluster_settings);
+     }
+diff --git a/crates/bevy_pbr/src/material_bind_groups.rs b/crates/bevy_pbr/src/material_bind_groups.rs
+index 780ac8e10c235..c984cfb85db7d 100644
+--- a/crates/bevy_pbr/src/material_bind_groups.rs
++++ b/crates/bevy_pbr/src/material_bind_groups.rs
+@@ -8,7 +8,7 @@ use crate::Material;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     resource::Resource,
+-    world::{FromWorld, World},
++    system::{Commands, Res},
+ };
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_reflect::{prelude::ReflectDefault, Reflect};
+@@ -1742,28 +1742,25 @@ impl MaterialBindlessSlab {
+     }
+ }
+ 
+-impl FromWorld for FallbackBindlessResources {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        FallbackBindlessResources {
+-            filtering_sampler: render_device.create_sampler(&SamplerDescriptor {
+-                label: Some("fallback filtering sampler"),
+-                ..default()
+-            }),
+-            non_filtering_sampler: render_device.create_sampler(&SamplerDescriptor {
+-                label: Some("fallback non-filtering sampler"),
+-                mag_filter: FilterMode::Nearest,
+-                min_filter: FilterMode::Nearest,
+-                mipmap_filter: FilterMode::Nearest,
+-                ..default()
+-            }),
+-            comparison_sampler: render_device.create_sampler(&SamplerDescriptor {
+-                label: Some("fallback comparison sampler"),
+-                compare: Some(CompareFunction::Always),
+-                ..default()
+-            }),
+-        }
+-    }
++pub fn init_fallback_bindless_resources(mut commands: Commands, render_device: Res<RenderDevice>) {
++    commands.insert_resource(FallbackBindlessResources {
++        filtering_sampler: render_device.create_sampler(&SamplerDescriptor {
++            label: Some("fallback filtering sampler"),
++            ..default()
++        }),
++        non_filtering_sampler: render_device.create_sampler(&SamplerDescriptor {
++            label: Some("fallback non-filtering sampler"),
++            mag_filter: FilterMode::Nearest,
++            min_filter: FilterMode::Nearest,
++            mipmap_filter: FilterMode::Nearest,
++            ..default()
++        }),
++        comparison_sampler: render_device.create_sampler(&SamplerDescriptor {
++            label: Some("fallback comparison sampler"),
++            compare: Some(CompareFunction::Always),
++            ..default()
++        }),
++    });
+ }
+ 
+ impl MaterialBindGroupNonBindlessAllocator {
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 74dc0ff15d366..bec2a6d1a9597 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -189,39 +189,31 @@ pub struct ShadowSamplers {
+     pub directional_light_linear_sampler: Sampler,
+ }
+ 
+-// TODO: this pattern for initializing the shaders / pipeline isn't ideal. this should be handled by the asset system
+-impl FromWorld for ShadowSamplers {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        let base_sampler_descriptor = SamplerDescriptor {
+-            address_mode_u: AddressMode::ClampToEdge,
+-            address_mode_v: AddressMode::ClampToEdge,
+-            address_mode_w: AddressMode::ClampToEdge,
+-            mag_filter: FilterMode::Linear,
+-            min_filter: FilterMode::Linear,
+-            mipmap_filter: FilterMode::Nearest,
+-            ..default()
+-        };
++pub fn init_shadow_samplers(mut commands: Commands, render_device: Res<RenderDevice>) {
++    let base_sampler_descriptor = SamplerDescriptor {
++        address_mode_u: AddressMode::ClampToEdge,
++        address_mode_v: AddressMode::ClampToEdge,
++        address_mode_w: AddressMode::ClampToEdge,
++        mag_filter: FilterMode::Linear,
++        min_filter: FilterMode::Linear,
++        mipmap_filter: FilterMode::Nearest,
++        ..default()
++    };
+ 
+-        ShadowSamplers {
+-            point_light_comparison_sampler: render_device.create_sampler(&SamplerDescriptor {
+-                compare: Some(CompareFunction::GreaterEqual),
+-                ..base_sampler_descriptor
+-            }),
+-            #[cfg(feature = "experimental_pbr_pcss")]
+-            point_light_linear_sampler: render_device.create_sampler(&base_sampler_descriptor),
+-            directional_light_comparison_sampler: render_device.create_sampler(
+-                &SamplerDescriptor {
+-                    compare: Some(CompareFunction::GreaterEqual),
+-                    ..base_sampler_descriptor
+-                },
+-            ),
+-            #[cfg(feature = "experimental_pbr_pcss")]
+-            directional_light_linear_sampler: render_device
+-                .create_sampler(&base_sampler_descriptor),
+-        }
+-    }
++    commands.insert_resource(ShadowSamplers {
++        point_light_comparison_sampler: render_device.create_sampler(&SamplerDescriptor {
++            compare: Some(CompareFunction::GreaterEqual),
++            ..base_sampler_descriptor
++        }),
++        #[cfg(feature = "experimental_pbr_pcss")]
++        point_light_linear_sampler: render_device.create_sampler(&base_sampler_descriptor),
++        directional_light_comparison_sampler: render_device.create_sampler(&SamplerDescriptor {
++            compare: Some(CompareFunction::GreaterEqual),
++            ..base_sampler_descriptor
++        }),
++        #[cfg(feature = "experimental_pbr_pcss")]
++        directional_light_linear_sampler: render_device.create_sampler(&base_sampler_descriptor),
++    });
+ }
+ 
+ pub fn extract_lights(
+diff --git a/release-content/migration-guides/render_startup.md b/release-content/migration-guides/render_startup.md
+index e888bd75883ba..c2b3991bdffe3 100644
+--- a/release-content/migration-guides/render_startup.md
++++ b/release-content/migration-guides/render_startup.md
+@@ -15,6 +15,9 @@ The following are the (public) resources that are now initialized in `RenderStar
+ - `FxaaPipeline`
+ - `SmaaPipelines`
+ - `TaaPipeline`
++- `ShadowSamplers`
++- `GlobalClusterableObjectMeta`
++- `FallbackBindlessResources`
+ - `AutoExposurePipeline`
+ - `MotionBlurPipeline`
+ - `SkyboxPrepassPipeline`
