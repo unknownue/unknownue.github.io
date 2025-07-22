@@ -1,0 +1,194 @@
+diff --git a/crates/bevy_ecs/src/schedule/graph/graph_map.rs b/crates/bevy_ecs/src/schedule/graph/graph_map.rs
+index a2a5b0801e009..09f3a1df353be 100644
+--- a/crates/bevy_ecs/src/schedule/graph/graph_map.rs
++++ b/crates/bevy_ecs/src/schedule/graph/graph_map.rs
+@@ -5,18 +5,36 @@
+ //! [`petgraph`]: https://docs.rs/petgraph/0.6.5/petgraph/
+ 
+ use alloc::vec::Vec;
+-use bevy_platform::{collections::HashSet, hash::FixedHasher};
+ use core::{
+-    fmt,
++    fmt::{self, Debug},
+     hash::{BuildHasher, Hash},
+ };
++
++use bevy_platform::{collections::HashSet, hash::FixedHasher};
+ use indexmap::IndexMap;
+ use smallvec::SmallVec;
+ 
+-use crate::schedule::graph::node::GraphNodeId;
+-
+ use Direction::{Incoming, Outgoing};
+ 
++/// Types that can be used as node identifiers in a [`DiGraph`]/[`UnGraph`].
++///
++/// [`DiGraph`]: crate::schedule::graph::DiGraph
++/// [`UnGraph`]: crate::schedule::graph::UnGraph
++pub trait GraphNodeId: Copy + Eq + Hash + Ord + Debug {
++    /// The type that packs and unpacks this [`GraphNodeId`] with a [`Direction`].
++    /// This is used to save space in the graph's adjacency list.
++    type Adjacent: Copy + Debug + From<(Self, Direction)> + Into<(Self, Direction)>;
++    /// The type that packs and unpacks this [`GraphNodeId`] with another
++    /// [`GraphNodeId`]. This is used to save space in the graph's edge list.
++    type Edge: Copy + Eq + Hash + Debug + From<(Self, Self)> + Into<(Self, Self)>;
++
++    /// Name of the kind of this node id.
++    ///
++    /// For structs, this should return a human-readable name of the struct.
++    /// For enums, this should return a human-readable name of the enum variant.
++    fn kind(&self) -> &'static str;
++}
++
+ /// A `Graph` with undirected edges of some [`GraphNodeId`] `N`.
+ ///
+ /// For example, an edge between *1* and *2* is equivalent to an edge between
+@@ -55,7 +73,7 @@ where
+     edges: HashSet<N::Edge, S>,
+ }
+ 
+-impl<const DIRECTED: bool, N: GraphNodeId, S: BuildHasher> fmt::Debug for Graph<DIRECTED, N, S> {
++impl<const DIRECTED: bool, N: GraphNodeId, S: BuildHasher> Debug for Graph<DIRECTED, N, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         self.nodes.fmt(f)
+     }
+diff --git a/crates/bevy_ecs/src/schedule/graph/mod.rs b/crates/bevy_ecs/src/schedule/graph/mod.rs
+index a88034a6a7fdb..0ad0190b031ab 100644
+--- a/crates/bevy_ecs/src/schedule/graph/mod.rs
++++ b/crates/bevy_ecs/src/schedule/graph/mod.rs
+@@ -13,11 +13,9 @@ use fixedbitset::FixedBitSet;
+ use crate::schedule::set::*;
+ 
+ mod graph_map;
+-mod node;
+ mod tarjan_scc;
+ 
+-pub use graph_map::{DiGraph, Direction, UnGraph};
+-pub use node::GraphNodeId;
++pub use graph_map::{DiGraph, Direction, GraphNodeId, UnGraph};
+ 
+ /// Specifies what kind of edge should be added to the dependency graph.
+ #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
+diff --git a/crates/bevy_ecs/src/schedule/graph/node.rs b/crates/bevy_ecs/src/schedule/graph/node.rs
+deleted file mode 100644
+index c3ab19c9da31d..0000000000000
+--- a/crates/bevy_ecs/src/schedule/graph/node.rs
++++ /dev/null
+@@ -1,16 +0,0 @@
+-use core::{fmt::Debug, hash::Hash};
+-
+-use crate::schedule::graph::Direction;
+-
+-/// Types that can be used as node identifiers in a [`DiGraph`]/[`UnGraph`].
+-///
+-/// [`DiGraph`]: crate::schedule::graph::DiGraph
+-/// [`UnGraph`]: crate::schedule::graph::UnGraph
+-pub trait GraphNodeId: Copy + Eq + Hash + Ord + Debug {
+-    /// The type that packs and unpacks this [`GraphNodeId`] with a [`Direction`].
+-    /// This is used to save space in the graph's adjacency list.
+-    type Adjacent: Copy + Debug + From<(Self, Direction)> + Into<(Self, Direction)>;
+-    /// The type that packs and unpacks this [`GraphNodeId`] with another
+-    /// [`GraphNodeId`]. This is used to save space in the graph's edge list.
+-    type Edge: Copy + Eq + Hash + Debug + From<(Self, Self)> + Into<(Self, Self)>;
+-}
+diff --git a/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs b/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs
+index 309ec321baa03..23584cab95f38 100644
+--- a/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs
++++ b/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs
+@@ -1,11 +1,10 @@
+-use crate::schedule::graph::node::GraphNodeId;
+-
+-use super::DiGraph;
+ use alloc::vec::Vec;
+-use core::hash::BuildHasher;
+-use core::num::NonZeroUsize;
++use core::{hash::BuildHasher, num::NonZeroUsize};
++
+ use smallvec::SmallVec;
+ 
++use crate::schedule::graph::{DiGraph, GraphNodeId};
++
+ /// Create an iterator over *strongly connected components* using Algorithm 3 in
+ /// [A Space-Efficient Algorithm for Finding Strongly Connected Components][1] by David J. Pierce,
+ /// which is a memory-efficient variation of [Tarjan's algorithm][2].
+diff --git a/crates/bevy_ecs/src/schedule/node.rs b/crates/bevy_ecs/src/schedule/node.rs
+index 36005cf0c9ee8..75c5c71ae8ce8 100644
+--- a/crates/bevy_ecs/src/schedule/node.rs
++++ b/crates/bevy_ecs/src/schedule/node.rs
+@@ -258,6 +258,19 @@ new_key_type! {
+ impl GraphNodeId for SystemKey {
+     type Adjacent = (SystemKey, Direction);
+     type Edge = (SystemKey, SystemKey);
++
++    fn kind(&self) -> &'static str {
++        "system"
++    }
++}
++
++impl GraphNodeId for SystemSetKey {
++    type Adjacent = (SystemSetKey, Direction);
++    type Edge = (SystemSetKey, SystemSetKey);
++
++    fn kind(&self) -> &'static str {
++        "system set"
++    }
+ }
+ 
+ impl TryFrom<NodeId> for SystemKey {
+@@ -324,6 +337,13 @@ impl NodeId {
+ impl GraphNodeId for NodeId {
+     type Adjacent = CompactNodeIdAndDirection;
+     type Edge = CompactNodeIdPair;
++
++    fn kind(&self) -> &'static str {
++        match self {
++            NodeId::System(n) => n.kind(),
++            NodeId::Set(n) => n.kind(),
++        }
++    }
+ }
+ 
+ impl From<SystemKey> for NodeId {
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index 6a13e6c4ff22c..8404ccf350935 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -1443,13 +1443,6 @@ impl ScheduleGraph {
+         )
+     }
+ 
+-    fn get_node_kind(&self, id: &NodeId) -> &'static str {
+-        match id {
+-            NodeId::System(_) => "system",
+-            NodeId::Set(_) => "system set",
+-        }
+-    }
+-
+     /// If [`ScheduleBuildSettings::hierarchy_detection`] is [`LogLevel::Ignore`] this check
+     /// is skipped.
+     fn optionally_check_hierarchy_conflicts(
+@@ -1481,7 +1474,7 @@ impl ScheduleGraph {
+             writeln!(
+                 message,
+                 " -- {} `{}` cannot be child of set `{}`, longer path exists",
+-                self.get_node_kind(child),
++                child.kind(),
+                 self.get_node_name(child),
+                 self.get_node_name(parent),
+             )
+@@ -1585,12 +1578,9 @@ impl ScheduleGraph {
+     ) -> String {
+         let mut message = format!("schedule has {} before/after cycle(s):\n", cycles.len());
+         for (i, cycle) in cycles.iter().enumerate() {
+-            let mut names = cycle.iter().map(|&id| {
+-                (
+-                    self.get_node_kind(&id.into()),
+-                    self.get_node_name(&id.into()),
+-                )
+-            });
++            let mut names = cycle
++                .iter()
++                .map(|&id| (id.into().kind(), self.get_node_name(&id.into())));
+             let (first_kind, first_name) = names.next().unwrap();
+             writeln!(
+                 message,
