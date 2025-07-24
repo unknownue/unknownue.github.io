@@ -1,0 +1,120 @@
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 70ac992924cf7..2bc74a1aa7acf 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -87,18 +87,6 @@ pub const DEFAULT_FONT_DATA: &[u8] = include_bytes!("FiraMono-subset.ttf");
+ #[derive(Default)]
+ pub struct TextPlugin;
+ 
+-/// Text is rendered for two different view projections;
+-/// 2-dimensional text ([`Text2d`]) is rendered in "world space" with a `BottomToTop` Y-axis,
+-/// while UI is rendered with a `TopToBottom` Y-axis.
+-/// This matters for text because the glyph positioning is different in either layout.
+-/// For `TopToBottom`, 0 is the top of the text, while for `BottomToTop` 0 is the bottom.
+-pub enum YAxisOrientation {
+-    /// Top to bottom Y-axis orientation, for UI
+-    TopToBottom,
+-    /// Bottom to top Y-axis orientation, for 2d world space
+-    BottomToTop,
+-}
+-
+ /// System set in [`PostUpdate`] where all 2d text update systems are executed.
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+ pub struct Text2dUpdateSystems;
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index 2a47866f76c27..93ee4907bdda4 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -17,7 +17,7 @@ use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Wrap};
+ 
+ use crate::{
+     error::TextError, ComputedTextBlock, Font, FontAtlasSets, FontSmoothing, JustifyText,
+-    LineBreak, PositionedGlyph, TextBounds, TextEntity, TextFont, TextLayout, YAxisOrientation,
++    LineBreak, PositionedGlyph, TextBounds, TextEntity, TextFont, TextLayout,
+ };
+ 
+ /// A wrapper resource around a [`cosmic_text::FontSystem`]
+@@ -228,7 +228,6 @@ impl TextPipeline {
+         font_atlas_sets: &mut FontAtlasSets,
+         texture_atlases: &mut Assets<TextureAtlasLayout>,
+         textures: &mut Assets<Image>,
+-        y_axis_orientation: YAxisOrientation,
+         computed: &mut ComputedTextBlock,
+         font_system: &mut CosmicFontSystem,
+         swash_cache: &mut SwashCache,
+@@ -348,10 +347,6 @@ impl TextPipeline {
+                     let x = glyph_size.x as f32 / 2.0 + left + physical_glyph.x as f32;
+                     let y =
+                         line_y.round() + physical_glyph.y as f32 - top + glyph_size.y as f32 / 2.0;
+-                    let y = match y_axis_orientation {
+-                        YAxisOrientation::TopToBottom => y,
+-                        YAxisOrientation::BottomToTop => box_size.y - y,
+-                    };
+ 
+                     let position = Vec2::new(x, y);
+ 
+diff --git a/crates/bevy_text/src/text2d.rs b/crates/bevy_text/src/text2d.rs
+index a9419e89c0f0c..5069804df8672 100644
+--- a/crates/bevy_text/src/text2d.rs
++++ b/crates/bevy_text/src/text2d.rs
+@@ -2,7 +2,7 @@ use crate::pipeline::CosmicFontSystem;
+ use crate::{
+     ComputedTextBlock, Font, FontAtlasSets, LineBreak, PositionedGlyph, SwashCache, TextBounds,
+     TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextPipeline, TextReader, TextRoot,
+-    TextSpanAccess, TextWriter, YAxisOrientation,
++    TextSpanAccess, TextWriter,
+ };
+ use bevy_asset::Assets;
+ use bevy_color::LinearRgba;
+@@ -182,10 +182,10 @@ pub fn extract_text2d_sprite(
+             text_bounds.width.unwrap_or(text_layout_info.size.x),
+             text_bounds.height.unwrap_or(text_layout_info.size.y),
+         );
+-        let bottom_left =
+-            -(anchor.as_vec() + 0.5) * size + (size.y - text_layout_info.size.y) * Vec2::Y;
++
++        let top_left = (Anchor::TOP_LEFT.0 - anchor.as_vec()) * size;
+         let transform =
+-            *global_transform * GlobalTransform::from_translation(bottom_left.extend(0.)) * scaling;
++            *global_transform * GlobalTransform::from_translation(top_left.extend(0.)) * scaling;
+         let mut color = LinearRgba::WHITE;
+         let mut current_span = usize::MAX;
+ 
+@@ -218,7 +218,7 @@ pub fn extract_text2d_sprite(
+                 .textures[atlas_info.location.glyph_index]
+                 .as_rect();
+             extracted_slices.slices.push(ExtractedSlice {
+-                offset: *position,
++                offset: Vec2::new(position.x, -position.y),
+                 rect,
+                 size: rect.size(),
+             });
+@@ -316,7 +316,6 @@ pub fn update_text2d_layout(
+                 &mut font_atlas_sets,
+                 &mut texture_atlases,
+                 &mut textures,
+-                YAxisOrientation::BottomToTop,
+                 computed.as_mut(),
+                 &mut font_system,
+                 &mut swash_cache,
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index 0153fa954c406..785040c1e9057 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -20,7 +20,7 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_text::{
+     scale_value, ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSets, LineBreak, SwashCache,
+     TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextMeasureInfo,
+-    TextPipeline, TextReader, TextRoot, TextSpanAccess, TextWriter, YAxisOrientation,
++    TextPipeline, TextReader, TextRoot, TextSpanAccess, TextWriter,
+ };
+ use taffy::style::AvailableSpace;
+ use tracing::error;
+@@ -328,7 +328,6 @@ fn queue_text(
+         font_atlas_sets,
+         texture_atlases,
+         textures,
+-        YAxisOrientation::TopToBottom,
+         computed,
+         font_system,
+         swash_cache,
