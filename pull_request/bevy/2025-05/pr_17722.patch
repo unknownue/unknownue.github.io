@@ -1,0 +1,135 @@
+diff --git a/crates/bevy_log/src/lib.rs b/crates/bevy_log/src/lib.rs
+index f0743f022de0f..0e48ccb213c2d 100644
+--- a/crates/bevy_log/src/lib.rs
++++ b/crates/bevy_log/src/lib.rs
+@@ -56,6 +56,7 @@ use bevy_app::{App, Plugin};
+ use tracing_log::LogTracer;
+ use tracing_subscriber::{
+     filter::{FromEnvError, ParseError},
++    layer::Layered,
+     prelude::*,
+     registry::Registry,
+     EnvFilter, Layer,
+@@ -97,6 +98,7 @@ pub(crate) struct FlushGuard(SyncCell<tracing_chrome::FlushGuard>);
+ ///             level: Level::DEBUG,
+ ///             filter: "wgpu=error,bevy_render=info,bevy_ecs=trace".to_string(),
+ ///             custom_layer: |_| None,
++///             fmt_layer: |_| None,
+ ///         }))
+ ///         .run();
+ /// }
+@@ -237,11 +239,38 @@ pub struct LogPlugin {
+     ///
+     /// Please see the `examples/log_layers.rs` for a complete example.
+     pub custom_layer: fn(app: &mut App) -> Option<BoxedLayer>,
++
++    /// Override the default [`tracing_subscriber::fmt::Layer`] with a custom one.
++    ///
++    /// This differs from [`custom_layer`](Self::custom_layer) in that
++    /// [`fmt_layer`](Self::fmt_layer) allows you to overwrite the default formatter layer, while
++    /// `custom_layer` only allows you to add additional layers (which are unable to modify the
++    /// default formatter).
++    ///
++    /// For example, you can use [`tracing_subscriber::fmt::Layer::without_time`] to remove the
++    /// timestamp from the log output.
++    ///
++    /// Please see the `examples/log_layers.rs` for a complete example.
++    pub fmt_layer: fn(app: &mut App) -> Option<BoxedFmtLayer>,
+ }
+ 
+-/// A boxed [`Layer`] that can be used with [`LogPlugin`].
++/// A boxed [`Layer`] that can be used with [`LogPlugin::custom_layer`].
+ pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+ 
++#[cfg(feature = "trace")]
++type BaseSubscriber =
++    Layered<EnvFilter, Layered<Option<Box<dyn Layer<Registry> + Send + Sync>>, Registry>>;
++
++#[cfg(feature = "trace")]
++type PreFmtSubscriber = Layered<tracing_error::ErrorLayer<BaseSubscriber>, BaseSubscriber>;
++
++#[cfg(not(feature = "trace"))]
++type PreFmtSubscriber =
++    Layered<EnvFilter, Layered<Option<Box<dyn Layer<Registry> + Send + Sync>>, Registry>>;
++
++/// A boxed [`Layer`] that can be used with [`LogPlugin::fmt_layer`].
++pub type BoxedFmtLayer = Box<dyn Layer<PreFmtSubscriber> + Send + Sync + 'static>;
++
+ /// The default [`LogPlugin`] [`EnvFilter`].
+ pub const DEFAULT_FILTER: &str = "wgpu=error,naga=warn";
+ 
+@@ -251,6 +280,7 @@ impl Default for LogPlugin {
+             filter: DEFAULT_FILTER.to_string(),
+             level: Level::INFO,
+             custom_layer: |_| None,
++            fmt_layer: |_| None,
+         }
+     }
+ }
+@@ -324,10 +354,12 @@ impl Plugin for LogPlugin {
+             #[cfg(feature = "tracing-tracy")]
+             let tracy_layer = tracing_tracy::TracyLayer::default();
+ 
+-            // note: the implementation of `Default` reads from the env var NO_COLOR
+-            // to decide whether to use ANSI color codes, which is common convention
+-            // https://no-color.org/
+-            let fmt_layer = tracing_subscriber::fmt::Layer::default().with_writer(std::io::stderr);
++            let fmt_layer = (self.fmt_layer)(app).unwrap_or_else(|| {
++                // note: the implementation of `Default` reads from the env var NO_COLOR
++                // to decide whether to use ANSI color codes, which is common convention
++                // https://no-color.org/
++                Box::new(tracing_subscriber::fmt::Layer::default().with_writer(std::io::stderr))
++            });
+ 
+             // bevy_render::renderer logs a `tracy.frame_mark` event every frame
+             // at Level::INFO. Formatted logs should omit it.
+diff --git a/examples/app/log_layers.rs b/examples/app/log_layers.rs
+index 558d5b2ba5a48..8f454e9ee0c9b 100644
+--- a/examples/app/log_layers.rs
++++ b/examples/app/log_layers.rs
+@@ -4,7 +4,7 @@ use bevy::{
+     log::{
+         tracing::{self, Subscriber},
+         tracing_subscriber::Layer,
+-        BoxedLayer,
++        BoxedFmtLayer, BoxedLayer,
+     },
+     prelude::*,
+ };
+@@ -36,10 +36,24 @@ fn custom_layer(_app: &mut App) -> Option<BoxedLayer> {
+     ]))
+ }
+ 
++// While `custom_layer` allows you to add _additional_ layers, it won't allow you to override the
++// default `tracing_subscriber::fmt::Layer` added by `LogPlugin`. To do that, you can use the
++// `fmt_layer` option.
++//
++// In this example, we're disabling the timestamp in the log output.
++fn fmt_layer(_app: &mut App) -> Option<BoxedFmtLayer> {
++    Some(Box::new(
++        bevy::log::tracing_subscriber::fmt::Layer::default()
++            .without_time()
++            .with_writer(std::io::stderr),
++    ))
++}
++
+ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins.set(bevy::log::LogPlugin {
+             custom_layer,
++            fmt_layer,
+ 
+             ..default()
+         }))
+diff --git a/examples/app/log_layers_ecs.rs b/examples/app/log_layers_ecs.rs
+index 30cba02b8ddb8..c77313e0dd54a 100644
+--- a/examples/app/log_layers_ecs.rs
++++ b/examples/app/log_layers_ecs.rs
+@@ -30,6 +30,7 @@ fn main() {
+             level: Level::TRACE,
+             filter: "warn,log_layers_ecs=trace".to_string(),
+             custom_layer,
++            ..default()
+         }))
+         .add_systems(Startup, (log_system, setup))
+         .add_systems(Update, print_logs)

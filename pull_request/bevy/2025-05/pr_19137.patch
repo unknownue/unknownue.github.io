@@ -1,0 +1,622 @@
+diff --git a/crates/bevy_asset/src/io/embedded/mod.rs b/crates/bevy_asset/src/io/embedded/mod.rs
+index e63d415342798..f6c44397fc16f 100644
+--- a/crates/bevy_asset/src/io/embedded/mod.rs
++++ b/crates/bevy_asset/src/io/embedded/mod.rs
+@@ -8,8 +8,10 @@ use crate::io::{
+     memory::{Dir, MemoryAssetReader, Value},
+     AssetSource, AssetSourceBuilders,
+ };
++use crate::AssetServer;
+ use alloc::boxed::Box;
+-use bevy_ecs::resource::Resource;
++use bevy_app::App;
++use bevy_ecs::{resource::Resource, world::World};
+ use std::path::{Path, PathBuf};
+ 
+ #[cfg(feature = "embedded_watcher")]
+@@ -132,6 +134,71 @@ impl EmbeddedAssetRegistry {
+     }
+ }
+ 
++/// Trait for the [`load_embedded_asset!`] macro, to access [`AssetServer`]
++/// from arbitrary things.
++///
++/// [`load_embedded_asset!`]: crate::load_embedded_asset
++pub trait GetAssetServer {
++    fn get_asset_server(&self) -> &AssetServer;
++}
++impl GetAssetServer for App {
++    fn get_asset_server(&self) -> &AssetServer {
++        self.world().get_asset_server()
++    }
++}
++impl GetAssetServer for World {
++    fn get_asset_server(&self) -> &AssetServer {
++        self.resource()
++    }
++}
++impl GetAssetServer for AssetServer {
++    fn get_asset_server(&self) -> &AssetServer {
++        self
++    }
++}
++
++/// Load an [embedded asset](crate::embedded_asset).
++///
++/// This is useful if the embedded asset in question is not publicly exposed, but
++/// you need to use it internally.
++///
++/// # Syntax
++///
++/// This macro takes two arguments and an optional third one:
++/// 1. The asset source. It may be `AssetServer`, `World` or `App`.
++/// 2. The path to the asset to embed, as a string literal.
++/// 3. Optionally, a closure of the same type as in [`AssetServer::load_with_settings`].
++///    Consider explicitly typing the closure argument in case of type error.
++///
++/// # Usage
++///
++/// The advantage compared to using directly [`AssetServer::load`] is:
++/// - This also accepts [`World`] and [`App`] arguments.
++/// - This uses the exact same path as `embedded_asset!`, so you can keep it
++///   consistent.
++///
++/// As a rule of thumb:
++/// - If the asset in used in the same module as it is declared using `embedded_asset!`,
++///   use this macro.
++/// - Otherwise, use `AssetServer::load`.
++#[macro_export]
++macro_rules! load_embedded_asset {
++    (@get: $path: literal, $provider: expr) => {{
++        let path = $crate::embedded_path!($path);
++        let path = $crate::AssetPath::from_path_buf(path).with_source("embedded");
++        let asset_server = $crate::io::embedded::GetAssetServer::get_asset_server($provider);
++        (path, asset_server)
++    }};
++    ($provider: expr, $path: literal, $settings: expr) => {{
++        let (path, asset_server) = $crate::load_embedded_asset!(@get: $path, $provider);
++        asset_server.load_with_settings(path, $settings)
++    }};
++    ($provider: expr, $path: literal) => {{
++        let (path, asset_server) = $crate::load_embedded_asset!(@get: $path, $provider);
++        asset_server.load(path)
++    }};
++}
++
+ /// Returns the [`Path`] for a given `embedded` asset.
+ /// This is used internally by [`embedded_asset`] and can be used to get a [`Path`]
+ /// that matches the [`AssetPath`](crate::AssetPath) used by that asset.
+@@ -140,7 +207,7 @@ impl EmbeddedAssetRegistry {
+ #[macro_export]
+ macro_rules! embedded_path {
+     ($path_str: expr) => {{
+-        embedded_path!("src", $path_str)
++        $crate::embedded_path!("src", $path_str)
+     }};
+ 
+     ($source_path: expr, $path_str: expr) => {{
+@@ -192,7 +259,7 @@ pub fn _embedded_asset_path(
+ /// Creates a new `embedded` asset by embedding the bytes of the given path into the current binary
+ /// and registering those bytes with the `embedded` [`AssetSource`].
+ ///
+-/// This accepts the current [`App`](bevy_app::App) as the first parameter and a path `&str` (relative to the current file) as the second.
++/// This accepts the current [`App`] as the first parameter and a path `&str` (relative to the current file) as the second.
+ ///
+ /// By default this will generate an [`AssetPath`] using the following rules:
+ ///
+@@ -217,14 +284,19 @@ pub fn _embedded_asset_path(
+ ///
+ /// `embedded_asset!(app, "rock.wgsl")`
+ ///
+-/// `rock.wgsl` can now be loaded by the [`AssetServer`](crate::AssetServer) with the following path:
++/// `rock.wgsl` can now be loaded by the [`AssetServer`] as follows:
+ ///
+ /// ```no_run
+-/// # use bevy_asset::{Asset, AssetServer};
++/// # use bevy_asset::{Asset, AssetServer, load_embedded_asset};
+ /// # use bevy_reflect::TypePath;
+ /// # let asset_server: AssetServer = panic!();
+ /// # #[derive(Asset, TypePath)]
+ /// # struct Shader;
++/// // If we are loading the shader in the same module we used `embedded_asset!`:
++/// let shader = load_embedded_asset!(&asset_server, "rock.wgsl");
++/// # let _: bevy_asset::Handle<Shader> = shader;
++///
++/// // If the goal is to expose the asset **to the end user**:
+ /// let shader = asset_server.load::<Shader>("embedded://bevy_rock/render/rock.wgsl");
+ /// ```
+ ///
+@@ -258,11 +330,11 @@ pub fn _embedded_asset_path(
+ /// [`embedded_path`]: crate::embedded_path
+ #[macro_export]
+ macro_rules! embedded_asset {
+-    ($app: ident, $path: expr) => {{
++    ($app: expr, $path: expr) => {{
+         $crate::embedded_asset!($app, "src", $path)
+     }};
+ 
+-    ($app: ident, $source_path: expr, $path: expr) => {{
++    ($app: expr, $source_path: expr, $path: expr) => {{
+         let mut embedded = $app
+             .world_mut()
+             .resource_mut::<$crate::io::embedded::EmbeddedAssetRegistry>();
+diff --git a/crates/bevy_asset/src/path.rs b/crates/bevy_asset/src/path.rs
+index ad127812dcfcf..97e6c6499de44 100644
+--- a/crates/bevy_asset/src/path.rs
++++ b/crates/bevy_asset/src/path.rs
+@@ -223,6 +223,16 @@ impl<'a> AssetPath<'a> {
+         Ok((source, path, label))
+     }
+ 
++    /// Creates a new [`AssetPath`] from a [`PathBuf`].
++    #[inline]
++    pub fn from_path_buf(path_buf: PathBuf) -> AssetPath<'a> {
++        AssetPath {
++            path: CowArc::Owned(path_buf.into()),
++            source: AssetSourceId::Default,
++            label: None,
++        }
++    }
++
+     /// Creates a new [`AssetPath`] from a [`Path`].
+     #[inline]
+     pub fn from_path(path: &'a Path) -> AssetPath<'a> {
+diff --git a/crates/bevy_pbr/src/deferred/mod.rs b/crates/bevy_pbr/src/deferred/mod.rs
+index eccf6404ad275..65be474e65470 100644
+--- a/crates/bevy_pbr/src/deferred/mod.rs
++++ b/crates/bevy_pbr/src/deferred/mod.rs
+@@ -10,7 +10,7 @@ use crate::{
+     ViewLightsUniformOffset,
+ };
+ use bevy_app::prelude::*;
+-use bevy_asset::{load_internal_asset, weak_handle, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
+ use bevy_core_pipeline::{
+     core_3d::graph::{Core3d, Node3d},
+     deferred::{
+@@ -34,9 +34,6 @@ use bevy_render::{
+ 
+ pub struct DeferredPbrLightingPlugin;
+ 
+-pub const DEFERRED_LIGHTING_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("f4295279-8890-4748-b654-ca4d2183df1c");
+-
+ pub const DEFAULT_PBR_DEFERRED_LIGHTING_PASS_ID: u8 = 1;
+ 
+ /// Component with a `depth_id` for specifying which corresponding materials should be rendered by this specific PBR deferred lighting pass.
+@@ -100,12 +97,7 @@ impl Plugin for DeferredPbrLightingPlugin {
+         ))
+         .add_systems(PostUpdate, insert_deferred_lighting_pass_id_component);
+ 
+-        load_internal_asset!(
+-            app,
+-            DEFERRED_LIGHTING_SHADER_HANDLE,
+-            "deferred_lighting.wgsl",
+-            Shader::from_wgsl
+-        );
++        embedded_asset!(app, "deferred_lighting.wgsl");
+ 
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+@@ -237,6 +229,7 @@ impl ViewNode for DeferredOpaquePass3dPbrLightingNode {
+ pub struct DeferredLightingLayout {
+     mesh_pipeline: MeshPipeline,
+     bind_group_layout_1: BindGroupLayout,
++    deferred_lighting_shader: Handle<Shader>,
+ }
+ 
+ #[derive(Component)]
+@@ -360,13 +353,13 @@ impl SpecializedRenderPipeline for DeferredLightingLayout {
+                 self.bind_group_layout_1.clone(),
+             ],
+             vertex: VertexState {
+-                shader: DEFERRED_LIGHTING_SHADER_HANDLE,
++                shader: self.deferred_lighting_shader.clone(),
+                 shader_defs: shader_defs.clone(),
+                 entry_point: "vertex".into(),
+                 buffers: Vec::new(),
+             },
+             fragment: Some(FragmentState {
+-                shader: DEFERRED_LIGHTING_SHADER_HANDLE,
++                shader: self.deferred_lighting_shader.clone(),
+                 shader_defs,
+                 entry_point: "fragment".into(),
+                 targets: vec![Some(ColorTargetState {
+@@ -416,6 +409,7 @@ impl FromWorld for DeferredLightingLayout {
+         Self {
+             mesh_pipeline: world.resource::<MeshPipeline>().clone(),
+             bind_group_layout_1: layout,
++            deferred_lighting_shader: load_embedded_asset!(world, "deferred_lighting.wgsl"),
+         }
+     }
+ }
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index f9226782c973e..12785f3e78607 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -124,7 +124,7 @@ pub mod graph {
+ 
+ use crate::{deferred::DeferredPbrLightingPlugin, graph::NodePbr};
+ use bevy_app::prelude::*;
+-use bevy_asset::{load_internal_asset, weak_handle, AssetApp, Assets, Handle};
++use bevy_asset::{load_internal_asset, weak_handle, AssetApp, AssetPath, Assets, Handle};
+ use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
+@@ -133,8 +133,9 @@ use bevy_render::{
+     camera::{sort_cameras, CameraUpdateSystems, Projection},
+     extract_component::ExtractComponentPlugin,
+     extract_resource::ExtractResourcePlugin,
++    load_shader_library,
+     render_graph::RenderGraph,
+-    render_resource::Shader,
++    render_resource::{Shader, ShaderRef},
+     sync_component::SyncComponentPlugin,
+     view::VisibilitySystems,
+     ExtractSchedule, Render, RenderApp, RenderDebugFlags, RenderSystems,
+@@ -142,40 +143,12 @@ use bevy_render::{
+ 
+ use bevy_transform::TransformSystems;
+ 
+-pub const PBR_TYPES_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("b0330585-2335-4268-9032-a6c4c2d932f6");
+-pub const PBR_BINDINGS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("13834c18-c7ec-4c4b-bbbd-432c3ba4cace");
+-pub const UTILS_HANDLE: Handle<Shader> = weak_handle!("0a32978f-2744-4608-98b6-4c3000a0638d");
+-pub const CLUSTERED_FORWARD_HANDLE: Handle<Shader> =
+-    weak_handle!("f8e3b4c6-60b7-4b23-8b2e-a6b27bb4ddce");
+-pub const PBR_LIGHTING_HANDLE: Handle<Shader> =
+-    weak_handle!("de0cf697-2876-49a0-aa0f-f015216f70c2");
+-pub const PBR_TRANSMISSION_HANDLE: Handle<Shader> =
+-    weak_handle!("22482185-36bb-4c16-9b93-a20e6d4a2725");
+-pub const SHADOWS_HANDLE: Handle<Shader> = weak_handle!("ff758c5a-3927-4a15-94c3-3fbdfc362590");
+-pub const SHADOW_SAMPLING_HANDLE: Handle<Shader> =
+-    weak_handle!("f6bf5843-54bc-4e39-bd9d-56bfcd77b033");
+-pub const PBR_FRAGMENT_HANDLE: Handle<Shader> =
+-    weak_handle!("1bd3c10d-851b-400c-934a-db489d99cc50");
+-pub const PBR_SHADER_HANDLE: Handle<Shader> = weak_handle!("0eba65ed-3e5b-4752-93ed-e8097e7b0c84");
+-pub const PBR_PREPASS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("9afeaeab-7c45-43ce-b322-4b97799eaeb9");
+-pub const PBR_FUNCTIONS_HANDLE: Handle<Shader> =
+-    weak_handle!("815b8618-f557-4a96-91a5-a2fb7e249fb0");
+-pub const PBR_AMBIENT_HANDLE: Handle<Shader> = weak_handle!("4a90b95b-112a-4a10-9145-7590d6f14260");
+-pub const PARALLAX_MAPPING_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("6cf57d9f-222a-429a-bba4-55ba9586e1d4");
+-pub const VIEW_TRANSFORMATIONS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("ec047703-cde3-4876-94df-fed121544abb");
+-pub const PBR_PREPASS_FUNCTIONS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("77b1bd3a-877c-4b2c-981b-b9c68d1b774a");
+-pub const PBR_DEFERRED_TYPES_HANDLE: Handle<Shader> =
+-    weak_handle!("43060da7-a717-4240-80a8-dbddd92bd25d");
+-pub const PBR_DEFERRED_FUNCTIONS_HANDLE: Handle<Shader> =
+-    weak_handle!("9dc46746-c51d-45e3-a321-6a50c3963420");
+-pub const RGB9E5_FUNCTIONS_HANDLE: Handle<Shader> =
+-    weak_handle!("90c19aa3-6a11-4252-8586-d9299352e94f");
++use std::path::PathBuf;
++
++fn shader_ref(path: PathBuf) -> ShaderRef {
++    ShaderRef::Path(AssetPath::from_path_buf(path).with_source("embedded"))
++}
++
+ const MESHLET_VISIBILITY_BUFFER_RESOLVE_SHADER_HANDLE: Handle<Shader> =
+     weak_handle!("69187376-3dea-4d0f-b3f5-185bde63d6a2");
+ 
+@@ -211,110 +184,26 @@ impl Default for PbrPlugin {
+ 
+ impl Plugin for PbrPlugin {
+     fn build(&self, app: &mut App) {
+-        load_internal_asset!(
+-            app,
+-            PBR_TYPES_SHADER_HANDLE,
+-            "render/pbr_types.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_BINDINGS_SHADER_HANDLE,
+-            "render/pbr_bindings.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(app, UTILS_HANDLE, "render/utils.wgsl", Shader::from_wgsl);
+-        load_internal_asset!(
+-            app,
+-            CLUSTERED_FORWARD_HANDLE,
+-            "render/clustered_forward.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_LIGHTING_HANDLE,
+-            "render/pbr_lighting.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_TRANSMISSION_HANDLE,
+-            "render/pbr_transmission.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            SHADOWS_HANDLE,
+-            "render/shadows.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_DEFERRED_TYPES_HANDLE,
+-            "deferred/pbr_deferred_types.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_DEFERRED_FUNCTIONS_HANDLE,
+-            "deferred/pbr_deferred_functions.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            SHADOW_SAMPLING_HANDLE,
+-            "render/shadow_sampling.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_FUNCTIONS_HANDLE,
+-            "render/pbr_functions.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            RGB9E5_FUNCTIONS_HANDLE,
+-            "render/rgb9e5.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_AMBIENT_HANDLE,
+-            "render/pbr_ambient.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_FRAGMENT_HANDLE,
+-            "render/pbr_fragment.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(app, PBR_SHADER_HANDLE, "render/pbr.wgsl", Shader::from_wgsl);
+-        load_internal_asset!(
+-            app,
+-            PBR_PREPASS_FUNCTIONS_SHADER_HANDLE,
+-            "render/pbr_prepass_functions.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PBR_PREPASS_SHADER_HANDLE,
+-            "render/pbr_prepass.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            PARALLAX_MAPPING_SHADER_HANDLE,
+-            "render/parallax_mapping.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            VIEW_TRANSFORMATIONS_SHADER_HANDLE,
+-            "render/view_transformations.wgsl",
+-            Shader::from_wgsl
+-        );
++        load_shader_library!(app, "render/pbr_types.wgsl");
++        load_shader_library!(app, "render/pbr_bindings.wgsl");
++        load_shader_library!(app, "render/utils.wgsl");
++        load_shader_library!(app, "render/clustered_forward.wgsl");
++        load_shader_library!(app, "render/pbr_lighting.wgsl");
++        load_shader_library!(app, "render/pbr_transmission.wgsl");
++        load_shader_library!(app, "render/shadows.wgsl");
++        load_shader_library!(app, "deferred/pbr_deferred_types.wgsl");
++        load_shader_library!(app, "deferred/pbr_deferred_functions.wgsl");
++        load_shader_library!(app, "render/shadow_sampling.wgsl");
++        load_shader_library!(app, "render/pbr_functions.wgsl");
++        load_shader_library!(app, "render/rgb9e5.wgsl");
++        load_shader_library!(app, "render/pbr_ambient.wgsl");
++        load_shader_library!(app, "render/pbr_fragment.wgsl");
++        load_shader_library!(app, "render/pbr.wgsl");
++        load_shader_library!(app, "render/pbr_prepass_functions.wgsl");
++        load_shader_library!(app, "render/pbr_prepass.wgsl");
++        load_shader_library!(app, "render/parallax_mapping.wgsl");
++        load_shader_library!(app, "render/view_transformations.wgsl");
++
+         // Setup dummy shaders for when MeshletPlugin is not used to prevent shader import errors.
+         load_internal_asset!(
+             app,
+diff --git a/crates/bevy_pbr/src/pbr_material.rs b/crates/bevy_pbr/src/pbr_material.rs
+index fd1babd8ecaf8..cbd8445483a7f 100644
+--- a/crates/bevy_pbr/src/pbr_material.rs
++++ b/crates/bevy_pbr/src/pbr_material.rs
+@@ -1345,7 +1345,7 @@ impl From<&StandardMaterial> for StandardMaterialKey {
+ 
+ impl Material for StandardMaterial {
+     fn fragment_shader() -> ShaderRef {
+-        PBR_SHADER_HANDLE.into()
++        shader_ref(bevy_asset::embedded_path!("render/pbr.wgsl"))
+     }
+ 
+     #[inline]
+@@ -1381,11 +1381,11 @@ impl Material for StandardMaterial {
+     }
+ 
+     fn prepass_fragment_shader() -> ShaderRef {
+-        PBR_PREPASS_SHADER_HANDLE.into()
++        shader_ref(bevy_asset::embedded_path!("render/pbr_prepass.wgsl"))
+     }
+ 
+     fn deferred_fragment_shader() -> ShaderRef {
+-        PBR_SHADER_HANDLE.into()
++        shader_ref(bevy_asset::embedded_path!("render/pbr.wgsl"))
+     }
+ 
+     #[cfg(feature = "meshlet")]
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 9dcec1a61bf85..4fc6252cab6fc 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -1,6 +1,6 @@
+ use crate::material_bind_groups::{MaterialBindGroupIndex, MaterialBindGroupSlot};
+ use allocator::MeshAllocator;
+-use bevy_asset::{load_internal_asset, AssetId};
++use bevy_asset::{load_internal_asset, weak_handle, AssetId};
+ use bevy_core_pipeline::{
+     core_3d::{AlphaMask3d, Opaque3d, Transmissive3d, Transparent3d, CORE_3D_DEPTH_FORMAT},
+     deferred::{AlphaMask3dDeferred, Opaque3dDeferred},
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index b4c9011c7887e..bad447bffeefd 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -72,6 +72,12 @@ pub mod prelude {
+     };
+ }
+ use batching::gpu_preprocessing::BatchingPlugin;
++
++#[doc(hidden)]
++pub mod _macro {
++    pub use bevy_asset;
++}
++
+ use bevy_ecs::schedule::ScheduleBuildSettings;
+ use bevy_utils::prelude::default;
+ pub use extract_param::Extract;
+@@ -102,13 +108,31 @@ use crate::{
+ };
+ use alloc::sync::Arc;
+ use bevy_app::{App, AppLabel, Plugin, SubApp};
+-use bevy_asset::{load_internal_asset, weak_handle, AssetApp, AssetServer, Handle};
++use bevy_asset::{AssetApp, AssetServer};
+ use bevy_ecs::{prelude::*, schedule::ScheduleLabel};
+ use bitflags::bitflags;
+ use core::ops::{Deref, DerefMut};
+ use std::sync::Mutex;
+ use tracing::debug;
+ 
++/// Inline shader as an `embedded_asset` and load it permanently.
++///
++/// This works around a limitation of the shader loader not properly loading
++/// dependencies of shaders.
++#[macro_export]
++macro_rules! load_shader_library {
++    ($asset_server_provider: expr, $path: literal $(, $settings: expr)?) => {
++        $crate::_macro::bevy_asset::embedded_asset!($asset_server_provider, $path);
++        let handle: $crate::_macro::bevy_asset::prelude::Handle<$crate::prelude::Shader> =
++            $crate::_macro::bevy_asset::load_embedded_asset!(
++                $asset_server_provider,
++                $path
++                $(,$settings)?
++            );
++        core::mem::forget(handle);
++    }
++}
++
+ /// Contains the default Bevy rendering backend based on wgpu.
+ ///
+ /// Rendering is done in a [`SubApp`], which exchanges data with the main app
+@@ -289,13 +313,6 @@ struct FutureRenderResources(Arc<Mutex<Option<RenderResources>>>);
+ #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, AppLabel)]
+ pub struct RenderApp;
+ 
+-pub const MATHS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("d94d70d4-746d-49c4-bfc3-27d63f2acda0");
+-pub const COLOR_OPERATIONS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("33a80b2f-aaf7-4c86-b828-e7ae83b72f1a");
+-pub const BINDLESS_SHADER_HANDLE: Handle<Shader> =
+-    weak_handle!("13f1baaa-41bf-448e-929e-258f9307a522");
+-
+ impl Plugin for RenderPlugin {
+     /// Initializes the renderer, sets up the [`RenderSystems`] and creates the rendering sub-app.
+     fn build(&self, app: &mut App) {
+@@ -443,19 +460,9 @@ impl Plugin for RenderPlugin {
+     }
+ 
+     fn finish(&self, app: &mut App) {
+-        load_internal_asset!(app, MATHS_SHADER_HANDLE, "maths.wgsl", Shader::from_wgsl);
+-        load_internal_asset!(
+-            app,
+-            COLOR_OPERATIONS_SHADER_HANDLE,
+-            "color_operations.wgsl",
+-            Shader::from_wgsl
+-        );
+-        load_internal_asset!(
+-            app,
+-            BINDLESS_SHADER_HANDLE,
+-            "bindless.wgsl",
+-            Shader::from_wgsl
+-        );
++        load_shader_library!(app, "maths.wgsl");
++        load_shader_library!(app, "color_operations.wgsl");
++        load_shader_library!(app, "bindless.wgsl");
+         if let Some(future_render_resources) =
+             app.world_mut().remove_resource::<FutureRenderResources>()
+         {
+diff --git a/crates/bevy_render/src/render_resource/pipeline_cache.rs b/crates/bevy_render/src/render_resource/pipeline_cache.rs
+index d9fcd19d247b8..c234b1ed4e0f4 100644
+--- a/crates/bevy_render/src/render_resource/pipeline_cache.rs
++++ b/crates/bevy_render/src/render_resource/pipeline_cache.rs
+@@ -139,7 +139,7 @@ struct ShaderCache {
+     composer: naga_oil::compose::Composer,
+ }
+ 
+-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
++#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug, Hash)]
+ pub enum ShaderDefVal {
+     Bool(String, bool),
+     Int(String, i32),
+diff --git a/crates/bevy_render/src/render_resource/shader.rs b/crates/bevy_render/src/render_resource/shader.rs
+index 005fb07c05bee..ff8430b951f63 100644
+--- a/crates/bevy_render/src/render_resource/shader.rs
++++ b/crates/bevy_render/src/render_resource/shader.rs
+@@ -324,14 +324,21 @@ pub enum ShaderLoaderError {
+     Parse(#[from] alloc::string::FromUtf8Error),
+ }
+ 
++/// Settings for loading shaders.
++#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
++pub struct ShaderSettings {
++    /// The `#define` specified for this shader.
++    pub shader_defs: Vec<ShaderDefVal>,
++}
++
+ impl AssetLoader for ShaderLoader {
+     type Asset = Shader;
+-    type Settings = ();
++    type Settings = ShaderSettings;
+     type Error = ShaderLoaderError;
+     async fn load(
+         &self,
+         reader: &mut dyn Reader,
+-        _settings: &Self::Settings,
++        settings: &Self::Settings,
+         load_context: &mut LoadContext<'_>,
+     ) -> Result<Shader, Self::Error> {
+         let ext = load_context.path().extension().unwrap().to_str().unwrap();
+@@ -341,9 +348,19 @@ impl AssetLoader for ShaderLoader {
+         let path = path.replace(std::path::MAIN_SEPARATOR, "/");
+         let mut bytes = Vec::new();
+         reader.read_to_end(&mut bytes).await?;
++        if ext != "wgsl" && !settings.shader_defs.is_empty() {
++            tracing::warn!(
++                "Tried to load a non-wgsl shader with shader defs, this isn't supported: \
++                    The shader defs will be ignored."
++            );
++        }
+         let mut shader = match ext {
+             "spv" => Shader::from_spirv(bytes, load_context.path().to_string_lossy()),
+-            "wgsl" => Shader::from_wgsl(String::from_utf8(bytes)?, path),
++            "wgsl" => Shader::from_wgsl_with_defs(
++                String::from_utf8(bytes)?,
++                path,
++                settings.shader_defs.clone(),
++            ),
+             "vert" => Shader::from_glsl(String::from_utf8(bytes)?, naga::ShaderStage::Vertex, path),
+             "frag" => {
+                 Shader::from_glsl(String::from_utf8(bytes)?, naga::ShaderStage::Fragment, path)

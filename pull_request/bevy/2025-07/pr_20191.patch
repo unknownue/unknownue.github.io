@@ -1,0 +1,231 @@
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index 8a8fe5ce2ca63..a7673ce7bbea3 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -39,8 +39,8 @@ pub use point_light::{
+ };
+ mod spot_light;
+ pub use spot_light::{
+-    spot_light_clip_from_view, spot_light_world_from_view, update_spot_light_frusta, SpotLight,
+-    SpotLightTexture,
++    orthonormalize, spot_light_clip_from_view, spot_light_world_from_view,
++    update_spot_light_frusta, SpotLight, SpotLightTexture,
+ };
+ mod directional_light;
+ pub use directional_light::{
+diff --git a/crates/bevy_light/src/spot_light.rs b/crates/bevy_light/src/spot_light.rs
+index 6bb8bc0d47c7b..0df3c8995515f 100644
+--- a/crates/bevy_light/src/spot_light.rs
++++ b/crates/bevy_light/src/spot_light.rs
+@@ -6,7 +6,7 @@ use bevy_camera::{
+ use bevy_color::Color;
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
+-use bevy_math::{Mat4, Vec4};
++use bevy_math::{Dir3, Mat3, Mat4, Vec3};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::{GlobalTransform, Transform};
+ 
+@@ -153,31 +153,39 @@ impl Default for SpotLight {
+     }
+ }
+ 
+-// this method of constructing a basis from a vec3 is used by glam::Vec3::any_orthonormal_pair
+-// we will also construct it in the fragment shader and need our implementations to match,
+-// so we reproduce it here to avoid a mismatch if glam changes. we also switch the handedness
+-// could move this onto transform but it's pretty niche
+-pub fn spot_light_world_from_view(transform: &GlobalTransform) -> Mat4 {
+-    // the matrix z_local (opposite of transform.forward())
+-    let fwd_dir = transform.back().extend(0.0);
+-
+-    let sign = 1f32.copysign(fwd_dir.z);
+-    let a = -1.0 / (fwd_dir.z + sign);
+-    let b = fwd_dir.x * fwd_dir.y * a;
+-    let up_dir = Vec4::new(
+-        1.0 + sign * fwd_dir.x * fwd_dir.x * a,
++/// Constructs a right-handed orthonormal basis from a given unit Z vector.
++///
++/// This method of constructing a basis from a [`Vec3`] is used by [`bevy_math::Vec3::any_orthonormal_pair`]
++// we will also construct it in the fragment shader and need our implementations to match exactly,
++// so we reproduce it here to avoid a mismatch if glam changes.
++// See bevy_render/maths.wgsl:orthonormalize
++pub fn orthonormalize(z_basis: Dir3) -> Mat3 {
++    let sign = 1f32.copysign(z_basis.z);
++    let a = -1.0 / (sign + z_basis.z);
++    let b = z_basis.x * z_basis.y * a;
++    let x_basis = Vec3::new(
++        1.0 + sign * z_basis.x * z_basis.x * a,
+         sign * b,
+-        -sign * fwd_dir.x,
+-        0.0,
++        -sign * z_basis.x,
+     );
+-    let right_dir = Vec4::new(-b, -sign - fwd_dir.y * fwd_dir.y * a, fwd_dir.y, 0.0);
+-
+-    Mat4::from_cols(
+-        right_dir,
+-        up_dir,
+-        fwd_dir,
+-        transform.translation().extend(1.0),
+-    )
++    let y_basis = Vec3::new(b, sign + z_basis.y * z_basis.y * a, -z_basis.y);
++    Mat3::from_cols(x_basis, y_basis, z_basis.into())
++}
++/// Constructs a left-handed orthonormal basis with translation, using only the forward direction and translation of a given [`GlobalTransform`].
++///
++/// This is a handedness-inverted version of [`orthonormalize`] which also includes translation.
++/// we mirror this construction in the fragment shader and need our implementations to match exactly.
++// See bevy_pbr/shadows.wgsl:spot_light_world_from_view
++pub fn spot_light_world_from_view(transform: &GlobalTransform) -> Mat4 {
++    // the matrix z_local (opposite of transform.forward())
++    let fwd_dir = transform.back();
++
++    let basis = orthonormalize(fwd_dir);
++    let mut mat = Mat4::from_mat3(basis);
++    // handedness flip
++    mat.x_axis = -mat.x_axis;
++    mat.w_axis = transform.translation().extend(1.0);
++    mat
+ }
+ 
+ pub fn spot_light_clip_from_view(angle: f32, near_z: f32) -> Mat4 {
+diff --git a/crates/bevy_pbr/src/render/shadows.wgsl b/crates/bevy_pbr/src/render/shadows.wgsl
+index ef2f73e968ce5..0672cf79ad61f 100644
+--- a/crates/bevy_pbr/src/render/shadows.wgsl
++++ b/crates/bevy_pbr/src/render/shadows.wgsl
+@@ -11,7 +11,7 @@
+ 
+ #import bevy_render::{
+     color_operations::hsv_to_rgb,
+-    maths::PI_2
++    maths::{orthonormalize, PI_2}
+ }
+ 
+ const flip_z: vec3<f32> = vec3<f32>(1.0, 1.0, -1.0);
+@@ -62,20 +62,19 @@ fn fetch_point_shadow(light_id: u32, frag_position: vec4<f32>, surface_normal: v
+     return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id);
+ }
+ 
++// Constructs a left-handed orthonormal basis from a given unit Z vector.
++//
++// NOTE: requires unit-length (normalized) input to function properly.
++//
+ // this method of constructing a basis from a vec3 is used by glam::Vec3::any_orthonormal_pair
+-// so we reproduce it here to avoid a mismatch if glam changes. we also switch the handedness
+-// the construction of the orthonormal basis up and right vectors needs to precisely mirror the code
++// the construction of the orthonormal basis up and right vectors here needs to precisely mirror the code
+ // in bevy_light/spot_light.rs:spot_light_world_from_view
+-fn spot_light_world_from_view(fwd: vec3<f32>) -> mat3x3<f32> {
+-    var sign = -1.0;
+-    if (fwd.z >= 0.0) {
+-        sign = 1.0;
+-    }
+-    let a = -1.0 / (fwd.z + sign);
+-    let b = fwd.x * fwd.y * a;
+-    let up_dir = vec3<f32>(1.0 + sign * fwd.x * fwd.x * a, sign * b, -sign * fwd.x);
+-    let right_dir = vec3<f32>(-b, -sign - fwd.y * fwd.y * a, fwd.y);
+-    return mat3x3<f32>(right_dir, up_dir, fwd);
++// so we use `bevy_math::orthonormalize` which matches the rust impl, but we also invert the handedness
++fn spot_light_world_from_view(z_basis: vec3<f32>) -> mat3x3<f32> {
++    var basis = orthonormalize(z_basis);
++    // handedness flip
++    basis[0] = -basis[0];
++    return basis;
+ }
+ 
+ fn fetch_spot_shadow(
+diff --git a/crates/bevy_render/src/maths.wgsl b/crates/bevy_render/src/maths.wgsl
+index 0f9a11076f726..31311a69a78a9 100644
+--- a/crates/bevy_render/src/maths.wgsl
++++ b/crates/bevy_render/src/maths.wgsl
+@@ -63,19 +63,25 @@ fn mat4x4_to_mat3x3(m: mat4x4<f32>) -> mat3x3<f32> {
+     return mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz);
+ }
+ 
+-// Creates an orthonormal basis given a normalized Z vector.
++// Copy the sign bit from B onto A.
++// copysign allows proper handling of negative zero to match the rust implementation of orthonormalize
++fn copysign(a: f32, b: f32) -> f32 {
++    return bitcast<f32>((bitcast<u32>(a) & 0x7FFFFFFF) | (bitcast<u32>(b) & 0x80000000));
++}
++
++// Constructs a right-handed orthonormal basis from a given unit Z vector.
+ //
+-// The results are equivalent to the Gram-Schmidt process [1].
++// NOTE: requires unit-length (normalized) input to function properly.
+ //
+-// [1]: https://math.stackexchange.com/a/1849294
+-fn orthonormalize(z_normalized: vec3<f32>) -> mat3x3<f32> {
+-    var up = vec3(0.0, 1.0, 0.0);
+-    if (abs(dot(up, z_normalized)) > 0.99) {
+-        up = vec3(1.0, 0.0, 0.0); // Avoid creating a degenerate basis.
+-    }
+-    let x_basis = normalize(cross(z_normalized, up));
+-    let y_basis = cross(z_normalized, x_basis);
+-    return mat3x3(x_basis, y_basis, z_normalized);
++// https://jcgt.org/published/0006/01/01/paper.pdf
++// this method of constructing a basis from a vec3 is also used by `glam::Vec3::any_orthonormal_pair`
++fn orthonormalize(z_basis: vec3<f32>) -> mat3x3<f32> {
++    let sign = copysign(1.0, z_basis.z);
++    let a = -1.0 / (sign + z_basis.z);
++    let b = z_basis.x * z_basis.y * a;
++    let x_basis = vec3(1.0 + sign * z_basis.x * z_basis.x * a, sign * b, -sign * z_basis.x);
++    let y_basis = vec3(b, sign + z_basis.y * z_basis.y * a, -z_basis.y);
++    return mat3x3(x_basis, y_basis, z_basis);
+ }
+ 
+ // Returns true if any part of a sphere is on the positive side of a plane.
+diff --git a/crates/bevy_solari/src/scene/sampling.wgsl b/crates/bevy_solari/src/scene/sampling.wgsl
+index e1f67ac1ed102..60f41c7a40a4f 100644
+--- a/crates/bevy_solari/src/scene/sampling.wgsl
++++ b/crates/bevy_solari/src/scene/sampling.wgsl
+@@ -1,7 +1,7 @@
+ #define_import_path bevy_solari::sampling
+ 
+ #import bevy_pbr::utils::{rand_f, rand_vec2f, rand_range_u}
+-#import bevy_render::maths::{PI, PI_2}
++#import bevy_render::maths::{PI, PI_2, orthonormalize}
+ #import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full}
+ 
+ // https://www.realtimerendering.com/raytracinggems/unofficial_RayTracingGems_v1.9.pdf#0004286901.INDD%3ASec28%3A303
+@@ -23,7 +23,7 @@ fn sample_uniform_hemisphere(normal: vec3<f32>, rng: ptr<function, u32>) -> vec3
+     let x = sin_theta * cos(phi);
+     let y = sin_theta * sin(phi);
+     let z = cos_theta;
+-    return build_orthonormal_basis(normal) * vec3(x, y, z);
++    return orthonormalize(normal) * vec3(x, y, z);
+ }
+ 
+ // https://www.realtimerendering.com/raytracinggems/unofficial_RayTracingGems_v1.9.pdf#0004286901.INDD%3ASec19%3A294
+@@ -118,7 +118,7 @@ fn calculate_directional_light_contribution(light_sample: LightSample, direction
+     var ray_direction = vec3(x, y, cos_theta);
+ 
+     // Rotate the ray so that the cone it was sampled from is aligned with the light direction
+-    ray_direction = build_orthonormal_basis(directional_light.direction_to_light) * ray_direction;
++    ray_direction = orthonormalize(directional_light.direction_to_light) * ray_direction;
+ #else
+     let ray_direction = directional_light.direction_to_light;
+ #endif
+@@ -172,7 +172,7 @@ fn trace_directional_light_visibility(light_sample: LightSample, directional_lig
+     var ray_direction = vec3(x, y, cos_theta);
+ 
+     // Rotate the ray so that the cone it was sampled from is aligned with the light direction
+-    ray_direction = build_orthonormal_basis(directional_light.direction_to_light) * ray_direction;
++    ray_direction = orthonormalize(directional_light.direction_to_light) * ray_direction;
+ #else
+     let ray_direction = directional_light.direction_to_light;
+ #endif
+@@ -208,13 +208,3 @@ fn triangle_barycentrics(random: vec2<f32>) -> vec3<f32> {
+     if barycentrics.x + barycentrics.y > 1.0 { barycentrics = 1.0 - barycentrics; }
+     return vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
+ }
+-
+-// https://jcgt.org/published/0006/01/01/paper.pdf
+-fn build_orthonormal_basis(normal: vec3<f32>) -> mat3x3<f32> {
+-    let sign = select(-1.0, 1.0, normal.z >= 0.0);
+-    let a = -1.0 / (sign + normal.z);
+-    let b = normal.x * normal.y * a;
+-    let tangent = vec3(1.0 + sign * normal.x * normal.x * a, sign * b, -sign * normal.x);
+-    let bitangent = vec3(b, sign + normal.y * normal.y * a, -normal.y);
+-    return mat3x3(tangent, bitangent, normal);
+-}
