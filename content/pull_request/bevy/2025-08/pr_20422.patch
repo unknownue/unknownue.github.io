@@ -1,0 +1,683 @@
+diff --git a/crates/bevy_feathers/src/controls/color_slider.rs b/crates/bevy_feathers/src/controls/color_slider.rs
+new file mode 100644
+index 0000000000000..a086bbc7f1d10
+--- /dev/null
++++ b/crates/bevy_feathers/src/controls/color_slider.rs
+@@ -0,0 +1,378 @@
++use core::f32::consts::PI;
++
++use bevy_app::{Plugin, PreUpdate};
++use bevy_asset::Handle;
++use bevy_color::{Alpha, Color, Hsla};
++use bevy_core_widgets::{
++    Callback, CoreSlider, CoreSliderThumb, SliderRange, SliderValue, TrackClick, ValueChange,
++};
++use bevy_ecs::{
++    bundle::Bundle,
++    children,
++    component::Component,
++    entity::Entity,
++    hierarchy::Children,
++    query::{Changed, Or, With},
++    schedule::IntoScheduleConfigs,
++    spawn::SpawnRelated,
++    system::{In, Query},
++};
++use bevy_input_focus::tab_navigation::TabIndex;
++use bevy_log::warn_once;
++use bevy_picking::PickingSystems;
++use bevy_ui::{
++    AlignItems, BackgroundColor, BackgroundGradient, BorderColor, BorderRadius, ColorStop, Display,
++    FlexDirection, Gradient, InterpolationColorSpace, LinearGradient, Node, Outline, PositionType,
++    UiRect, UiTransform, Val, Val2, ZIndex,
++};
++use bevy_ui_render::ui_material::MaterialNode;
++
++use crate::{
++    alpha_pattern::{AlphaPattern, AlphaPatternMaterial},
++    cursor::EntityCursor,
++    palette,
++    rounded_corners::RoundedCorners,
++};
++
++const SLIDER_HEIGHT: f32 = 16.0;
++const TRACK_PADDING: f32 = 3.0;
++const TRACK_RADIUS: f32 = SLIDER_HEIGHT * 0.5 - TRACK_PADDING;
++const THUMB_SIZE: f32 = SLIDER_HEIGHT - 2.0;
++
++/// Indicates which color channel we want to edit.
++#[derive(Component, Default, Clone)]
++pub enum ColorChannel {
++    /// Editing the RGB red channel (0..=1)
++    #[default]
++    Red,
++    /// Editing the RGB green channel (0..=1)
++    Green,
++    /// Editing the RGB blue channel (0..=1)
++    Blue,
++    /// Editing the hue channel (0..=360)
++    HslHue,
++    /// Editing the chroma / saturation channel (0..=1)
++    HslSaturation,
++    /// Editing the luminance channel (0..=1)
++    HslLightness,
++    /// Editing the alpha channel (0..=1)
++    Alpha,
++}
++
++impl ColorChannel {
++    /// Return the range of this color channel.
++    pub fn range(&self) -> SliderRange {
++        match self {
++            ColorChannel::Red
++            | ColorChannel::Green
++            | ColorChannel::Blue
++            | ColorChannel::Alpha
++            | ColorChannel::HslSaturation
++            | ColorChannel::HslLightness => SliderRange::new(0., 1.),
++            ColorChannel::HslHue => SliderRange::new(0., 360.),
++        }
++    }
++
++    /// Return the color endpoints and midpoint of the gradient. This is determined by both the
++    /// channel being edited and the base color.
++    pub fn gradient_ends(&self, base_color: Color) -> (Color, Color, Color) {
++        match self {
++            ColorChannel::Red => {
++                let base_rgb = base_color.to_srgba();
++                (
++                    Color::srgb(0.0, base_rgb.green, base_rgb.blue),
++                    Color::srgb(0.5, base_rgb.green, base_rgb.blue),
++                    Color::srgb(1.0, base_rgb.green, base_rgb.blue),
++                )
++            }
++
++            ColorChannel::Green => {
++                let base_rgb = base_color.to_srgba();
++                (
++                    Color::srgb(base_rgb.red, 0.0, base_rgb.blue),
++                    Color::srgb(base_rgb.red, 0.5, base_rgb.blue),
++                    Color::srgb(base_rgb.red, 1.0, base_rgb.blue),
++                )
++            }
++
++            ColorChannel::Blue => {
++                let base_rgb = base_color.to_srgba();
++                (
++                    Color::srgb(base_rgb.red, base_rgb.green, 0.0),
++                    Color::srgb(base_rgb.red, base_rgb.green, 0.5),
++                    Color::srgb(base_rgb.red, base_rgb.green, 1.0),
++                )
++            }
++
++            ColorChannel::HslHue => (
++                Color::hsl(0.0 + 0.0001, 1.0, 0.5),
++                Color::hsl(180.0, 1.0, 0.5),
++                Color::hsl(360.0 - 0.0001, 1.0, 0.5),
++            ),
++
++            ColorChannel::HslSaturation => {
++                let base_hsla: Hsla = base_color.into();
++                (
++                    Color::hsl(base_hsla.hue, 0.0, base_hsla.lightness),
++                    Color::hsl(base_hsla.hue, 0.5, base_hsla.lightness),
++                    Color::hsl(base_hsla.hue, 1.0, base_hsla.lightness),
++                )
++            }
++
++            ColorChannel::HslLightness => {
++                let base_hsla: Hsla = base_color.into();
++                (
++                    Color::hsl(base_hsla.hue, base_hsla.saturation, 0.0),
++                    Color::hsl(base_hsla.hue, base_hsla.saturation, 0.5),
++                    Color::hsl(base_hsla.hue, base_hsla.saturation, 1.0),
++                )
++            }
++
++            ColorChannel::Alpha => (
++                base_color.with_alpha(0.),
++                base_color.with_alpha(0.5),
++                base_color.with_alpha(1.),
++            ),
++        }
++    }
++}
++
++/// Used to store the color channels that we are not editing: the components of the color
++/// that are constant for this slider.
++#[derive(Component, Default, Clone)]
++pub struct SliderBaseColor(pub Color);
++
++/// Color slider template properties, passed to [`color_slider`] function.
++pub struct ColorSliderProps {
++    /// Slider current value
++    pub value: f32,
++    /// On-change handler
++    pub on_change: Callback<In<ValueChange<f32>>>,
++    /// Which color component we're editing
++    pub channel: ColorChannel,
++}
++
++impl Default for ColorSliderProps {
++    fn default() -> Self {
++        Self {
++            value: 0.0,
++            on_change: Callback::Ignore,
++            channel: ColorChannel::Alpha,
++        }
++    }
++}
++
++/// A color slider widget.
++#[derive(Component, Default, Clone)]
++#[require(CoreSlider, SliderBaseColor(Color::WHITE))]
++pub struct ColorSlider {
++    /// Which channel is being edited by this slider.
++    pub channel: ColorChannel,
++}
++
++/// Marker for the track
++#[derive(Component, Default, Clone)]
++struct ColorSliderTrack;
++
++/// Marker for the thumb
++#[derive(Component, Default, Clone)]
++struct ColorSliderThumb;
++
++/// Spawn a new slider widget.
++///
++/// # Arguments
++///
++/// * `props` - construction properties for the slider.
++/// * `overrides` - a bundle of components that are merged in with the normal slider components.
++pub fn color_slider<B: Bundle>(props: ColorSliderProps, overrides: B) -> impl Bundle {
++    (
++        Node {
++            display: Display::Flex,
++            flex_direction: FlexDirection::Row,
++            height: Val::Px(SLIDER_HEIGHT),
++            align_items: AlignItems::Stretch,
++            flex_grow: 1.0,
++            ..Default::default()
++        },
++        CoreSlider {
++            on_change: props.on_change,
++            track_click: TrackClick::Snap,
++        },
++        ColorSlider {
++            channel: props.channel.clone(),
++        },
++        SliderValue(props.value),
++        props.channel.range(),
++        EntityCursor::System(bevy_window::SystemCursorIcon::Pointer),
++        TabIndex(0),
++        overrides,
++        children![
++            // track
++            (
++                Node {
++                    position_type: PositionType::Absolute,
++                    left: Val::Px(0.),
++                    right: Val::Px(0.),
++                    top: Val::Px(TRACK_PADDING),
++                    bottom: Val::Px(TRACK_PADDING),
++                    ..Default::default()
++                },
++                RoundedCorners::All.to_border_radius(TRACK_RADIUS),
++                ColorSliderTrack,
++                AlphaPattern,
++                MaterialNode::<AlphaPatternMaterial>(Handle::default()),
++                children![
++                    // Left endcap
++                    (
++                        Node {
++                            width: Val::Px(THUMB_SIZE * 0.5),
++                            ..Default::default()
++                        },
++                        RoundedCorners::Left.to_border_radius(TRACK_RADIUS),
++                        BackgroundColor(palette::X_AXIS),
++                    ),
++                    // Track with gradient
++                    (
++                        Node {
++                            flex_grow: 1.0,
++                            ..Default::default()
++                        },
++                        BackgroundGradient(vec![Gradient::Linear(LinearGradient {
++                            angle: PI * 0.5,
++                            stops: vec![
++                                ColorStop::new(Color::NONE, Val::Percent(0.)),
++                                ColorStop::new(Color::NONE, Val::Percent(50.)),
++                                ColorStop::new(Color::NONE, Val::Percent(100.)),
++                            ],
++                            color_space: InterpolationColorSpace::Srgba,
++                        })]),
++                        ZIndex(1),
++                        children![(
++                            Node {
++                                position_type: PositionType::Absolute,
++                                left: Val::Percent(0.),
++                                top: Val::Percent(50.),
++                                width: Val::Px(THUMB_SIZE),
++                                height: Val::Px(THUMB_SIZE),
++                                border: UiRect::all(Val::Px(2.0)),
++                                ..Default::default()
++                            },
++                            CoreSliderThumb,
++                            ColorSliderThumb,
++                            BorderRadius::MAX,
++                            BorderColor::all(palette::WHITE),
++                            Outline {
++                                width: Val::Px(1.),
++                                offset: Val::Px(0.),
++                                color: palette::BLACK
++                            },
++                            UiTransform::from_translation(Val2::new(
++                                Val::Percent(-50.0),
++                                Val::Percent(-50.0),
++                            ))
++                        )]
++                    ),
++                    // Right endcap
++                    (
++                        Node {
++                            width: Val::Px(THUMB_SIZE * 0.5),
++                            ..Default::default()
++                        },
++                        RoundedCorners::Right.to_border_radius(TRACK_RADIUS),
++                        BackgroundColor(palette::Z_AXIS),
++                    ),
++                ]
++            ),
++        ],
++    )
++}
++
++fn update_slider_pos(
++    mut q_sliders: Query<
++        (Entity, &SliderValue, &SliderRange),
++        (
++            With<ColorSlider>,
++            Or<(Changed<SliderValue>, Changed<SliderRange>)>,
++        ),
++    >,
++    q_children: Query<&Children>,
++    mut q_slider_thumb: Query<&mut Node, With<ColorSliderThumb>>,
++) {
++    for (slider_ent, value, range) in q_sliders.iter_mut() {
++        for child in q_children.iter_descendants(slider_ent) {
++            if let Ok(mut thumb_node) = q_slider_thumb.get_mut(child) {
++                thumb_node.left = Val::Percent(range.thumb_position(value.0) * 100.0);
++            }
++        }
++    }
++}
++
++fn update_track_color(
++    mut q_sliders: Query<(Entity, &ColorSlider, &SliderBaseColor), Changed<SliderBaseColor>>,
++    q_children: Query<&Children>,
++    q_track: Query<(), With<ColorSliderTrack>>,
++    mut q_background: Query<&mut BackgroundColor>,
++    mut q_gradient: Query<&mut BackgroundGradient>,
++) {
++    for (slider_ent, slider, SliderBaseColor(base_color)) in q_sliders.iter_mut() {
++        let (start, middle, end) = slider.channel.gradient_ends(*base_color);
++        if let Some(track_ent) = q_children
++            .iter_descendants(slider_ent)
++            .find(|ent| q_track.contains(*ent))
++        {
++            let Ok(track_children) = q_children.get(track_ent) else {
++                continue;
++            };
++
++            if let Ok(mut cap_bg) = q_background.get_mut(track_children[0]) {
++                cap_bg.0 = start;
++            }
++
++            if let Ok(mut gradient) = q_gradient.get_mut(track_children[1]) {
++                if let [Gradient::Linear(linear_gradient)] = &mut gradient.0[..] {
++                    linear_gradient.stops[0].color = start;
++                    linear_gradient.stops[1].color = middle;
++                    linear_gradient.stops[2].color = end;
++                    linear_gradient.color_space = match slider.channel {
++                        ColorChannel::Red | ColorChannel::Green | ColorChannel::Blue => {
++                            InterpolationColorSpace::Srgba
++                        }
++                        ColorChannel::HslHue
++                        | ColorChannel::HslLightness
++                        | ColorChannel::HslSaturation => InterpolationColorSpace::Hsla,
++                        ColorChannel::Alpha => match base_color {
++                            Color::Srgba(_) => InterpolationColorSpace::Srgba,
++                            Color::LinearRgba(_) => InterpolationColorSpace::LinearRgba,
++                            Color::Oklaba(_) => InterpolationColorSpace::Oklaba,
++                            Color::Oklcha(_) => InterpolationColorSpace::OklchaLong,
++                            Color::Hsla(_) | Color::Hsva(_) => InterpolationColorSpace::Hsla,
++                            _ => {
++                                warn_once!(
++                                    "Unsupported color space for ColorSlider: {:?}",
++                                    base_color
++                                );
++                                InterpolationColorSpace::Srgba
++                            }
++                        },
++                    };
++                }
++            }
++
++            if let Ok(mut cap_bg) = q_background.get_mut(track_children[2]) {
++                cap_bg.0 = end;
++            }
++        }
++    }
++}
++
++/// Plugin which registers the systems for updating the slider styles.
++pub struct ColorSliderPlugin;
++
++impl Plugin for ColorSliderPlugin {
++    fn build(&self, app: &mut bevy_app::App) {
++        app.add_systems(
++            PreUpdate,
++            (update_slider_pos, update_track_color).in_set(PickingSystems::Last),
++        );
++    }
++}
+diff --git a/crates/bevy_feathers/src/controls/mod.rs b/crates/bevy_feathers/src/controls/mod.rs
+index c398b25e10bb0..f5b9ef4c43dd5 100644
+--- a/crates/bevy_feathers/src/controls/mod.rs
++++ b/crates/bevy_feathers/src/controls/mod.rs
+@@ -3,6 +3,7 @@ use bevy_app::Plugin;
+ 
+ mod button;
+ mod checkbox;
++mod color_slider;
+ mod color_swatch;
+ mod radio;
+ mod slider;
+@@ -11,6 +12,9 @@ mod virtual_keyboard;
+ 
+ pub use button::{button, ButtonPlugin, ButtonProps, ButtonVariant};
+ pub use checkbox::{checkbox, CheckboxPlugin, CheckboxProps};
++pub use color_slider::{
++    color_slider, ColorChannel, ColorSlider, ColorSliderPlugin, ColorSliderProps, SliderBaseColor,
++};
+ pub use color_swatch::{color_swatch, ColorSwatch, ColorSwatchFg};
+ pub use radio::{radio, RadioPlugin};
+ pub use slider::{slider, SliderPlugin, SliderProps};
+@@ -28,6 +32,7 @@ impl Plugin for ControlsPlugin {
+             AlphaPatternPlugin,
+             ButtonPlugin,
+             CheckboxPlugin,
++            ColorSliderPlugin,
+             RadioPlugin,
+             SliderPlugin,
+             ToggleSwitchPlugin,
+diff --git a/examples/ui/feathers.rs b/examples/ui/feathers.rs
+index 94af8279e8853..1fa6806cae56c 100644
+--- a/examples/ui/feathers.rs
++++ b/examples/ui/feathers.rs
+@@ -1,14 +1,16 @@
+ //! This example shows off the various Bevy Feathers widgets.
+ 
+ use bevy::{
++    color::palettes,
+     core_widgets::{
+         Activate, Callback, CoreRadio, CoreRadioGroup, CoreWidgetsPlugins, SliderPrecision,
+-        SliderStep,
++        SliderStep, SliderValue, ValueChange,
+     },
+     feathers::{
+         controls::{
+-            button, checkbox, color_swatch, radio, slider, toggle_switch, ButtonProps,
+-            ButtonVariant, CheckboxProps, SliderProps, ToggleSwitchProps,
++            button, checkbox, color_slider, color_swatch, radio, slider, toggle_switch,
++            ButtonProps, ButtonVariant, CheckboxProps, ColorChannel, ColorSlider, ColorSliderProps,
++            ColorSwatch, SliderBaseColor, SliderProps, ToggleSwitchProps,
+         },
+         dark_theme::create_dark_theme,
+         rounded_corners::RoundedCorners,
+@@ -24,6 +26,19 @@ use bevy::{
+     winit::WinitSettings,
+ };
+ 
++/// A struct to hold the state of various widgets shown in the demo.
++#[derive(Resource)]
++struct DemoWidgetStates {
++    rgb_color: Srgba,
++    hsl_color: Hsla,
++}
++
++#[derive(Component, Clone, Copy, PartialEq)]
++enum SwatchType {
++    Rgb,
++    Hsl,
++}
++
+ fn main() {
+     App::new()
+         .add_plugins((
+@@ -34,9 +49,14 @@ fn main() {
+             FeathersPlugin,
+         ))
+         .insert_resource(UiTheme(create_dark_theme()))
++        .insert_resource(DemoWidgetStates {
++            rgb_color: palettes::tailwind::EMERALD_800.with_alpha(0.7),
++            hsl_color: palettes::tailwind::AMBER_800.into(),
++        })
+         // Only run the app when there is user input. This will significantly reduce CPU/GPU use.
+         .insert_resource(WinitSettings::desktop_app())
+         .add_systems(Startup, setup)
++        .add_systems(Update, update_colors)
+         .run();
+ }
+ 
+@@ -61,6 +81,48 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+         },
+     );
+ 
++    let change_red = commands.register_system(
++        |change: In<ValueChange<f32>>, mut color: ResMut<DemoWidgetStates>| {
++            color.rgb_color.red = change.value;
++        },
++    );
++
++    let change_green = commands.register_system(
++        |change: In<ValueChange<f32>>, mut color: ResMut<DemoWidgetStates>| {
++            color.rgb_color.green = change.value;
++        },
++    );
++
++    let change_blue = commands.register_system(
++        |change: In<ValueChange<f32>>, mut color: ResMut<DemoWidgetStates>| {
++            color.rgb_color.blue = change.value;
++        },
++    );
++
++    let change_alpha = commands.register_system(
++        |change: In<ValueChange<f32>>, mut color: ResMut<DemoWidgetStates>| {
++            color.rgb_color.alpha = change.value;
++        },
++    );
++
++    let change_hue = commands.register_system(
++        |change: In<ValueChange<f32>>, mut color: ResMut<DemoWidgetStates>| {
++            color.hsl_color.hue = change.value;
++        },
++    );
++
++    let change_saturation = commands.register_system(
++        |change: In<ValueChange<f32>>, mut color: ResMut<DemoWidgetStates>| {
++            color.hsl_color.saturation = change.value;
++        },
++    );
++
++    let change_lightness = commands.register_system(
++        |change: In<ValueChange<f32>>, mut color: ResMut<DemoWidgetStates>| {
++            color.hsl_color.lightness = change.value;
++        },
++    );
++
+     (
+         Node {
+             width: Val::Percent(100.0),
+@@ -276,8 +338,146 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                     },
+                     (SliderStep(10.), SliderPrecision(2)),
+                 ),
+-                color_swatch(()),
++                (
++                    Node {
++                        display: Display::Flex,
++                        flex_direction: FlexDirection::Row,
++                        justify_content: JustifyContent::SpaceBetween,
++                        ..default()
++                    },
++                    children![Text("Srgba".to_owned()), color_swatch(SwatchType::Rgb),]
++                ),
++                color_slider(
++                    ColorSliderProps {
++                        value: 0.5,
++                        on_change: Callback::System(change_red),
++                        channel: ColorChannel::Red
++                    },
++                    ()
++                ),
++                color_slider(
++                    ColorSliderProps {
++                        value: 0.5,
++                        on_change: Callback::System(change_green),
++                        channel: ColorChannel::Green
++                    },
++                    ()
++                ),
++                color_slider(
++                    ColorSliderProps {
++                        value: 0.5,
++                        on_change: Callback::System(change_blue),
++                        channel: ColorChannel::Blue
++                    },
++                    ()
++                ),
++                color_slider(
++                    ColorSliderProps {
++                        value: 0.5,
++                        on_change: Callback::System(change_alpha),
++                        channel: ColorChannel::Alpha
++                    },
++                    ()
++                ),
++                (
++                    Node {
++                        display: Display::Flex,
++                        flex_direction: FlexDirection::Row,
++                        justify_content: JustifyContent::SpaceBetween,
++                        ..default()
++                    },
++                    children![Text("Hsl".to_owned()), color_swatch(SwatchType::Hsl),]
++                ),
++                color_slider(
++                    ColorSliderProps {
++                        value: 0.5,
++                        on_change: Callback::System(change_hue),
++                        channel: ColorChannel::HslHue
++                    },
++                    ()
++                ),
++                color_slider(
++                    ColorSliderProps {
++                        value: 0.5,
++                        on_change: Callback::System(change_saturation),
++                        channel: ColorChannel::HslSaturation
++                    },
++                    ()
++                ),
++                color_slider(
++                    ColorSliderProps {
++                        value: 0.5,
++                        on_change: Callback::System(change_lightness),
++                        channel: ColorChannel::HslLightness
++                    },
++                    ()
++                )
+             ]
+         ),],
+     )
+ }
++
++fn update_colors(
++    colors: Res<DemoWidgetStates>,
++    mut sliders: Query<(Entity, &ColorSlider, &mut SliderBaseColor)>,
++    swatches: Query<(&SwatchType, &Children), With<ColorSwatch>>,
++    mut commands: Commands,
++) {
++    if colors.is_changed() {
++        for (slider_ent, slider, mut base) in sliders.iter_mut() {
++            match slider.channel {
++                ColorChannel::Red => {
++                    base.0 = colors.rgb_color.into();
++                    commands
++                        .entity(slider_ent)
++                        .insert(SliderValue(colors.rgb_color.red));
++                }
++                ColorChannel::Green => {
++                    base.0 = colors.rgb_color.into();
++                    commands
++                        .entity(slider_ent)
++                        .insert(SliderValue(colors.rgb_color.green));
++                }
++                ColorChannel::Blue => {
++                    base.0 = colors.rgb_color.into();
++                    commands
++                        .entity(slider_ent)
++                        .insert(SliderValue(colors.rgb_color.blue));
++                }
++                ColorChannel::HslHue => {
++                    base.0 = colors.hsl_color.into();
++                    commands
++                        .entity(slider_ent)
++                        .insert(SliderValue(colors.hsl_color.hue));
++                }
++                ColorChannel::HslSaturation => {
++                    base.0 = colors.hsl_color.into();
++                    commands
++                        .entity(slider_ent)
++                        .insert(SliderValue(colors.hsl_color.saturation));
++                }
++                ColorChannel::HslLightness => {
++                    base.0 = colors.hsl_color.into();
++                    commands
++                        .entity(slider_ent)
++                        .insert(SliderValue(colors.hsl_color.lightness));
++                }
++                ColorChannel::Alpha => {
++                    base.0 = colors.rgb_color.into();
++                    commands
++                        .entity(slider_ent)
++                        .insert(SliderValue(colors.rgb_color.alpha));
++                }
++            }
++        }
++
++        for (swatch_type, children) in swatches.iter() {
++            commands
++                .entity(children[0])
++                .insert(BackgroundColor(match swatch_type {
++                    SwatchType::Rgb => colors.rgb_color.into(),
++                    SwatchType::Hsl => colors.hsl_color.into(),
++                }));
++        }
++    }
++}
+diff --git a/release-content/release-notes/feathers.md b/release-content/release-notes/feathers.md
+index bf21ba16bc725..734f6a2966724 100644
+--- a/release-content/release-notes/feathers.md
++++ b/release-content/release-notes/feathers.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Bevy Feathers
+ authors: ["@viridia", "@Atlas16A", "@ickshonpe"]
+-pull_requests: [19730, 19900, 19928, 20237, 20169, 20350]
++pull_requests: [19730, 19900, 19928, 20237, 20169, 20422, 20350]
+ ---
+ 
+ To make it easier for Bevy engine developers and third-party tool creators to make comfortable, visually cohesive tooling,
