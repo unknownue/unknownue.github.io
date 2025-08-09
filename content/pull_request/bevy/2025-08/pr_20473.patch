@@ -1,0 +1,1125 @@
+diff --git a/crates/bevy_gizmos/Cargo.toml b/crates/bevy_gizmos/Cargo.toml
+index c4833dbe7e052..e29dea96869b2 100644
+--- a/crates/bevy_gizmos/Cargo.toml
++++ b/crates/bevy_gizmos/Cargo.toml
+@@ -21,6 +21,7 @@ bevy_app = { path = "../bevy_app", version = "0.17.0-dev" }
+ bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
++bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev", optional = true }
+diff --git a/crates/bevy_gizmos/src/lib.rs b/crates/bevy_gizmos/src/lib.rs
+index ca3aba088b9a4..ecc8ee0e48c03 100755
+--- a/crates/bevy_gizmos/src/lib.rs
++++ b/crates/bevy_gizmos/src/lib.rs
+@@ -95,7 +95,7 @@ use bevy_reflect::TypePath;
+     feature = "bevy_render",
+     any(feature = "bevy_pbr", feature = "bevy_sprite")
+ ))]
+-use crate::config::GizmoMeshConfig;
++use {crate::config::GizmoMeshConfig, bevy_mesh::VertexBufferLayout};
+ 
+ use crate::{config::ErasedGizmoConfigGroup, gizmos::GizmoBuffer};
+ 
+@@ -133,7 +133,7 @@ use {
+     feature = "bevy_render",
+     any(feature = "bevy_pbr", feature = "bevy_sprite"),
+ ))]
+-use bevy_render::render_resource::{VertexAttribute, VertexBufferLayout, VertexStepMode};
++use bevy_render::render_resource::{VertexAttribute, VertexStepMode};
+ use bevy_time::Fixed;
+ use bevy_utils::TypeIdMap;
+ #[cfg(feature = "bevy_render")]
+diff --git a/crates/bevy_internal/src/prelude.rs b/crates/bevy_internal/src/prelude.rs
+index c8ba27ea82c1e..25f6caad2e877 100644
+--- a/crates/bevy_internal/src/prelude.rs
++++ b/crates/bevy_internal/src/prelude.rs
+@@ -17,6 +17,10 @@ pub use crate::window::prelude::*;
+ #[cfg(feature = "bevy_image")]
+ pub use crate::image::prelude::*;
+ 
++#[doc(hidden)]
++#[cfg(feature = "bevy_image")]
++pub use crate::mesh::prelude::*;
++
+ pub use bevy_derive::{bevy_main, Deref, DerefMut};
+ 
+ #[doc(hidden)]
+diff --git a/crates/bevy_mesh/src/lib.rs b/crates/bevy_mesh/src/lib.rs
+index 635e36ead4a19..fb8275f90c04e 100644
+--- a/crates/bevy_mesh/src/lib.rs
++++ b/crates/bevy_mesh/src/lib.rs
+@@ -21,6 +21,16 @@ pub use primitives::*;
+ pub use vertex::*;
+ pub use wgpu_types::VertexFormat;
+ 
++/// The mesh prelude.
++///
++/// This includes the most common types in this crate, re-exported for your convenience.
++pub mod prelude {
++    #[doc(hidden)]
++    pub use crate::{
++        morph::MorphWeights, primitives::MeshBuilder, primitives::Meshable, Mesh, Mesh2d, Mesh3d,
++    };
++}
++
+ bitflags! {
+     /// Our base mesh pipeline key bits start from the highest bit and go
+     /// downward. The PBR mesh pipeline key bits start from the lowest bit and
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index a3beade1d5cbf..22ff2e487a929 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -43,6 +43,7 @@ bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.17.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
+ bevy_light = { path = "../bevy_light", version = "0.17.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
++bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", features = [
+diff --git a/crates/bevy_pbr/src/decal/forward.rs b/crates/bevy_pbr/src/decal/forward.rs
+index f5b24169d069e..28ac04510f74e 100644
+--- a/crates/bevy_pbr/src/decal/forward.rs
++++ b/crates/bevy_pbr/src/decal/forward.rs
+@@ -8,18 +8,17 @@ use bevy_ecs::{
+     component::Component, lifecycle::HookContext, resource::Resource, world::DeferredWorld,
+ };
+ use bevy_math::{prelude::Rectangle, Quat, Vec2, Vec3};
++use bevy_mesh::{Mesh, Mesh3d, MeshBuilder, MeshVertexBufferLayoutRef, Meshable};
+ use bevy_reflect::{Reflect, TypePath};
+-use bevy_render::load_shader_library;
+-use bevy_render::mesh::Mesh3d;
+-use bevy_render::render_asset::RenderAssets;
+-use bevy_render::render_resource::{AsBindGroupShaderType, ShaderType};
+-use bevy_render::texture::GpuImage;
+ use bevy_render::{
+     alpha::AlphaMode,
+-    mesh::{Mesh, MeshBuilder, MeshVertexBufferLayoutRef, Meshable},
++    load_shader_library,
++    render_asset::RenderAssets,
+     render_resource::{
+-        AsBindGroup, CompareFunction, RenderPipelineDescriptor, SpecializedMeshPipelineError,
++        AsBindGroup, AsBindGroupShaderType, CompareFunction, RenderPipelineDescriptor, ShaderType,
++        SpecializedMeshPipelineError,
+     },
++    texture::GpuImage,
+     RenderDebugFlags,
+ };
+ 
+diff --git a/crates/bevy_pbr/src/extended_material.rs b/crates/bevy_pbr/src/extended_material.rs
+index 165debee6f328..55681f860a8fa 100644
+--- a/crates/bevy_pbr/src/extended_material.rs
++++ b/crates/bevy_pbr/src/extended_material.rs
+@@ -2,11 +2,11 @@ use alloc::borrow::Cow;
+ 
+ use bevy_asset::Asset;
+ use bevy_ecs::system::SystemParamItem;
++use bevy_mesh::MeshVertexBufferLayoutRef;
+ use bevy_platform::{collections::HashSet, hash::FixedHasher};
+ use bevy_reflect::{impl_type_path, Reflect};
+ use bevy_render::{
+     alpha::AlphaMode,
+-    mesh::MeshVertexBufferLayoutRef,
+     render_resource::{
+         AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindlessDescriptor,
+         BindlessResourceType, BindlessSlabResourceLimit, RenderPipelineDescriptor, ShaderRef,
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index a0871141638a7..cd9179884c934 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -25,6 +25,9 @@ use bevy_ecs::{
+         SystemParamItem,
+     },
+ };
++use bevy_mesh::{
++    mark_3d_meshes_as_changed_if_their_assets_changed, Mesh3d, MeshVertexBufferLayoutRef,
++};
+ use bevy_platform::collections::hash_map::Entry;
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_platform::hash::FixedHasher;
+@@ -34,14 +37,13 @@ use bevy_render::camera::extract_cameras;
+ use bevy_render::erased_render_asset::{
+     ErasedRenderAsset, ErasedRenderAssetPlugin, ErasedRenderAssets, PrepareAssetError,
+ };
+-use bevy_render::mesh::mark_3d_meshes_as_changed_if_their_assets_changed;
+ use bevy_render::render_asset::{prepare_assets, RenderAssets};
+ use bevy_render::renderer::RenderQueue;
+ use bevy_render::RenderStartup;
+ use bevy_render::{
+     batching::gpu_preprocessing::GpuPreprocessingSupport,
+     extract_resource::ExtractResource,
+-    mesh::{Mesh3d, MeshVertexBufferLayoutRef, RenderMesh},
++    mesh::RenderMesh,
+     prelude::*,
+     render_phase::*,
+     render_resource::*,
+diff --git a/crates/bevy_pbr/src/meshlet/material_pipeline_prepare.rs b/crates/bevy_pbr/src/meshlet/material_pipeline_prepare.rs
+index 1ec316dcd8376..4f8b9e08603ec 100644
+--- a/crates/bevy_pbr/src/meshlet/material_pipeline_prepare.rs
++++ b/crates/bevy_pbr/src/meshlet/material_pipeline_prepare.rs
+@@ -10,6 +10,7 @@ use bevy_core_pipeline::{
+ };
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_light::EnvironmentMapLight;
++use bevy_mesh::VertexBufferLayout;
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_render::erased_render_asset::ErasedRenderAssets;
+ use bevy_render::{
+diff --git a/crates/bevy_pbr/src/pbr_material.rs b/crates/bevy_pbr/src/pbr_material.rs
+index c641d28b09b27..d8dd90a6e18fb 100644
+--- a/crates/bevy_pbr/src/pbr_material.rs
++++ b/crates/bevy_pbr/src/pbr_material.rs
+@@ -1,11 +1,9 @@
+ use bevy_asset::Asset;
+ use bevy_color::{Alpha, ColorToComponents};
+ use bevy_math::{Affine2, Affine3, Mat2, Mat3, Vec2, Vec3, Vec4};
++use bevy_mesh::MeshVertexBufferLayoutRef;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::{
+-    mesh::MeshVertexBufferLayoutRef, render_asset::RenderAssets, render_resource::*,
+-    texture::GpuImage,
+-};
++use bevy_render::{render_asset::RenderAssets, render_resource::*, texture::GpuImage};
+ use bitflags::bitflags;
+ 
+ use crate::{deferred::DEFAULT_PBR_DEFERRED_LIGHTING_PASS_ID, *};
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 267dd66f314b7..9175875c52c44 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -11,21 +11,8 @@ use crate::{
+     RenderMeshInstances, RenderPhaseType, SetMaterialBindGroup, SetMeshBindGroup, ShadowView,
+ };
+ use bevy_app::{App, Plugin, PreUpdate};
+-use bevy_render::{
+-    alpha::AlphaMode,
+-    batching::gpu_preprocessing::GpuPreprocessingSupport,
+-    load_shader_library,
+-    mesh::{allocator::MeshAllocator, Mesh3d, MeshVertexBufferLayoutRef, RenderMesh},
+-    render_asset::prepare_assets,
+-    render_resource::binding_types::uniform_buffer,
+-    renderer::RenderAdapter,
+-    sync_world::RenderEntity,
+-    view::{RenderVisibilityRanges, RetainedViewEntity, VISIBILITY_RANGES_STORAGE_BUFFER_COUNT},
+-    ExtractSchedule, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
+-};
+-pub use prepass_bindings::*;
+-
+ use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
++use bevy_camera::Camera;
+ use bevy_core_pipeline::{
+     core_3d::CORE_3D_DEPTH_FORMAT, deferred::*, prelude::Camera3d, prepass::*,
+ };
+@@ -37,17 +24,26 @@ use bevy_ecs::{
+     },
+ };
+ use bevy_math::{Affine3A, Vec4};
++use bevy_mesh::{Mesh, Mesh3d, MeshVertexBufferLayoutRef};
+ use bevy_render::{
++    alpha::AlphaMode,
++    batching::gpu_preprocessing::GpuPreprocessingSupport,
+     globals::{GlobalsBuffer, GlobalsUniform},
+-    prelude::{Camera, Mesh},
+-    render_asset::RenderAssets,
++    load_shader_library,
++    mesh::{allocator::MeshAllocator, RenderMesh},
++    render_asset::{prepare_assets, RenderAssets},
+     render_phase::*,
+-    render_resource::*,
+-    renderer::{RenderDevice, RenderQueue},
+-    view::{ExtractedView, Msaa, ViewUniform, ViewUniformOffset, ViewUniforms},
+-    Extract,
++    render_resource::{binding_types::uniform_buffer, *},
++    renderer::{RenderAdapter, RenderDevice, RenderQueue},
++    sync_world::RenderEntity,
++    view::{
++        ExtractedView, Msaa, RenderVisibilityRanges, RetainedViewEntity, ViewUniform,
++        ViewUniformOffset, ViewUniforms, VISIBILITY_RANGES_STORAGE_BUFFER_COUNT,
++    },
++    Extract, ExtractSchedule, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
+ };
+ use bevy_transform::prelude::GlobalTransform;
++pub use prepass_bindings::*;
+ use tracing::{error, warn};
+ 
+ #[cfg(feature = "meshlet")]
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 97b28e865a059..88474792e971b 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -1,6 +1,10 @@
+ use crate::material_bind_groups::{MaterialBindGroupIndex, MaterialBindGroupSlot};
+-use allocator::MeshAllocator;
+ use bevy_asset::{embedded_asset, load_embedded_asset, AssetId};
++use bevy_camera::{
++    primitives::Aabb,
++    visibility::{NoFrustumCulling, ViewVisibility, VisibilityRange},
++    Camera,
++};
+ use bevy_core_pipeline::{
+     core_3d::{AlphaMask3d, Opaque3d, Transmissive3d, Transparent3d, CORE_3D_DEPTH_FORMAT},
+     deferred::{AlphaMask3dDeferred, Opaque3dDeferred},
+@@ -19,6 +23,10 @@ use bevy_light::{
+     EnvironmentMapLight, NotShadowCaster, NotShadowReceiver, TransmittedShadowReceiver,
+ };
+ use bevy_math::{Affine3, Rect, UVec2, Vec3, Vec4};
++use bevy_mesh::{
++    skinning::SkinnedMesh, BaseMeshPipelineKey, Mesh, Mesh3d, MeshTag, MeshVertexBufferLayoutRef,
++    VertexAttributeDescriptor,
++};
+ use bevy_platform::collections::{hash_map::Entry, HashMap};
+ use bevy_render::{
+     batching::{
+@@ -29,9 +37,7 @@ use bevy_render::{
+         },
+         no_gpu_preprocessing, GetBatchData, GetFullBatchData, NoAutomaticBatching,
+     },
+-    camera::Camera,
+-    mesh::{skinning::SkinnedMesh, *},
+-    primitives::Aabb,
++    mesh::{allocator::MeshAllocator, RenderMesh, RenderMeshBufferInfo},
+     render_asset::RenderAssets,
+     render_phase::{
+         BinnedRenderPhasePlugin, InputUniformIndex, PhaseItem, PhaseItemExtraIndex, RenderCommand,
+@@ -42,8 +48,8 @@ use bevy_render::{
+     sync_world::MainEntityHashSet,
+     texture::{DefaultImageSampler, GpuImage},
+     view::{
+-        self, NoFrustumCulling, NoIndirectDrawing, RenderVisibilityRanges, RetainedViewEntity,
+-        ViewTarget, ViewUniformOffset, ViewVisibility, VisibilityRange,
++        self, NoIndirectDrawing, RenderVisibilityRanges, RetainedViewEntity, ViewTarget,
++        ViewUniformOffset,
+     },
+     Extract,
+ };
+diff --git a/crates/bevy_pbr/src/render/mesh_bindings.rs b/crates/bevy_pbr/src/render/mesh_bindings.rs
+index b8f095af72a86..cd7eb34b1a500 100644
+--- a/crates/bevy_pbr/src/render/mesh_bindings.rs
++++ b/crates/bevy_pbr/src/render/mesh_bindings.rs
+@@ -1,8 +1,8 @@
+ //! Bind group layout related definitions for the mesh pipeline.
+ 
+ use bevy_math::Mat4;
++use bevy_mesh::morph::MAX_MORPH_WEIGHTS;
+ use bevy_render::{
+-    mesh::morph::MAX_MORPH_WEIGHTS,
+     render_resource::*,
+     renderer::{RenderAdapter, RenderDevice},
+ };
+diff --git a/crates/bevy_pbr/src/render/morph.rs b/crates/bevy_pbr/src/render/morph.rs
+index 29070724dd51c..9da2de83809e4 100644
+--- a/crates/bevy_pbr/src/render/morph.rs
++++ b/crates/bevy_pbr/src/render/morph.rs
+@@ -1,10 +1,10 @@
+ use core::{iter, mem};
+ 
+ use bevy_ecs::prelude::*;
++use bevy_mesh::morph::{MeshMorphWeights, MAX_MORPH_WEIGHTS};
+ use bevy_render::sync_world::MainEntityHashMap;
+ use bevy_render::{
+     batching::NoAutomaticBatching,
+-    mesh::morph::{MeshMorphWeights, MAX_MORPH_WEIGHTS},
+     render_resource::{BufferUsages, RawBufferVec},
+     renderer::{RenderDevice, RenderQueue},
+     view::ViewVisibility,
+diff --git a/crates/bevy_pbr/src/render/skin.rs b/crates/bevy_pbr/src/render/skin.rs
+index ca035c980aa48..1723a571a3d94 100644
+--- a/crates/bevy_pbr/src/render/skin.rs
++++ b/crates/bevy_pbr/src/render/skin.rs
+@@ -4,12 +4,12 @@ use std::sync::OnceLock;
+ use bevy_asset::{prelude::AssetChanged, Assets};
+ use bevy_ecs::prelude::*;
+ use bevy_math::Mat4;
++use bevy_mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+ use bevy_platform::collections::hash_map::Entry;
+ use bevy_render::render_resource::{Buffer, BufferDescriptor};
+ use bevy_render::sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet};
+ use bevy_render::{
+     batching::NoAutomaticBatching,
+-    mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+     render_resource::BufferUsages,
+     renderer::{RenderDevice, RenderQueue},
+     view::ViewVisibility,
+diff --git a/crates/bevy_pbr/src/volumetric_fog/mod.rs b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+index 0b1b21020ec76..42e3ac219ed35 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/mod.rs
++++ b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+@@ -41,8 +41,8 @@ use bevy_math::{
+     primitives::{Cuboid, Plane3d},
+     Vec2, Vec3,
+ };
++use bevy_mesh::{Mesh, Meshable};
+ use bevy_render::{
+-    mesh::{Mesh, Meshable},
+     render_graph::{RenderGraphExt, ViewNodeRunner},
+     render_resource::SpecializedRenderPipelines,
+     sync_component::SyncComponentPlugin,
+diff --git a/crates/bevy_pbr/src/volumetric_fog/render.rs b/crates/bevy_pbr/src/volumetric_fog/render.rs
+index e7d8d33b82b28..6226f9443fc06 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/render.rs
++++ b/crates/bevy_pbr/src/volumetric_fog/render.rs
+@@ -19,11 +19,10 @@ use bevy_ecs::{
+ };
+ use bevy_image::{BevyDefault, Image};
+ use bevy_math::{vec4, Mat3A, Mat4, Vec3, Vec3A, Vec4, Vec4Swizzles as _};
++use bevy_mesh::{Mesh, MeshVertexBufferLayoutRef};
+ use bevy_render::{
+     diagnostic::RecordDiagnostics,
+-    mesh::{
+-        allocator::MeshAllocator, Mesh, MeshVertexBufferLayoutRef, RenderMesh, RenderMeshBufferInfo,
+-    },
++    mesh::{allocator::MeshAllocator, RenderMesh, RenderMeshBufferInfo},
+     render_asset::RenderAssets,
+     render_graph::{NodeRunError, RenderGraphContext, ViewNode},
+     render_resource::{
+diff --git a/crates/bevy_pbr/src/wireframe.rs b/crates/bevy_pbr/src/wireframe.rs
+index e8add9058d23f..eb3a65d0bef32 100644
+--- a/crates/bevy_pbr/src/wireframe.rs
++++ b/crates/bevy_pbr/src/wireframe.rs
+@@ -20,6 +20,7 @@ use bevy_ecs::{
+     query::QueryItem,
+     system::{lifetimeless::SRes, SystemChangeTick, SystemParamItem},
+ };
++use bevy_mesh::{Mesh3d, MeshVertexBufferLayoutRef};
+ use bevy_platform::{
+     collections::{HashMap, HashSet},
+     hash::FixedHasher,
+@@ -32,7 +33,7 @@ use bevy_render::{
+     extract_resource::ExtractResource,
+     mesh::{
+         allocator::{MeshAllocator, SlabId},
+-        Mesh3d, MeshVertexBufferLayoutRef, RenderMesh,
++        RenderMesh,
+     },
+     prelude::*,
+     render_asset::{
+diff --git a/crates/bevy_render/src/mesh/allocator.rs b/crates/bevy_render/src/mesh/allocator.rs
+index 3746acbbc4f3d..d18c3c77cf2a3 100644
+--- a/crates/bevy_render/src/mesh/allocator.rs
++++ b/crates/bevy_render/src/mesh/allocator.rs
+@@ -1,6 +1,7 @@
+ //! Manages mesh vertex and index buffers.
+ 
+ use alloc::vec::Vec;
++use bevy_mesh::Indices;
+ use core::{
+     fmt::{self, Display, Formatter},
+     ops::Range,
+@@ -26,7 +27,7 @@ use wgpu::{
+ };
+ 
+ use crate::{
+-    mesh::{Indices, Mesh, MeshVertexBufferLayouts, RenderMesh},
++    mesh::{Mesh, MeshVertexBufferLayouts, RenderMesh},
+     render_asset::{prepare_assets, ExtractedAssets},
+     render_resource::Buffer,
+     renderer::{RenderAdapter, RenderDevice, RenderQueue},
+diff --git a/crates/bevy_render/src/mesh/mod.rs b/crates/bevy_render/src/mesh/mod.rs
+index 2f998fbe2fd91..7fce37942e60a 100644
+--- a/crates/bevy_render/src/mesh/mod.rs
++++ b/crates/bevy_render/src/mesh/mod.rs
+@@ -1,6 +1,3 @@
+-use bevy_camera::visibility::VisibilitySystems;
+-pub use bevy_mesh::*;
+-use morph::{MeshMorphWeights, MorphWeights};
+ pub mod allocator;
+ use crate::{
+     render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
+@@ -11,6 +8,7 @@ use crate::{
+ use allocator::MeshAllocatorPlugin;
+ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_asset::{AssetApp, AssetEventSystems, AssetId, RenderAssetUsages};
++use bevy_camera::visibility::VisibilitySystems;
+ use bevy_ecs::{
+     prelude::*,
+     system::{
+@@ -18,7 +16,8 @@ use bevy_ecs::{
+         SystemParamItem,
+     },
+ };
+-pub use bevy_mesh::{mark_3d_meshes_as_changed_if_their_assets_changed, Mesh2d, Mesh3d, MeshTag};
++use bevy_mesh::morph::{MeshMorphWeights, MorphWeights};
++pub use bevy_mesh::*;
+ use wgpu::IndexFormat;
+ 
+ /// Adds the [`Mesh`] as an asset and makes sure that they are extracted and prepared for the GPU.
+diff --git a/crates/bevy_render/src/render_resource/mod.rs b/crates/bevy_render/src/render_resource/mod.rs
+index d87e6df3149ec..efac4c4bb4cba 100644
+--- a/crates/bevy_render/src/render_resource/mod.rs
++++ b/crates/bevy_render/src/render_resource/mod.rs
+@@ -66,8 +66,6 @@ pub use wgpu::{
+     VertexStepMode, COPY_BUFFER_ALIGNMENT,
+ };
+ 
+-pub use crate::mesh::VertexBufferLayout;
+-
+ pub mod encase {
+     pub use bevy_encase_derive::ShaderType;
+     pub use encase::*;
+diff --git a/crates/bevy_render/src/render_resource/pipeline.rs b/crates/bevy_render/src/render_resource/pipeline.rs
+index ccd4337e684f5..c2cba3ad3e408 100644
+--- a/crates/bevy_render/src/render_resource/pipeline.rs
++++ b/crates/bevy_render/src/render_resource/pipeline.rs
+@@ -1,5 +1,4 @@
+ use super::{empty_bind_group_layout, ShaderDefVal};
+-use crate::mesh::VertexBufferLayout;
+ use crate::WgpuWrapper;
+ use crate::{
+     define_atomic_id,
+@@ -7,6 +6,7 @@ use crate::{
+ };
+ use alloc::borrow::Cow;
+ use bevy_asset::Handle;
++use bevy_mesh::VertexBufferLayout;
+ use core::iter;
+ use core::ops::Deref;
+ use thiserror::Error;
+diff --git a/crates/bevy_render/src/render_resource/pipeline_specializer.rs b/crates/bevy_render/src/render_resource/pipeline_specializer.rs
+index 01147aa6e50e0..f2e84a2fc3575 100644
+--- a/crates/bevy_render/src/render_resource/pipeline_specializer.rs
++++ b/crates/bevy_render/src/render_resource/pipeline_specializer.rs
+@@ -1,11 +1,9 @@
+-use crate::{
+-    mesh::{MeshVertexBufferLayoutRef, MissingVertexAttributeError, VertexBufferLayout},
+-    render_resource::{
+-        CachedComputePipelineId, CachedRenderPipelineId, ComputePipelineDescriptor, PipelineCache,
+-        RenderPipelineDescriptor,
+-    },
++use crate::render_resource::{
++    CachedComputePipelineId, CachedRenderPipelineId, ComputePipelineDescriptor, PipelineCache,
++    RenderPipelineDescriptor,
+ };
+ use bevy_ecs::resource::Resource;
++use bevy_mesh::{MeshVertexBufferLayoutRef, MissingVertexAttributeError, VertexBufferLayout};
+ use bevy_platform::{
+     collections::{
+         hash_map::{Entry, RawEntryMut, VacantEntry},
+diff --git a/crates/bevy_sprite/Cargo.toml b/crates/bevy_sprite/Cargo.toml
+index 1538ac1ebc5d4..a1fefc62c7434 100644
+--- a/crates/bevy_sprite/Cargo.toml
++++ b/crates/bevy_sprite/Cargo.toml
+@@ -21,6 +21,7 @@ bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
+ bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.17.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
++bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev", optional = true }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index 2a2a7353d28df..1b7f45d5716c6 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -48,10 +48,10 @@ use bevy_asset::{embedded_asset, AssetEventSystems, Assets};
+ use bevy_core_pipeline::core_2d::{AlphaMask2d, Opaque2d, Transparent2d};
+ use bevy_ecs::prelude::*;
+ use bevy_image::{prelude::*, TextureAtlasPlugin};
++use bevy_mesh::{Mesh, Mesh2d};
+ use bevy_render::{
+     batching::sort_binned_render_phase,
+     load_shader_library,
+-    mesh::{Mesh, Mesh2d},
+     primitives::{Aabb, MeshAabb},
+     render_phase::AddRenderCommand,
+     render_resource::SpecializedRenderPipelines,
+diff --git a/crates/bevy_sprite/src/mesh2d/material.rs b/crates/bevy_sprite/src/mesh2d/material.rs
+index 84d8c80827934..48dcff4cb75c4 100644
+--- a/crates/bevy_sprite/src/mesh2d/material.rs
++++ b/crates/bevy_sprite/src/mesh2d/material.rs
+@@ -20,6 +20,7 @@ use bevy_ecs::{
+     system::{lifetimeless::SRes, SystemParamItem},
+ };
+ use bevy_math::FloatOrd;
++use bevy_mesh::MeshVertexBufferLayoutRef;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{prelude::ReflectDefault, Reflect};
+ use bevy_render::camera::extract_cameras;
+@@ -28,7 +29,7 @@ use bevy_render::render_resource::{CachedRenderPipelineId, ShaderDefVal};
+ use bevy_render::view::RenderVisibleEntities;
+ use bevy_render::RenderStartup;
+ use bevy_render::{
+-    mesh::{MeshVertexBufferLayoutRef, RenderMesh},
++    mesh::RenderMesh,
+     render_asset::{
+         prepare_assets, PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets,
+     },
+diff --git a/crates/bevy_sprite/src/mesh2d/mesh.rs b/crates/bevy_sprite/src/mesh2d/mesh.rs
+index d29825eaac92a..d30dcd1782b9b 100644
+--- a/crates/bevy_sprite/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite/src/mesh2d/mesh.rs
+@@ -20,7 +20,7 @@ use bevy_ecs::{
+ };
+ use bevy_image::{BevyDefault, Image, ImageSampler, TextureFormatPixelInfo};
+ use bevy_math::{Affine3, Vec4};
+-use bevy_render::mesh::MeshTag;
++use bevy_mesh::{Mesh, Mesh2d, MeshTag, MeshVertexBufferLayoutRef};
+ use bevy_render::prelude::Msaa;
+ use bevy_render::RenderSystems::PrepareAssets;
+ use bevy_render::{
+@@ -33,10 +33,7 @@ use bevy_render::{
+         GetBatchData, GetFullBatchData, NoAutomaticBatching,
+     },
+     globals::{GlobalsBuffer, GlobalsUniform},
+-    mesh::{
+-        allocator::MeshAllocator, Mesh, Mesh2d, MeshVertexBufferLayoutRef, RenderMesh,
+-        RenderMeshBufferInfo,
+-    },
++    mesh::{allocator::MeshAllocator, RenderMesh, RenderMeshBufferInfo},
+     render_asset::RenderAssets,
+     render_phase::{
+         sweep_old_entities, PhaseItem, PhaseItemExtraIndex, RenderCommand, RenderCommandResult,
+diff --git a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+index bd31b7b6d647a..cf3493c87c3bb 100644
+--- a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
++++ b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+@@ -19,6 +19,7 @@ use bevy_ecs::{
+     query::QueryItem,
+     system::{lifetimeless::SRes, SystemChangeTick, SystemParamItem},
+ };
++use bevy_mesh::{Mesh2d, MeshVertexBufferLayoutRef};
+ use bevy_platform::{
+     collections::{HashMap, HashSet},
+     hash::FixedHasher,
+@@ -31,7 +32,7 @@ use bevy_render::{
+     extract_resource::ExtractResource,
+     mesh::{
+         allocator::{MeshAllocator, SlabId},
+-        Mesh2d, MeshVertexBufferLayoutRef, RenderMesh,
++        RenderMesh,
+     },
+     prelude::*,
+     render_asset::{
+diff --git a/crates/bevy_sprite/src/render/mod.rs b/crates/bevy_sprite/src/render/mod.rs
+index 909fb51d81f6b..915e1ef83eaac 100644
+--- a/crates/bevy_sprite/src/render/mod.rs
++++ b/crates/bevy_sprite/src/render/mod.rs
+@@ -18,6 +18,7 @@ use bevy_ecs::{
+ };
+ use bevy_image::{BevyDefault, Image, ImageSampler, TextureAtlasLayout, TextureFormatPixelInfo};
+ use bevy_math::{Affine3A, FloatOrd, Quat, Rect, Vec2, Vec4};
++use bevy_mesh::VertexBufferLayout;
+ use bevy_platform::collections::HashMap;
+ use bevy_render::view::{RenderVisibleEntities, RetainedViewEntity};
+ use bevy_render::{
+diff --git a/crates/bevy_sprite/src/tilemap_chunk/mod.rs b/crates/bevy_sprite/src/tilemap_chunk/mod.rs
+index 005e61e6a75c4..c4fb8468045cd 100644
+--- a/crates/bevy_sprite/src/tilemap_chunk/mod.rs
++++ b/crates/bevy_sprite/src/tilemap_chunk/mod.rs
+@@ -15,9 +15,9 @@ use bevy_ecs::{
+ };
+ use bevy_image::Image;
+ use bevy_math::{primitives::Rectangle, UVec2};
++use bevy_mesh::{Mesh, Mesh2d};
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{prelude::*, Reflect};
+-use bevy_render::mesh::{Mesh, Mesh2d};
+ use bevy_utils::default;
+ use tracing::warn;
+ 
+diff --git a/crates/bevy_ui_render/Cargo.toml b/crates/bevy_ui_render/Cargo.toml
+index 309e33ce40851..970836ae9e79f 100644
+--- a/crates/bevy_ui_render/Cargo.toml
++++ b/crates/bevy_ui_render/Cargo.toml
+@@ -18,6 +18,7 @@ bevy_derive = { path = "../bevy_derive", version = "0.17.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
++bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev" }
+diff --git a/crates/bevy_ui_render/src/box_shadow.rs b/crates/bevy_ui_render/src/box_shadow.rs
+index 4c97e714cca8c..d31610d0713c9 100644
+--- a/crates/bevy_ui_render/src/box_shadow.rs
++++ b/crates/bevy_ui_render/src/box_shadow.rs
+@@ -15,6 +15,7 @@ use bevy_ecs::{
+ };
+ use bevy_image::BevyDefault as _;
+ use bevy_math::{vec2, Affine2, FloatOrd, Rect, Vec2};
++use bevy_mesh::VertexBufferLayout;
+ use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
+ use bevy_render::{
+     render_phase::*,
+diff --git a/crates/bevy_ui_render/src/gradient.rs b/crates/bevy_ui_render/src/gradient.rs
+index 705ed5c14b522..a5f84a4c95aa2 100644
+--- a/crates/bevy_ui_render/src/gradient.rs
++++ b/crates/bevy_ui_render/src/gradient.rs
+@@ -21,6 +21,7 @@ use bevy_math::{
+     FloatOrd, Rect, Vec2,
+ };
+ use bevy_math::{Affine2, Vec2Swizzles};
++use bevy_mesh::VertexBufferLayout;
+ use bevy_render::{
+     render_phase::*,
+     render_resource::{binding_types::uniform_buffer, *},
+diff --git a/crates/bevy_ui_render/src/pipeline.rs b/crates/bevy_ui_render/src/pipeline.rs
+index 631509127177e..1d5f3e5d3fd28 100644
+--- a/crates/bevy_ui_render/src/pipeline.rs
++++ b/crates/bevy_ui_render/src/pipeline.rs
+@@ -1,6 +1,7 @@
+ use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+ use bevy_ecs::prelude::*;
+ use bevy_image::BevyDefault as _;
++use bevy_mesh::VertexBufferLayout;
+ use bevy_render::{
+     render_resource::{
+         binding_types::{sampler, texture_2d, uniform_buffer},
+diff --git a/crates/bevy_ui_render/src/ui_material_pipeline.rs b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+index eb4f5050cf946..3fcf19f936cec 100644
+--- a/crates/bevy_ui_render/src/ui_material_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+@@ -11,6 +11,7 @@ use bevy_ecs::{
+ };
+ use bevy_image::BevyDefault as _;
+ use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
++use bevy_mesh::VertexBufferLayout;
+ use bevy_render::{
+     globals::{GlobalsBuffer, GlobalsUniform},
+     load_shader_library,
+diff --git a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+index 9b3323bd8fb8e..66fe75d1a3910 100644
+--- a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+@@ -12,6 +12,7 @@ use bevy_ecs::{
+ };
+ use bevy_image::prelude::*;
+ use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
++use bevy_mesh::VertexBufferLayout;
+ use bevy_platform::collections::HashMap;
+ use bevy_render::{
+     render_asset::RenderAssets,
+diff --git a/examples/2d/custom_gltf_vertex_attribute.rs b/examples/2d/custom_gltf_vertex_attribute.rs
+index 0742e3616fe04..fa723a6067d0e 100644
+--- a/examples/2d/custom_gltf_vertex_attribute.rs
++++ b/examples/2d/custom_gltf_vertex_attribute.rs
+@@ -2,12 +2,10 @@
+ 
+ use bevy::{
+     gltf::GltfPlugin,
++    mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef},
+     prelude::*,
+     reflect::TypePath,
+-    render::{
+-        mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef},
+-        render_resource::*,
+-    },
++    render::render_resource::*,
+     sprite::{Material2d, Material2dKey, Material2dPlugin},
+ };
+ 
+diff --git a/examples/2d/mesh2d_arcs.rs b/examples/2d/mesh2d_arcs.rs
+index db66b784acd54..af9c3ec5638b8 100644
+--- a/examples/2d/mesh2d_arcs.rs
++++ b/examples/2d/mesh2d_arcs.rs
+@@ -10,8 +10,8 @@ use bevy::{
+         bounding::{Bounded2d, BoundingVolume},
+         Isometry2d,
+     },
++    mesh::{CircularMeshUvMode, CircularSectorMeshBuilder, CircularSegmentMeshBuilder},
+     prelude::*,
+-    render::mesh::{CircularMeshUvMode, CircularSectorMeshBuilder, CircularSegmentMeshBuilder},
+ };
+ 
+ fn main() {
+diff --git a/examples/2d/mesh2d_manual.rs b/examples/2d/mesh2d_manual.rs
+index 4a33404762e3e..b90218fb6058c 100644
+--- a/examples/2d/mesh2d_manual.rs
++++ b/examples/2d/mesh2d_manual.rs
+@@ -9,9 +9,10 @@ use bevy::{
+     color::palettes::basic::YELLOW,
+     core_pipeline::core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT},
+     math::{ops, FloatOrd},
++    mesh::{Indices, MeshVertexAttribute, VertexBufferLayout},
+     prelude::*,
+     render::{
+-        mesh::{Indices, MeshVertexAttribute, RenderMesh},
++        mesh::RenderMesh,
+         render_asset::{RenderAssetUsages, RenderAssets},
+         render_phase::{
+             AddRenderCommand, DrawFunctions, PhaseItemExtraIndex, SetItemPipeline,
+@@ -22,7 +23,7 @@ use bevy::{
+             DepthStencilState, Face, FragmentState, MultisampleState, PipelineCache,
+             PrimitiveState, PrimitiveTopology, RenderPipelineDescriptor, SpecializedRenderPipeline,
+             SpecializedRenderPipelines, StencilFaceState, StencilState, TextureFormat,
+-            VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
++            VertexFormat, VertexState, VertexStepMode,
+         },
+         sync_component::SyncComponentPlugin,
+         sync_world::{MainEntityHashMap, RenderEntity},
+diff --git a/examples/3d/generate_custom_mesh.rs b/examples/3d/generate_custom_mesh.rs
+index 9776f1accf907..575e54a7d3dbc 100644
+--- a/examples/3d/generate_custom_mesh.rs
++++ b/examples/3d/generate_custom_mesh.rs
+@@ -3,12 +3,9 @@
+ //! and how to change the UV mapping at run-time.
+ 
+ use bevy::{
++    mesh::{Indices, VertexAttributeValues},
+     prelude::*,
+-    render::{
+-        mesh::{Indices, VertexAttributeValues},
+-        render_asset::RenderAssetUsages,
+-        render_resource::PrimitiveTopology,
+-    },
++    render::{render_asset::RenderAssetUsages, render_resource::PrimitiveTopology},
+ };
+ 
+ // Define a "marker" component to mark the custom mesh. Marker components are often used in Bevy for
+diff --git a/examples/3d/lines.rs b/examples/3d/lines.rs
+index 0ee62f599c20b..2670ae549a514 100644
+--- a/examples/3d/lines.rs
++++ b/examples/3d/lines.rs
+@@ -1,11 +1,11 @@
+ //! Create a custom material to draw basic lines in 3D
+ 
+ use bevy::{
++    mesh::{MeshVertexBufferLayoutRef, PrimitiveTopology},
+     pbr::{MaterialPipeline, MaterialPipelineKey},
+     prelude::*,
+     reflect::TypePath,
+     render::{
+-        mesh::{MeshVertexBufferLayoutRef, PrimitiveTopology},
+         render_asset::RenderAssetUsages,
+         render_resource::{
+             AsBindGroup, PolygonMode, RenderPipelineDescriptor, ShaderRef,
+diff --git a/examples/3d/query_gltf_primitives.rs b/examples/3d/query_gltf_primitives.rs
+index 36f13d0ddb685..892d087e2f24a 100644
+--- a/examples/3d/query_gltf_primitives.rs
++++ b/examples/3d/query_gltf_primitives.rs
+@@ -3,7 +3,7 @@
+ 
+ use std::f32::consts::PI;
+ 
+-use bevy::{gltf::GltfMaterialName, prelude::*, render::mesh::VertexAttributeValues};
++use bevy::{gltf::GltfMaterialName, mesh::VertexAttributeValues, prelude::*};
+ 
+ fn main() {
+     App::new()
+diff --git a/examples/3d/vertex_colors.rs b/examples/3d/vertex_colors.rs
+index 90eb67abd7ce3..3a5c31f94a7bf 100644
+--- a/examples/3d/vertex_colors.rs
++++ b/examples/3d/vertex_colors.rs
+@@ -1,6 +1,6 @@
+ //! Illustrates the use of vertex colors.
+ 
+-use bevy::{prelude::*, render::mesh::VertexAttributeValues};
++use bevy::{mesh::VertexAttributeValues, prelude::*};
+ 
+ fn main() {
+     App::new()
+diff --git a/examples/animation/custom_skinned_mesh.rs b/examples/animation/custom_skinned_mesh.rs
+index b091f2dd4254c..f20f036ca93e6 100644
+--- a/examples/animation/custom_skinned_mesh.rs
++++ b/examples/animation/custom_skinned_mesh.rs
+@@ -5,14 +5,12 @@ use std::f32::consts::*;
+ 
+ use bevy::{
+     math::ops,
+-    prelude::*,
+-    render::{
+-        mesh::{
+-            skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+-            Indices, PrimitiveTopology, VertexAttributeValues,
+-        },
+-        render_asset::RenderAssetUsages,
++    mesh::{
++        skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
++        Indices, PrimitiveTopology, VertexAttributeValues,
+     },
++    prelude::*,
++    render::render_asset::RenderAssetUsages,
+ };
+ use rand::{Rng, SeedableRng};
+ use rand_chacha::ChaCha8Rng;
+diff --git a/examples/animation/gltf_skinned_mesh.rs b/examples/animation/gltf_skinned_mesh.rs
+index 2e1dd160179b6..aa88728df938a 100644
+--- a/examples/animation/gltf_skinned_mesh.rs
++++ b/examples/animation/gltf_skinned_mesh.rs
+@@ -3,7 +3,7 @@
+ 
+ use std::f32::consts::*;
+ 
+-use bevy::{math::ops, prelude::*, render::mesh::skinning::SkinnedMesh};
++use bevy::{math::ops, mesh::skinning::SkinnedMesh, prelude::*};
+ 
+ fn main() {
+     App::new()
+diff --git a/examples/asset/alter_mesh.rs b/examples/asset/alter_mesh.rs
+index 7462c47ae1f85..02c7536a831e4 100644
+--- a/examples/asset/alter_mesh.rs
++++ b/examples/asset/alter_mesh.rs
+@@ -1,10 +1,8 @@
+ //! Shows how to modify mesh assets after spawning.
+ 
+ use bevy::{
+-    gltf::GltfLoaderSettings,
+-    input::common_conditions::input_just_pressed,
+-    prelude::*,
+-    render::{mesh::VertexAttributeValues, render_asset::RenderAssetUsages},
++    gltf::GltfLoaderSettings, input::common_conditions::input_just_pressed,
++    mesh::VertexAttributeValues, prelude::*, render::render_asset::RenderAssetUsages,
+ };
+ 
+ fn main() {
+diff --git a/examples/math/custom_primitives.rs b/examples/math/custom_primitives.rs
+index cf6d0d5aaffaa..ee26cdf723ffd 100644
+--- a/examples/math/custom_primitives.rs
++++ b/examples/math/custom_primitives.rs
+@@ -12,12 +12,9 @@ use bevy::{
+         },
+         Isometry2d,
+     },
++    mesh::{Extrudable, ExtrusionBuilder, PerimeterSegment},
+     prelude::*,
+-    render::{
+-        camera::ScalingMode,
+-        mesh::{Extrudable, ExtrusionBuilder, PerimeterSegment},
+-        render_asset::RenderAssetUsages,
+-    },
++    render::{camera::ScalingMode, render_asset::RenderAssetUsages},
+ };
+ 
+ const HEART: Heart = Heart::new(0.5);
+@@ -443,10 +440,10 @@ impl MeshBuilder for HeartMeshBuilder {
+ 
+         // Here, the actual `Mesh` is created. We set the indices, vertices, normals and UVs created above and specify the topology of the mesh.
+         Mesh::new(
+-            bevy::render::mesh::PrimitiveTopology::TriangleList,
++            bevy::mesh::PrimitiveTopology::TriangleList,
+             RenderAssetUsages::default(),
+         )
+-        .with_inserted_indices(bevy::render::mesh::Indices::U32(indices))
++        .with_inserted_indices(bevy::mesh::Indices::U32(indices))
+         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
+         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+diff --git a/examples/math/random_sampling.rs b/examples/math/random_sampling.rs
+index 33018c7734c8e..474f27f22bc81 100644
+--- a/examples/math/random_sampling.rs
++++ b/examples/math/random_sampling.rs
+@@ -3,8 +3,8 @@
+ use bevy::{
+     input::mouse::{AccumulatedMouseMotion, MouseButtonInput},
+     math::prelude::*,
++    mesh::SphereKind,
+     prelude::*,
+-    render::mesh::SphereKind,
+ };
+ use rand::{distributions::Distribution, SeedableRng};
+ use rand_chacha::ChaCha8Rng;
+diff --git a/examples/shader/automatic_instancing.rs b/examples/shader/automatic_instancing.rs
+index 854e08a4dd7fb..81de7858c1ba1 100644
+--- a/examples/shader/automatic_instancing.rs
++++ b/examples/shader/automatic_instancing.rs
+@@ -3,12 +3,10 @@
+ //! Also demonstrates how to use `MeshTag` to use external data in a custom material.
+ 
+ use bevy::{
++    mesh::MeshTag,
+     prelude::*,
+     reflect::TypePath,
+-    render::{
+-        mesh::MeshTag,
+-        render_resource::{AsBindGroup, ShaderRef},
+-    },
++    render::render_resource::{AsBindGroup, ShaderRef},
+ };
+ 
+ const SHADER_ASSET_PATH: &str = "shaders/automatic_instancing.wgsl";
+diff --git a/examples/shader/extended_material_bindless.rs b/examples/shader/extended_material_bindless.rs
+index 562522fa437ff..3b678dc19e065 100644
+--- a/examples/shader/extended_material_bindless.rs
++++ b/examples/shader/extended_material_bindless.rs
+@@ -4,12 +4,10 @@ use std::f32::consts::FRAC_PI_2;
+ 
+ use bevy::{
+     color::palettes::{css::RED, tailwind::GRAY_600},
++    mesh::{SphereKind, SphereMeshBuilder},
+     pbr::{ExtendedMaterial, MaterialExtension, MeshMaterial3d},
+     prelude::*,
+-    render::{
+-        mesh::{SphereKind, SphereMeshBuilder},
+-        render_resource::{AsBindGroup, ShaderRef, ShaderType},
+-    },
++    render::render_resource::{AsBindGroup, ShaderRef, ShaderType},
+     utils::default,
+ };
+ 
+diff --git a/examples/shader/shader_defs.rs b/examples/shader/shader_defs.rs
+index 1944040142d2f..21788496cff91 100644
+--- a/examples/shader/shader_defs.rs
++++ b/examples/shader/shader_defs.rs
+@@ -1,14 +1,12 @@
+ //! A shader that uses "shaders defs", which selectively toggle parts of a shader.
+ 
+ use bevy::{
++    mesh::MeshVertexBufferLayoutRef,
+     pbr::{MaterialPipeline, MaterialPipelineKey},
+     prelude::*,
+     reflect::TypePath,
+-    render::{
+-        mesh::MeshVertexBufferLayoutRef,
+-        render_resource::{
+-            AsBindGroup, RenderPipelineDescriptor, ShaderRef, SpecializedMeshPipelineError,
+-        },
++    render::render_resource::{
++        AsBindGroup, RenderPipelineDescriptor, ShaderRef, SpecializedMeshPipelineError,
+     },
+ };
+ 
+diff --git a/examples/shader/storage_buffer.rs b/examples/shader/storage_buffer.rs
+index f8e7be074b928..8637472c2714a 100644
+--- a/examples/shader/storage_buffer.rs
++++ b/examples/shader/storage_buffer.rs
+@@ -1,9 +1,9 @@
+ //! This example demonstrates how to use a storage buffer with `AsBindGroup` in a custom material.
+ use bevy::{
++    mesh::MeshTag,
+     prelude::*,
+     reflect::TypePath,
+     render::{
+-        mesh::MeshTag,
+         render_resource::{AsBindGroup, ShaderRef},
+         storage::ShaderStorageBuffer,
+     },
+diff --git a/examples/shader_advanced/custom_phase_item.rs b/examples/shader_advanced/custom_phase_item.rs
+index 9d97aab12cdb3..cb49d24bf01b2 100644
+--- a/examples/shader_advanced/custom_phase_item.rs
++++ b/examples/shader_advanced/custom_phase_item.rs
+@@ -14,6 +14,7 @@ use bevy::{
+         query::ROQueryItem,
+         system::{lifetimeless::SRes, SystemParamItem},
+     },
++    mesh::VertexBufferLayout,
+     prelude::*,
+     render::{
+         extract_component::{ExtractComponent, ExtractComponentPlugin},
+@@ -27,8 +28,7 @@ use bevy::{
+             BufferUsages, Canonical, ColorTargetState, ColorWrites, CompareFunction,
+             DepthStencilState, FragmentState, IndexFormat, PipelineCache, RawBufferVec,
+             RenderPipeline, RenderPipelineDescriptor, Specializer, SpecializerKey, TextureFormat,
+-            Variants, VertexAttribute, VertexBufferLayout, VertexFormat, VertexState,
+-            VertexStepMode,
++            Variants, VertexAttribute, VertexFormat, VertexState, VertexStepMode,
+         },
+         renderer::{RenderDevice, RenderQueue},
+         view::{self, ExtractedView, RenderVisibleEntities, VisibilityClass},
+diff --git a/examples/shader_advanced/custom_render_phase.rs b/examples/shader_advanced/custom_render_phase.rs
+index ca0171c1b5859..4f18287849a69 100644
+--- a/examples/shader_advanced/custom_render_phase.rs
++++ b/examples/shader_advanced/custom_render_phase.rs
+@@ -21,6 +21,7 @@ use bevy::{
+         system::{lifetimeless::SRes, SystemParamItem},
+     },
+     math::FloatOrd,
++    mesh::MeshVertexBufferLayoutRef,
+     pbr::{
+         DrawMesh, MeshInputUniform, MeshPipeline, MeshPipelineKey, MeshPipelineViewLayoutKey,
+         MeshUniform, RenderMeshInstances, SetMeshBindGroup, SetMeshViewBindGroup,
+@@ -37,7 +38,7 @@ use bevy::{
+         },
+         camera::{ExtractedCamera, MainPassResolutionOverride},
+         extract_component::{ExtractComponent, ExtractComponentPlugin},
+-        mesh::{allocator::MeshAllocator, MeshVertexBufferLayoutRef, RenderMesh},
++        mesh::{allocator::MeshAllocator, RenderMesh},
+         render_asset::RenderAssets,
+         render_graph::{
+             NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
+diff --git a/examples/shader_advanced/custom_shader_instancing.rs b/examples/shader_advanced/custom_shader_instancing.rs
+index 4a578dc5c6e04..7aa873adfdd98 100644
+--- a/examples/shader_advanced/custom_shader_instancing.rs
++++ b/examples/shader_advanced/custom_shader_instancing.rs
+@@ -14,15 +14,14 @@ use bevy::{
+         query::QueryItem,
+         system::{lifetimeless::*, SystemParamItem},
+     },
++    mesh::{MeshVertexBufferLayoutRef, VertexBufferLayout},
+     pbr::{
+         MeshPipeline, MeshPipelineKey, RenderMeshInstances, SetMeshBindGroup, SetMeshViewBindGroup,
+     },
+     prelude::*,
+     render::{
+         extract_component::{ExtractComponent, ExtractComponentPlugin},
+-        mesh::{
+-            allocator::MeshAllocator, MeshVertexBufferLayoutRef, RenderMesh, RenderMeshBufferInfo,
+-        },
++        mesh::{allocator::MeshAllocator, RenderMesh, RenderMeshBufferInfo},
+         render_asset::RenderAssets,
+         render_phase::{
+             AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
+diff --git a/examples/shader_advanced/custom_vertex_attribute.rs b/examples/shader_advanced/custom_vertex_attribute.rs
+index 46ab930851bde..5a12db436477b 100644
+--- a/examples/shader_advanced/custom_vertex_attribute.rs
++++ b/examples/shader_advanced/custom_vertex_attribute.rs
+@@ -1,15 +1,13 @@
+ //! A shader that reads a mesh's custom vertex attribute.
+ 
+ use bevy::{
++    mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef},
+     pbr::{MaterialPipeline, MaterialPipelineKey},
+     prelude::*,
+     reflect::TypePath,
+-    render::{
+-        mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef},
+-        render_resource::{
+-            AsBindGroup, RenderPipelineDescriptor, ShaderRef, SpecializedMeshPipelineError,
+-            VertexFormat,
+-        },
++    render::render_resource::{
++        AsBindGroup, RenderPipelineDescriptor, ShaderRef, SpecializedMeshPipelineError,
++        VertexFormat,
+     },
+ };
+ 
+diff --git a/examples/shader_advanced/specialized_mesh_pipeline.rs b/examples/shader_advanced/specialized_mesh_pipeline.rs
+index 86baf7afd8b54..836034e87a08e 100644
+--- a/examples/shader_advanced/specialized_mesh_pipeline.rs
++++ b/examples/shader_advanced/specialized_mesh_pipeline.rs
+@@ -10,6 +10,7 @@ use bevy::{
+     core_pipeline::core_3d::{Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, CORE_3D_DEPTH_FORMAT},
+     ecs::component::Tick,
+     math::{vec3, vec4},
++    mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology},
+     pbr::{
+         DrawMesh, MeshPipeline, MeshPipelineKey, MeshPipelineViewLayoutKey, RenderMeshInstances,
+         SetMeshBindGroup, SetMeshViewBindGroup, SetMeshViewEmptyBindGroup,
+@@ -18,10 +19,7 @@ use bevy::{
+     render::{
+         batching::gpu_preprocessing::GpuPreprocessingSupport,
+         extract_component::{ExtractComponent, ExtractComponentPlugin},
+-        mesh::{
+-            allocator::MeshAllocator, Indices, MeshVertexBufferLayoutRef, PrimitiveTopology,
+-            RenderMesh,
+-        },
++        mesh::{allocator::MeshAllocator, RenderMesh},
+         render_asset::{RenderAssetUsages, RenderAssets},
+         render_phase::{
+             AddRenderCommand, BinnedRenderPhaseType, DrawFunctions, SetItemPipeline,
+diff --git a/tests/3d/test_invalid_skinned_mesh.rs b/tests/3d/test_invalid_skinned_mesh.rs
+index a4567016ed3c5..0215a9ea879b7 100644
+--- a/tests/3d/test_invalid_skinned_mesh.rs
++++ b/tests/3d/test_invalid_skinned_mesh.rs
+@@ -3,15 +3,12 @@
+ use bevy::{
+     core_pipeline::motion_blur::MotionBlur,
+     math::ops,
+-    prelude::*,
+-    render::{
+-        camera::ScalingMode,
+-        mesh::{
+-            skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+-            Indices, PrimitiveTopology, VertexAttributeValues,
+-        },
+-        render_asset::RenderAssetUsages,
++    mesh::{
++        skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
++        Indices, PrimitiveTopology, VertexAttributeValues,
+     },
++    prelude::*,
++    render::{camera::ScalingMode, render_asset::RenderAssetUsages},
+ };
+ use core::f32::consts::TAU;
+ 
