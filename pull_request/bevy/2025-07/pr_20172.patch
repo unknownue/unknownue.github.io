@@ -1,0 +1,1534 @@
+diff --git a/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs b/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs
+index 4e4cbd7eeb579..f158c2c747a25 100644
+--- a/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs
++++ b/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs
+@@ -26,7 +26,7 @@ use super::{
+ pub struct AutoInsertApplyDeferredPass {
+     /// Dependency edges that will **not** automatically insert an instance of `ApplyDeferred` on the edge.
+     no_sync_edges: BTreeSet<(NodeId, NodeId)>,
+-    auto_sync_node_ids: HashMap<u32, NodeId>,
++    auto_sync_node_ids: HashMap<u32, SystemKey>,
+ }
+ 
+ /// If added to a dependency edge, the edge will not be considered for auto sync point insertions.
+@@ -35,14 +35,14 @@ pub struct IgnoreDeferred;
+ impl AutoInsertApplyDeferredPass {
+     /// Returns the `NodeId` of the cached auto sync point. Will create
+     /// a new one if needed.
+-    fn get_sync_point(&mut self, graph: &mut ScheduleGraph, distance: u32) -> NodeId {
++    fn get_sync_point(&mut self, graph: &mut ScheduleGraph, distance: u32) -> SystemKey {
+         self.auto_sync_node_ids
+             .get(&distance)
+             .copied()
+             .unwrap_or_else(|| {
+-                let node_id = NodeId::System(self.add_auto_sync(graph));
+-                self.auto_sync_node_ids.insert(distance, node_id);
+-                node_id
++                let key = self.add_auto_sync(graph);
++                self.auto_sync_node_ids.insert(distance, key);
++                key
+             })
+     }
+     /// add an [`ApplyDeferred`] system with no config
+@@ -72,7 +72,7 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+         &mut self,
+         _world: &mut World,
+         graph: &mut ScheduleGraph,
+-        dependency_flattened: &mut DiGraph,
++        dependency_flattened: &mut DiGraph<SystemKey>,
+     ) -> Result<(), ScheduleBuildError> {
+         let mut sync_point_graph = dependency_flattened.clone();
+         let topo = graph.topsort_graph(dependency_flattened, ReportCycles::Dependency)?;
+@@ -119,14 +119,10 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+             HashMap::with_capacity_and_hasher(topo.len(), Default::default());
+ 
+         // Keep track of any explicit sync nodes for a specific distance.
+-        let mut distance_to_explicit_sync_node: HashMap<u32, NodeId> = HashMap::default();
++        let mut distance_to_explicit_sync_node: HashMap<u32, SystemKey> = HashMap::default();
+ 
+         // Determine the distance for every node and collect the explicit sync points.
+-        for node in &topo {
+-            let &NodeId::System(key) = node else {
+-                panic!("Encountered a non-system node in the flattened dependency graph: {node:?}");
+-            };
+-
++        for &key in &topo {
+             let (node_distance, mut node_needs_sync) = distances_and_pending_sync
+                 .get(&key)
+                 .copied()
+@@ -137,7 +133,7 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+                 // makes sure that this node is no unvisited target of another node.
+                 // Because of this, the sync point can be stored for this distance to be reused as
+                 // automatically added sync points later.
+-                distance_to_explicit_sync_node.insert(node_distance, NodeId::System(key));
++                distance_to_explicit_sync_node.insert(node_distance, key);
+ 
+                 // This node just did a sync, so the only reason to do another sync is if one was
+                 // explicitly scheduled afterwards.
+@@ -148,10 +144,7 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+                 node_needs_sync = graph.systems[key].has_deferred();
+             }
+ 
+-            for target in dependency_flattened.neighbors_directed(*node, Direction::Outgoing) {
+-                let NodeId::System(target) = target else {
+-                    panic!("Encountered a non-system node in the flattened dependency graph: {target:?}");
+-                };
++            for target in dependency_flattened.neighbors_directed(key, Direction::Outgoing) {
+                 let (target_distance, target_pending_sync) =
+                     distances_and_pending_sync.entry(target).or_default();
+ 
+@@ -160,7 +153,7 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+                     && !graph.systems[target].is_exclusive()
+                     && self
+                         .no_sync_edges
+-                        .contains(&(*node, NodeId::System(target)))
++                        .contains(&(NodeId::System(key), NodeId::System(target)))
+                 {
+                     // The node has deferred params to apply, but this edge is ignoring sync points.
+                     // Mark the target as 'delaying' those commands to a future edge and the current
+@@ -184,19 +177,13 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+ 
+         // Find any edges which have a different number of sync points between them and make sure
+         // there is a sync point between them.
+-        for node in &topo {
+-            let &NodeId::System(key) = node else {
+-                panic!("Encountered a non-system node in the flattened dependency graph: {node:?}");
+-            };
++        for &key in &topo {
+             let (node_distance, _) = distances_and_pending_sync
+                 .get(&key)
+                 .copied()
+                 .unwrap_or_default();
+ 
+-            for target in dependency_flattened.neighbors_directed(*node, Direction::Outgoing) {
+-                let NodeId::System(target) = target else {
+-                    panic!("Encountered a non-system node in the flattened dependency graph: {target:?}");
+-                };
++            for target in dependency_flattened.neighbors_directed(key, Direction::Outgoing) {
+                 let (target_distance, _) = distances_and_pending_sync
+                     .get(&target)
+                     .copied()
+@@ -218,11 +205,11 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+                     .copied()
+                     .unwrap_or_else(|| self.get_sync_point(graph, target_distance));
+ 
+-                sync_point_graph.add_edge(*node, sync_point);
+-                sync_point_graph.add_edge(sync_point, NodeId::System(target));
++                sync_point_graph.add_edge(key, sync_point);
++                sync_point_graph.add_edge(sync_point, target);
+ 
+                 // The edge without the sync point is now redundant.
+-                sync_point_graph.remove_edge(*node, NodeId::System(target));
++                sync_point_graph.remove_edge(key, target);
+             }
+         }
+ 
+@@ -234,14 +221,14 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+         &mut self,
+         set: SystemSetKey,
+         systems: &[SystemKey],
+-        dependency_flattened: &DiGraph,
++        dependency_flattening: &DiGraph<NodeId>,
+     ) -> impl Iterator<Item = (NodeId, NodeId)> {
+         if systems.is_empty() {
+             // collapse dependencies for empty sets
+-            for a in dependency_flattened.neighbors_directed(NodeId::Set(set), Direction::Incoming)
++            for a in dependency_flattening.neighbors_directed(NodeId::Set(set), Direction::Incoming)
+             {
+                 for b in
+-                    dependency_flattened.neighbors_directed(NodeId::Set(set), Direction::Outgoing)
++                    dependency_flattening.neighbors_directed(NodeId::Set(set), Direction::Outgoing)
+                 {
+                     if self.no_sync_edges.contains(&(a, NodeId::Set(set)))
+                         && self.no_sync_edges.contains(&(NodeId::Set(set), b))
+@@ -251,7 +238,7 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+                 }
+             }
+         } else {
+-            for a in dependency_flattened.neighbors_directed(NodeId::Set(set), Direction::Incoming)
++            for a in dependency_flattening.neighbors_directed(NodeId::Set(set), Direction::Incoming)
+             {
+                 for &sys in systems {
+                     if self.no_sync_edges.contains(&(a, NodeId::Set(set))) {
+@@ -260,7 +247,7 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+                 }
+             }
+ 
+-            for b in dependency_flattened.neighbors_directed(NodeId::Set(set), Direction::Outgoing)
++            for b in dependency_flattening.neighbors_directed(NodeId::Set(set), Direction::Outgoing)
+             {
+                 for &sys in systems {
+                     if self.no_sync_edges.contains(&(NodeId::Set(set), b)) {
+diff --git a/crates/bevy_ecs/src/schedule/graph/graph_map.rs b/crates/bevy_ecs/src/schedule/graph/graph_map.rs
+index 9224efe276560..a2a5b0801e009 100644
+--- a/crates/bevy_ecs/src/schedule/graph/graph_map.rs
++++ b/crates/bevy_ecs/src/schedule/graph/graph_map.rs
+@@ -11,27 +11,26 @@ use core::{
+     hash::{BuildHasher, Hash},
+ };
+ use indexmap::IndexMap;
+-use slotmap::{Key, KeyData};
+ use smallvec::SmallVec;
+ 
+-use super::NodeId;
++use crate::schedule::graph::node::GraphNodeId;
+ 
+ use Direction::{Incoming, Outgoing};
+ 
+-/// A `Graph` with undirected edges.
++/// A `Graph` with undirected edges of some [`GraphNodeId`] `N`.
+ ///
+ /// For example, an edge between *1* and *2* is equivalent to an edge between
+ /// *2* and *1*.
+-pub type UnGraph<S = FixedHasher> = Graph<false, S>;
++pub type UnGraph<N, S = FixedHasher> = Graph<false, N, S>;
+ 
+-/// A `Graph` with directed edges.
++/// A `Graph` with directed edges of some [`GraphNodeId`] `N`.
+ ///
+ /// For example, an edge from *1* to *2* is distinct from an edge from *2* to
+ /// *1*.
+-pub type DiGraph<S = FixedHasher> = Graph<true, S>;
++pub type DiGraph<N, S = FixedHasher> = Graph<true, N, S>;
+ 
+ /// `Graph<DIRECTED>` is a graph datastructure using an associative array
+-/// of its node weights `NodeId`.
++/// of its node weights of some [`GraphNodeId`].
+ ///
+ /// It uses a combined adjacency list and sparse adjacency matrix
+ /// representation, using **O(|N| + |E|)** space, and allows testing for edge
+@@ -41,30 +40,28 @@ pub type DiGraph<S = FixedHasher> = Graph<true, S>;
+ ///
+ /// - Constant generic bool `DIRECTED` determines whether the graph edges are directed or
+ ///   undirected.
++/// - The `GraphNodeId` type `N`, which is used as the node weight.
+ /// - The `BuildHasher` `S`.
+ ///
+ /// You can use the type aliases `UnGraph` and `DiGraph` for convenience.
+ ///
+ /// `Graph` does not allow parallel edges, but self loops are allowed.
+ #[derive(Clone)]
+-pub struct Graph<const DIRECTED: bool, S = FixedHasher>
++pub struct Graph<const DIRECTED: bool, N: GraphNodeId, S = FixedHasher>
+ where
+     S: BuildHasher,
+ {
+-    nodes: IndexMap<NodeId, Vec<CompactNodeIdAndDirection>, S>,
+-    edges: HashSet<CompactNodeIdPair, S>,
++    nodes: IndexMap<N, Vec<N::Adjacent>, S>,
++    edges: HashSet<N::Edge, S>,
+ }
+ 
+-impl<const DIRECTED: bool, S: BuildHasher> fmt::Debug for Graph<DIRECTED, S> {
++impl<const DIRECTED: bool, N: GraphNodeId, S: BuildHasher> fmt::Debug for Graph<DIRECTED, N, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         self.nodes.fmt(f)
+     }
+ }
+ 
+-impl<const DIRECTED: bool, S> Graph<DIRECTED, S>
+-where
+-    S: BuildHasher,
+-{
++impl<const DIRECTED: bool, N: GraphNodeId, S: BuildHasher> Graph<DIRECTED, N, S> {
+     /// Create a new `Graph` with estimated capacity.
+     pub fn with_capacity(nodes: usize, edges: usize) -> Self
+     where
+@@ -78,10 +75,10 @@ where
+ 
+     /// Use their natural order to map the node pair (a, b) to a canonical edge id.
+     #[inline]
+-    fn edge_key(a: NodeId, b: NodeId) -> CompactNodeIdPair {
++    fn edge_key(a: N, b: N) -> N::Edge {
+         let (a, b) = if DIRECTED || a <= b { (a, b) } else { (b, a) };
+ 
+-        CompactNodeIdPair::store(a, b)
++        N::Edge::from((a, b))
+     }
+ 
+     /// Return the number of nodes in the graph.
+@@ -89,20 +86,25 @@ where
+         self.nodes.len()
+     }
+ 
++    /// Return the number of edges in the graph.
++    pub fn edge_count(&self) -> usize {
++        self.edges.len()
++    }
++
+     /// Add node `n` to the graph.
+-    pub fn add_node(&mut self, n: NodeId) {
++    pub fn add_node(&mut self, n: N) {
+         self.nodes.entry(n).or_default();
+     }
+ 
+     /// Remove a node `n` from the graph.
+     ///
+     /// Computes in **O(N)** time, due to the removal of edges with other nodes.
+-    pub fn remove_node(&mut self, n: NodeId) {
++    pub fn remove_node(&mut self, n: N) {
+         let Some(links) = self.nodes.swap_remove(&n) else {
+             return;
+         };
+ 
+-        let links = links.into_iter().map(CompactNodeIdAndDirection::load);
++        let links = links.into_iter().map(N::Adjacent::into);
+ 
+         for (succ, dir) in links {
+             let edge = if dir == Outgoing {
+@@ -118,7 +120,7 @@ where
+     }
+ 
+     /// Return `true` if the node is contained in the graph.
+-    pub fn contains_node(&self, n: NodeId) -> bool {
++    pub fn contains_node(&self, n: N) -> bool {
+         self.nodes.contains_key(&n)
+     }
+ 
+@@ -126,27 +128,27 @@ where
+     /// For a directed graph, the edge is directed from `a` to `b`.
+     ///
+     /// Inserts nodes `a` and/or `b` if they aren't already part of the graph.
+-    pub fn add_edge(&mut self, a: NodeId, b: NodeId) {
++    pub fn add_edge(&mut self, a: N, b: N) {
+         if self.edges.insert(Self::edge_key(a, b)) {
+             // insert in the adjacency list if it's a new edge
+             self.nodes
+                 .entry(a)
+                 .or_insert_with(|| Vec::with_capacity(1))
+-                .push(CompactNodeIdAndDirection::store(b, Outgoing));
++                .push(N::Adjacent::from((b, Outgoing)));
+             if a != b {
+                 // self loops don't have the Incoming entry
+                 self.nodes
+                     .entry(b)
+                     .or_insert_with(|| Vec::with_capacity(1))
+-                    .push(CompactNodeIdAndDirection::store(a, Incoming));
++                    .push(N::Adjacent::from((a, Incoming)));
+             }
+         }
+     }
+ 
+-    /// Remove edge relation from a to b
++    /// Remove edge relation from a to b.
+     ///
+     /// Return `true` if it did exist.
+-    fn remove_single_edge(&mut self, a: NodeId, b: NodeId, dir: Direction) -> bool {
++    fn remove_single_edge(&mut self, a: N, b: N, dir: Direction) -> bool {
+         let Some(sus) = self.nodes.get_mut(&a) else {
+             return false;
+         };
+@@ -154,7 +156,7 @@ where
+         let Some(index) = sus
+             .iter()
+             .copied()
+-            .map(CompactNodeIdAndDirection::load)
++            .map(N::Adjacent::into)
+             .position(|elt| (DIRECTED && elt == (b, dir)) || (!DIRECTED && elt.0 == b))
+         else {
+             return false;
+@@ -167,7 +169,7 @@ where
+     /// Remove edge from `a` to `b` from the graph.
+     ///
+     /// Return `false` if the edge didn't exist.
+-    pub fn remove_edge(&mut self, a: NodeId, b: NodeId) -> bool {
++    pub fn remove_edge(&mut self, a: N, b: N) -> bool {
+         let exist1 = self.remove_single_edge(a, b, Outgoing);
+         let exist2 = if a != b {
+             self.remove_single_edge(b, a, Incoming)
+@@ -180,26 +182,24 @@ where
+     }
+ 
+     /// Return `true` if the edge connecting `a` with `b` is contained in the graph.
+-    pub fn contains_edge(&self, a: NodeId, b: NodeId) -> bool {
++    pub fn contains_edge(&self, a: N, b: N) -> bool {
+         self.edges.contains(&Self::edge_key(a, b))
+     }
+ 
+     /// Return an iterator over the nodes of the graph.
+-    pub fn nodes(
+-        &self,
+-    ) -> impl DoubleEndedIterator<Item = NodeId> + ExactSizeIterator<Item = NodeId> + '_ {
++    pub fn nodes(&self) -> impl DoubleEndedIterator<Item = N> + ExactSizeIterator<Item = N> + '_ {
+         self.nodes.keys().copied()
+     }
+ 
+     /// Return an iterator of all nodes with an edge starting from `a`.
+-    pub fn neighbors(&self, a: NodeId) -> impl DoubleEndedIterator<Item = NodeId> + '_ {
++    pub fn neighbors(&self, a: N) -> impl DoubleEndedIterator<Item = N> + '_ {
+         let iter = match self.nodes.get(&a) {
+             Some(neigh) => neigh.iter(),
+             None => [].iter(),
+         };
+ 
+         iter.copied()
+-            .map(CompactNodeIdAndDirection::load)
++            .map(N::Adjacent::into)
+             .filter_map(|(n, dir)| (!DIRECTED || dir == Outgoing).then_some(n))
+     }
+ 
+@@ -208,22 +208,22 @@ where
+     /// If the graph's edges are undirected, this is equivalent to *.neighbors(a)*.
+     pub fn neighbors_directed(
+         &self,
+-        a: NodeId,
++        a: N,
+         dir: Direction,
+-    ) -> impl DoubleEndedIterator<Item = NodeId> + '_ {
++    ) -> impl DoubleEndedIterator<Item = N> + '_ {
+         let iter = match self.nodes.get(&a) {
+             Some(neigh) => neigh.iter(),
+             None => [].iter(),
+         };
+ 
+         iter.copied()
+-            .map(CompactNodeIdAndDirection::load)
++            .map(N::Adjacent::into)
+             .filter_map(move |(n, d)| (!DIRECTED || d == dir || n == a).then_some(n))
+     }
+ 
+     /// Return an iterator of target nodes with an edge starting from `a`,
+     /// paired with their respective edge weights.
+-    pub fn edges(&self, a: NodeId) -> impl DoubleEndedIterator<Item = (NodeId, NodeId)> + '_ {
++    pub fn edges(&self, a: N) -> impl DoubleEndedIterator<Item = (N, N)> + '_ {
+         self.neighbors(a)
+             .map(move |b| match self.edges.get(&Self::edge_key(a, b)) {
+                 None => unreachable!(),
+@@ -235,9 +235,9 @@ where
+     /// paired with their respective edge weights.
+     pub fn edges_directed(
+         &self,
+-        a: NodeId,
++        a: N,
+         dir: Direction,
+-    ) -> impl DoubleEndedIterator<Item = (NodeId, NodeId)> + '_ {
++    ) -> impl DoubleEndedIterator<Item = (N, N)> + '_ {
+         self.neighbors_directed(a, dir).map(move |b| {
+             let (a, b) = if dir == Incoming { (b, a) } else { (a, b) };
+ 
+@@ -249,18 +249,67 @@ where
+     }
+ 
+     /// Return an iterator over all edges of the graph with their weight in arbitrary order.
+-    pub fn all_edges(&self) -> impl ExactSizeIterator<Item = (NodeId, NodeId)> + '_ {
+-        self.edges.iter().copied().map(CompactNodeIdPair::load)
++    pub fn all_edges(&self) -> impl ExactSizeIterator<Item = (N, N)> + '_ {
++        self.edges.iter().copied().map(N::Edge::into)
+     }
+ 
+-    pub(crate) fn to_index(&self, ix: NodeId) -> usize {
++    pub(crate) fn to_index(&self, ix: N) -> usize {
+         self.nodes.get_index_of(&ix).unwrap()
+     }
++
++    /// Converts from one [`GraphNodeId`] type to another. If the conversion fails,
++    /// it returns the error from the target type's [`TryFrom`] implementation.
++    ///
++    /// Nodes must uniquely convert from `N` to `T` (i.e. no two `N` can convert
++    /// to the same `T`).
++    ///
++    /// # Errors
++    ///
++    /// If the conversion fails, it returns an error of type `T::Error`.
++    pub fn try_into<T: GraphNodeId + TryFrom<N>>(self) -> Result<Graph<DIRECTED, T, S>, T::Error>
++    where
++        S: Default,
++    {
++        // Converts the node key and every adjacency list entry from `N` to `T`.
++        fn try_convert_node<N: GraphNodeId, T: GraphNodeId + TryFrom<N>>(
++            (key, adj): (N, Vec<N::Adjacent>),
++        ) -> Result<(T, Vec<T::Adjacent>), T::Error> {
++            let key = key.try_into()?;
++            let adj = adj
++                .into_iter()
++                .map(|node| {
++                    let (id, dir) = node.into();
++                    Ok(T::Adjacent::from((id.try_into()?, dir)))
++                })
++                .collect::<Result<_, T::Error>>()?;
++            Ok((key, adj))
++        }
++        // Unpacks the edge pair, converts the nodes from `N` to `T`, and repacks them.
++        fn try_convert_edge<N: GraphNodeId, T: GraphNodeId + TryFrom<N>>(
++            edge: N::Edge,
++        ) -> Result<T::Edge, T::Error> {
++            let (a, b) = edge.into();
++            Ok(T::Edge::from((a.try_into()?, b.try_into()?)))
++        }
++
++        let nodes = self
++            .nodes
++            .into_iter()
++            .map(try_convert_node::<N, T>)
++            .collect::<Result<_, T::Error>>()?;
++        let edges = self
++            .edges
++            .into_iter()
++            .map(try_convert_edge::<N, T>)
++            .collect::<Result<_, T::Error>>()?;
++        Ok(Graph { nodes, edges })
++    }
+ }
+ 
+ /// Create a new empty `Graph`.
+-impl<const DIRECTED: bool, S> Default for Graph<DIRECTED, S>
++impl<const DIRECTED: bool, N, S> Default for Graph<DIRECTED, N, S>
+ where
++    N: GraphNodeId,
+     S: BuildHasher + Default,
+ {
+     fn default() -> Self {
+@@ -268,9 +317,9 @@ where
+     }
+ }
+ 
+-impl<S: BuildHasher> DiGraph<S> {
++impl<N: GraphNodeId, S: BuildHasher> DiGraph<N, S> {
+     /// Iterate over all *Strongly Connected Components* in this graph.
+-    pub(crate) fn iter_sccs(&self) -> impl Iterator<Item = SmallVec<[NodeId; 4]>> + '_ {
++    pub(crate) fn iter_sccs(&self) -> impl Iterator<Item = SmallVec<[N; 4]>> + '_ {
+         super::tarjan_scc::new_tarjan_scc(self)
+     }
+ }
+@@ -296,113 +345,9 @@ impl Direction {
+     }
+ }
+ 
+-/// Compact storage of a [`NodeId`] and a [`Direction`].
+-#[derive(Clone, Copy)]
+-struct CompactNodeIdAndDirection {
+-    key: KeyData,
+-    is_system: bool,
+-    direction: Direction,
+-}
+-
+-impl fmt::Debug for CompactNodeIdAndDirection {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        self.load().fmt(f)
+-    }
+-}
+-
+-impl CompactNodeIdAndDirection {
+-    fn store(node: NodeId, direction: Direction) -> Self {
+-        let key = match node {
+-            NodeId::System(key) => key.data(),
+-            NodeId::Set(key) => key.data(),
+-        };
+-        let is_system = node.is_system();
+-
+-        Self {
+-            key,
+-            is_system,
+-            direction,
+-        }
+-    }
+-
+-    fn load(self) -> (NodeId, Direction) {
+-        let Self {
+-            key,
+-            is_system,
+-            direction,
+-        } = self;
+-
+-        let node = match is_system {
+-            true => NodeId::System(key.into()),
+-            false => NodeId::Set(key.into()),
+-        };
+-
+-        (node, direction)
+-    }
+-}
+-
+-/// Compact storage of a [`NodeId`] pair.
+-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+-struct CompactNodeIdPair {
+-    key_a: KeyData,
+-    key_b: KeyData,
+-    is_system_a: bool,
+-    is_system_b: bool,
+-}
+-
+-impl fmt::Debug for CompactNodeIdPair {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        self.load().fmt(f)
+-    }
+-}
+-
+-impl CompactNodeIdPair {
+-    fn store(a: NodeId, b: NodeId) -> Self {
+-        let key_a = match a {
+-            NodeId::System(index) => index.data(),
+-            NodeId::Set(index) => index.data(),
+-        };
+-        let is_system_a = a.is_system();
+-
+-        let key_b = match b {
+-            NodeId::System(index) => index.data(),
+-            NodeId::Set(index) => index.data(),
+-        };
+-        let is_system_b = b.is_system();
+-
+-        Self {
+-            key_a,
+-            key_b,
+-            is_system_a,
+-            is_system_b,
+-        }
+-    }
+-
+-    fn load(self) -> (NodeId, NodeId) {
+-        let Self {
+-            key_a,
+-            key_b,
+-            is_system_a,
+-            is_system_b,
+-        } = self;
+-
+-        let a = match is_system_a {
+-            true => NodeId::System(key_a.into()),
+-            false => NodeId::Set(key_a.into()),
+-        };
+-
+-        let b = match is_system_b {
+-            true => NodeId::System(key_b.into()),
+-            false => NodeId::Set(key_b.into()),
+-        };
+-
+-        (a, b)
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+-    use crate::schedule::SystemKey;
++    use crate::schedule::{NodeId, SystemKey};
+ 
+     use super::*;
+     use alloc::vec;
+@@ -416,7 +361,7 @@ mod tests {
+         use NodeId::System;
+ 
+         let mut slotmap = SlotMap::<SystemKey, ()>::with_key();
+-        let mut graph = <DiGraph>::default();
++        let mut graph = DiGraph::<NodeId>::default();
+ 
+         let sys1 = slotmap.insert(());
+         let sys2 = slotmap.insert(());
+@@ -464,7 +409,7 @@ mod tests {
+         use NodeId::System;
+ 
+         let mut slotmap = SlotMap::<SystemKey, ()>::with_key();
+-        let mut graph = <DiGraph>::default();
++        let mut graph = DiGraph::<NodeId>::default();
+ 
+         let sys1 = slotmap.insert(());
+         let sys2 = slotmap.insert(());
+diff --git a/crates/bevy_ecs/src/schedule/graph/mod.rs b/crates/bevy_ecs/src/schedule/graph/mod.rs
+index 8a98604102058..a88034a6a7fdb 100644
+--- a/crates/bevy_ecs/src/schedule/graph/mod.rs
++++ b/crates/bevy_ecs/src/schedule/graph/mod.rs
+@@ -17,7 +17,7 @@ mod node;
+ mod tarjan_scc;
+ 
+ pub use graph_map::{DiGraph, Direction, UnGraph};
+-pub use node::NodeId;
++pub use node::GraphNodeId;
+ 
+ /// Specifies what kind of edge should be added to the dependency graph.
+ #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
+@@ -82,24 +82,24 @@ pub(crate) fn row_col(index: usize, num_cols: usize) -> (usize, usize) {
+ }
+ 
+ /// Stores the results of the graph analysis.
+-pub(crate) struct CheckGraphResults {
++pub(crate) struct CheckGraphResults<N: GraphNodeId> {
+     /// Boolean reachability matrix for the graph.
+     pub(crate) reachable: FixedBitSet,
+     /// Pairs of nodes that have a path connecting them.
+-    pub(crate) connected: HashSet<(NodeId, NodeId)>,
++    pub(crate) connected: HashSet<(N, N)>,
+     /// Pairs of nodes that don't have a path connecting them.
+-    pub(crate) disconnected: Vec<(NodeId, NodeId)>,
++    pub(crate) disconnected: Vec<(N, N)>,
+     /// Edges that are redundant because a longer path exists.
+-    pub(crate) transitive_edges: Vec<(NodeId, NodeId)>,
++    pub(crate) transitive_edges: Vec<(N, N)>,
+     /// Variant of the graph with no transitive edges.
+-    pub(crate) transitive_reduction: DiGraph,
++    pub(crate) transitive_reduction: DiGraph<N>,
+     /// Variant of the graph with all possible transitive edges.
+     // TODO: this will very likely be used by "if-needed" ordering
+     #[expect(dead_code, reason = "See the TODO above this attribute.")]
+-    pub(crate) transitive_closure: DiGraph,
++    pub(crate) transitive_closure: DiGraph<N>,
+ }
+ 
+-impl Default for CheckGraphResults {
++impl<N: GraphNodeId> Default for CheckGraphResults<N> {
+     fn default() -> Self {
+         Self {
+             reachable: FixedBitSet::new(),
+@@ -123,7 +123,10 @@ impl Default for CheckGraphResults {
+ /// ["On the calculation of transitive reduction-closure of orders"][1] by Habib, Morvan and Rampon.
+ ///
+ /// [1]: https://doi.org/10.1016/0012-365X(93)90164-O
+-pub(crate) fn check_graph(graph: &DiGraph, topological_order: &[NodeId]) -> CheckGraphResults {
++pub(crate) fn check_graph<N: GraphNodeId>(
++    graph: &DiGraph<N>,
++    topological_order: &[N],
++) -> CheckGraphResults<N> {
+     if graph.node_count() == 0 {
+         return CheckGraphResults::default();
+     }
+@@ -132,7 +135,7 @@ pub(crate) fn check_graph(graph: &DiGraph, topological_order: &[NodeId]) -> Chec
+ 
+     // build a copy of the graph where the nodes and edges appear in topsorted order
+     let mut map = <HashMap<_, _>>::with_capacity_and_hasher(n, Default::default());
+-    let mut topsorted = <DiGraph>::default();
++    let mut topsorted = DiGraph::<N>::default();
+     // iterate nodes in topological order
+     for (i, &node) in topological_order.iter().enumerate() {
+         map.insert(node, i);
+@@ -228,13 +231,13 @@ pub(crate) fn check_graph(graph: &DiGraph, topological_order: &[NodeId]) -> Chec
+ /// ["Finding all the elementary circuits of a directed graph"][1] by D. B. Johnson.
+ ///
+ /// [1]: https://doi.org/10.1137/0204007
+-pub fn simple_cycles_in_component(graph: &DiGraph, scc: &[NodeId]) -> Vec<Vec<NodeId>> {
++pub fn simple_cycles_in_component<N: GraphNodeId>(graph: &DiGraph<N>, scc: &[N]) -> Vec<Vec<N>> {
+     let mut cycles = vec![];
+     let mut sccs = vec![SmallVec::from_slice(scc)];
+ 
+     while let Some(mut scc) = sccs.pop() {
+         // only look at nodes and edges in this strongly-connected component
+-        let mut subgraph = <DiGraph>::default();
++        let mut subgraph = DiGraph::<N>::default();
+         for &node in &scc {
+             subgraph.add_node(node);
+         }
+@@ -254,12 +257,12 @@ pub fn simple_cycles_in_component(graph: &DiGraph, scc: &[NodeId]) -> Vec<Vec<No
+             HashSet::with_capacity_and_hasher(subgraph.node_count(), Default::default());
+         // connects nodes along path segments that can't be part of a cycle (given current root)
+         // those nodes can be unblocked at the same time
+-        let mut unblock_together: HashMap<NodeId, HashSet<NodeId>> =
++        let mut unblock_together: HashMap<N, HashSet<N>> =
+             HashMap::with_capacity_and_hasher(subgraph.node_count(), Default::default());
+         // stack for unblocking nodes
+         let mut unblock_stack = Vec::with_capacity(subgraph.node_count());
+         // nodes can be involved in multiple cycles
+-        let mut maybe_in_more_cycles: HashSet<NodeId> =
++        let mut maybe_in_more_cycles: HashSet<N> =
+             HashSet::with_capacity_and_hasher(subgraph.node_count(), Default::default());
+         // stack for DFS
+         let mut stack = Vec::with_capacity(subgraph.node_count());
+diff --git a/crates/bevy_ecs/src/schedule/graph/node.rs b/crates/bevy_ecs/src/schedule/graph/node.rs
+index 40f4f53988853..c3ab19c9da31d 100644
+--- a/crates/bevy_ecs/src/schedule/graph/node.rs
++++ b/crates/bevy_ecs/src/schedule/graph/node.rs
+@@ -1,42 +1,16 @@
+-use core::fmt::Debug;
++use core::{fmt::Debug, hash::Hash};
+ 
+-use crate::schedule::{SystemKey, SystemSetKey};
++use crate::schedule::graph::Direction;
+ 
+-/// Unique identifier for a system or system set stored in a [`ScheduleGraph`].
++/// Types that can be used as node identifiers in a [`DiGraph`]/[`UnGraph`].
+ ///
+-/// [`ScheduleGraph`]: crate::schedule::ScheduleGraph
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+-pub enum NodeId {
+-    /// Identifier for a system.
+-    System(SystemKey),
+-    /// Identifier for a system set.
+-    Set(SystemSetKey),
+-}
+-
+-impl NodeId {
+-    /// Returns `true` if the identified node is a system.
+-    pub const fn is_system(&self) -> bool {
+-        matches!(self, NodeId::System(_))
+-    }
+-
+-    /// Returns `true` if the identified node is a system set.
+-    pub const fn is_set(&self) -> bool {
+-        matches!(self, NodeId::Set(_))
+-    }
+-
+-    /// Returns the system key if the node is a system, otherwise `None`.
+-    pub const fn as_system(&self) -> Option<SystemKey> {
+-        match self {
+-            NodeId::System(system) => Some(*system),
+-            NodeId::Set(_) => None,
+-        }
+-    }
+-
+-    /// Returns the system set key if the node is a system set, otherwise `None`.
+-    pub const fn as_set(&self) -> Option<SystemSetKey> {
+-        match self {
+-            NodeId::System(_) => None,
+-            NodeId::Set(set) => Some(*set),
+-        }
+-    }
++/// [`DiGraph`]: crate::schedule::graph::DiGraph
++/// [`UnGraph`]: crate::schedule::graph::UnGraph
++pub trait GraphNodeId: Copy + Eq + Hash + Ord + Debug {
++    /// The type that packs and unpacks this [`GraphNodeId`] with a [`Direction`].
++    /// This is used to save space in the graph's adjacency list.
++    type Adjacent: Copy + Debug + From<(Self, Direction)> + Into<(Self, Direction)>;
++    /// The type that packs and unpacks this [`GraphNodeId`] with another
++    /// [`GraphNodeId`]. This is used to save space in the graph's edge list.
++    type Edge: Copy + Eq + Hash + Debug + From<(Self, Self)> + Into<(Self, Self)>;
+ }
+diff --git a/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs b/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs
+index 5718dd2cfb83b..309ec321baa03 100644
+--- a/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs
++++ b/crates/bevy_ecs/src/schedule/graph/tarjan_scc.rs
+@@ -1,5 +1,6 @@
++use crate::schedule::graph::node::GraphNodeId;
++
+ use super::DiGraph;
+-use super::NodeId;
+ use alloc::vec::Vec;
+ use core::hash::BuildHasher;
+ use core::num::NonZeroUsize;
+@@ -16,9 +17,9 @@ use smallvec::SmallVec;
+ /// Returns each strongly strongly connected component (scc).
+ /// The order of node ids within each scc is arbitrary, but the order of
+ /// the sccs is their postorder (reverse topological sort).
+-pub(crate) fn new_tarjan_scc<S: BuildHasher>(
+-    graph: &DiGraph<S>,
+-) -> impl Iterator<Item = SmallVec<[NodeId; 4]>> + '_ {
++pub(crate) fn new_tarjan_scc<N: GraphNodeId, S: BuildHasher>(
++    graph: &DiGraph<N, S>,
++) -> impl Iterator<Item = SmallVec<[N; 4]>> + '_ {
+     // Create a list of all nodes we need to visit.
+     let unchecked_nodes = graph.nodes();
+ 
+@@ -46,9 +47,9 @@ pub(crate) fn new_tarjan_scc<S: BuildHasher>(
+     }
+ }
+ 
+-struct NodeData<N: Iterator<Item = NodeId>> {
++struct NodeData<Neighbors: Iterator<Item: GraphNodeId>> {
+     root_index: Option<NonZeroUsize>,
+-    neighbors: N,
++    neighbors: Neighbors,
+ }
+ 
+ /// A state for computing the *strongly connected components* using [Tarjan's algorithm][1].
+@@ -58,35 +59,41 @@ struct NodeData<N: Iterator<Item = NodeId>> {
+ /// [1]: https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm
+ /// [`petgraph`]: https://docs.rs/petgraph/0.6.5/petgraph/
+ /// [`TarjanScc`]: https://docs.rs/petgraph/0.6.5/petgraph/algo/struct.TarjanScc.html
+-struct TarjanScc<'graph, Hasher, AllNodes, Neighbors>
++struct TarjanScc<'graph, N, Hasher, AllNodes, Neighbors>
+ where
++    N: GraphNodeId,
+     Hasher: BuildHasher,
+-    AllNodes: Iterator<Item = NodeId>,
+-    Neighbors: Iterator<Item = NodeId>,
++    AllNodes: Iterator<Item = N>,
++    Neighbors: Iterator<Item = N>,
+ {
+     /// Source of truth [`DiGraph`]
+-    graph: &'graph DiGraph<Hasher>,
+-    /// An [`Iterator`] of [`NodeId`]s from the `graph` which may not have been visited yet.
++    graph: &'graph DiGraph<N, Hasher>,
++    /// An [`Iterator`] of [`GraphNodeId`]s from the `graph` which may not have been visited yet.
+     unchecked_nodes: AllNodes,
+     /// The index of the next SCC
+     index: usize,
+     /// A count of potentially remaining SCCs
+     component_count: usize,
+-    /// Information about each [`NodeId`], including a possible SCC index and an
++    /// Information about each [`GraphNodeId`], including a possible SCC index and an
+     /// [`Iterator`] of possibly unvisited neighbors.
+     nodes: Vec<NodeData<Neighbors>>,
+-    /// A stack of [`NodeId`]s where a SCC will be found starting at the top of the stack.
+-    stack: Vec<NodeId>,
+-    /// A stack of [`NodeId`]s which need to be visited to determine which SCC they belong to.
+-    visitation_stack: Vec<(NodeId, bool)>,
++    /// A stack of [`GraphNodeId`]s where a SCC will be found starting at the top of the stack.
++    stack: Vec<N>,
++    /// A stack of [`GraphNodeId`]s which need to be visited to determine which SCC they belong to.
++    visitation_stack: Vec<(N, bool)>,
+     /// An index into the `stack` indicating the starting point of a SCC.
+     start: Option<usize>,
+     /// An adjustment to the `index` which will be applied once the current SCC is found.
+     index_adjustment: Option<usize>,
+ }
+ 
+-impl<'graph, S: BuildHasher, A: Iterator<Item = NodeId>, N: Iterator<Item = NodeId>>
+-    TarjanScc<'graph, S, A, N>
++impl<
++        'graph,
++        N: GraphNodeId,
++        S: BuildHasher,
++        A: Iterator<Item = N>,
++        Neighbors: Iterator<Item = N>,
++    > TarjanScc<'graph, N, S, A, Neighbors>
+ {
+     /// Compute the next *strongly connected component* using Algorithm 3 in
+     /// [A Space-Efficient Algorithm for Finding Strongly Connected Components][1] by David J. Pierce,
+@@ -99,7 +106,7 @@ impl<'graph, S: BuildHasher, A: Iterator<Item = NodeId>, N: Iterator<Item = Node
+     /// Returns `Some` for each strongly strongly connected component (scc).
+     /// The order of node ids within each scc is arbitrary, but the order of
+     /// the sccs is their postorder (reverse topological sort).
+-    fn next_scc(&mut self) -> Option<&[NodeId]> {
++    fn next_scc(&mut self) -> Option<&[N]> {
+         // Cleanup from possible previous iteration
+         if let (Some(start), Some(index_adjustment)) =
+             (self.start.take(), self.index_adjustment.take())
+@@ -139,7 +146,7 @@ impl<'graph, S: BuildHasher, A: Iterator<Item = NodeId>, N: Iterator<Item = Node
+     /// If a visitation is required, this will return `None` and mark the required neighbor and the
+     /// current node as in need of visitation again.
+     /// If no SCC can be found in the current visitation stack, returns `None`.
+-    fn visit_once(&mut self, v: NodeId, mut v_is_local_root: bool) -> Option<usize> {
++    fn visit_once(&mut self, v: N, mut v_is_local_root: bool) -> Option<usize> {
+         let node_v = &mut self.nodes[self.graph.to_index(v)];
+ 
+         if node_v.root_index.is_none() {
+@@ -203,13 +210,18 @@ impl<'graph, S: BuildHasher, A: Iterator<Item = NodeId>, N: Iterator<Item = Node
+     }
+ }
+ 
+-impl<'graph, S: BuildHasher, A: Iterator<Item = NodeId>, N: Iterator<Item = NodeId>> Iterator
+-    for TarjanScc<'graph, S, A, N>
++impl<
++        'graph,
++        N: GraphNodeId,
++        S: BuildHasher,
++        A: Iterator<Item = N>,
++        Neighbors: Iterator<Item = N>,
++    > Iterator for TarjanScc<'graph, N, S, A, Neighbors>
+ {
+     // It is expected that the `DiGraph` is sparse, and as such wont have many large SCCs.
+     // Returning a `SmallVec` allows this iterator to skip allocation in cases where that
+     // assumption holds.
+-    type Item = SmallVec<[NodeId; 4]>;
++    type Item = SmallVec<[N; 4]>;
+ 
+     fn next(&mut self) -> Option<Self::Item> {
+         let next = SmallVec::from_slice(self.next_scc()?);
+diff --git a/crates/bevy_ecs/src/schedule/mod.rs b/crates/bevy_ecs/src/schedule/mod.rs
+index 7f07600ab2742..66dd9448de138 100644
+--- a/crates/bevy_ecs/src/schedule/mod.rs
++++ b/crates/bevy_ecs/src/schedule/mod.rs
+@@ -14,8 +14,6 @@ use self::graph::*;
+ pub use self::{condition::*, config::*, executor::*, node::*, schedule::*, set::*};
+ pub use pass::ScheduleBuildPass;
+ 
+-pub use self::graph::NodeId;
+-
+ /// An implementation of a graph data structure.
+ pub mod graph;
+ 
+diff --git a/crates/bevy_ecs/src/schedule/node.rs b/crates/bevy_ecs/src/schedule/node.rs
+index bc96d4871e294..36005cf0c9ee8 100644
+--- a/crates/bevy_ecs/src/schedule/node.rs
++++ b/crates/bevy_ecs/src/schedule/node.rs
+@@ -2,17 +2,21 @@ use alloc::{boxed::Box, vec::Vec};
+ use bevy_utils::prelude::DebugName;
+ use core::{
+     any::TypeId,
++    fmt::{self, Debug},
+     ops::{Index, IndexMut, Range},
+ };
+ 
+ use bevy_platform::collections::HashMap;
+-use slotmap::{new_key_type, SecondaryMap, SlotMap};
++use slotmap::{new_key_type, Key, KeyData, SecondaryMap, SlotMap};
+ 
+ use crate::{
+     component::{CheckChangeTicks, ComponentId, Tick},
+     prelude::{SystemIn, SystemSet},
+     query::FilteredAccessSet,
+-    schedule::{BoxedCondition, InternedSystemSet},
++    schedule::{
++        graph::{Direction, GraphNodeId},
++        BoxedCondition, InternedSystemSet,
++    },
+     system::{
+         ReadOnlySystem, RunSystemError, ScheduleSystem, System, SystemParamValidationError,
+         SystemStateFlags,
+@@ -251,6 +255,186 @@ new_key_type! {
+     pub struct SystemSetKey;
+ }
+ 
++impl GraphNodeId for SystemKey {
++    type Adjacent = (SystemKey, Direction);
++    type Edge = (SystemKey, SystemKey);
++}
++
++impl TryFrom<NodeId> for SystemKey {
++    type Error = SystemSetKey;
++
++    fn try_from(value: NodeId) -> Result<Self, Self::Error> {
++        match value {
++            NodeId::System(key) => Ok(key),
++            NodeId::Set(key) => Err(key),
++        }
++    }
++}
++
++impl TryFrom<NodeId> for SystemSetKey {
++    type Error = SystemKey;
++
++    fn try_from(value: NodeId) -> Result<Self, Self::Error> {
++        match value {
++            NodeId::System(key) => Err(key),
++            NodeId::Set(key) => Ok(key),
++        }
++    }
++}
++
++/// Unique identifier for a system or system set stored in a [`ScheduleGraph`].
++///
++/// [`ScheduleGraph`]: crate::schedule::ScheduleGraph
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub enum NodeId {
++    /// Identifier for a system.
++    System(SystemKey),
++    /// Identifier for a system set.
++    Set(SystemSetKey),
++}
++
++impl NodeId {
++    /// Returns `true` if the identified node is a system.
++    pub const fn is_system(&self) -> bool {
++        matches!(self, NodeId::System(_))
++    }
++
++    /// Returns `true` if the identified node is a system set.
++    pub const fn is_set(&self) -> bool {
++        matches!(self, NodeId::Set(_))
++    }
++
++    /// Returns the system key if the node is a system, otherwise `None`.
++    pub const fn as_system(&self) -> Option<SystemKey> {
++        match self {
++            NodeId::System(system) => Some(*system),
++            NodeId::Set(_) => None,
++        }
++    }
++
++    /// Returns the system set key if the node is a system set, otherwise `None`.
++    pub const fn as_set(&self) -> Option<SystemSetKey> {
++        match self {
++            NodeId::System(_) => None,
++            NodeId::Set(set) => Some(*set),
++        }
++    }
++}
++
++impl GraphNodeId for NodeId {
++    type Adjacent = CompactNodeIdAndDirection;
++    type Edge = CompactNodeIdPair;
++}
++
++impl From<SystemKey> for NodeId {
++    fn from(system: SystemKey) -> Self {
++        NodeId::System(system)
++    }
++}
++
++impl From<SystemSetKey> for NodeId {
++    fn from(set: SystemSetKey) -> Self {
++        NodeId::Set(set)
++    }
++}
++
++/// Compact storage of a [`NodeId`] and a [`Direction`].
++#[derive(Clone, Copy)]
++pub struct CompactNodeIdAndDirection {
++    key: KeyData,
++    is_system: bool,
++    direction: Direction,
++}
++
++impl Debug for CompactNodeIdAndDirection {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let tuple: (_, _) = (*self).into();
++        tuple.fmt(f)
++    }
++}
++
++impl From<(NodeId, Direction)> for CompactNodeIdAndDirection {
++    fn from((id, direction): (NodeId, Direction)) -> Self {
++        let key = match id {
++            NodeId::System(key) => key.data(),
++            NodeId::Set(key) => key.data(),
++        };
++        let is_system = id.is_system();
++
++        Self {
++            key,
++            is_system,
++            direction,
++        }
++    }
++}
++
++impl From<CompactNodeIdAndDirection> for (NodeId, Direction) {
++    fn from(value: CompactNodeIdAndDirection) -> Self {
++        let node = match value.is_system {
++            true => NodeId::System(value.key.into()),
++            false => NodeId::Set(value.key.into()),
++        };
++
++        (node, value.direction)
++    }
++}
++
++/// Compact storage of a [`NodeId`] pair.
++#[derive(Clone, Copy, Hash, PartialEq, Eq)]
++pub struct CompactNodeIdPair {
++    key_a: KeyData,
++    key_b: KeyData,
++    is_system_a: bool,
++    is_system_b: bool,
++}
++
++impl Debug for CompactNodeIdPair {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let tuple: (_, _) = (*self).into();
++        tuple.fmt(f)
++    }
++}
++
++impl From<(NodeId, NodeId)> for CompactNodeIdPair {
++    fn from((a, b): (NodeId, NodeId)) -> Self {
++        let key_a = match a {
++            NodeId::System(index) => index.data(),
++            NodeId::Set(index) => index.data(),
++        };
++        let is_system_a = a.is_system();
++
++        let key_b = match b {
++            NodeId::System(index) => index.data(),
++            NodeId::Set(index) => index.data(),
++        };
++        let is_system_b = b.is_system();
++
++        Self {
++            key_a,
++            key_b,
++            is_system_a,
++            is_system_b,
++        }
++    }
++}
++
++impl From<CompactNodeIdPair> for (NodeId, NodeId) {
++    fn from(value: CompactNodeIdPair) -> Self {
++        let a = match value.is_system_a {
++            true => NodeId::System(value.key_a.into()),
++            false => NodeId::Set(value.key_a.into()),
++        };
++
++        let b = match value.is_system_b {
++            true => NodeId::System(value.key_b.into()),
++            false => NodeId::Set(value.key_b.into()),
++        };
++
++        (a, b)
++    }
++}
++
+ /// Container for systems in a schedule.
+ #[derive(Default)]
+ pub struct Systems {
+diff --git a/crates/bevy_ecs/src/schedule/pass.rs b/crates/bevy_ecs/src/schedule/pass.rs
+index c980378dd804a..9072c3ae65c97 100644
+--- a/crates/bevy_ecs/src/schedule/pass.rs
++++ b/crates/bevy_ecs/src/schedule/pass.rs
+@@ -24,7 +24,7 @@ pub trait ScheduleBuildPass: Send + Sync + Debug + 'static {
+         &mut self,
+         set: SystemSetKey,
+         systems: &[SystemKey],
+-        dependency_flattened: &DiGraph,
++        dependency_flattening: &DiGraph<NodeId>,
+     ) -> impl Iterator<Item = (NodeId, NodeId)>;
+ 
+     /// The implementation will be able to modify the `ScheduleGraph` here.
+@@ -32,7 +32,7 @@ pub trait ScheduleBuildPass: Send + Sync + Debug + 'static {
+         &mut self,
+         world: &mut World,
+         graph: &mut ScheduleGraph,
+-        dependency_flattened: &mut DiGraph,
++        dependency_flattened: &mut DiGraph<SystemKey>,
+     ) -> Result<(), ScheduleBuildError>;
+ }
+ 
+@@ -42,14 +42,14 @@ pub(super) trait ScheduleBuildPassObj: Send + Sync + Debug {
+         &mut self,
+         world: &mut World,
+         graph: &mut ScheduleGraph,
+-        dependency_flattened: &mut DiGraph,
++        dependency_flattened: &mut DiGraph<SystemKey>,
+     ) -> Result<(), ScheduleBuildError>;
+ 
+     fn collapse_set(
+         &mut self,
+         set: SystemSetKey,
+         systems: &[SystemKey],
+-        dependency_flattened: &DiGraph,
++        dependency_flattening: &DiGraph<NodeId>,
+         dependencies_to_add: &mut Vec<(NodeId, NodeId)>,
+     );
+     fn add_dependency(&mut self, from: NodeId, to: NodeId, all_options: &TypeIdMap<Box<dyn Any>>);
+@@ -60,7 +60,7 @@ impl<T: ScheduleBuildPass> ScheduleBuildPassObj for T {
+         &mut self,
+         world: &mut World,
+         graph: &mut ScheduleGraph,
+-        dependency_flattened: &mut DiGraph,
++        dependency_flattened: &mut DiGraph<SystemKey>,
+     ) -> Result<(), ScheduleBuildError> {
+         self.build(world, graph, dependency_flattened)
+     }
+@@ -68,10 +68,10 @@ impl<T: ScheduleBuildPass> ScheduleBuildPassObj for T {
+         &mut self,
+         set: SystemSetKey,
+         systems: &[SystemKey],
+-        dependency_flattened: &DiGraph,
++        dependency_flattening: &DiGraph<NodeId>,
+         dependencies_to_add: &mut Vec<(NodeId, NodeId)>,
+     ) {
+-        let iter = self.collapse_set(set, systems, dependency_flattened);
++        let iter = self.collapse_set(set, systems, dependency_flattening);
+         dependencies_to_add.extend(iter);
+     }
+     fn add_dependency(&mut self, from: NodeId, to: NodeId, all_options: &TypeIdMap<Box<dyn Any>>) {
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index 848763dfad0d6..6a13e6c4ff22c 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -615,15 +615,14 @@ impl Schedule {
+ }
+ 
+ /// A directed acyclic graph structure.
+-#[derive(Default)]
+-pub struct Dag {
++pub struct Dag<N: GraphNodeId> {
+     /// A directed graph.
+-    graph: DiGraph,
++    graph: DiGraph<N>,
+     /// A cached topological ordering of the graph.
+-    topsort: Vec<NodeId>,
++    topsort: Vec<N>,
+ }
+ 
+-impl Dag {
++impl<N: GraphNodeId> Dag<N> {
+     fn new() -> Self {
+         Self {
+             graph: DiGraph::default(),
+@@ -632,18 +631,27 @@ impl Dag {
+     }
+ 
+     /// The directed graph of the stored systems, connected by their ordering dependencies.
+-    pub fn graph(&self) -> &DiGraph {
++    pub fn graph(&self) -> &DiGraph<N> {
+         &self.graph
+     }
+ 
+     /// A cached topological ordering of the graph.
+     ///
+     /// The order is determined by the ordering dependencies between systems.
+-    pub fn cached_topsort(&self) -> &[NodeId] {
++    pub fn cached_topsort(&self) -> &[N] {
+         &self.topsort
+     }
+ }
+ 
++impl<N: GraphNodeId> Default for Dag<N> {
++    fn default() -> Self {
++        Self {
++            graph: Default::default(),
++            topsort: Default::default(),
++        }
++    }
++}
++
+ /// Metadata for a [`Schedule`].
+ ///
+ /// The order isn't optimized; calling `ScheduleGraph::build_schedule` will return a
+@@ -655,10 +663,10 @@ pub struct ScheduleGraph {
+     /// Container of system sets in the schedule.
+     pub system_sets: SystemSets,
+     /// Directed acyclic graph of the hierarchy (which systems/sets are children of which sets)
+-    hierarchy: Dag,
++    hierarchy: Dag<NodeId>,
+     /// Directed acyclic graph of the dependency (which systems/sets have to run before which other systems/sets)
+-    dependency: Dag,
+-    ambiguous_with: UnGraph,
++    dependency: Dag<NodeId>,
++    ambiguous_with: UnGraph<NodeId>,
+     /// Nodes that are allowed to have ambiguous ordering relationship with any other systems.
+     pub ambiguous_with_all: HashSet<NodeId>,
+     conflicting_systems: Vec<(SystemKey, SystemKey, Vec<ComponentId>)>,
+@@ -690,7 +698,7 @@ impl ScheduleGraph {
+     ///
+     /// The hierarchy is a directed acyclic graph of the systems and sets,
+     /// where an edge denotes that a system or set is the child of another set.
+-    pub fn hierarchy(&self) -> &Dag {
++    pub fn hierarchy(&self) -> &Dag<NodeId> {
+         &self.hierarchy
+     }
+ 
+@@ -698,7 +706,7 @@ impl ScheduleGraph {
+     ///
+     /// Nodes in this graph are systems and sets, and edges denote that
+     /// a system or set has to run before another system or set.
+-    pub fn dependency(&self) -> &Dag {
++    pub fn dependency(&self) -> &Dag<NodeId> {
+         &self.dependency
+     }
+ 
+@@ -1024,7 +1032,7 @@ impl ScheduleGraph {
+     fn map_sets_to_systems(
+         &self,
+         hierarchy_topsort: &[NodeId],
+-        hierarchy_graph: &DiGraph,
++        hierarchy_graph: &DiGraph<NodeId>,
+     ) -> (
+         HashMap<SystemSetKey, Vec<SystemKey>>,
+         HashMap<SystemSetKey, HashSet<SystemKey>>,
+@@ -1065,49 +1073,58 @@ impl ScheduleGraph {
+     fn get_dependency_flattened(
+         &mut self,
+         set_systems: &HashMap<SystemSetKey, Vec<SystemKey>>,
+-    ) -> DiGraph {
++    ) -> DiGraph<SystemKey> {
+         // flatten: combine `in_set` with `before` and `after` information
+         // have to do it like this to preserve transitivity
+-        let mut dependency_flattened = self.dependency.graph.clone();
++        let mut dependency_flattening = self.dependency.graph.clone();
+         let mut temp = Vec::new();
+         for (&set, systems) in set_systems {
+             for pass in self.passes.values_mut() {
+-                pass.collapse_set(set, systems, &dependency_flattened, &mut temp);
++                pass.collapse_set(set, systems, &dependency_flattening, &mut temp);
+             }
+             if systems.is_empty() {
+                 // collapse dependencies for empty sets
+-                for a in dependency_flattened.neighbors_directed(NodeId::Set(set), Incoming) {
+-                    for b in dependency_flattened.neighbors_directed(NodeId::Set(set), Outgoing) {
++                for a in dependency_flattening.neighbors_directed(NodeId::Set(set), Incoming) {
++                    for b in dependency_flattening.neighbors_directed(NodeId::Set(set), Outgoing) {
+                         temp.push((a, b));
+                     }
+                 }
+             } else {
+-                for a in dependency_flattened.neighbors_directed(NodeId::Set(set), Incoming) {
++                for a in dependency_flattening.neighbors_directed(NodeId::Set(set), Incoming) {
+                     for &sys in systems {
+                         temp.push((a, NodeId::System(sys)));
+                     }
+                 }
+ 
+-                for b in dependency_flattened.neighbors_directed(NodeId::Set(set), Outgoing) {
++                for b in dependency_flattening.neighbors_directed(NodeId::Set(set), Outgoing) {
+                     for &sys in systems {
+                         temp.push((NodeId::System(sys), b));
+                     }
+                 }
+             }
+ 
+-            dependency_flattened.remove_node(NodeId::Set(set));
++            dependency_flattening.remove_node(NodeId::Set(set));
+             for (a, b) in temp.drain(..) {
+-                dependency_flattened.add_edge(a, b);
++                dependency_flattening.add_edge(a, b);
+             }
+         }
+ 
+-        dependency_flattened
++        // By this point, we should have removed all system sets from the graph,
++        // so this conversion should never fail.
++        dependency_flattening
++            .try_into::<SystemKey>()
++            .unwrap_or_else(|n| {
++                unreachable!(
++                    "Flattened dependency graph has a leftover system set {}",
++                    self.get_node_name(&NodeId::Set(n))
++                )
++            })
+     }
+ 
+     fn get_ambiguous_with_flattened(
+         &self,
+         set_systems: &HashMap<SystemSetKey, Vec<SystemKey>>,
+-    ) -> UnGraph {
++    ) -> UnGraph<NodeId> {
+         let mut ambiguous_with_flattened = UnGraph::default();
+         for (lhs, rhs) in self.ambiguous_with.all_edges() {
+             match (lhs, rhs) {
+@@ -1140,29 +1157,19 @@ impl ScheduleGraph {
+ 
+     fn get_conflicting_systems(
+         &self,
+-        flat_results_disconnected: &Vec<(NodeId, NodeId)>,
+-        ambiguous_with_flattened: &UnGraph,
++        flat_results_disconnected: &Vec<(SystemKey, SystemKey)>,
++        ambiguous_with_flattened: &UnGraph<NodeId>,
+         ignored_ambiguities: &BTreeSet<ComponentId>,
+     ) -> Vec<(SystemKey, SystemKey, Vec<ComponentId>)> {
+         let mut conflicting_systems = Vec::new();
+         for &(a, b) in flat_results_disconnected {
+-            if ambiguous_with_flattened.contains_edge(a, b)
+-                || self.ambiguous_with_all.contains(&a)
+-                || self.ambiguous_with_all.contains(&b)
++            if ambiguous_with_flattened.contains_edge(NodeId::System(a), NodeId::System(b))
++                || self.ambiguous_with_all.contains(&NodeId::System(a))
++                || self.ambiguous_with_all.contains(&NodeId::System(b))
+             {
+                 continue;
+             }
+ 
+-            let NodeId::System(a) = a else {
+-                panic!(
+-                    "Encountered a non-system node in the flattened disconnected results: {a:?}"
+-                );
+-            };
+-            let NodeId::System(b) = b else {
+-                panic!(
+-                    "Encountered a non-system node in the flattened disconnected results: {b:?}"
+-                );
+-            };
+             let system_a = &self.systems[a];
+             let system_b = &self.systems[b];
+             if system_a.is_exclusive() || system_b.is_exclusive() {
+@@ -1197,14 +1204,10 @@ impl ScheduleGraph {
+ 
+     fn build_schedule_inner(
+         &self,
+-        dependency_flattened_dag: Dag,
++        dependency_flattened_dag: Dag<SystemKey>,
+         hier_results_reachable: FixedBitSet,
+     ) -> SystemSchedule {
+-        let dg_system_ids = dependency_flattened_dag
+-            .topsort
+-            .iter()
+-            .filter_map(NodeId::as_system)
+-            .collect::<Vec<_>>();
++        let dg_system_ids = dependency_flattened_dag.topsort;
+         let dg_system_idx_map = dg_system_ids
+             .iter()
+             .cloned()
+@@ -1246,16 +1249,13 @@ impl ScheduleGraph {
+         for &sys_key in &dg_system_ids {
+             let num_dependencies = dependency_flattened_dag
+                 .graph
+-                .neighbors_directed(NodeId::System(sys_key), Incoming)
++                .neighbors_directed(sys_key, Incoming)
+                 .count();
+ 
+             let dependents = dependency_flattened_dag
+                 .graph
+-                .neighbors_directed(NodeId::System(sys_key), Outgoing)
+-                .filter_map(|dep_id| {
+-                    let dep_key = dep_id.as_system()?;
+-                    Some(dg_system_idx_map[&dep_key])
+-                })
++                .neighbors_directed(sys_key, Outgoing)
++                .map(|dep_id| dg_system_idx_map[&dep_id])
+                 .collect::<Vec<_>>();
+ 
+             system_dependencies.push(num_dependencies);
+@@ -1500,15 +1500,15 @@ impl ScheduleGraph {
+     /// # Errors
+     ///
+     /// If the graph contain cycles, then an error is returned.
+-    pub fn topsort_graph(
++    pub fn topsort_graph<N: GraphNodeId + Into<NodeId>>(
+         &self,
+-        graph: &DiGraph,
++        graph: &DiGraph<N>,
+         report: ReportCycles,
+-    ) -> Result<Vec<NodeId>, ScheduleBuildError> {
++    ) -> Result<Vec<N>, ScheduleBuildError> {
+         // Check explicitly for self-edges.
+         // `iter_sccs` won't report them as cycles because they still form components of one node.
+         if let Some((node, _)) = graph.all_edges().find(|(left, right)| left == right) {
+-            let name = self.get_node_name(&node);
++            let name = self.get_node_name(&node.into());
+             let error = match report {
+                 ReportCycles::Hierarchy => ScheduleBuildError::HierarchyLoop(name),
+                 ReportCycles::Dependency => ScheduleBuildError::DependencyLoop(name),
+@@ -1554,10 +1554,13 @@ impl ScheduleGraph {
+     }
+ 
+     /// Logs details of cycles in the hierarchy graph.
+-    fn get_hierarchy_cycles_error_message(&self, cycles: &[Vec<NodeId>]) -> String {
++    fn get_hierarchy_cycles_error_message<N: GraphNodeId + Into<NodeId>>(
++        &self,
++        cycles: &[Vec<N>],
++    ) -> String {
+         let mut message = format!("schedule has {} in_set cycle(s):\n", cycles.len());
+         for (i, cycle) in cycles.iter().enumerate() {
+-            let mut names = cycle.iter().map(|id| self.get_node_name(id));
++            let mut names = cycle.iter().map(|&id| self.get_node_name(&id.into()));
+             let first_name = names.next().unwrap();
+             writeln!(
+                 message,
+@@ -1576,12 +1579,18 @@ impl ScheduleGraph {
+     }
+ 
+     /// Logs details of cycles in the dependency graph.
+-    fn get_dependency_cycles_error_message(&self, cycles: &[Vec<NodeId>]) -> String {
++    fn get_dependency_cycles_error_message<N: GraphNodeId + Into<NodeId>>(
++        &self,
++        cycles: &[Vec<N>],
++    ) -> String {
+         let mut message = format!("schedule has {} before/after cycle(s):\n", cycles.len());
+         for (i, cycle) in cycles.iter().enumerate() {
+-            let mut names = cycle
+-                .iter()
+-                .map(|id| (self.get_node_kind(id), self.get_node_name(id)));
++            let mut names = cycle.iter().map(|&id| {
++                (
++                    self.get_node_kind(&id.into()),
++                    self.get_node_name(&id.into()),
++                )
++            });
+             let (first_kind, first_name) = names.next().unwrap();
+             writeln!(
+                 message,
+@@ -1601,7 +1610,7 @@ impl ScheduleGraph {
+ 
+     fn check_for_cross_dependencies(
+         &self,
+-        dep_results: &CheckGraphResults,
++        dep_results: &CheckGraphResults<NodeId>,
+         hier_results_connected: &HashSet<(NodeId, NodeId)>,
+     ) -> Result<(), ScheduleBuildError> {
+         for &(a, b) in &dep_results.connected {
+diff --git a/release-content/migration-guides/schedule_cleanup.md b/release-content/migration-guides/schedule_cleanup.md
+index 86aa9cf56e9a9..21ce981af357e 100644
+--- a/release-content/migration-guides/schedule_cleanup.md
++++ b/release-content/migration-guides/schedule_cleanup.md
+@@ -1,6 +1,6 @@
+ ---
+ title: Schedule API Cleanup
+-pull_requests: [19352, 20119]
++pull_requests: [19352, 20119, 20172]
+ ---
+ 
+ In order to support removing systems from schedules, `Vec`s storing `System`s and
+@@ -9,9 +9,14 @@ reusing indices. The maps are respectively keyed by `SystemKey`s and `SystemSetK
+ 
+ The following signatures were changed:
+ 
++- `DiGraph` and `UnGraph` now have an additional, required type parameter `N`, which
++  is a `GraphNodeId`. Use `DiGraph<NodeId>`/`UnGraph<NodeId>` for the equivalent to the previous type.
+ - `NodeId::System`: Now stores a `SystemKey` instead of a plain `usize`
+ - `NodeId::Set`: Now stores a `SystemSetKey` instead of a plain `usize`
+-- `ScheduleBuildPass::collapse_set`: Now takes the type-specific keys. Wrap them back into a `NodeId` if necessary.
++- `ScheduleBuildPass::collapse_set`: Now takes the type-specific keys.
++  Wrap them back into a `NodeId` if necessary.
++- `ScheduleBuildPass::build`: Now takes a `DiGraph<SystemKey>` instead of `DiGraph<NodeId>`.
++  Re-wrap the keys back into `NodeId` if necessary.
+ - The following functions now return the type-specific keys. Wrap them back into a `NodeId` if necessary.
+   - `Schedule::systems`
+   - `ScheduleGraph::conflicting_systems`
