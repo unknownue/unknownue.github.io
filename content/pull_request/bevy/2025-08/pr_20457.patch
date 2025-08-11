@@ -1,0 +1,196 @@
+diff --git a/crates/bevy_solari/src/lib.rs b/crates/bevy_solari/src/lib.rs
+index 8f07a004a6de8..0ad14fd13315d 100644
+--- a/crates/bevy_solari/src/lib.rs
++++ b/crates/bevy_solari/src/lib.rs
+@@ -5,6 +5,9 @@
+ //! See [`SolariPlugins`] for more info.
+ //!
+ //! ![`bevy_solari` logo](https://raw.githubusercontent.com/bevyengine/bevy/refs/heads/main/assets/branding/bevy_solari.svg)
++
++extern crate alloc;
++
+ pub mod pathtracer;
+ pub mod realtime;
+ pub mod scene;
+diff --git a/crates/bevy_solari/src/scene/blas.rs b/crates/bevy_solari/src/scene/blas.rs
+index 5beaa3b57c4a4..7e574dd100bb2 100644
+--- a/crates/bevy_solari/src/scene/blas.rs
++++ b/crates/bevy_solari/src/scene/blas.rs
+@@ -1,3 +1,4 @@
++use alloc::collections::VecDeque;
+ use bevy_asset::AssetId;
+ use bevy_ecs::{
+     resource::Resource,
+@@ -15,12 +16,19 @@ use bevy_render::{
+     renderer::{RenderDevice, RenderQueue},
+ };
+ 
++/// After compacting this many vertices worth of meshes per frame, no further BLAS will be compacted.
++/// Lower this number to distribute the work across more frames.
++const MAX_COMPACTION_VERTICES_PER_FRAME: u32 = 400_000;
++
+ #[derive(Resource, Default)]
+-pub struct BlasManager(HashMap<AssetId<Mesh>, Blas>);
++pub struct BlasManager {
++    blas: HashMap<AssetId<Mesh>, Blas>,
++    compaction_queue: VecDeque<(AssetId<Mesh>, u32, bool)>,
++}
+ 
+ impl BlasManager {
+     pub fn get(&self, mesh: &AssetId<Mesh>) -> Option<&Blas> {
+-        self.0.get(mesh)
++        self.blas.get(mesh)
+     }
+ }
+ 
+@@ -31,15 +39,13 @@ pub fn prepare_raytracing_blas(
+     render_device: Res<RenderDevice>,
+     render_queue: Res<RenderQueue>,
+ ) {
+-    let blas_manager = &mut blas_manager.0;
+-
+     // Delete BLAS for deleted or modified meshes
+     for asset_id in extracted_meshes
+         .removed
+         .iter()
+         .chain(extracted_meshes.modified.iter())
+     {
+-        blas_manager.remove(asset_id);
++        blas_manager.blas.remove(asset_id);
+     }
+ 
+     if extracted_meshes.extracted.is_empty() {
+@@ -58,7 +64,10 @@ pub fn prepare_raytracing_blas(
+             let (blas, blas_size) =
+                 allocate_blas(&vertex_slice, &index_slice, asset_id, &render_device);
+ 
+-            blas_manager.insert(*asset_id, blas);
++            blas_manager.blas.insert(*asset_id, blas);
++            blas_manager
++                .compaction_queue
++                .push_back((*asset_id, blas_size.vertex_count, false));
+ 
+             (*asset_id, vertex_slice, index_slice, blas_size)
+         })
+@@ -79,7 +88,7 @@ pub fn prepare_raytracing_blas(
+                 transform_buffer_offset: None,
+             };
+             BlasBuildEntry {
+-                blas: &blas_manager[asset_id],
++                blas: &blas_manager.blas[asset_id],
+                 geometry: BlasGeometries::TriangleGeometries(vec![geometry]),
+             }
+         })
+@@ -92,6 +101,48 @@ pub fn prepare_raytracing_blas(
+     render_queue.submit([command_encoder.finish()]);
+ }
+ 
++pub fn compact_raytracing_blas(
++    mut blas_manager: ResMut<BlasManager>,
++    render_queue: Res<RenderQueue>,
++) {
++    let mut first_mesh_processed = None;
++
++    let mut vertices_compacted = 0;
++    while vertices_compacted < MAX_COMPACTION_VERTICES_PER_FRAME
++        && let Some((mesh, vertex_count, compaction_started)) =
++            blas_manager.compaction_queue.pop_front()
++    {
++        // Stop iterating once we loop back around to the start of the list
++        if Some(mesh) == first_mesh_processed {
++            break;
++        }
++        if first_mesh_processed.is_none() {
++            first_mesh_processed = Some(mesh);
++        }
++
++        let Some(blas) = blas_manager.get(&mesh) else {
++            continue;
++        };
++
++        if !compaction_started {
++            blas.prepare_compaction_async(|_| {});
++        }
++
++        if blas.ready_for_compaction() {
++            let compacted_blas = render_queue.compact_blas(blas);
++            blas_manager.blas.insert(mesh, compacted_blas);
++
++            vertices_compacted += vertex_count;
++            continue;
++        }
++
++        // BLAS not ready for compaction, put back in queue
++        blas_manager
++            .compaction_queue
++            .push_back((mesh, vertex_count, true));
++    }
++}
++
+ fn allocate_blas(
+     vertex_slice: &MeshBufferSlice,
+     index_slice: &MeshBufferSlice,
+@@ -109,7 +160,8 @@ fn allocate_blas(
+     let blas = render_device.wgpu_device().create_blas(
+         &CreateBlasDescriptor {
+             label: Some(&asset_id.to_string()),
+-            flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
++            flags: AccelerationStructureFlags::PREFER_FAST_TRACE
++                | AccelerationStructureFlags::ALLOW_COMPACTION,
+             update_mode: AccelerationStructureUpdateMode::Build,
+         },
+         BlasGeometrySizeDescriptors::Triangles {
+diff --git a/crates/bevy_solari/src/scene/mod.rs b/crates/bevy_solari/src/scene/mod.rs
+index e600d6f584295..a6ddc12d6ed40 100644
+--- a/crates/bevy_solari/src/scene/mod.rs
++++ b/crates/bevy_solari/src/scene/mod.rs
+@@ -22,7 +22,7 @@ use bevy_render::{
+     ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+ use binder::prepare_raytracing_scene_bindings;
+-use blas::{prepare_raytracing_blas, BlasManager};
++use blas::{compact_raytracing_blas, prepare_raytracing_blas, BlasManager};
+ use extract::{extract_raytracing_scene, StandardMaterialAssets};
+ use tracing::warn;
+ 
+@@ -69,6 +69,9 @@ impl Plugin for RaytracingScenePlugin {
+                         .in_set(RenderSystems::PrepareAssets)
+                         .before(prepare_assets::<RenderMesh>)
+                         .after(allocate_and_free_meshes),
++                    compact_raytracing_blas
++                        .in_set(RenderSystems::PrepareAssets)
++                        .after(prepare_raytracing_blas),
+                     prepare_raytracing_scene_bindings.in_set(RenderSystems::PrepareBindGroups),
+                 ),
+             );
+diff --git a/release-content/release-notes/bevy_solari.md b/release-content/release-notes/bevy_solari.md
+index d569cd065fd4a..f2f99ce3d09a9 100644
+--- a/release-content/release-notes/bevy_solari.md
++++ b/release-content/release-notes/bevy_solari.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Initial raytraced lighting progress (bevy_solari)
+ authors: ["@JMS55", "@SparkyPotato"]
+-pull_requests: [19058, 19620, 19790, 20020, 20113, 20156, 20213, 20242, 20259, 20406]
++pull_requests: [19058, 19620, 19790, 20020, 20113, 20156, 20213, 20242, 20259, 20406, 20457]
+ ---
+ 
+ (TODO: Embed solari example screenshot here)
+@@ -10,7 +10,7 @@ In Bevy 0.17, we've made the first steps towards realtime raytraced lighting in
+ 
+ For some background, lighting in video games can be split into two parts: direct and indirect lighting.
+ 
+-Direct lighting is light that is emitted from a light source, bounces off of one surface, and then reaches the camera. Indirect lighting by contrast is light that bounces off of different surfaces many times before reaching the camera, and is often called global illumination.
++Direct lighting is light that is emitted from a light source, bounces off of one surface, and then reaches the camera. Indirect lighting by contrast is light that bounces off of different surfaces many times before reaching the camera. Indirect lighting is also often called global illumination.
+ 
+ (TODO: Diagrams of direct vs indirect light)
+ 
+@@ -23,7 +23,7 @@ The problem with these methods is that they all have large downsides:
+ * Baked lighting does not update in realtime as objects and lights move around, is low resolution/quality, and requires time to bake, slowing down game production.
+ * Screen-space methods have low quality and do not capture off-screen geometry and light.
+ 
+-Bevy Solari is intended as a completely alternate, high-end lighting solution for Bevy that uses GPU-accelerated raytracing to fix all of the above problems. Emissive meshes will properly cast light and shadows, you will be able to have hundreds of shadow casting lights, quality will be much better, it will require no baking time, and it will support _fully_ dynamic scenes!
++Bevy Solari is intended as a completely alternate, high-end lighting solution for Bevy that uses GPU-accelerated raytracing to fix all of the above problems. Emissive meshes properly cast light and shadows, you can have hundreds of shadow casting lights, quality is much better, it requires no baking time, and it supports _fully_ dynamic scenes!
+ 
+ While Bevy 0.17 adds the bevy_solari crate, it's intended as a long-term project. It is not yet usable by game developers. However, feel free to run the solari example (`cargo run --release --example solari --features bevy_solari` (realtime, no denoising) or `cargo run --release --example solari --features bevy_solari -- --pathtracer` (non-realtime)) to check out the progress we've made, and look forward to more work on Bevy Solari in future releases!
+ 
