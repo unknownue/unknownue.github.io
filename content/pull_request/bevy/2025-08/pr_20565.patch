@@ -1,0 +1,613 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 261cb23632208..7d4dd19cef186 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -327,6 +327,9 @@ spirv_shader_passthrough = ["bevy_internal/spirv_shader_passthrough"]
+ # Statically linked DXC shader compiler for DirectX 12
+ statically-linked-dxc = ["bevy_internal/statically-linked-dxc"]
+ 
++# Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
++raw_vulkan_init = ["bevy_internal/raw_vulkan_init"]
++
+ # Tracing support, saving a file in Chrome Tracing format
+ trace_chrome = ["trace", "bevy_internal/trace_chrome"]
+ 
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 1ff92d7087422..f7b98bef606ac 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -62,6 +62,9 @@ spirv_shader_passthrough = ["bevy_render/spirv_shader_passthrough"]
+ # TODO: When wgpu switches to DirectX 12 instead of Vulkan by default on windows, make this a default feature
+ statically-linked-dxc = ["bevy_render/statically-linked-dxc"]
+ 
++# Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
++raw_vulkan_init = ["bevy_render/raw_vulkan_init"]
++
+ # Include tonemapping LUT KTX2 files.
+ tonemapping_luts = ["bevy_core_pipeline/tonemapping_luts"]
+ # Include Bluenoise texture for environment map generation.
+diff --git a/crates/bevy_render/Cargo.toml b/crates/bevy_render/Cargo.toml
+index 152791442d7db..737c21b7986a7 100644
+--- a/crates/bevy_render/Cargo.toml
++++ b/crates/bevy_render/Cargo.toml
+@@ -32,6 +32,9 @@ spirv_shader_passthrough = ["wgpu/spirv"]
+ # TODO: When wgpu switches to DirectX 12 instead of Vulkan by default on windows, make this a default feature
+ statically-linked-dxc = ["wgpu/static-dxc"]
+ 
++# Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
++raw_vulkan_init = ["wgpu/vulkan"]
++
+ trace = ["profiling"]
+ tracing-tracy = ["dep:tracy-client"]
+ ci_limits = []
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index e3e6d2b60e3d9..99666e2dff061 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -85,7 +85,7 @@ use crate::{
+     mesh::{MeshPlugin, MorphPlugin, RenderMesh},
+     render_asset::prepare_assets,
+     render_resource::{init_empty_bind_group_layout, PipelineCache},
+-    renderer::{render_system, RenderAdapterInfo, RenderInstance},
++    renderer::{render_system, RenderAdapterInfo},
+     settings::RenderCreation,
+     storage::StoragePlugin,
+     texture::TexturePlugin,
+@@ -114,7 +114,6 @@ use render_asset::{
+ use settings::RenderResources;
+ use std::sync::Mutex;
+ use sync_world::{despawn_temporary_render_entities, entity_sync_system, SyncWorldPlugin};
+-use tracing::debug;
+ pub use wgpu_wrapper::WgpuWrapper;
+ 
+ /// Contains the default Bevy rendering backend based on wgpu.
+@@ -329,76 +328,29 @@ impl Plugin for RenderPlugin {
+                         .single(app.world())
+                         .ok()
+                         .cloned();
++
+                     let settings = render_creation.clone();
++
++                    #[cfg(feature = "raw_vulkan_init")]
++                    let raw_vulkan_init_settings = app
++                        .world_mut()
++                        .get_resource::<renderer::raw_vulkan_init::RawVulkanInitSettings>()
++                        .cloned()
++                        .unwrap_or_default();
++
+                     let async_renderer = async move {
+-                        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
++                        let render_resources = renderer::initialize_renderer(
+                             backends,
+-                            flags: settings.instance_flags,
+-                            memory_budget_thresholds: settings.instance_memory_budget_thresholds,
+-                            backend_options: wgpu::BackendOptions {
+-                                gl: wgpu::GlBackendOptions {
+-                                    gles_minor_version: settings.gles3_minor_version,
+-                                    fence_behavior: wgpu::GlFenceBehavior::Normal,
+-                                },
+-                                dx12: wgpu::Dx12BackendOptions {
+-                                    shader_compiler: settings.dx12_shader_compiler.clone(),
+-                                },
+-                                noop: wgpu::NoopBackendOptions { enable: false },
+-                            },
+-                        });
+-
+-                        let surface = primary_window.and_then(|wrapper| {
+-                            let maybe_handle = wrapper.0.lock().expect(
+-                                "Couldn't get the window handle in time for renderer initialization",
+-                            );
+-                            if let Some(wrapper) = maybe_handle.as_ref() {
+-                                // SAFETY: Plugins should be set up on the main thread.
+-                                let handle = unsafe { wrapper.get_handle() };
+-                                Some(
+-                                    instance
+-                                        .create_surface(handle)
+-                                        .expect("Failed to create wgpu surface"),
+-                                )
+-                            } else {
+-                                None
+-                            }
+-                        });
+-
+-                        let force_fallback_adapter = std::env::var("WGPU_FORCE_FALLBACK_ADAPTER")
+-                            .map_or(settings.force_fallback_adapter, |v| {
+-                                !(v.is_empty() || v == "0" || v == "false")
+-                            });
+-
+-                        let desired_adapter_name = std::env::var("WGPU_ADAPTER_NAME")
+-                            .as_deref()
+-                            .map_or(settings.adapter_name.clone(), |x| Some(x.to_lowercase()));
+-
+-                        let request_adapter_options = wgpu::RequestAdapterOptions {
+-                            power_preference: settings.power_preference,
+-                            compatible_surface: surface.as_ref(),
+-                            force_fallback_adapter,
+-                        };
+-
+-                        let (device, queue, adapter_info, render_adapter) =
+-                            renderer::initialize_renderer(
+-                                &instance,
+-                                &settings,
+-                                &request_adapter_options,
+-                                desired_adapter_name,
+-                            )
+-                            .await;
+-                        debug!("Configured wgpu adapter Limits: {:#?}", device.limits());
+-                        debug!("Configured wgpu adapter Features: {:#?}", device.features());
+-                        let mut future_render_resources_inner =
+-                            future_render_resources_wrapper.lock().unwrap();
+-                        *future_render_resources_inner = Some(RenderResources(
+-                            device,
+-                            queue,
+-                            adapter_info,
+-                            render_adapter,
+-                            RenderInstance(Arc::new(WgpuWrapper::new(instance))),
+-                        ));
++                            primary_window,
++                            &settings,
++                            #[cfg(feature = "raw_vulkan_init")]
++                            raw_vulkan_init_settings,
++                        )
++                        .await;
++
++                        *future_render_resources_wrapper.lock().unwrap() = Some(render_resources);
+                     };
++
+                     // In wasm, spawn a task and detach it for execution
+                     #[cfg(target_arch = "wasm32")]
+                     bevy_tasks::IoTaskPool::get()
+@@ -461,8 +413,9 @@ impl Plugin for RenderPlugin {
+         if let Some(future_render_resources) =
+             app.world_mut().remove_resource::<FutureRenderResources>()
+         {
+-            let RenderResources(device, queue, adapter_info, render_adapter, instance) =
+-                future_render_resources.0.lock().unwrap().take().unwrap();
++            let render_resources = future_render_resources.0.lock().unwrap().take().unwrap();
++            let RenderResources(device, queue, adapter_info, render_adapter, instance, ..) =
++                render_resources;
+ 
+             let compressed_image_format_support = CompressedImageFormatSupport(
+                 CompressedImageFormats::from_features(device.features()),
+@@ -476,6 +429,13 @@ impl Plugin for RenderPlugin {
+ 
+             let render_app = app.sub_app_mut(RenderApp);
+ 
++            #[cfg(feature = "raw_vulkan_init")]
++            {
++                let additional_vulkan_features: renderer::raw_vulkan_init::AdditionalVulkanFeatures =
++                    render_resources.5;
++                render_app.insert_resource(additional_vulkan_features);
++            }
++
+             render_app
+                 .insert_resource(instance)
+                 .insert_resource(PipelineCache::new(
+diff --git a/crates/bevy_render/src/renderer/mod.rs b/crates/bevy_render/src/renderer/mod.rs
+index e06053cfd3cc0..019d5f50e2422 100644
+--- a/crates/bevy_render/src/renderer/mod.rs
++++ b/crates/bevy_render/src/renderer/mod.rs
+@@ -1,28 +1,29 @@
+ mod graph_runner;
++#[cfg(feature = "raw_vulkan_init")]
++pub mod raw_vulkan_init;
+ mod render_device;
+ 
+-use crate::WgpuWrapper;
+-use bevy_derive::{Deref, DerefMut};
+-#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+-use bevy_tasks::ComputeTaskPool;
+ pub use graph_runner::*;
+ pub use render_device::*;
+-use tracing::{debug, error, info, info_span, warn};
+ 
+ use crate::{
+     diagnostic::{internal::DiagnosticsRecorder, RecordDiagnostics},
+     render_graph::RenderGraph,
+     render_phase::TrackedRenderPass,
+     render_resource::RenderPassDescriptor,
+-    settings::{WgpuSettings, WgpuSettingsPriority},
++    settings::{RenderResources, WgpuSettings, WgpuSettingsPriority},
+     view::{ExtractedWindows, ViewTarget},
++    WgpuWrapper,
+ };
+ use alloc::sync::Arc;
++use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{prelude::*, system::SystemState};
+ use bevy_platform::time::Instant;
+ use bevy_time::TimeSender;
++use bevy_window::RawHandleWrapperHolder;
++use tracing::{debug, error, info, info_span, warn};
+ use wgpu::{
+-    Adapter, AdapterInfo, CommandBuffer, CommandEncoder, DeviceType, Instance, Queue,
++    Adapter, AdapterInfo, Backends, CommandBuffer, CommandEncoder, DeviceType, Instance, Queue,
+     RequestAdapterOptions, Trace,
+ };
+ 
+@@ -171,15 +172,76 @@ fn find_adapter_by_name(
+ /// Initializes the renderer by retrieving and preparing the GPU instance, device and queue
+ /// for the specified backend.
+ pub async fn initialize_renderer(
+-    instance: &Instance,
++    backends: Backends,
++    primary_window: Option<RawHandleWrapperHolder>,
+     options: &WgpuSettings,
+-    request_adapter_options: &RequestAdapterOptions<'_, '_>,
+-    desired_adapter_name: Option<String>,
+-) -> (RenderDevice, RenderQueue, RenderAdapterInfo, RenderAdapter) {
++    #[cfg(feature = "raw_vulkan_init")]
++    raw_vulkan_init_settings: raw_vulkan_init::RawVulkanInitSettings,
++) -> RenderResources {
++    let instance_descriptor = wgpu::InstanceDescriptor {
++        backends,
++        flags: options.instance_flags,
++        memory_budget_thresholds: options.instance_memory_budget_thresholds,
++        backend_options: wgpu::BackendOptions {
++            gl: wgpu::GlBackendOptions {
++                gles_minor_version: options.gles3_minor_version,
++                fence_behavior: wgpu::GlFenceBehavior::Normal,
++            },
++            dx12: wgpu::Dx12BackendOptions {
++                shader_compiler: options.dx12_shader_compiler.clone(),
++            },
++            noop: wgpu::NoopBackendOptions { enable: false },
++        },
++    };
++
++    #[cfg(not(feature = "raw_vulkan_init"))]
++    let instance = Instance::new(&instance_descriptor);
++    #[cfg(feature = "raw_vulkan_init")]
++    let mut additional_vulkan_features = raw_vulkan_init::AdditionalVulkanFeatures::default();
++    #[cfg(feature = "raw_vulkan_init")]
++    let instance = raw_vulkan_init::create_raw_vulkan_instance(
++        &instance_descriptor,
++        &raw_vulkan_init_settings,
++        &mut additional_vulkan_features,
++    );
++
++    let surface = primary_window.and_then(|wrapper| {
++        let maybe_handle = wrapper
++            .0
++            .lock()
++            .expect("Couldn't get the window handle in time for renderer initialization");
++        if let Some(wrapper) = maybe_handle.as_ref() {
++            // SAFETY: Plugins should be set up on the main thread.
++            let handle = unsafe { wrapper.get_handle() };
++            Some(
++                instance
++                    .create_surface(handle)
++                    .expect("Failed to create wgpu surface"),
++            )
++        } else {
++            None
++        }
++    });
++
++    let force_fallback_adapter = std::env::var("WGPU_FORCE_FALLBACK_ADAPTER")
++        .map_or(options.force_fallback_adapter, |v| {
++            !(v.is_empty() || v == "0" || v == "false")
++        });
++
++    let desired_adapter_name = std::env::var("WGPU_ADAPTER_NAME")
++        .as_deref()
++        .map_or(options.adapter_name.clone(), |x| Some(x.to_lowercase()));
++
++    let request_adapter_options = RequestAdapterOptions {
++        power_preference: options.power_preference,
++        compatible_surface: surface.as_ref(),
++        force_fallback_adapter,
++    };
++
+     #[cfg(not(target_family = "wasm"))]
+     let mut selected_adapter = desired_adapter_name.and_then(|adapter_name| {
+         find_adapter_by_name(
+-            instance,
++            &instance,
+             options,
+             request_adapter_options.compatible_surface,
+             &adapter_name,
+@@ -198,7 +260,10 @@ pub async fn initialize_renderer(
+             "Searching for adapter with options: {:?}",
+             request_adapter_options
+         );
+-        selected_adapter = instance.request_adapter(request_adapter_options).await.ok();
++        selected_adapter = instance
++            .request_adapter(&request_adapter_options)
++            .await
++            .ok();
+     }
+ 
+     let adapter = selected_adapter.expect(GPU_NOT_FOUND_ERROR_MESSAGE);
+@@ -364,24 +429,39 @@ pub async fn initialize_renderer(
+         };
+     }
+ 
+-    let (device, queue) = adapter
+-        .request_device(&wgpu::DeviceDescriptor {
+-            label: options.device_label.as_ref().map(AsRef::as_ref),
+-            required_features: features,
+-            required_limits: limits,
+-            memory_hints: options.memory_hints.clone(),
+-            // See https://github.com/gfx-rs/wgpu/issues/5974
+-            trace: Trace::Off,
+-        })
+-        .await
+-        .unwrap();
+-    let queue = Arc::new(WgpuWrapper::new(queue));
+-    let adapter = Arc::new(WgpuWrapper::new(adapter));
+-    (
++    let device_descriptor = wgpu::DeviceDescriptor {
++        label: options.device_label.as_ref().map(AsRef::as_ref),
++        required_features: features,
++        required_limits: limits,
++        memory_hints: options.memory_hints.clone(),
++        // See https://github.com/gfx-rs/wgpu/issues/5974
++        trace: Trace::Off,
++    };
++
++    #[cfg(not(feature = "raw_vulkan_init"))]
++    let (device, queue) = adapter.request_device(&device_descriptor).await.unwrap();
++
++    #[cfg(feature = "raw_vulkan_init")]
++    let (device, queue) = raw_vulkan_init::create_raw_device(
++        &adapter,
++        &device_descriptor,
++        &raw_vulkan_init_settings,
++        &mut additional_vulkan_features,
++    )
++    .await
++    .unwrap();
++
++    debug!("Configured wgpu adapter Limits: {:#?}", device.limits());
++    debug!("Configured wgpu adapter Features: {:#?}", device.features());
++
++    RenderResources(
+         RenderDevice::from(device),
+-        RenderQueue(queue),
++        RenderQueue(Arc::new(WgpuWrapper::new(queue))),
+         RenderAdapterInfo(WgpuWrapper::new(adapter_info)),
+-        RenderAdapter(adapter),
++        RenderAdapter(Arc::new(WgpuWrapper::new(adapter))),
++        RenderInstance(Arc::new(WgpuWrapper::new(instance))),
++        #[cfg(feature = "raw_vulkan_init")]
++        additional_vulkan_features,
+     )
+ }
+ 
+@@ -499,22 +579,24 @@ impl<'w> RenderContext<'w> {
+ 
+         #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+         {
+-            let mut task_based_command_buffers = ComputeTaskPool::get().scope(|task_pool| {
+-                for (i, queued_command_buffer) in self.command_buffer_queue.into_iter().enumerate()
+-                {
+-                    match queued_command_buffer {
+-                        QueuedCommandBuffer::Ready(command_buffer) => {
+-                            command_buffers.push((i, command_buffer));
+-                        }
+-                        QueuedCommandBuffer::Task(command_buffer_generation_task) => {
+-                            let render_device = self.render_device.clone();
+-                            task_pool.spawn(async move {
+-                                (i, command_buffer_generation_task(render_device))
+-                            });
++            let mut task_based_command_buffers =
++                bevy_tasks::ComputeTaskPool::get().scope(|task_pool| {
++                    for (i, queued_command_buffer) in
++                        self.command_buffer_queue.into_iter().enumerate()
++                    {
++                        match queued_command_buffer {
++                            QueuedCommandBuffer::Ready(command_buffer) => {
++                                command_buffers.push((i, command_buffer));
++                            }
++                            QueuedCommandBuffer::Task(command_buffer_generation_task) => {
++                                let render_device = self.render_device.clone();
++                                task_pool.spawn(async move {
++                                    (i, command_buffer_generation_task(render_device))
++                                });
++                            }
+                         }
+                     }
+-                }
+-            });
++                });
+             command_buffers.append(&mut task_based_command_buffers);
+         }
+ 
+diff --git a/crates/bevy_render/src/renderer/raw_vulkan_init.rs b/crates/bevy_render/src/renderer/raw_vulkan_init.rs
+new file mode 100644
+index 0000000000000..2dee01d914f06
+--- /dev/null
++++ b/crates/bevy_render/src/renderer/raw_vulkan_init.rs
+@@ -0,0 +1,146 @@
++use alloc::sync::Arc;
++use bevy_ecs::resource::Resource;
++use bevy_platform::collections::HashSet;
++use core::any::{Any, TypeId};
++use thiserror::Error;
++use wgpu::{
++    hal::api::Vulkan, Adapter, Device, DeviceDescriptor, Instance, InstanceDescriptor, Queue,
++};
++
++/// When the `raw_vulkan_init` feature is enabled, these settings will be used to configure the raw vulkan instance.
++#[derive(Resource, Default, Clone)]
++pub struct RawVulkanInitSettings {
++    // SAFETY: this must remain private to ensure that registering callbacks is unsafe
++    create_instance_callbacks: Vec<
++        Arc<
++            dyn Fn(
++                    &mut wgpu::hal::vulkan::CreateInstanceCallbackArgs,
++                    &mut AdditionalVulkanFeatures,
++                ) + Send
++                + Sync,
++        >,
++    >,
++    // SAFETY: this must remain private to ensure that registering callbacks is unsafe
++    create_device_callbacks: Vec<
++        Arc<
++            dyn Fn(
++                    &mut wgpu::hal::vulkan::CreateDeviceCallbackArgs,
++                    &wgpu::hal::vulkan::Adapter,
++                    &mut AdditionalVulkanFeatures,
++                ) + Send
++                + Sync,
++        >,
++    >,
++}
++
++impl RawVulkanInitSettings {
++    /// Adds a new Vulkan create instance callback. See [`wgpu::hal::vulkan::Instance::init_with_callback`] for details.
++    ///
++    /// # Safety
++    /// - Callback must not remove features.
++    /// - Callback must not change anything to what the instance does not support.
++    pub unsafe fn add_create_instance_callback(
++        &mut self,
++        callback: impl Fn(&mut wgpu::hal::vulkan::CreateInstanceCallbackArgs, &mut AdditionalVulkanFeatures)
++            + Send
++            + Sync
++            + 'static,
++    ) {
++        self.create_instance_callbacks.push(Arc::new(callback));
++    }
++
++    /// Adds a new Vulkan create device callback. See [`wgpu::hal::vulkan::Adapter::open_with_callback`] for details.
++    ///
++    /// # Safety
++    /// - Callback must not remove features.
++    /// - Callback must not change anything to what the device does not support.
++    pub unsafe fn add_create_device_callback(
++        &mut self,
++        callback: impl Fn(
++                &mut wgpu::hal::vulkan::CreateDeviceCallbackArgs,
++                &wgpu::hal::vulkan::Adapter,
++                &mut AdditionalVulkanFeatures,
++            ) + Send
++            + Sync
++            + 'static,
++    ) {
++        self.create_device_callbacks.push(Arc::new(callback));
++    }
++}
++
++pub(crate) fn create_raw_vulkan_instance(
++    instance_descriptor: &InstanceDescriptor,
++    settings: &RawVulkanInitSettings,
++    additional_features: &mut AdditionalVulkanFeatures,
++) -> Instance {
++    // SAFETY: Registering callbacks is unsafe. Callback authors promise not to remove features
++    // or change the instance to something it does not support
++    unsafe {
++        wgpu::hal::vulkan::Instance::init_with_callback(
++            &wgpu::hal::InstanceDescriptor {
++                name: "wgpu",
++                flags: instance_descriptor.flags,
++                memory_budget_thresholds: instance_descriptor.memory_budget_thresholds,
++                backend_options: instance_descriptor.backend_options.clone(),
++            },
++            Some(Box::new(|mut args| {
++                for callback in &settings.create_instance_callbacks {
++                    (callback)(&mut args, additional_features);
++                }
++            })),
++        )
++        .map(|raw_instance| Instance::from_hal::<Vulkan>(raw_instance))
++        .unwrap_or_else(|_| Instance::new(instance_descriptor))
++    }
++}
++
++pub(crate) async fn create_raw_device(
++    adapter: &Adapter,
++    device_descriptor: &DeviceDescriptor<'_>,
++    settings: &RawVulkanInitSettings,
++    additional_features: &mut AdditionalVulkanFeatures,
++) -> Result<(Device, Queue), CreateRawVulkanDeviceError> {
++    // SAFETY: Registering callbacks is unsafe. Callback authors promise not to remove features
++    // or change the adapter to something it does not support
++    unsafe {
++        let Some(raw_adapter) = adapter.as_hal::<Vulkan>() else {
++            return Ok(adapter.request_device(device_descriptor).await?);
++        };
++        let open_device = raw_adapter.open_with_callback(
++            device_descriptor.required_features,
++            &device_descriptor.memory_hints,
++            Some(Box::new(|mut args| {
++                for callback in &settings.create_device_callbacks {
++                    (callback)(&mut args, &raw_adapter, additional_features);
++                }
++            })),
++        )?;
++
++        Ok(adapter.create_device_from_hal::<Vulkan>(open_device, device_descriptor)?)
++    }
++}
++
++#[derive(Error, Debug)]
++pub(crate) enum CreateRawVulkanDeviceError {
++    #[error("Could not create a raw Vulkan device because the Vulkan backend is not supported")]
++    UnsupportedBackend,
++    #[error(transparent)]
++    RequestDeviceError(#[from] wgpu::RequestDeviceError),
++    #[error(transparent)]
++    DeviceError(#[from] wgpu::hal::DeviceError),
++}
++
++/// A list of additional Vulkan features that are supported by the current wgpu instance / adapter. This is populated
++/// by callbacks defined in [`RawVulkanInitSettings`]
++#[derive(Resource, Default, Clone)]
++pub struct AdditionalVulkanFeatures(HashSet<TypeId>);
++
++impl AdditionalVulkanFeatures {
++    pub fn register<T: Any>(&mut self) {
++        self.0.insert(TypeId::of::<T>());
++    }
++
++    pub fn has<T: Any>(&self) -> bool {
++        self.0.contains(&TypeId::of::<T>())
++    }
++}
+diff --git a/crates/bevy_render/src/settings.rs b/crates/bevy_render/src/settings.rs
+index 411a21ceeb0bc..6140d179b1b97 100644
+--- a/crates/bevy_render/src/settings.rs
++++ b/crates/bevy_render/src/settings.rs
+@@ -151,6 +151,8 @@ pub struct RenderResources(
+     pub RenderAdapterInfo,
+     pub RenderAdapter,
+     pub RenderInstance,
++    #[cfg(feature = "raw_vulkan_init")]
++    pub  crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures,
+ );
+ 
+ /// An enum describing how the renderer will initialize resources. This is used when creating the [`RenderPlugin`](crate::RenderPlugin).
+@@ -173,8 +175,19 @@ impl RenderCreation {
+         adapter_info: RenderAdapterInfo,
+         adapter: RenderAdapter,
+         instance: RenderInstance,
++        #[cfg(feature = "raw_vulkan_init")]
++        additional_vulkan_features: crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures,
+     ) -> Self {
+-        RenderResources(device, queue, adapter_info, adapter, instance).into()
++        RenderResources(
++            device,
++            queue,
++            adapter_info,
++            adapter,
++            instance,
++            #[cfg(feature = "raw_vulkan_init")]
++            additional_vulkan_features,
++        )
++        .into()
+     }
+ }
+ 
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index d287b90868bb0..967f1eaf5cd8f 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -110,6 +110,7 @@ The default feature set enables most of the expected features of a game engine,
+ |pbr_transmission_textures|Enable support for transmission-related textures in the `StandardMaterial`, at the risk of blowing past the global, per-shader texture limit on older/lower-end GPUs|
+ |pnm|PNM image format support, includes pam, pbm, pgm and ppm|
+ |qoi|QOI image format support|
++|raw_vulkan_init|Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration|
+ |reflect_auto_register_static|Enable automatic reflect registration without inventory. See `reflect::load_type_registrations` for more info.|
+ |reflect_documentation|Enable documentation reflection|
+ |reflect_functions|Enable function reflection|
