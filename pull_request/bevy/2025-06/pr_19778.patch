@@ -1,0 +1,578 @@
+diff --git a/crates/bevy_core_widgets/src/core_radio.rs b/crates/bevy_core_widgets/src/core_radio.rs
+new file mode 100644
+index 0000000000000..d5dd18fb1a839
+--- /dev/null
++++ b/crates/bevy_core_widgets/src/core_radio.rs
+@@ -0,0 +1,213 @@
++use accesskit::Role;
++use bevy_a11y::AccessibilityNode;
++use bevy_app::{App, Plugin};
++use bevy_ecs::hierarchy::{ChildOf, Children};
++use bevy_ecs::query::Has;
++use bevy_ecs::system::In;
++use bevy_ecs::{
++    component::Component,
++    entity::Entity,
++    observer::On,
++    query::With,
++    system::{Commands, Query, SystemId},
++};
++use bevy_input::keyboard::{KeyCode, KeyboardInput};
++use bevy_input::ButtonState;
++use bevy_input_focus::FocusedInput;
++use bevy_picking::events::{Click, Pointer};
++use bevy_ui::{Checked, InteractionDisabled};
++
++/// Headless widget implementation for a "radio button group". This component is used to group
++/// multiple [`CoreRadio`] components together, allowing them to behave as a single unit. It
++/// implements the tab navigation logic and keyboard shortcuts for radio buttons.
++///
++/// The [`CoreRadioGroup`] component does not have any state itself, and makes no assumptions about
++/// what, if any, value is associated with each radio button, or what Rust type that value might be.
++/// Instead, the output of the group is the entity id of the selected button. The app can then
++/// derive the selected value from this using app-specific means, such as accessing a component on
++/// the individual buttons.
++///
++/// The [`CoreRadioGroup`] doesn't actually set the [`Checked`] states directly, that is presumed to
++/// happen by the app or via some external data-binding scheme. Typically, each button would be
++/// associated with a particular constant value, and would be checked whenever that value is equal
++/// to the group's value. This also means that as long as each button's associated value is unique
++/// within the group, it should never be the case that more than one button is selected at a time.
++#[derive(Component, Debug)]
++#[require(AccessibilityNode(accesskit::Node::new(Role::RadioGroup)))]
++pub struct CoreRadioGroup {
++    /// Callback which is called when the selected radio button changes.
++    pub on_change: Option<SystemId<In<Entity>>>,
++}
++
++/// Headless widget implementation for radio buttons. These should be enclosed within a
++/// [`CoreRadioGroup`] widget, which is responsible for the mutual exclusion logic.
++///
++/// According to the WAI-ARIA best practices document, radio buttons should not be focusable,
++/// but rather the enclosing group should be focusable.
++/// See <https://www.w3.org/WAI/ARIA/apg/patterns/radio>/
++#[derive(Component, Debug)]
++#[require(AccessibilityNode(accesskit::Node::new(Role::RadioButton)), Checked)]
++pub struct CoreRadio;
++
++fn radio_group_on_key_input(
++    mut ev: On<FocusedInput<KeyboardInput>>,
++    q_group: Query<&CoreRadioGroup>,
++    q_radio: Query<(Has<Checked>, Has<InteractionDisabled>), With<CoreRadio>>,
++    q_children: Query<&Children>,
++    mut commands: Commands,
++) {
++    if let Ok(CoreRadioGroup { on_change }) = q_group.get(ev.target()) {
++        let event = &ev.event().input;
++        if event.state == ButtonState::Pressed
++            && !event.repeat
++            && matches!(
++                event.key_code,
++                KeyCode::ArrowUp
++                    | KeyCode::ArrowDown
++                    | KeyCode::ArrowLeft
++                    | KeyCode::ArrowRight
++                    | KeyCode::Home
++                    | KeyCode::End
++            )
++        {
++            let key_code = event.key_code;
++            ev.propagate(false);
++
++            // Find all radio descendants that are not disabled
++            let radio_buttons = q_children
++                .iter_descendants(ev.target())
++                .filter_map(|child_id| match q_radio.get(child_id) {
++                    Ok((checked, false)) => Some((child_id, checked)),
++                    Ok((_, true)) | Err(_) => None,
++                })
++                .collect::<Vec<_>>();
++            if radio_buttons.is_empty() {
++                return; // No enabled radio buttons in the group
++            }
++            let current_index = radio_buttons
++                .iter()
++                .position(|(_, checked)| *checked)
++                .unwrap_or(usize::MAX); // Default to invalid index if none are checked
++
++            let next_index = match key_code {
++                KeyCode::ArrowUp | KeyCode::ArrowLeft => {
++                    // Navigate to the previous radio button in the group
++                    if current_index == 0 || current_index >= radio_buttons.len() {
++                        // If we're at the first one, wrap around to the last
++                        radio_buttons.len() - 1
++                    } else {
++                        // Move to the previous one
++                        current_index - 1
++                    }
++                }
++                KeyCode::ArrowDown | KeyCode::ArrowRight => {
++                    // Navigate to the next radio button in the group
++                    if current_index >= radio_buttons.len() - 1 {
++                        // If we're at the last one, wrap around to the first
++                        0
++                    } else {
++                        // Move to the next one
++                        current_index + 1
++                    }
++                }
++                KeyCode::Home => {
++                    // Navigate to the first radio button in the group
++                    0
++                }
++                KeyCode::End => {
++                    // Navigate to the last radio button in the group
++                    radio_buttons.len() - 1
++                }
++                _ => {
++                    return;
++                }
++            };
++
++            if current_index == next_index {
++                // If the next index is the same as the current, do nothing
++                return;
++            }
++
++            let (next_id, _) = radio_buttons[next_index];
++
++            // Trigger the on_change event for the newly checked radio button
++            if let Some(on_change) = on_change {
++                commands.run_system_with(*on_change, next_id);
++            }
++        }
++    }
++}
++
++fn radio_group_on_button_click(
++    mut ev: On<Pointer<Click>>,
++    q_group: Query<&CoreRadioGroup>,
++    q_radio: Query<(Has<Checked>, Has<InteractionDisabled>), With<CoreRadio>>,
++    q_parents: Query<&ChildOf>,
++    q_children: Query<&Children>,
++    mut commands: Commands,
++) {
++    if let Ok(CoreRadioGroup { on_change }) = q_group.get(ev.target()) {
++        // Starting with the original target, search upward for a radio button.
++        let radio_id = if q_radio.contains(ev.original_target()) {
++            ev.original_target()
++        } else {
++            // Search ancestors for the first radio button
++            let mut found_radio = None;
++            for ancestor in q_parents.iter_ancestors(ev.original_target()) {
++                if q_group.contains(ancestor) {
++                    // We reached a radio group before finding a radio button, bail out
++                    return;
++                }
++                if q_radio.contains(ancestor) {
++                    found_radio = Some(ancestor);
++                    break;
++                }
++            }
++
++            match found_radio {
++                Some(radio) => radio,
++                None => return, // No radio button found in the ancestor chain
++            }
++        };
++
++        // Gather all the enabled radio group descendants for exclusion.
++        let radio_buttons = q_children
++            .iter_descendants(ev.target())
++            .filter_map(|child_id| match q_radio.get(child_id) {
++                Ok((checked, false)) => Some((child_id, checked)),
++                Ok((_, true)) | Err(_) => None,
++            })
++            .collect::<Vec<_>>();
++
++        if radio_buttons.is_empty() {
++            return; // No enabled radio buttons in the group
++        }
++
++        // Pick out the radio button that is currently checked.
++        ev.propagate(false);
++        let current_radio = radio_buttons
++            .iter()
++            .find(|(_, checked)| *checked)
++            .map(|(id, _)| *id);
++
++        if current_radio == Some(radio_id) {
++            // If they clicked the currently checked radio button, do nothing
++            return;
++        }
++
++        // Trigger the on_change event for the newly checked radio button
++        if let Some(on_change) = on_change {
++            commands.run_system_with(*on_change, radio_id);
++        }
++    }
++}
++
++/// Plugin that adds the observers for the [`CoreRadioGroup`] widget.
++pub struct CoreRadioGroupPlugin;
++
++impl Plugin for CoreRadioGroupPlugin {
++    fn build(&self, app: &mut App) {
++        app.add_observer(radio_group_on_key_input)
++            .add_observer(radio_group_on_button_click);
++    }
++}
+diff --git a/crates/bevy_core_widgets/src/core_slider.rs b/crates/bevy_core_widgets/src/core_slider.rs
+index 5a6b90636ae76..d85f12dd22a80 100644
+--- a/crates/bevy_core_widgets/src/core_slider.rs
++++ b/crates/bevy_core_widgets/src/core_slider.rs
+@@ -23,7 +23,7 @@ use bevy_picking::events::{Drag, DragEnd, DragStart, Pointer, Press};
+ use bevy_ui::{ComputedNode, ComputedNodeTarget, InteractionDisabled, UiGlobalTransform, UiScale};
+ 
+ /// Defines how the slider should behave when you click on the track (not the thumb).
+-#[derive(Debug, Default)]
++#[derive(Debug, Default, PartialEq, Clone, Copy)]
+ pub enum TrackClick {
+     /// Clicking on the track lets you drag to edit the value, just like clicking on the thumb.
+     #[default]
+diff --git a/crates/bevy_core_widgets/src/lib.rs b/crates/bevy_core_widgets/src/lib.rs
+index cdb9142b523f6..ef9f3db51c2e1 100644
+--- a/crates/bevy_core_widgets/src/lib.rs
++++ b/crates/bevy_core_widgets/src/lib.rs
+@@ -16,12 +16,14 @@
+ 
+ mod core_button;
+ mod core_checkbox;
++mod core_radio;
+ mod core_slider;
+ 
+ use bevy_app::{App, Plugin};
+ 
+ pub use core_button::{CoreButton, CoreButtonPlugin};
+ pub use core_checkbox::{CoreCheckbox, CoreCheckboxPlugin, SetChecked, ToggleChecked};
++pub use core_radio::{CoreRadio, CoreRadioGroup, CoreRadioGroupPlugin};
+ pub use core_slider::{
+     CoreSlider, CoreSliderDragState, CoreSliderPlugin, CoreSliderThumb, SetSliderValue,
+     SliderRange, SliderStep, SliderValue, TrackClick,
+@@ -33,6 +35,11 @@ pub struct CoreWidgetsPlugin;
+ 
+ impl Plugin for CoreWidgetsPlugin {
+     fn build(&self, app: &mut App) {
+-        app.add_plugins((CoreButtonPlugin, CoreCheckboxPlugin, CoreSliderPlugin));
++        app.add_plugins((
++            CoreButtonPlugin,
++            CoreCheckboxPlugin,
++            CoreRadioGroupPlugin,
++            CoreSliderPlugin,
++        ));
+     }
+ }
+diff --git a/examples/ui/core_widgets.rs b/examples/ui/core_widgets.rs
+index 96959be5bcc34..ca91605206373 100644
+--- a/examples/ui/core_widgets.rs
++++ b/examples/ui/core_widgets.rs
+@@ -3,8 +3,8 @@
+ use bevy::{
+     color::palettes::basic::*,
+     core_widgets::{
+-        CoreButton, CoreCheckbox, CoreSlider, CoreSliderThumb, CoreWidgetsPlugin, SliderRange,
+-        SliderValue, TrackClick,
++        CoreButton, CoreCheckbox, CoreRadio, CoreRadioGroup, CoreSlider, CoreSliderThumb,
++        CoreWidgetsPlugin, SliderRange, SliderValue, TrackClick,
+     },
+     ecs::system::SystemId,
+     input_focus::{
+@@ -27,7 +27,10 @@ fn main() {
+         ))
+         // Only run the app when there is user input. This will significantly reduce CPU/GPU use.
+         .insert_resource(WinitSettings::desktop_app())
+-        .insert_resource(DemoWidgetStates { slider_value: 50.0 })
++        .insert_resource(DemoWidgetStates {
++            slider_value: 50.0,
++            slider_click: TrackClick::Snap,
++        })
+         .add_systems(Startup, setup)
+         .add_systems(
+             Update,
+@@ -37,8 +40,8 @@ fn main() {
+                 update_button_style2,
+                 update_slider_style.after(update_widget_values),
+                 update_slider_style2.after(update_widget_values),
+-                update_checkbox_style.after(update_widget_values),
+-                update_checkbox_style2.after(update_widget_values),
++                update_checkbox_or_radio_style.after(update_widget_values),
++                update_checkbox_or_radio_style2.after(update_widget_values),
+                 toggle_disabled,
+             ),
+         )
+@@ -69,6 +72,11 @@ struct DemoSliderThumb;
+ #[derive(Component, Default)]
+ struct DemoCheckbox;
+ 
++/// Marker which identifies a styled radio button. We'll use this to change the track click
++/// behavior.
++#[derive(Component, Default)]
++struct DemoRadio(TrackClick);
++
+ /// A struct to hold the state of various widgets shown in the demo.
+ ///
+ /// While it is possible to use the widget's own state components as the source of truth,
+@@ -78,19 +86,33 @@ struct DemoCheckbox;
+ #[derive(Resource)]
+ struct DemoWidgetStates {
+     slider_value: f32,
++    slider_click: TrackClick,
+ }
+ 
+ /// Update the widget states based on the changing resource.
+ fn update_widget_values(
+     res: Res<DemoWidgetStates>,
+-    mut sliders: Query<Entity, With<DemoSlider>>,
++    mut sliders: Query<(Entity, &mut CoreSlider), With<DemoSlider>>,
++    radios: Query<(Entity, &DemoRadio, Has<Checked>)>,
+     mut commands: Commands,
+ ) {
+     if res.is_changed() {
+-        for slider_ent in sliders.iter_mut() {
++        for (slider_ent, mut slider) in sliders.iter_mut() {
+             commands
+                 .entity(slider_ent)
+                 .insert(SliderValue(res.slider_value));
++            slider.track_click = res.slider_click;
++        }
++
++        for (radio_id, radio_value, checked) in radios.iter() {
++            let will_be_checked = radio_value.0 == res.slider_click;
++            if will_be_checked != checked {
++                if will_be_checked {
++                    commands.entity(radio_id).insert(Checked);
++                } else {
++                    commands.entity(radio_id).remove::<Checked>();
++                }
++            }
+         }
+     }
+ }
+@@ -109,15 +131,32 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+         },
+     );
+ 
++    // System to update a resource when the radio group changes.
++    let on_change_radio = commands.register_system(
++        |value: In<Entity>,
++         mut widget_states: ResMut<DemoWidgetStates>,
++         q_radios: Query<&DemoRadio>| {
++            if let Ok(radio) = q_radios.get(*value) {
++                widget_states.slider_click = radio.0;
++            }
++        },
++    );
++
+     // ui camera
+     commands.spawn(Camera2d);
+-    commands.spawn(demo_root(&assets, on_click, on_change_value));
++    commands.spawn(demo_root(
++        &assets,
++        on_click,
++        on_change_value,
++        on_change_radio,
++    ));
+ }
+ 
+ fn demo_root(
+     asset_server: &AssetServer,
+     on_click: SystemId,
+     on_change_value: SystemId<In<f32>>,
++    on_change_radio: SystemId<In<Entity>>,
+ ) -> impl Bundle {
+     (
+         Node {
+@@ -135,6 +174,7 @@ fn demo_root(
+             button(asset_server, on_click),
+             slider(0.0, 100.0, 50.0, Some(on_change_value)),
+             checkbox(asset_server, "Checkbox", None),
++            radio_group(asset_server, Some(on_change_radio)),
+             Text::new("Press 'D' to toggle widget disabled states"),
+         ],
+     )
+@@ -476,11 +516,11 @@ fn checkbox(
+ }
+ 
+ // Update the checkbox's styles.
+-fn update_checkbox_style(
++fn update_checkbox_or_radio_style(
+     mut q_checkbox: Query<
+         (Has<Checked>, &Hovered, Has<InteractionDisabled>, &Children),
+         (
+-            With<DemoCheckbox>,
++            Or<(With<DemoCheckbox>, With<DemoRadio>)>,
+             Or<(
+                 Added<DemoCheckbox>,
+                 Changed<Hovered>,
+@@ -489,7 +529,10 @@ fn update_checkbox_style(
+             )>,
+         ),
+     >,
+-    mut q_border_color: Query<(&mut BorderColor, &mut Children), Without<DemoCheckbox>>,
++    mut q_border_color: Query<
++        (&mut BorderColor, &mut Children),
++        (Without<DemoCheckbox>, Without<DemoRadio>),
++    >,
+     mut q_bg_color: Query<&mut BackgroundColor, (Without<DemoCheckbox>, Without<Children>)>,
+ ) {
+     for (checked, Hovered(is_hovering), is_disabled, children) in q_checkbox.iter_mut() {
+@@ -511,7 +554,7 @@ fn update_checkbox_style(
+             continue;
+         };
+ 
+-        set_checkbox_style(
++        set_checkbox_or_radio_style(
+             is_disabled,
+             *is_hovering,
+             checked,
+@@ -521,13 +564,19 @@ fn update_checkbox_style(
+     }
+ }
+ 
+-fn update_checkbox_style2(
++fn update_checkbox_or_radio_style2(
+     mut q_checkbox: Query<
+         (Has<Checked>, &Hovered, Has<InteractionDisabled>, &Children),
+-        With<DemoCheckbox>,
++        Or<(With<DemoCheckbox>, With<DemoRadio>)>,
++    >,
++    mut q_border_color: Query<
++        (&mut BorderColor, &mut Children),
++        (Without<DemoCheckbox>, Without<DemoRadio>),
++    >,
++    mut q_bg_color: Query<
++        &mut BackgroundColor,
++        (Without<DemoCheckbox>, Without<DemoRadio>, Without<Children>),
+     >,
+-    mut q_border_color: Query<(&mut BorderColor, &mut Children), Without<DemoCheckbox>>,
+-    mut q_bg_color: Query<&mut BackgroundColor, (Without<DemoCheckbox>, Without<Children>)>,
+     mut removed_checked: RemovedComponents<Checked>,
+     mut removed_disabled: RemovedComponents<InteractionDisabled>,
+ ) {
+@@ -557,7 +606,7 @@ fn update_checkbox_style2(
+                     return;
+                 };
+ 
+-                set_checkbox_style(
++                set_checkbox_or_radio_style(
+                     is_disabled,
+                     *is_hovering,
+                     checked,
+@@ -568,7 +617,7 @@ fn update_checkbox_style2(
+         });
+ }
+ 
+-fn set_checkbox_style(
++fn set_checkbox_or_radio_style(
+     disabled: bool,
+     hovering: bool,
+     checked: bool,
+@@ -601,11 +650,94 @@ fn set_checkbox_style(
+     }
+ }
+ 
++/// Create a demo radio group
++fn radio_group(asset_server: &AssetServer, on_change: Option<SystemId<In<Entity>>>) -> impl Bundle {
++    (
++        Node {
++            display: Display::Flex,
++            flex_direction: FlexDirection::Column,
++            align_items: AlignItems::Start,
++            column_gap: Val::Px(4.0),
++            ..default()
++        },
++        Name::new("RadioGroup"),
++        CoreRadioGroup { on_change },
++        TabIndex::default(),
++        children![
++            (radio(asset_server, TrackClick::Drag, "Slider Drag"),),
++            (radio(asset_server, TrackClick::Step, "Slider Step"),),
++            (radio(asset_server, TrackClick::Snap, "Slider Snap"),)
++        ],
++    )
++}
++
++/// Create a demo radio button
++fn radio(asset_server: &AssetServer, value: TrackClick, caption: &str) -> impl Bundle {
++    (
++        Node {
++            display: Display::Flex,
++            flex_direction: FlexDirection::Row,
++            justify_content: JustifyContent::FlexStart,
++            align_items: AlignItems::Center,
++            align_content: AlignContent::Center,
++            column_gap: Val::Px(4.0),
++            ..default()
++        },
++        Name::new("RadioButton"),
++        Hovered::default(),
++        DemoRadio(value),
++        CoreRadio,
++        Children::spawn((
++            Spawn((
++                // Radio outer
++                Node {
++                    display: Display::Flex,
++                    width: Val::Px(16.0),
++                    height: Val::Px(16.0),
++                    border: UiRect::all(Val::Px(2.0)),
++                    ..default()
++                },
++                BorderColor::all(CHECKBOX_OUTLINE), // Border color for the checkbox
++                BorderRadius::MAX,
++                children![
++                    // Radio inner
++                    (
++                        Node {
++                            display: Display::Flex,
++                            width: Val::Px(8.0),
++                            height: Val::Px(8.0),
++                            position_type: PositionType::Absolute,
++                            left: Val::Px(2.0),
++                            top: Val::Px(2.0),
++                            ..default()
++                        },
++                        BorderRadius::MAX,
++                        BackgroundColor(CHECKBOX_CHECK),
++                    ),
++                ],
++            )),
++            Spawn((
++                Text::new(caption),
++                TextFont {
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font_size: 20.0,
++                    ..default()
++                },
++            )),
++        )),
++    )
++}
++
+ fn toggle_disabled(
+     input: Res<ButtonInput<KeyCode>>,
+     mut interaction_query: Query<
+         (Entity, Has<InteractionDisabled>),
+-        Or<(With<CoreButton>, With<CoreSlider>, With<CoreCheckbox>)>,
++        Or<(
++            With<CoreButton>,
++            With<CoreSlider>,
++            With<CoreCheckbox>,
++            With<CoreRadio>,
++        )>,
+     >,
+     mut commands: Commands,
+ ) {
+diff --git a/release-content/release-notes/headless-widgets.md b/release-content/release-notes/headless-widgets.md
+index 6fc82648cc05d..e28c44ee9efc8 100644
+--- a/release-content/release-notes/headless-widgets.md
++++ b/release-content/release-notes/headless-widgets.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Headless Widgets
+ authors: ["@viridia"]
+-pull_requests: [19366, 19584, 19665]
++pull_requests: [19366, 19584, 19665, 19778]
+ ---
+ 
+ Bevy's `Button` and `Interaction` components have been around for a long time. Unfortunately

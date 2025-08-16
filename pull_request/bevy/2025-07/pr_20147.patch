@@ -1,0 +1,728 @@
+diff --git a/crates/bevy_gizmos/src/pipeline_2d.rs b/crates/bevy_gizmos/src/pipeline_2d.rs
+index 128ecca883d1d..4fc75e63b7370 100644
+--- a/crates/bevy_gizmos/src/pipeline_2d.rs
++++ b/crates/bevy_gizmos/src/pipeline_2d.rs
+@@ -27,7 +27,9 @@ use bevy_render::{
+     Render, RenderApp, RenderSystems,
+ };
+ use bevy_render::{sync_world::MainEntity, RenderStartup};
+-use bevy_sprite::{Mesh2dPipeline, Mesh2dPipelineKey, SetMesh2dViewBindGroup};
++use bevy_sprite::{
++    init_mesh_2d_pipeline, Mesh2dPipeline, Mesh2dPipelineKey, SetMesh2dViewBindGroup,
++};
+ use bevy_utils::default;
+ use tracing::error;
+ 
+@@ -56,7 +58,9 @@ impl Plugin for LineGizmo2dPlugin {
+             )
+             .add_systems(
+                 RenderStartup,
+-                init_line_gizmo_pipelines.after(init_line_gizmo_uniform_bind_group_layout),
++                init_line_gizmo_pipelines
++                    .after(init_line_gizmo_uniform_bind_group_layout)
++                    .after(init_mesh_2d_pipeline),
+             )
+             .add_systems(
+                 Render,
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index fab5b2d993c29..91982938949ea 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -56,7 +56,7 @@ use bevy_render::{
+     render_phase::AddRenderCommand,
+     render_resource::SpecializedRenderPipelines,
+     view::{NoFrustumCulling, VisibilitySystems},
+-    ExtractSchedule, Render, RenderApp, RenderSystems,
++    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ 
+ /// Adds support for 2D sprite rendering.
+@@ -118,7 +118,9 @@ impl Plugin for SpritePlugin {
+                 .init_resource::<ExtractedSprites>()
+                 .init_resource::<ExtractedSlices>()
+                 .init_resource::<SpriteAssetEvents>()
++                .init_resource::<SpriteBatches>()
+                 .add_render_command::<Transparent2d, DrawSprite>()
++                .add_systems(RenderStartup, init_sprite_pipeline)
+                 .add_systems(
+                     ExtractSchedule,
+                     (
+@@ -140,14 +142,6 @@ impl Plugin for SpritePlugin {
+                 );
+         };
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            render_app
+-                .init_resource::<SpriteBatches>()
+-                .init_resource::<SpritePipeline>();
+-        }
+-    }
+ }
+ 
+ /// System calculating and inserting an [`Aabb`] component to entities with either:
+diff --git a/crates/bevy_sprite/src/mesh2d/material.rs b/crates/bevy_sprite/src/mesh2d/material.rs
+index 4117e398230bf..8d575d8be4edb 100644
+--- a/crates/bevy_sprite/src/mesh2d/material.rs
++++ b/crates/bevy_sprite/src/mesh2d/material.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+-    DrawMesh2d, Mesh2d, Mesh2dPipeline, Mesh2dPipelineKey, RenderMesh2dInstances,
+-    SetMesh2dBindGroup, SetMesh2dViewBindGroup, ViewKeyCache, ViewSpecializationTicks,
++    init_mesh_2d_pipeline, DrawMesh2d, Mesh2d, Mesh2dPipeline, Mesh2dPipelineKey,
++    RenderMesh2dInstances, SetMesh2dBindGroup, SetMesh2dViewBindGroup, ViewKeyCache,
++    ViewSpecializationTicks,
+ };
+ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_asset::prelude::AssetChanged;
+@@ -25,6 +26,7 @@ use bevy_render::camera::extract_cameras;
+ use bevy_render::render_phase::{DrawFunctionId, InputUniformIndex};
+ use bevy_render::render_resource::CachedRenderPipelineId;
+ use bevy_render::view::RenderVisibleEntities;
++use bevy_render::RenderStartup;
+ use bevy_render::{
+     mesh::{MeshVertexBufferLayoutRef, RenderMesh},
+     render_asset::{
+@@ -285,6 +287,10 @@ where
+                 .add_render_command::<Transparent2d, DrawMaterial2d<M>>()
+                 .init_resource::<RenderMaterial2dInstances<M>>()
+                 .init_resource::<SpecializedMeshPipelines<Material2dPipeline<M>>>()
++                .add_systems(
++                    RenderStartup,
++                    init_material_2d_pipeline::<M>.after(init_mesh_2d_pipeline),
++                )
+                 .add_systems(
+                     ExtractSchedule,
+                     (
+@@ -306,12 +312,6 @@ where
+                 );
+         }
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            render_app.init_resource::<Material2dPipeline<M>>();
+-        }
+-    }
+ }
+ 
+ #[derive(Resource, Deref, DerefMut)]
+@@ -463,28 +463,29 @@ where
+     }
+ }
+ 
+-impl<M: Material2d> FromWorld for Material2dPipeline<M> {
+-    fn from_world(world: &mut World) -> Self {
+-        let asset_server = world.resource::<AssetServer>();
+-        let render_device = world.resource::<RenderDevice>();
+-        let material2d_layout = M::bind_group_layout(render_device);
+-
+-        Material2dPipeline {
+-            mesh2d_pipeline: world.resource::<Mesh2dPipeline>().clone(),
+-            material2d_layout,
+-            vertex_shader: match M::vertex_shader() {
+-                ShaderRef::Default => None,
+-                ShaderRef::Handle(handle) => Some(handle),
+-                ShaderRef::Path(path) => Some(asset_server.load(path)),
+-            },
+-            fragment_shader: match M::fragment_shader() {
+-                ShaderRef::Default => None,
+-                ShaderRef::Handle(handle) => Some(handle),
+-                ShaderRef::Path(path) => Some(asset_server.load(path)),
+-            },
+-            marker: PhantomData,
+-        }
+-    }
++pub fn init_material_2d_pipeline<M: Material2d>(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    asset_server: Res<AssetServer>,
++    mesh_2d_pipeline: Res<Mesh2dPipeline>,
++) {
++    let material2d_layout = M::bind_group_layout(&render_device);
++
++    commands.insert_resource(Material2dPipeline::<M> {
++        mesh2d_pipeline: mesh_2d_pipeline.clone(),
++        material2d_layout,
++        vertex_shader: match M::vertex_shader() {
++            ShaderRef::Default => None,
++            ShaderRef::Handle(handle) => Some(handle),
++            ShaderRef::Path(path) => Some(asset_server.load(path)),
++        },
++        fragment_shader: match M::fragment_shader() {
++            ShaderRef::Default => None,
++            ShaderRef::Handle(handle) => Some(handle),
++            ShaderRef::Path(path) => Some(asset_server.load(path)),
++        },
++        marker: PhantomData,
++    });
+ }
+ 
+ pub(super) type DrawMaterial2d<M> = (
+diff --git a/crates/bevy_sprite/src/mesh2d/mesh.rs b/crates/bevy_sprite/src/mesh2d/mesh.rs
+index 08620c5a4dc79..d29825eaac92a 100644
+--- a/crates/bevy_sprite/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite/src/mesh2d/mesh.rs
+@@ -1,6 +1,6 @@
+ use bevy_app::Plugin;
+-use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, Handle};
+-use bevy_render::load_shader_library;
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, AssetServer, Handle};
++use bevy_render::{load_shader_library, RenderStartup};
+ 
+ use crate::{tonemapping_pipeline_key, Material2dBindGroupId};
+ use bevy_core_pipeline::tonemapping::DebandDither;
+@@ -16,7 +16,7 @@ use bevy_ecs::system::SystemChangeTick;
+ use bevy_ecs::{
+     prelude::*,
+     query::ROQueryItem,
+-    system::{lifetimeless::*, SystemParamItem, SystemState},
++    system::{lifetimeless::*, SystemParamItem},
+ };
+ use bevy_image::{BevyDefault, Image, ImageSampler, TextureFormatPixelInfo};
+ use bevy_math::{Affine3, Vec4};
+@@ -69,15 +69,29 @@ impl Plugin for Mesh2dRenderPlugin {
+ 
+         embedded_asset!(app, "mesh2d.wgsl");
+ 
++        // These bindings should be loaded as a shader library, but it depends on runtime
++        // information, so we will load it in a system.
++        embedded_asset!(app, "mesh2d_bindings.wgsl");
++
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app
+                 .init_resource::<ViewKeyCache>()
+                 .init_resource::<RenderMesh2dInstances>()
+                 .init_resource::<SpecializedMeshPipelines<Mesh2dPipeline>>()
++                .init_resource::<ViewSpecializationTicks>()
++                .add_systems(
++                    RenderStartup,
++                    (
++                        init_mesh_2d_pipeline,
++                        init_batched_instance_buffer,
++                        load_mesh2d_bindings,
++                    ),
++                )
+                 .add_systems(ExtractSchedule, extract_mesh2d)
+                 .add_systems(
+                     Render,
+                     (
++                        check_views_need_specialization.in_set(PrepareAssets),
+                         (
+                             sweep_old_entities::<Opaque2d>,
+                             sweep_old_entities::<AlphaMask2d>,
+@@ -100,42 +114,6 @@ impl Plugin for Mesh2dRenderPlugin {
+                 );
+         }
+     }
+-
+-    fn finish(&self, app: &mut bevy_app::App) {
+-        let mut mesh_bindings_shader_defs = Vec::with_capacity(1);
+-
+-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            let render_device = render_app.world().resource::<RenderDevice>();
+-            let batched_instance_buffer =
+-                BatchedInstanceBuffer::<Mesh2dUniform>::new(render_device);
+-
+-            if let Some(per_object_buffer_batch_size) =
+-                GpuArrayBuffer::<Mesh2dUniform>::batch_size(render_device)
+-            {
+-                mesh_bindings_shader_defs.push(ShaderDefVal::UInt(
+-                    "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
+-                    per_object_buffer_batch_size,
+-                ));
+-            }
+-
+-            render_app
+-                .insert_resource(batched_instance_buffer)
+-                .init_resource::<Mesh2dPipeline>()
+-                .init_resource::<ViewKeyCache>()
+-                .init_resource::<ViewSpecializationTicks>()
+-                .add_systems(
+-                    Render,
+-                    check_views_need_specialization.in_set(PrepareAssets),
+-                );
+-        }
+-
+-        // Load the mesh_bindings shader module here as it depends on runtime information about
+-        // whether storage buffers are supported, or the maximum uniform buffer binding size.
+-        load_shader_library!(app, "mesh2d_bindings.wgsl", move |settings| *settings =
+-            ShaderSettings {
+-                shader_defs: mesh_bindings_shader_defs.clone()
+-            });
+-    }
+ }
+ 
+ #[derive(Resource, Deref, DerefMut, Default, Debug, Clone)]
+@@ -180,6 +158,38 @@ pub fn check_views_need_specialization(
+     }
+ }
+ 
++pub fn init_batched_instance_buffer(mut commands: Commands, render_device: Res<RenderDevice>) {
++    commands.insert_resource(BatchedInstanceBuffer::<Mesh2dUniform>::new(&render_device));
++}
++
++fn load_mesh2d_bindings(render_device: Res<RenderDevice>, asset_server: Res<AssetServer>) {
++    let mut mesh_bindings_shader_defs = Vec::with_capacity(1);
++
++    if let Some(per_object_buffer_batch_size) =
++        GpuArrayBuffer::<Mesh2dUniform>::batch_size(&render_device)
++    {
++        mesh_bindings_shader_defs.push(ShaderDefVal::UInt(
++            "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
++            per_object_buffer_batch_size,
++        ));
++    }
++
++    // Load the mesh_bindings shader module here as it depends on runtime information about
++    // whether storage buffers are supported, or the maximum uniform buffer binding size.
++    let handle: Handle<Shader> = load_embedded_asset!(
++        asset_server.as_ref(),
++        "mesh2d_bindings.wgsl",
++        move |settings| {
++            *settings = ShaderSettings {
++                shader_defs: mesh_bindings_shader_defs.clone(),
++            }
++        }
++    );
++    // Forget the handle so we don't have to store it anywhere, and we keep the embedded asset
++    // loaded. Note: This is what happens in `load_shader_library` internally.
++    core::mem::forget(handle);
++}
++
+ #[derive(Component)]
+ pub struct Mesh2dTransforms {
+     pub world_from_local: Affine3,
+@@ -282,79 +292,74 @@ pub struct Mesh2dPipeline {
+     pub per_object_buffer_batch_size: Option<u32>,
+ }
+ 
+-impl FromWorld for Mesh2dPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let mut system_state: SystemState<(
+-            Res<RenderDevice>,
+-            Res<RenderQueue>,
+-            Res<DefaultImageSampler>,
+-        )> = SystemState::new(world);
+-        let (render_device, render_queue, default_sampler) = system_state.get_mut(world);
+-        let render_device = render_device.into_inner();
+-        let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
+-        let view_layout = render_device.create_bind_group_layout(
+-            "mesh2d_view_layout",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::VERTEX_FRAGMENT,
+-                (
+-                    uniform_buffer::<ViewUniform>(true),
+-                    uniform_buffer::<GlobalsUniform>(false),
+-                    tonemapping_lut_entries[0].visibility(ShaderStages::FRAGMENT),
+-                    tonemapping_lut_entries[1].visibility(ShaderStages::FRAGMENT),
+-                ),
++pub fn init_mesh_2d_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    render_queue: Res<RenderQueue>,
++    default_sampler: Res<DefaultImageSampler>,
++    asset_server: Res<AssetServer>,
++) {
++    let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
++    let view_layout = render_device.create_bind_group_layout(
++        "mesh2d_view_layout",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::VERTEX_FRAGMENT,
++            (
++                uniform_buffer::<ViewUniform>(true),
++                uniform_buffer::<GlobalsUniform>(false),
++                tonemapping_lut_entries[0].visibility(ShaderStages::FRAGMENT),
++                tonemapping_lut_entries[1].visibility(ShaderStages::FRAGMENT),
+             ),
+-        );
++        ),
++    );
+ 
+-        let mesh_layout = render_device.create_bind_group_layout(
+-            "mesh2d_layout",
+-            &BindGroupLayoutEntries::single(
+-                ShaderStages::VERTEX_FRAGMENT,
+-                GpuArrayBuffer::<Mesh2dUniform>::binding_layout(render_device),
+-            ),
+-        );
+-        // A 1x1x1 'all 1.0' texture to use as a dummy texture to use in place of optional StandardMaterial textures
+-        let dummy_white_gpu_image = {
+-            let image = Image::default();
+-            let texture = render_device.create_texture(&image.texture_descriptor);
+-            let sampler = match image.sampler {
+-                ImageSampler::Default => (**default_sampler).clone(),
+-                ImageSampler::Descriptor(ref descriptor) => {
+-                    render_device.create_sampler(&descriptor.as_wgpu())
+-                }
+-            };
+-
+-            let format_size = image.texture_descriptor.format.pixel_size();
+-            render_queue.write_texture(
+-                texture.as_image_copy(),
+-                image.data.as_ref().expect("Image has no data"),
+-                TexelCopyBufferLayout {
+-                    offset: 0,
+-                    bytes_per_row: Some(image.width() * format_size as u32),
+-                    rows_per_image: None,
+-                },
+-                image.texture_descriptor.size,
+-            );
+-
+-            let texture_view = texture.create_view(&TextureViewDescriptor::default());
+-            GpuImage {
+-                texture,
+-                texture_view,
+-                texture_format: image.texture_descriptor.format,
+-                sampler,
+-                size: image.texture_descriptor.size,
+-                mip_level_count: image.texture_descriptor.mip_level_count,
++    let mesh_layout = render_device.create_bind_group_layout(
++        "mesh2d_layout",
++        &BindGroupLayoutEntries::single(
++            ShaderStages::VERTEX_FRAGMENT,
++            GpuArrayBuffer::<Mesh2dUniform>::binding_layout(&render_device),
++        ),
++    );
++    // A 1x1x1 'all 1.0' texture to use as a dummy texture to use in place of optional StandardMaterial textures
++    let dummy_white_gpu_image = {
++        let image = Image::default();
++        let texture = render_device.create_texture(&image.texture_descriptor);
++        let sampler = match image.sampler {
++            ImageSampler::Default => (**default_sampler).clone(),
++            ImageSampler::Descriptor(ref descriptor) => {
++                render_device.create_sampler(&descriptor.as_wgpu())
+             }
+         };
+-        Mesh2dPipeline {
+-            view_layout,
+-            mesh_layout,
+-            dummy_white_gpu_image,
+-            per_object_buffer_batch_size: GpuArrayBuffer::<Mesh2dUniform>::batch_size(
+-                render_device,
+-            ),
+-            shader: load_embedded_asset!(world, "mesh2d.wgsl"),
++
++        let format_size = image.texture_descriptor.format.pixel_size();
++        render_queue.write_texture(
++            texture.as_image_copy(),
++            image.data.as_ref().expect("Image has no data"),
++            TexelCopyBufferLayout {
++                offset: 0,
++                bytes_per_row: Some(image.width() * format_size as u32),
++                rows_per_image: None,
++            },
++            image.texture_descriptor.size,
++        );
++
++        let texture_view = texture.create_view(&TextureViewDescriptor::default());
++        GpuImage {
++            texture,
++            texture_view,
++            texture_format: image.texture_descriptor.format,
++            sampler,
++            size: image.texture_descriptor.size,
++            mip_level_count: image.texture_descriptor.mip_level_count,
+         }
+-    }
++    };
++    commands.insert_resource(Mesh2dPipeline {
++        view_layout,
++        mesh_layout,
++        dummy_white_gpu_image,
++        per_object_buffer_batch_size: GpuArrayBuffer::<Mesh2dUniform>::batch_size(&render_device),
++        shader: load_embedded_asset!(asset_server.as_ref(), "mesh2d.wgsl"),
++    });
+ }
+ 
+ impl Mesh2dPipeline {
+diff --git a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+index f71d8c63f7e80..912c25f9bb019 100644
+--- a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
++++ b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+@@ -1,11 +1,11 @@
+ use crate::{
+-    DrawMesh2d, Mesh2dPipeline, Mesh2dPipelineKey, RenderMesh2dInstances, SetMesh2dBindGroup,
+-    SetMesh2dViewBindGroup, ViewKeyCache, ViewSpecializationTicks,
++    init_mesh_2d_pipeline, DrawMesh2d, Mesh2dPipeline, Mesh2dPipelineKey, RenderMesh2dInstances,
++    SetMesh2dBindGroup, SetMesh2dViewBindGroup, ViewKeyCache, ViewSpecializationTicks,
+ };
+ use bevy_app::{App, Plugin, PostUpdate, Startup, Update};
+ use bevy_asset::{
+     embedded_asset, load_embedded_asset, prelude::AssetChanged, AsAssetId, Asset, AssetApp,
+-    AssetEventSystems, AssetId, Assets, Handle, UntypedAssetId,
++    AssetEventSystems, AssetId, AssetServer, Assets, Handle, UntypedAssetId,
+ };
+ use bevy_color::{Color, ColorToComponents};
+ use bevy_core_pipeline::core_2d::{
+@@ -49,7 +49,7 @@ use bevy_render::{
+     view::{
+         ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewDepthTexture, ViewTarget,
+     },
+-    Extract, Render, RenderApp, RenderDebugFlags, RenderSystems,
++    Extract, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
+ };
+ use core::{hash::Hash, ops::Range};
+ use tracing::error;
+@@ -129,6 +129,10 @@ impl Plugin for Wireframe2dPlugin {
+                     Node2d::PostProcessing,
+                 ),
+             )
++            .add_systems(
++                RenderStartup,
++                init_wireframe_2d_pipeline.after(init_mesh_2d_pipeline),
++            )
+             .add_systems(
+                 ExtractSchedule,
+                 (
+@@ -150,13 +154,6 @@ impl Plugin for Wireframe2dPlugin {
+                 ),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        render_app.init_resource::<Wireframe2dPipeline>();
+-    }
+ }
+ 
+ /// Enables wireframe rendering for any entity it is attached to.
+@@ -327,13 +324,15 @@ pub struct Wireframe2dPipeline {
+     shader: Handle<Shader>,
+ }
+ 
+-impl FromWorld for Wireframe2dPipeline {
+-    fn from_world(render_world: &mut World) -> Self {
+-        Wireframe2dPipeline {
+-            mesh_pipeline: render_world.resource::<Mesh2dPipeline>().clone(),
+-            shader: load_embedded_asset!(render_world, "wireframe2d.wgsl"),
+-        }
+-    }
++pub fn init_wireframe_2d_pipeline(
++    mut commands: Commands,
++    mesh_2d_pipeline: Res<Mesh2dPipeline>,
++    asset_server: Res<AssetServer>,
++) {
++    commands.insert_resource(Wireframe2dPipeline {
++        mesh_pipeline: mesh_2d_pipeline.clone(),
++        shader: load_embedded_asset!(asset_server.as_ref(), "wireframe2d.wgsl"),
++    });
+ }
+ 
+ impl SpecializedMeshPipeline for Wireframe2dPipeline {
+diff --git a/crates/bevy_sprite/src/render/mod.rs b/crates/bevy_sprite/src/render/mod.rs
+index cabab135c2849..909fb51d81f6b 100644
+--- a/crates/bevy_sprite/src/render/mod.rs
++++ b/crates/bevy_sprite/src/render/mod.rs
+@@ -1,7 +1,7 @@
+ use core::ops::Range;
+ 
+ use crate::{Anchor, ComputedTextureSlices, ScalingMode, Sprite};
+-use bevy_asset::{load_embedded_asset, AssetEvent, AssetId, Assets, Handle};
++use bevy_asset::{load_embedded_asset, AssetEvent, AssetId, AssetServer, Assets, Handle};
+ use bevy_color::{ColorToComponents, LinearRgba};
+ use bevy_core_pipeline::{
+     core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT},
+@@ -14,7 +14,7 @@ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     prelude::*,
+     query::ROQueryItem,
+-    system::{lifetimeless::*, SystemParamItem, SystemState},
++    system::{lifetimeless::*, SystemParamItem},
+ };
+ use bevy_image::{BevyDefault, Image, ImageSampler, TextureAtlasLayout, TextureFormatPixelInfo};
+ use bevy_math::{Affine3A, FloatOrd, Quat, Rect, Vec2, Vec4};
+@@ -52,77 +52,74 @@ pub struct SpritePipeline {
+     pub dummy_white_gpu_image: GpuImage,
+ }
+ 
+-impl FromWorld for SpritePipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let mut system_state: SystemState<(
+-            Res<RenderDevice>,
+-            Res<DefaultImageSampler>,
+-            Res<RenderQueue>,
+-        )> = SystemState::new(world);
+-        let (render_device, default_sampler, render_queue) = system_state.get_mut(world);
+-
+-        let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
+-        let view_layout = render_device.create_bind_group_layout(
+-            "sprite_view_layout",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::VERTEX_FRAGMENT,
+-                (
+-                    uniform_buffer::<ViewUniform>(true),
+-                    tonemapping_lut_entries[0].visibility(ShaderStages::FRAGMENT),
+-                    tonemapping_lut_entries[1].visibility(ShaderStages::FRAGMENT),
+-                ),
++pub fn init_sprite_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    default_sampler: Res<DefaultImageSampler>,
++    render_queue: Res<RenderQueue>,
++    asset_server: Res<AssetServer>,
++) {
++    let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
++    let view_layout = render_device.create_bind_group_layout(
++        "sprite_view_layout",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::VERTEX_FRAGMENT,
++            (
++                uniform_buffer::<ViewUniform>(true),
++                tonemapping_lut_entries[0].visibility(ShaderStages::FRAGMENT),
++                tonemapping_lut_entries[1].visibility(ShaderStages::FRAGMENT),
+             ),
+-        );
+-
+-        let material_layout = render_device.create_bind_group_layout(
+-            "sprite_material_layout",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::FRAGMENT,
+-                (
+-                    texture_2d(TextureSampleType::Float { filterable: true }),
+-                    sampler(SamplerBindingType::Filtering),
+-                ),
++        ),
++    );
++
++    let material_layout = render_device.create_bind_group_layout(
++        "sprite_material_layout",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
++            (
++                texture_2d(TextureSampleType::Float { filterable: true }),
++                sampler(SamplerBindingType::Filtering),
+             ),
+-        );
+-        let dummy_white_gpu_image = {
+-            let image = Image::default();
+-            let texture = render_device.create_texture(&image.texture_descriptor);
+-            let sampler = match image.sampler {
+-                ImageSampler::Default => (**default_sampler).clone(),
+-                ImageSampler::Descriptor(ref descriptor) => {
+-                    render_device.create_sampler(&descriptor.as_wgpu())
+-                }
+-            };
+-
+-            let format_size = image.texture_descriptor.format.pixel_size();
+-            render_queue.write_texture(
+-                texture.as_image_copy(),
+-                image.data.as_ref().expect("Image has no data"),
+-                TexelCopyBufferLayout {
+-                    offset: 0,
+-                    bytes_per_row: Some(image.width() * format_size as u32),
+-                    rows_per_image: None,
+-                },
+-                image.texture_descriptor.size,
+-            );
+-            let texture_view = texture.create_view(&TextureViewDescriptor::default());
+-            GpuImage {
+-                texture,
+-                texture_view,
+-                texture_format: image.texture_descriptor.format,
+-                sampler,
+-                size: image.texture_descriptor.size,
+-                mip_level_count: image.texture_descriptor.mip_level_count,
++        ),
++    );
++    let dummy_white_gpu_image = {
++        let image = Image::default();
++        let texture = render_device.create_texture(&image.texture_descriptor);
++        let sampler = match image.sampler {
++            ImageSampler::Default => (**default_sampler).clone(),
++            ImageSampler::Descriptor(ref descriptor) => {
++                render_device.create_sampler(&descriptor.as_wgpu())
+             }
+         };
+ 
+-        SpritePipeline {
+-            view_layout,
+-            material_layout,
+-            dummy_white_gpu_image,
+-            shader: load_embedded_asset!(world, "sprite.wgsl"),
++        let format_size = image.texture_descriptor.format.pixel_size();
++        render_queue.write_texture(
++            texture.as_image_copy(),
++            image.data.as_ref().expect("Image has no data"),
++            TexelCopyBufferLayout {
++                offset: 0,
++                bytes_per_row: Some(image.width() * format_size as u32),
++                rows_per_image: None,
++            },
++            image.texture_descriptor.size,
++        );
++        let texture_view = texture.create_view(&TextureViewDescriptor::default());
++        GpuImage {
++            texture,
++            texture_view,
++            texture_format: image.texture_descriptor.format,
++            sampler,
++            size: image.texture_descriptor.size,
++            mip_level_count: image.texture_descriptor.mip_level_count,
+         }
+-    }
++    };
++
++    commands.insert_resource(SpritePipeline {
++        view_layout,
++        material_layout,
++        dummy_white_gpu_image,
++        shader: load_embedded_asset!(asset_server.as_ref(), "sprite.wgsl"),
++    });
+ }
+ 
+ bitflags::bitflags! {
+diff --git a/examples/2d/mesh2d_manual.rs b/examples/2d/mesh2d_manual.rs
+index f61f540ef30b4..4a33404762e3e 100644
+--- a/examples/2d/mesh2d_manual.rs
++++ b/examples/2d/mesh2d_manual.rs
+@@ -30,8 +30,8 @@ use bevy::{
+         Extract, Render, RenderApp, RenderStartup, RenderSystems,
+     },
+     sprite::{
+-        extract_mesh2d, DrawMesh2d, Material2dBindGroupId, Mesh2dPipeline, Mesh2dPipelineKey,
+-        Mesh2dTransforms, MeshFlags, RenderMesh2dInstance, SetMesh2dBindGroup,
++        extract_mesh2d, init_mesh_2d_pipeline, DrawMesh2d, Material2dBindGroupId, Mesh2dPipeline,
++        Mesh2dPipelineKey, Mesh2dTransforms, MeshFlags, RenderMesh2dInstance, SetMesh2dBindGroup,
+         SetMesh2dViewBindGroup,
+     },
+ };
+@@ -309,7 +309,10 @@ impl Plugin for ColoredMesh2dPlugin {
+             .add_render_command::<Transparent2d, DrawColoredMesh2d>()
+             .init_resource::<SpecializedRenderPipelines<ColoredMesh2dPipeline>>()
+             .init_resource::<RenderColoredMesh2dInstances>()
+-            .add_systems(RenderStartup, init_colored_mesh_2d_pipeline)
++            .add_systems(
++                RenderStartup,
++                init_colored_mesh_2d_pipeline.after(init_mesh_2d_pipeline),
++            )
+             .add_systems(
+                 ExtractSchedule,
+                 extract_colored_mesh2d.after(extract_mesh2d),
+diff --git a/release-content/migration-guides/render_startup.md b/release-content/migration-guides/render_startup.md
+index d1b9b76052fda..ecb1b002d39d3 100644
+--- a/release-content/migration-guides/render_startup.md
++++ b/release-content/migration-guides/render_startup.md
+@@ -1,6 +1,6 @@
+ ---
+ title: Many render resources now initialized in `RenderStartup`
+-pull_requests: [19841, 19926, 19885, 19886, 19897, 19898, 19901]
++pull_requests: [19841, 19926, 19885, 19886, 19897, 19898, 19901, 20147]
+ ---
+ 
+ Many render resources are **no longer present** during `Plugin::finish`. Instead they are
+@@ -27,6 +27,11 @@ The following are the (public) resources that are now initialized in `RenderStar
+ - `PrepassViewBindGroup`
+ - `Wireframe3dPipeline`
+ - `MaterialPipeline`
++- `Wireframe2dPipeline`
++- `Material2dPipeline`
++- `SpritePipeline`
++- `Mesh2dPipeline`
++- `BatchedInstanceBuffer<Mesh2dUniform>`
+ 
+ The vast majority of cases for initializing render resources look like so (in Bevy 0.16):
+ 
