@@ -1,0 +1,333 @@
+diff --git a/crates/bevy_pbr/src/extended_material.rs b/crates/bevy_pbr/src/extended_material.rs
+index 4db6276e2c452..585039263100b 100644
+--- a/crates/bevy_pbr/src/extended_material.rs
++++ b/crates/bevy_pbr/src/extended_material.rs
+@@ -147,7 +147,7 @@ where
+     }
+ }
+ 
+-#[derive(bytemuck::Pod, bytemuck::Zeroable, Copy, Clone, PartialEq, Eq, Hash)]
++#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+ #[repr(C, packed)]
+ pub struct MaterialExtensionBindGroupData<B, E> {
+     pub base: B,
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 059c37db0cb83..ec46bd4f9fd16 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -57,7 +57,8 @@ use bevy_render::{mesh::allocator::MeshAllocator, sync_world::MainEntityHashMap}
+ use bevy_render::{texture::FallbackImage, view::RenderVisibleEntities};
+ use bevy_shader::{Shader, ShaderDefVal};
+ use bevy_utils::Parallel;
+-use core::any::TypeId;
++use core::any::{Any, TypeId};
++use core::hash::{BuildHasher, Hasher};
+ use core::{hash::Hash, marker::PhantomData};
+ use smallvec::SmallVec;
+ use tracing::error;
+@@ -432,7 +433,7 @@ pub struct MaterialPipelineKey<M: Material> {
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+ pub struct ErasedMaterialPipelineKey {
+     pub mesh_key: MeshPipelineKey,
+-    pub material_key: SmallVec<[u8; 8]>,
++    pub material_key: ErasedMaterialKey,
+     pub type_id: TypeId,
+ }
+ 
+@@ -1290,6 +1291,85 @@ pub struct DeferredDrawFunction;
+ #[derive(DrawFunctionLabel, Debug, Hash, PartialEq, Eq, Clone, Default)]
+ pub struct ShadowsDrawFunction;
+ 
++#[derive(Debug)]
++pub struct ErasedMaterialKey {
++    type_id: TypeId,
++    hash: u64,
++    value: Box<dyn Any + Send + Sync>,
++    vtable: Arc<ErasedMaterialKeyVTable>,
++}
++
++#[derive(Debug)]
++pub struct ErasedMaterialKeyVTable {
++    clone_fn: fn(&dyn Any) -> Box<dyn Any + Send + Sync>,
++    partial_eq_fn: fn(&dyn Any, &dyn Any) -> bool,
++}
++
++impl ErasedMaterialKey {
++    pub fn new<T>(material_key: T) -> Self
++    where
++        T: Clone + Hash + PartialEq + Send + Sync + 'static,
++    {
++        let type_id = TypeId::of::<T>();
++        let hash = FixedHasher::hash_one(&FixedHasher, &material_key);
++
++        fn clone<T: Clone + Send + Sync + 'static>(any: &dyn Any) -> Box<dyn Any + Send + Sync> {
++            Box::new(any.downcast_ref::<T>().unwrap().clone())
++        }
++        fn partial_eq<T: PartialEq + 'static>(a: &dyn Any, b: &dyn Any) -> bool {
++            a.downcast_ref::<T>().unwrap() == b.downcast_ref::<T>().unwrap()
++        }
++
++        Self {
++            type_id,
++            hash,
++            value: Box::new(material_key),
++            vtable: Arc::new(ErasedMaterialKeyVTable {
++                clone_fn: clone::<T>,
++                partial_eq_fn: partial_eq::<T>,
++            }),
++        }
++    }
++
++    pub fn to_key<T: Clone + 'static>(&self) -> T {
++        debug_assert_eq!(self.type_id, TypeId::of::<T>());
++        self.value.downcast_ref::<T>().unwrap().clone()
++    }
++}
++
++impl PartialEq for ErasedMaterialKey {
++    fn eq(&self, other: &Self) -> bool {
++        self.type_id == other.type_id
++            && (self.vtable.partial_eq_fn)(self.value.as_ref(), other.value.as_ref())
++    }
++}
++
++impl Eq for ErasedMaterialKey {}
++
++impl Clone for ErasedMaterialKey {
++    fn clone(&self) -> Self {
++        Self {
++            type_id: self.type_id,
++            hash: self.hash,
++            value: (self.vtable.clone_fn)(self.value.as_ref()),
++            vtable: self.vtable.clone(),
++        }
++    }
++}
++
++impl Hash for ErasedMaterialKey {
++    fn hash<H: Hasher>(&self, state: &mut H) {
++        self.type_id.hash(state);
++        self.hash.hash(state);
++    }
++}
++
++impl Default for ErasedMaterialKey {
++    fn default() -> Self {
++        Self::new(())
++    }
++}
++
+ /// Common [`Material`] properties, calculated for a specific material instance.
+ #[derive(Default)]
+ pub struct MaterialProperties {
+@@ -1332,7 +1412,7 @@ pub struct MaterialProperties {
+     >,
+     /// The key for this material, typically a bitfield of flags that are used to modify
+     /// the pipeline descriptor used for this material.
+-    pub material_key: SmallVec<[u8; 8]>,
++    pub material_key: ErasedMaterialKey,
+     /// Whether shadows are enabled for this material
+     pub shadows_enabled: bool,
+     /// Whether prepass is enabled for this material
+@@ -1395,7 +1475,7 @@ pub struct PreparedMaterial {
+ // orphan rules T_T
+ impl<M: Material> ErasedRenderAsset for MeshMaterial3d<M>
+ where
+-    M::Data: Clone,
++    M::Data: PartialEq + Eq + Hash + Clone,
+ {
+     type SourceAsset = M;
+     type ErasedAsset = PreparedMaterial;
+@@ -1556,21 +1636,24 @@ where
+ 
+         let bindless = material_uses_bindless_resources::<M>(render_device);
+         let bind_group_data = material.bind_group_data();
+-        let material_key = SmallVec::from(bytemuck::bytes_of(&bind_group_data));
++        let material_key = ErasedMaterialKey::new(bind_group_data);
+         fn specialize<M: Material>(
+             pipeline: &MaterialPipeline,
+             descriptor: &mut RenderPipelineDescriptor,
+             mesh_layout: &MeshVertexBufferLayoutRef,
+             erased_key: ErasedMaterialPipelineKey,
+-        ) -> Result<(), SpecializedMeshPipelineError> {
+-            let material_key = bytemuck::from_bytes(erased_key.material_key.as_slice());
++        ) -> Result<(), SpecializedMeshPipelineError>
++        where
++            M::Data: Hash + Clone,
++        {
++            let material_key = erased_key.material_key.to_key();
+             M::specialize(
+                 pipeline,
+                 descriptor,
+                 mesh_layout,
+                 MaterialPipelineKey {
+                     mesh_key: erased_key.mesh_key,
+-                    bind_group_data: *material_key,
++                    bind_group_data: material_key,
+                 },
+             )
+         }
+diff --git a/crates/bevy_pbr/src/pbr_material.rs b/crates/bevy_pbr/src/pbr_material.rs
+index 173fa05113b3e..2d19f863efc7e 100644
+--- a/crates/bevy_pbr/src/pbr_material.rs
++++ b/crates/bevy_pbr/src/pbr_material.rs
+@@ -1210,7 +1210,7 @@ impl AsBindGroupShaderType<StandardMaterialUniform> for StandardMaterial {
+ bitflags! {
+     /// The pipeline key for `StandardMaterial`, packed into 64 bits.
+     #[repr(C)]
+-    #[derive(Clone, Copy, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
++    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+     pub struct StandardMaterialKey: u64 {
+         const CULL_FRONT               = 0x000001;
+         const CULL_BACK                = 0x000002;
+diff --git a/crates/bevy_render/src/render_resource/bind_group.rs b/crates/bevy_render/src/render_resource/bind_group.rs
+index 3dfd8881ce484..9cf6fb9c67d9a 100644
+--- a/crates/bevy_render/src/render_resource/bind_group.rs
++++ b/crates/bevy_render/src/render_resource/bind_group.rs
+@@ -482,26 +482,24 @@ impl Deref for BindGroup {
+ /// }
+ ///
+ /// // Materials keys are intended to be small, cheap to hash, and
+-/// // uniquely identify a specific material permutation, which
+-/// // is why they are required to be `bytemuck::Pod` and `bytemuck::Zeroable`
+-/// // when using the `AsBindGroup` derive macro.
++/// // uniquely identify a specific material permutation.
+ /// #[repr(C)]
+-/// #[derive(Copy, Clone, Hash, Eq, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++/// #[derive(Copy, Clone, Hash, Eq, PartialEq)]
+ /// struct CoolMaterialKey {
+-///     is_shaded: u32,
++///     is_shaded: bool,
+ /// }
+ ///
+ /// impl From<&CoolMaterial> for CoolMaterialKey {
+ ///     fn from(material: &CoolMaterial) -> CoolMaterialKey {
+ ///         CoolMaterialKey {
+-///             is_shaded: material.is_shaded as u32,
++///             is_shaded: material.is_shaded,
+ ///         }
+ ///     }
+ /// }
+ /// ```
+ pub trait AsBindGroup {
+     /// Data that will be stored alongside the "prepared" bind group.
+-    type Data: bytemuck::Pod + bytemuck::Zeroable + Send + Sync;
++    type Data: Send + Sync;
+ 
+     type Param: SystemParam + 'static;
+ 
+diff --git a/crates/bevy_sprite_render/src/mesh2d/material.rs b/crates/bevy_sprite_render/src/mesh2d/material.rs
+index 947aece96b1f7..19559fee29ba0 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/material.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/material.rs
+@@ -409,7 +409,7 @@ where
+     fn clone(&self) -> Self {
+         Self {
+             mesh_key: self.mesh_key,
+-            bind_group_data: self.bind_group_data,
++            bind_group_data: self.bind_group_data.clone(),
+         }
+     }
+ }
+@@ -763,7 +763,7 @@ pub fn specialize_material2d_meshes<M: Material2d>(
+                 &material2d_pipeline,
+                 Material2dKey {
+                     mesh_key,
+-                    bind_group_data: material_2d.key,
++                    bind_group_data: material_2d.key.clone(),
+                 },
+                 &mesh.layout,
+             );
+diff --git a/crates/bevy_ui_render/src/ui_material.rs b/crates/bevy_ui_render/src/ui_material.rs
+index 9c92eb99f3b8d..fc3ff836bdc40 100644
+--- a/crates/bevy_ui_render/src/ui_material.rs
++++ b/crates/bevy_ui_render/src/ui_material.rs
+@@ -143,7 +143,7 @@ where
+     fn clone(&self) -> Self {
+         Self {
+             hdr: self.hdr,
+-            bind_group_data: self.bind_group_data,
++            bind_group_data: self.bind_group_data.clone(),
+         }
+     }
+ }
+diff --git a/crates/bevy_ui_render/src/ui_material_pipeline.rs b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+index 7b098f7ee8786..60c0b9e302701 100644
+--- a/crates/bevy_ui_render/src/ui_material_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+@@ -614,7 +614,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
+             &ui_material_pipeline,
+             UiMaterialKey {
+                 hdr: view.hdr,
+-                bind_group_data: material.key,
++                bind_group_data: material.key.clone(),
+             },
+         );
+         if transparent_phase.items.capacity() < extracted_uinodes.uinodes.len() {
+diff --git a/examples/shader/shader_defs.rs b/examples/shader/shader_defs.rs
+index 5d256c29284fa..b9d00819cc57f 100644
+--- a/examples/shader/shader_defs.rs
++++ b/examples/shader/shader_defs.rs
+@@ -65,7 +65,7 @@ impl Material for CustomMaterial {
+         _layout: &MeshVertexBufferLayoutRef,
+         key: MaterialPipelineKey<Self>,
+     ) -> Result<(), SpecializedMeshPipelineError> {
+-        if key.bind_group_data.is_red == 1 {
++        if key.bind_group_data.is_red {
+             let fragment = descriptor.fragment.as_mut().unwrap();
+             fragment.shader_defs.push("IS_RED".into());
+         }
+@@ -86,18 +86,16 @@ struct CustomMaterial {
+ // In this case, we specialize on whether or not to configure the "IS_RED" shader def.
+ // Specialization keys should be kept as small / cheap to hash as possible,
+ // as they will be used to look up the pipeline for each drawn entity with this material type,
+-// Which is why they are required to be `bytemuck::Pod` and `bytemuck::Zeroable` for materials
+-// that use the `AsBindGroup` derive macro.
+ #[repr(C)]
+-#[derive(Eq, PartialEq, Hash, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
++#[derive(Eq, PartialEq, Hash, Copy, Clone)]
+ struct CustomMaterialKey {
+-    is_red: u32,
++    is_red: bool,
+ }
+ 
+ impl From<&CustomMaterial> for CustomMaterialKey {
+     fn from(material: &CustomMaterial) -> Self {
+         Self {
+-            is_red: material.is_red as u32,
++            is_red: material.is_red,
+         }
+     }
+ }
+diff --git a/examples/shader/shader_material_wesl.rs b/examples/shader/shader_material_wesl.rs
+index 33920c28711b2..b13d8325401f5 100644
+--- a/examples/shader/shader_material_wesl.rs
++++ b/examples/shader/shader_material_wesl.rs
+@@ -100,15 +100,15 @@ struct CustomMaterial {
+ }
+ 
+ #[repr(C)]
+-#[derive(Eq, PartialEq, Hash, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
++#[derive(Eq, PartialEq, Hash, Copy, Clone)]
+ struct CustomMaterialKey {
+-    party_mode: u32,
++    party_mode: bool,
+ }
+ 
+ impl From<&CustomMaterial> for CustomMaterialKey {
+     fn from(material: &CustomMaterial) -> Self {
+         Self {
+-            party_mode: material.party_mode as u32,
++            party_mode: material.party_mode,
+         }
+     }
+ }
+@@ -127,7 +127,7 @@ impl Material for CustomMaterial {
+         let fragment = descriptor.fragment.as_mut().unwrap();
+         fragment.shader_defs.push(ShaderDefVal::Bool(
+             "PARTY_MODE".to_string(),
+-            key.bind_group_data.party_mode == 1,
++            key.bind_group_data.party_mode,
+         ));
+         Ok(())
+     }
