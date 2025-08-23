@@ -1,0 +1,236 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 97bbfdddb0152..28612f1c0a516 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -281,7 +281,7 @@ bevy_sprite_render = [
+ ]
+ 
+ # Provides text functionality
+-bevy_text = ["bevy_internal/bevy_text", "bevy_asset", "bevy_sprite"]
++bevy_text = ["bevy_internal/bevy_text", "bevy_asset"]
+ 
+ # A custom ECS-driven UI framework
+ bevy_ui = [
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 9e3a611c318af..e382008231f1d 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -199,14 +199,18 @@ bevy_ci_testing = ["bevy_dev_tools/bevy_ci_testing", "bevy_render?/ci_limits"]
+ # Enable animation support, and glTF animation loading
+ animation = ["bevy_animation", "bevy_mesh", "bevy_gltf?/bevy_animation"]
+ 
+-bevy_window = ["dep:bevy_window", "dep:bevy_a11y"]
+-
+ bevy_shader = ["dep:bevy_shader"]
+ bevy_image = ["dep:bevy_image"]
+ bevy_sprite = ["dep:bevy_sprite", "bevy_image"]
+-bevy_text = ["dep:bevy_text", "bevy_image", "bevy_sprite"]
++bevy_text = [
++  "dep:bevy_text",
++  "bevy_image",
++  "bevy_sprite?/bevy_text",
++  "bevy_sprite_render?/bevy_text",
++]
+ bevy_mesh = ["dep:bevy_mesh", "bevy_image"]
+-bevy_camera = ["dep:bevy_camera", "bevy_mesh"]
++bevy_window = ["dep:bevy_window", "dep:bevy_a11y", "bevy_image"]
++bevy_camera = ["dep:bevy_camera", "bevy_mesh", "bevy_window"]
+ bevy_light = ["dep:bevy_light", "bevy_camera"]
+ bevy_render = [
+   "dep:bevy_render",
+@@ -227,6 +231,7 @@ bevy_pbr = [
+ bevy_sprite_render = [
+   "dep:bevy_sprite_render",
+   "bevy_sprite",
++  "bevy_window",
+   "bevy_core_pipeline",
+   "bevy_gizmos?/bevy_sprite",
+   "bevy_gizmos?/bevy_sprite_render",
+diff --git a/crates/bevy_sprite/Cargo.toml b/crates/bevy_sprite/Cargo.toml
+index 48cfe2d7cbf52..0e832daac2b00 100644
+--- a/crates/bevy_sprite/Cargo.toml
++++ b/crates/bevy_sprite/Cargo.toml
+@@ -9,7 +9,8 @@ license = "MIT OR Apache-2.0"
+ keywords = ["bevy"]
+ 
+ [features]
+-bevy_sprite_picking_backend = ["bevy_picking"]
++bevy_sprite_picking_backend = ["bevy_picking", "bevy_window"]
++bevy_text = ["dep:bevy_text", "bevy_window"]
+ 
+ [dependencies]
+ # bevy
+@@ -24,9 +25,9 @@ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev", optional = true }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+-bevy_window = { path = "../bevy_window", version = "0.17.0-dev" }
++bevy_window = { path = "../bevy_window", version = "0.17.0-dev", optional = true }
+ bevy_derive = { path = "../bevy_derive", version = "0.17.0-dev" }
+-bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
++bevy_text = { path = "../bevy_text", version = "0.17.0-dev", optional = true }
+ 
+ # other
+ radsort = "0.1"
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index 115e996e6aedf..29663e0302fd5 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -13,6 +13,7 @@ extern crate alloc;
+ #[cfg(feature = "bevy_sprite_picking_backend")]
+ mod picking_backend;
+ mod sprite;
++#[cfg(feature = "bevy_text")]
+ mod text2d;
+ mod texture_slice;
+ 
+@@ -25,28 +26,28 @@ pub mod prelude {
+     pub use crate::picking_backend::{
+         SpritePickingCamera, SpritePickingMode, SpritePickingPlugin, SpritePickingSettings,
+     };
++    #[cfg(feature = "bevy_text")]
++    #[doc(hidden)]
++    pub use crate::text2d::{Text2d, Text2dReader, Text2dWriter};
+     #[doc(hidden)]
+     pub use crate::{
+         sprite::{Sprite, SpriteImageMode},
+-        text2d::{Text2d, Text2dReader, Text2dWriter},
+         texture_slice::{BorderRect, SliceScaleMode, TextureSlice, TextureSlicer},
+         ScalingMode,
+     };
+ }
+ 
+-use bevy_app::AnimationSystems;
+ use bevy_asset::Assets;
+ use bevy_camera::{
+     primitives::{Aabb, MeshAabb},
+     visibility::NoFrustumCulling,
++    visibility::VisibilitySystems,
+ };
+-use bevy_camera::{visibility::VisibilitySystems, CameraUpdateSystems};
+ use bevy_mesh::{Mesh, Mesh2d};
+-use bevy_text::detect_text_needs_rerender;
+-use bevy_text::Text2dUpdateSystems;
+ #[cfg(feature = "bevy_sprite_picking_backend")]
+ pub use picking_backend::*;
+ pub use sprite::*;
++#[cfg(feature = "bevy_text")]
+ pub use text2d::*;
+ pub use texture_slice::*;
+ 
+@@ -79,22 +80,23 @@ impl Plugin for SpritePlugin {
+             calculate_bounds_2d.in_set(VisibilitySystems::CalculateBounds),
+         );
+ 
++        #[cfg(feature = "bevy_text")]
+         app.add_systems(
+             PostUpdate,
+             (
+-                detect_text_needs_rerender::<Text2d>,
++                bevy_text::detect_text_needs_rerender::<Text2d>,
+                 update_text2d_layout
+                     // Potential conflict: `Assets<Image>`
+                     // In practice, they run independently since `bevy_render::camera_update_system`
+                     // will only ever observe its own render target, and `update_text2d_layout`
+                     // will never modify a pre-existing `Image` asset.
+-                    .ambiguous_with(CameraUpdateSystems)
++                    .ambiguous_with(bevy_camera::CameraUpdateSystems)
+                     .after(bevy_text::remove_dropped_font_atlas_sets),
+                 calculate_bounds_text2d.in_set(VisibilitySystems::CalculateBounds),
+             )
+                 .chain()
+-                .in_set(Text2dUpdateSystems)
+-                .after(AnimationSystems),
++                .in_set(bevy_text::Text2dUpdateSystems)
++                .after(bevy_app::AnimationSystems),
+         );
+ 
+         #[cfg(feature = "bevy_sprite_picking_backend")]
+diff --git a/crates/bevy_sprite_render/Cargo.toml b/crates/bevy_sprite_render/Cargo.toml
+index 3e99922125ea8..ddf702398ab50 100644
+--- a/crates/bevy_sprite_render/Cargo.toml
++++ b/crates/bevy_sprite_render/Cargo.toml
+@@ -11,6 +11,7 @@ keywords = ["bevy"]
+ [features]
+ webgl = []
+ webgpu = []
++bevy_text = ["dep:bevy_text", "bevy_sprite/bevy_text"]
+ 
+ [dependencies]
+ # bevy
+@@ -25,7 +26,7 @@ bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_shader = { path = "../bevy_shader", version = "0.17.0-dev" }
+ bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev" }
+-bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
++bevy_text = { path = "../bevy_text", version = "0.17.0-dev", optional = true }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+diff --git a/crates/bevy_sprite_render/src/lib.rs b/crates/bevy_sprite_render/src/lib.rs
+index 801336b849677..43ec82e742e93 100644
+--- a/crates/bevy_sprite_render/src/lib.rs
++++ b/crates/bevy_sprite_render/src/lib.rs
+@@ -12,6 +12,7 @@ extern crate alloc;
+ 
+ mod mesh2d;
+ mod render;
++#[cfg(feature = "bevy_text")]
+ mod text2d;
+ mod texture_slice;
+ mod tilemap_chunk;
+@@ -43,6 +44,7 @@ use bevy_render::{
+ };
+ use bevy_sprite::Sprite;
+ 
++#[cfg(feature = "bevy_text")]
+ use crate::text2d::extract_text2d_sprite;
+ 
+ /// Adds support for 2D sprite rendering.
+@@ -103,6 +105,7 @@ impl Plugin for SpriteRenderingPlugin {
+                     (
+                         extract_sprites.in_set(SpriteSystems::ExtractSprites),
+                         extract_sprite_events,
++                        #[cfg(feature = "bevy_text")]
+                         extract_text2d_sprite.after(SpriteSystems::ExtractSprites),
+                     ),
+                 )
+diff --git a/crates/bevy_ui/Cargo.toml b/crates/bevy_ui/Cargo.toml
+index ea8109707e4d0..96a379d288e8a 100644
+--- a/crates/bevy_ui/Cargo.toml
++++ b/crates/bevy_ui/Cargo.toml
+@@ -21,7 +21,9 @@ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
+ bevy_input = { path = "../bevy_input", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+-bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev" }
++bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev", features = [
++  "bevy_text",
++] }
+ bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev", optional = true }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+diff --git a/crates/bevy_ui_render/Cargo.toml b/crates/bevy_ui_render/Cargo.toml
+index 455fc123ebc53..f058985486e4f 100644
+--- a/crates/bevy_ui_render/Cargo.toml
++++ b/crates/bevy_ui_render/Cargo.toml
+@@ -24,7 +24,9 @@ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_shader = { path = "../bevy_shader", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev" }
+-bevy_sprite_render = { path = "../bevy_sprite_render", version = "0.17.0-dev" }
++bevy_sprite_render = { path = "../bevy_sprite_render", version = "0.17.0-dev", features = [
++  "bevy_text",
++] }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev", optional = true }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+ bevy_utils = { path = "../bevy_utils", version = "0.17.0-dev" }
+@@ -32,7 +34,7 @@ bevy_platform = { path = "../bevy_platform", version = "0.17.0-dev", default-fea
+   "std",
+ ] }
+ bevy_ui = { path = "../bevy_ui", version = "0.17.0-dev" }
+-bevy_text = { path = "../bevy_text", version = "0.17.0-dev", default-features = false }
++bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
+ bevy_window = { path = "../bevy_window", version = "0.17.0-dev", default-features = false }
+ 
+ # other
