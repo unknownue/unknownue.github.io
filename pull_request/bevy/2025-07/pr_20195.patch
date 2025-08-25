@@ -1,0 +1,199 @@
+diff --git a/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs b/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs
+index 5f930d85fd20f..9a23c0e34d752 100644
+--- a/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs
++++ b/crates/bevy_core_pipeline/src/deferred/copy_lighting_id.rs
+@@ -3,7 +3,7 @@ use crate::{
+     FullscreenShader,
+ };
+ use bevy_app::prelude::*;
+-use bevy_asset::{embedded_asset, load_embedded_asset};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
+ use bevy_ecs::prelude::*;
+ use bevy_image::ToExtents;
+ use bevy_render::{
+@@ -12,7 +12,7 @@ use bevy_render::{
+     renderer::RenderDevice,
+     texture::{CachedTexture, TextureCache},
+     view::ViewTarget,
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ 
+ use super::DEFERRED_LIGHTING_PASS_ID_DEPTH_FORMAT;
+@@ -31,18 +31,12 @@ impl Plugin for CopyDeferredLightingIdPlugin {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+-        render_app.add_systems(
+-            Render,
+-            (prepare_deferred_lighting_id_textures.in_set(RenderSystems::PrepareResources),),
+-        );
+-    }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app.init_resource::<CopyDeferredLightingIdPipeline>();
++        render_app
++            .add_systems(RenderStartup, init_copy_deferred_lighting_id_pipeline)
++            .add_systems(
++                Render,
++                (prepare_deferred_lighting_id_textures.in_set(RenderSystems::PrepareResources),),
++            );
+     }
+ }
+ 
+@@ -118,47 +112,46 @@ struct CopyDeferredLightingIdPipeline {
+     pipeline_id: CachedRenderPipelineId,
+ }
+ 
+-impl FromWorld for CopyDeferredLightingIdPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        let layout = render_device.create_bind_group_layout(
+-            "copy_deferred_lighting_id_bind_group_layout",
+-            &BindGroupLayoutEntries::single(
+-                ShaderStages::FRAGMENT,
+-                texture_2d(TextureSampleType::Uint),
+-            ),
+-        );
++pub fn init_copy_deferred_lighting_id_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++    pipeline_cache: Res<PipelineCache>,
++) {
++    let layout = render_device.create_bind_group_layout(
++        "copy_deferred_lighting_id_bind_group_layout",
++        &BindGroupLayoutEntries::single(
++            ShaderStages::FRAGMENT,
++            texture_2d(TextureSampleType::Uint),
++        ),
++    );
+ 
+-        let vertex_state = world.resource::<FullscreenShader>().to_vertex_state();
+-        let shader = load_embedded_asset!(world, "copy_deferred_lighting_id.wgsl");
+-
+-        let pipeline_id =
+-            world
+-                .resource_mut::<PipelineCache>()
+-                .queue_render_pipeline(RenderPipelineDescriptor {
+-                    label: Some("copy_deferred_lighting_id_pipeline".into()),
+-                    layout: vec![layout.clone()],
+-                    vertex: vertex_state,
+-                    fragment: Some(FragmentState {
+-                        shader,
+-                        ..default()
+-                    }),
+-                    depth_stencil: Some(DepthStencilState {
+-                        format: DEFERRED_LIGHTING_PASS_ID_DEPTH_FORMAT,
+-                        depth_write_enabled: true,
+-                        depth_compare: CompareFunction::Always,
+-                        stencil: StencilState::default(),
+-                        bias: DepthBiasState::default(),
+-                    }),
+-                    ..default()
+-                });
+-
+-        Self {
+-            layout,
+-            pipeline_id,
+-        }
+-    }
++    let vertex_state = fullscreen_shader.to_vertex_state();
++    let shader = load_embedded_asset!(asset_server.as_ref(), "copy_deferred_lighting_id.wgsl");
++
++    let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
++        label: Some("copy_deferred_lighting_id_pipeline".into()),
++        layout: vec![layout.clone()],
++        vertex: vertex_state,
++        fragment: Some(FragmentState {
++            shader,
++            ..default()
++        }),
++        depth_stencil: Some(DepthStencilState {
++            format: DEFERRED_LIGHTING_PASS_ID_DEPTH_FORMAT,
++            depth_write_enabled: true,
++            depth_compare: CompareFunction::Always,
++            stencil: StencilState::default(),
++            bias: DepthBiasState::default(),
++        }),
++        ..default()
++    });
++
++    commands.insert_resource(CopyDeferredLightingIdPipeline {
++        layout,
++        pipeline_id,
++    });
+ }
+ 
+ #[derive(Component)]
+diff --git a/release-content/migration-guides/render_startup.md b/release-content/migration-guides/render_startup.md
+index e888bd75883ba..e29acff299759 100644
+--- a/release-content/migration-guides/render_startup.md
++++ b/release-content/migration-guides/render_startup.md
+@@ -31,6 +31,7 @@ The following are the (public) resources that are now initialized in `RenderStar
+ - `UiTextureSlicePipeline`
+ - `VolumetricFogPipeline`
+ - `DeferredLightingLayout`
++- `CopyDeferredLightingIdPipeline`
+ - `RenderLightmaps`
+ - `PrepassPipeline`
+ - `PrepassViewBindGroup`
+diff --git a/tests/ecs/ambiguity_detection.rs b/tests/ecs/ambiguity_detection.rs
+index 1b9271b16112f..072e9a05e54f4 100644
+--- a/tests/ecs/ambiguity_detection.rs
++++ b/tests/ecs/ambiguity_detection.rs
+@@ -8,17 +8,29 @@ use bevy::{
+     ecs::schedule::{InternedScheduleLabel, LogLevel, ScheduleBuildSettings},
+     platform::collections::HashMap,
+     prelude::*,
+-    render::pipelined_rendering::RenderExtractApp,
++    render::{pipelined_rendering::PipelinedRenderingPlugin, RenderPlugin},
+ };
+ 
+ fn main() {
+     let mut app = App::new();
+-    app.add_plugins(DefaultPlugins);
++    app.add_plugins(
++        DefaultPlugins
++            .build()
++            .set(RenderPlugin {
++                // llvmpipe driver can cause segfaults when aborting the binary while pipelines are being
++                // compiled (which happens very quickly in this example since we only run for a single
++                // frame). Synchronous pipeline compilation helps prevent these segfaults as the
++                // rendering thread blocks on these pipeline compilations.
++                synchronous_pipeline_compilation: true,
++                ..Default::default()
++            })
++            // We also have to disable pipelined rendering to ensure the test doesn't end while the
++            // rendering frame is still executing in another thread.
++            .disable::<PipelinedRenderingPlugin>(),
++    );
+ 
+     let main_app = app.main_mut();
+     configure_ambiguity_detection(main_app);
+-    let render_extract_app = app.sub_app_mut(RenderExtractApp);
+-    configure_ambiguity_detection(render_extract_app);
+ 
+     // Ambiguities in the RenderApp are currently allowed.
+     // Eventually, we should forbid these: see https://github.com/bevyengine/bevy/issues/7386
+@@ -36,14 +48,6 @@ fn main() {
+         0,
+         "Main app has unexpected ambiguities among the following schedules: \n{main_app_ambiguities:#?}.",
+     );
+-
+-    // RenderApp is not checked here, because it is not within the App at this point.
+-    let render_extract_ambiguities = count_ambiguities(app.sub_app(RenderExtractApp));
+-    assert_eq!(
+-        render_extract_ambiguities.total(),
+-        0,
+-        "RenderExtract app has unexpected ambiguities among the following schedules: \n{render_extract_ambiguities:#?}",
+-    );
+ }
+ 
+ /// Contains the number of conflicting systems per schedule.

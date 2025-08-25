@@ -1,0 +1,2159 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index a37d11ddf95b8..526ac4c4013de 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -95,7 +95,7 @@ jobs:
+       - name: CI job
+         # To run the tests one item at a time for troubleshooting, use
+         # cargo --quiet test --lib -- --list | sed 's/: test$//' | MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-disable-weak-memory-emulation" xargs -n1 cargo miri test -p bevy_ecs --lib -- --exact
+-        run: cargo miri test -p bevy_ecs
++        run: cargo miri test -p bevy_ecs --features bevy_utils/debug
+         env:
+           # -Zrandomize-layout makes sure we dont rely on the layout of anything that might change
+           RUSTFLAGS: -Zrandomize-layout
+diff --git a/Cargo.toml b/Cargo.toml
+index ed2b369f5fe77..d2e5b92258d79 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -165,6 +165,7 @@ default = [
+   "vorbis",
+   "webgl2",
+   "x11",
++  "debug",
+ ]
+ 
+ # Recommended defaults for no_std applications
+@@ -507,7 +508,10 @@ file_watcher = ["bevy_internal/file_watcher"]
+ embedded_watcher = ["bevy_internal/embedded_watcher"]
+ 
+ # Enable stepping-based debugging of Bevy systems
+-bevy_debug_stepping = ["bevy_internal/bevy_debug_stepping"]
++bevy_debug_stepping = [
++  "bevy_internal/bevy_debug_stepping",
++  "bevy_internal/debug",
++]
+ 
+ # Enables the meshlet renderer for dense high-poly scenes (experimental)
+ meshlet = ["bevy_internal/meshlet"]
+@@ -551,6 +555,9 @@ web = ["bevy_internal/web"]
+ # Enable hotpatching of Bevy systems
+ hotpatching = ["bevy_internal/hotpatching"]
+ 
++# Enable collecting debug information about systems and components to help with diagnostics
++debug = ["bevy_internal/debug"]
++
+ [dependencies]
+ bevy_internal = { path = "crates/bevy_internal", version = "0.16.0-dev", default-features = false }
+ tracing = { version = "0.1", default-features = false, optional = true }
+@@ -2098,6 +2105,7 @@ wasm = false
+ name = "dynamic"
+ path = "examples/ecs/dynamic.rs"
+ doc-scrape-examples = true
++required-features = ["debug"]
+ 
+ [package.metadata.example.dynamic]
+ name = "Dynamic ECS"
+diff --git a/crates/bevy_ecs/Cargo.toml b/crates/bevy_ecs/Cargo.toml
+index 27498f58bc25c..c2c663b7d7fb5 100644
+--- a/crates/bevy_ecs/Cargo.toml
++++ b/crates/bevy_ecs/Cargo.toml
+@@ -35,7 +35,7 @@ backtrace = ["std"]
+ 
+ ## Enables `tracing` integration, allowing spans and other metrics to be reported
+ ## through that framework.
+-trace = ["std", "dep:tracing"]
++trace = ["std", "dep:tracing", "bevy_utils/debug"]
+ 
+ ## Enables a more detailed set of traces which may be noisy if left on by default.
+ detailed_trace = ["trace"]
+@@ -63,9 +63,9 @@ std = [
+   "bevy_reflect?/std",
+   "bevy_tasks/std",
+   "bevy_utils/parallel",
++  "bevy_utils/std",
+   "bitflags/std",
+   "concurrent-queue/std",
+-  "disqualified/alloc",
+   "fixedbitset/std",
+   "indexmap/std",
+   "serde?/std",
+@@ -98,7 +98,6 @@ bevy_platform = { path = "../bevy_platform", version = "0.16.0-dev", default-fea
+ ] }
+ 
+ bitflags = { version = "2.3", default-features = false }
+-disqualified = { version = "1.0", default-features = false }
+ fixedbitset = { version = "0.5", default-features = false }
+ serde = { version = "1", default-features = false, features = [
+   "alloc",
+diff --git a/crates/bevy_ecs/src/bundle.rs b/crates/bevy_ecs/src/bundle.rs
+index a264f0b14bab9..2687f7eb16ad0 100644
+--- a/crates/bevy_ecs/src/bundle.rs
++++ b/crates/bevy_ecs/src/bundle.rs
+@@ -550,10 +550,9 @@ impl BundleInfo {
+                     // SAFETY: the caller ensures component_id is valid.
+                     unsafe { components.get_info_unchecked(id).name() }
+                 })
+-                .collect::<Vec<_>>()
+-                .join(", ");
++                .collect::<Vec<_>>();
+ 
+-            panic!("Bundle {bundle_type_name} has duplicate components: {names}");
++            panic!("Bundle {bundle_type_name} has duplicate components: {names:?}");
+         }
+ 
+         // handle explicit components
+diff --git a/crates/bevy_ecs/src/component.rs b/crates/bevy_ecs/src/component.rs
+index 27b51ede6ff15..cfcde29ab2ff1 100644
+--- a/crates/bevy_ecs/src/component.rs
++++ b/crates/bevy_ecs/src/component.rs
+@@ -24,7 +24,7 @@ use bevy_platform::{
+ use bevy_ptr::{OwningPtr, UnsafeCellDeref};
+ #[cfg(feature = "bevy_reflect")]
+ use bevy_reflect::Reflect;
+-use bevy_utils::TypeIdMap;
++use bevy_utils::{prelude::DebugName, TypeIdMap};
+ use core::{
+     alloc::Layout,
+     any::{Any, TypeId},
+@@ -34,7 +34,6 @@ use core::{
+     mem::needs_drop,
+     ops::{Deref, DerefMut},
+ };
+-use disqualified::ShortName;
+ use smallvec::SmallVec;
+ use thiserror::Error;
+ 
+@@ -678,8 +677,8 @@ impl ComponentInfo {
+ 
+     /// Returns the name of the current component.
+     #[inline]
+-    pub fn name(&self) -> &str {
+-        &self.descriptor.name
++    pub fn name(&self) -> DebugName {
++        self.descriptor.name.clone()
+     }
+ 
+     /// Returns `true` if the current component is mutable.
+@@ -836,7 +835,7 @@ impl SparseSetIndex for ComponentId {
+ /// A value describing a component or resource, which may or may not correspond to a Rust type.
+ #[derive(Clone)]
+ pub struct ComponentDescriptor {
+-    name: Cow<'static, str>,
++    name: DebugName,
+     // SAFETY: This must remain private. It must match the statically known StorageType of the
+     // associated rust component type if one exists.
+     storage_type: StorageType,
+@@ -882,7 +881,7 @@ impl ComponentDescriptor {
+     /// Create a new `ComponentDescriptor` for the type `T`.
+     pub fn new<T: Component>() -> Self {
+         Self {
+-            name: Cow::Borrowed(core::any::type_name::<T>()),
++            name: DebugName::type_name::<T>(),
+             storage_type: T::STORAGE_TYPE,
+             is_send_and_sync: true,
+             type_id: Some(TypeId::of::<T>()),
+@@ -907,7 +906,7 @@ impl ComponentDescriptor {
+         clone_behavior: ComponentCloneBehavior,
+     ) -> Self {
+         Self {
+-            name: name.into(),
++            name: name.into().into(),
+             storage_type,
+             is_send_and_sync: true,
+             type_id: None,
+@@ -923,7 +922,7 @@ impl ComponentDescriptor {
+     /// The [`StorageType`] for resources is always [`StorageType::Table`].
+     pub fn new_resource<T: Resource>() -> Self {
+         Self {
+-            name: Cow::Borrowed(core::any::type_name::<T>()),
++            name: DebugName::type_name::<T>(),
+             // PERF: `SparseStorage` may actually be a more
+             // reasonable choice as `storage_type` for resources.
+             storage_type: StorageType::Table,
+@@ -938,7 +937,7 @@ impl ComponentDescriptor {
+ 
+     fn new_non_send<T: Any>(storage_type: StorageType) -> Self {
+         Self {
+-            name: Cow::Borrowed(core::any::type_name::<T>()),
++            name: DebugName::type_name::<T>(),
+             storage_type,
+             is_send_and_sync: false,
+             type_id: Some(TypeId::of::<T>()),
+@@ -964,8 +963,8 @@ impl ComponentDescriptor {
+ 
+     /// Returns the name of the current component.
+     #[inline]
+-    pub fn name(&self) -> &str {
+-        self.name.as_ref()
++    pub fn name(&self) -> DebugName {
++        self.name.clone()
+     }
+ 
+     /// Returns whether this component is mutable.
+@@ -1854,13 +1853,10 @@ impl Components {
+     ///
+     /// This will return an incorrect result if `id` did not come from the same world as `self`. It may return `None` or a garbage value.
+     #[inline]
+-    pub fn get_name<'a>(&'a self, id: ComponentId) -> Option<Cow<'a, str>> {
++    pub fn get_name<'a>(&'a self, id: ComponentId) -> Option<DebugName> {
+         self.components
+             .get(id.0)
+-            .and_then(|info| {
+-                info.as_ref()
+-                    .map(|info| Cow::Borrowed(info.descriptor.name()))
+-            })
++            .and_then(|info| info.as_ref().map(|info| info.descriptor.name()))
+             .or_else(|| {
+                 let queued = self.queued.read().unwrap_or_else(PoisonError::into_inner);
+                 // first check components, then resources, then dynamic
+@@ -2813,13 +2809,13 @@ pub fn enforce_no_required_components_recursion(
+                 "Recursive required components detected: {}\nhelp: {}",
+                 recursion_check_stack
+                     .iter()
+-                    .map(|id| format!("{}", ShortName(&components.get_name(*id).unwrap())))
++                    .map(|id| format!("{}", components.get_name(*id).unwrap().shortname()))
+                     .collect::<Vec<_>>()
+                     .join(" → "),
+                 if direct_recursion {
+                     format!(
+                         "Remove require({}).",
+-                        ShortName(&components.get_name(requiree).unwrap())
++                        components.get_name(requiree).unwrap().shortname()
+                     )
+                 } else {
+                     "If this is intentional, consider merging the components.".into()
+diff --git a/crates/bevy_ecs/src/entity/clone_entities.rs b/crates/bevy_ecs/src/entity/clone_entities.rs
+index b124055d16ac6..02d2491b7a6c3 100644
+--- a/crates/bevy_ecs/src/entity/clone_entities.rs
++++ b/crates/bevy_ecs/src/entity/clone_entities.rs
+@@ -1,6 +1,7 @@
+ use alloc::{borrow::ToOwned, boxed::Box, collections::VecDeque, vec::Vec};
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_ptr::{Ptr, PtrMut};
++use bevy_utils::prelude::DebugName;
+ use bumpalo::Bump;
+ use core::any::TypeId;
+ 
+@@ -171,7 +172,8 @@ impl<'a, 'b> ComponentCloneCtx<'a, 'b> {
+     /// - `ComponentId` of component being written does not match expected `ComponentId`.
+     pub fn write_target_component<C: Component>(&mut self, mut component: C) {
+         C::map_entities(&mut component, &mut self.mapper);
+-        let short_name = disqualified::ShortName::of::<C>();
++        let debug_name = DebugName::type_name::<C>();
++        let short_name = debug_name.shortname();
+         if self.target_component_written {
+             panic!("Trying to write component '{short_name}' multiple times")
+         }
+diff --git a/crates/bevy_ecs/src/error/command_handling.rs b/crates/bevy_ecs/src/error/command_handling.rs
+index bf2741d3766e5..c303b76d170b2 100644
+--- a/crates/bevy_ecs/src/error/command_handling.rs
++++ b/crates/bevy_ecs/src/error/command_handling.rs
+@@ -1,4 +1,6 @@
+-use core::{any::type_name, fmt};
++use core::fmt;
++
++use bevy_utils::prelude::DebugName;
+ 
+ use crate::{
+     entity::Entity,
+@@ -31,7 +33,7 @@ where
+             Err(err) => (error_handler)(
+                 err.into(),
+                 ErrorContext::Command {
+-                    name: type_name::<C>().into(),
++                    name: DebugName::type_name::<C>(),
+                 },
+             ),
+         }
+@@ -43,7 +45,7 @@ where
+             Err(err) => world.default_error_handler()(
+                 err.into(),
+                 ErrorContext::Command {
+-                    name: type_name::<C>().into(),
++                    name: DebugName::type_name::<C>(),
+                 },
+             ),
+         }
+diff --git a/crates/bevy_ecs/src/error/handler.rs b/crates/bevy_ecs/src/error/handler.rs
+index c89408b2505c2..85a5a13297d22 100644
+--- a/crates/bevy_ecs/src/error/handler.rs
++++ b/crates/bevy_ecs/src/error/handler.rs
+@@ -1,7 +1,7 @@
+ use core::fmt::Display;
+ 
+ use crate::{component::Tick, error::BevyError, prelude::Resource};
+-use alloc::borrow::Cow;
++use bevy_utils::prelude::DebugName;
+ use derive_more::derive::{Deref, DerefMut};
+ 
+ /// Context for a [`BevyError`] to aid in debugging.
+@@ -10,26 +10,26 @@ pub enum ErrorContext {
+     /// The error occurred in a system.
+     System {
+         /// The name of the system that failed.
+-        name: Cow<'static, str>,
++        name: DebugName,
+         /// The last tick that the system was run.
+         last_run: Tick,
+     },
+     /// The error occurred in a run condition.
+     RunCondition {
+         /// The name of the run condition that failed.
+-        name: Cow<'static, str>,
++        name: DebugName,
+         /// The last tick that the run condition was evaluated.
+         last_run: Tick,
+     },
+     /// The error occurred in a command.
+     Command {
+         /// The name of the command that failed.
+-        name: Cow<'static, str>,
++        name: DebugName,
+     },
+     /// The error occurred in an observer.
+     Observer {
+         /// The name of the observer that failed.
+-        name: Cow<'static, str>,
++        name: DebugName,
+         /// The last tick that the observer was run.
+         last_run: Tick,
+     },
+@@ -54,12 +54,12 @@ impl Display for ErrorContext {
+ 
+ impl ErrorContext {
+     /// The name of the ECS construct that failed.
+-    pub fn name(&self) -> &str {
++    pub fn name(&self) -> DebugName {
+         match self {
+             Self::System { name, .. }
+             | Self::Command { name, .. }
+             | Self::Observer { name, .. }
+-            | Self::RunCondition { name, .. } => name,
++            | Self::RunCondition { name, .. } => name.clone(),
+         }
+     }
+ 
+diff --git a/crates/bevy_ecs/src/hierarchy.rs b/crates/bevy_ecs/src/hierarchy.rs
+index 31c7b5e65aa87..d99e89b355e7e 100644
+--- a/crates/bevy_ecs/src/hierarchy.rs
++++ b/crates/bevy_ecs/src/hierarchy.rs
+@@ -22,9 +22,9 @@ use alloc::{format, string::String, vec::Vec};
+ use bevy_reflect::std_traits::ReflectDefault;
+ #[cfg(all(feature = "serialize", feature = "bevy_reflect"))]
+ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
++use bevy_utils::prelude::DebugName;
+ use core::ops::Deref;
+ use core::slice;
+-use disqualified::ShortName;
+ use log::warn;
+ 
+ /// Stores the parent entity of this child entity with this component.
+@@ -461,11 +461,12 @@ pub fn validate_parent_has_component<C: Component>(
+     {
+         // TODO: print name here once Name lives in bevy_ecs
+         let name: Option<String> = None;
++        let debug_name = DebugName::type_name::<C>();
+         warn!(
+             "warning[B0004]: {}{name} with the {ty_name} component has a parent without {ty_name}.\n\
+             This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004",
+             caller.map(|c| format!("{c}: ")).unwrap_or_default(),
+-            ty_name = ShortName::of::<C>(),
++            ty_name = debug_name.shortname(),
+             name = name.map_or_else(
+                 || format!("Entity {entity}"),
+                 |s| format!("The {s} entity")
+diff --git a/crates/bevy_ecs/src/observer/runner.rs b/crates/bevy_ecs/src/observer/runner.rs
+index b6f10de2e4bb7..d6bffd8f22ddf 100644
+--- a/crates/bevy_ecs/src/observer/runner.rs
++++ b/crates/bevy_ecs/src/observer/runner.rs
+@@ -1,4 +1,5 @@
+-use alloc::{borrow::Cow, boxed::Box, vec};
++use alloc::{boxed::Box, vec};
++use bevy_utils::prelude::DebugName;
+ use core::any::Any;
+ 
+ use crate::{
+@@ -301,7 +302,7 @@ impl Observer {
+     }
+ 
+     /// Returns the name of the [`Observer`]'s system .
+-    pub fn system_name(&self) -> Cow<'static, str> {
++    pub fn system_name(&self) -> DebugName {
+         self.system.system_name()
+     }
+ }
+@@ -420,11 +421,11 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+ }
+ 
+ trait AnyNamedSystem: Any + Send + Sync + 'static {
+-    fn system_name(&self) -> Cow<'static, str>;
++    fn system_name(&self) -> DebugName;
+ }
+ 
+ impl<T: Any + System> AnyNamedSystem for T {
+-    fn system_name(&self) -> Cow<'static, str> {
++    fn system_name(&self) -> DebugName {
+         self.name()
+     }
+ }
+diff --git a/crates/bevy_ecs/src/query/access.rs b/crates/bevy_ecs/src/query/access.rs
+index 9c63cb5a74a59..0c5b29f715c7e 100644
+--- a/crates/bevy_ecs/src/query/access.rs
++++ b/crates/bevy_ecs/src/query/access.rs
+@@ -4,7 +4,6 @@ use crate::world::World;
+ use alloc::{format, string::String, vec, vec::Vec};
+ use core::{fmt, fmt::Debug, marker::PhantomData};
+ use derive_more::From;
+-use disqualified::ShortName;
+ use fixedbitset::FixedBitSet;
+ use thiserror::Error;
+ 
+@@ -999,12 +998,11 @@ impl AccessConflicts {
+                 .map(|index| {
+                     format!(
+                         "{}",
+-                        ShortName(
+-                            &world
+-                                .components
+-                                .get_name(ComponentId::get_sparse_set_index(index))
+-                                .unwrap()
+-                        )
++                        world
++                            .components
++                            .get_name(ComponentId::get_sparse_set_index(index))
++                            .unwrap()
++                            .shortname()
+                     )
+                 })
+                 .collect::<Vec<_>>()
+diff --git a/crates/bevy_ecs/src/query/error.rs b/crates/bevy_ecs/src/query/error.rs
+index 6d0b149b86058..fd431f4be1dc1 100644
+--- a/crates/bevy_ecs/src/query/error.rs
++++ b/crates/bevy_ecs/src/query/error.rs
+@@ -1,3 +1,4 @@
++use bevy_utils::prelude::DebugName;
+ use thiserror::Error;
+ 
+ use crate::{
+@@ -54,10 +55,10 @@ impl core::fmt::Display for QueryEntityError {
+ pub enum QuerySingleError {
+     /// No entity fits the query.
+     #[error("No entities fit the query {0}")]
+-    NoEntities(&'static str),
++    NoEntities(DebugName),
+     /// Multiple entities fit the query.
+     #[error("Multiple entities fit the query {0}")]
+-    MultipleEntities(&'static str),
++    MultipleEntities(DebugName),
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index ba1a85cec31ee..4abdbbe530fe5 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -12,6 +12,7 @@ use crate::{
+     },
+ };
+ use bevy_ptr::{ThinSlicePtr, UnsafeCellDeref};
++use bevy_utils::prelude::DebugName;
+ use core::{cell::UnsafeCell, marker::PhantomData, panic::Location};
+ use smallvec::SmallVec;
+ use variadics_please::all_tuples;
+@@ -1232,7 +1233,7 @@ where
+         assert!(
+             access.is_compatible(&my_access),
+             "`EntityRefExcept<{}>` conflicts with a previous access in this query.",
+-            core::any::type_name::<B>(),
++            DebugName::type_name::<B>(),
+         );
+         access.extend(&my_access);
+     }
+@@ -1343,7 +1344,7 @@ where
+         assert!(
+             access.is_compatible(&my_access),
+             "`EntityMutExcept<{}>` conflicts with a previous access in this query.",
+-            core::any::type_name::<B>()
++            DebugName::type_name::<B>()
+         );
+         access.extend(&my_access);
+     }
+@@ -1589,7 +1590,7 @@ unsafe impl<T: Component> WorldQuery for &T {
+         assert!(
+             !access.access().has_component_write(component_id),
+             "&{} conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.",
+-            core::any::type_name::<T>(),
++            DebugName::type_name::<T>(),
+         );
+         access.add_component_read(component_id);
+     }
+@@ -1775,7 +1776,7 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
+         assert!(
+             !access.access().has_component_write(component_id),
+             "&{} conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.",
+-            core::any::type_name::<T>(),
++            DebugName::type_name::<T>(),
+         );
+         access.add_component_read(component_id);
+     }
+@@ -1984,7 +1985,7 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
+         assert!(
+             !access.access().has_component_read(component_id),
+             "&mut {} conflicts with a previous access in this query. Mutable component access must be unique.",
+-            core::any::type_name::<T>(),
++            DebugName::type_name::<T>(),
+         );
+         access.add_component_write(component_id);
+     }
+@@ -2134,7 +2135,7 @@ unsafe impl<'__w, T: Component> WorldQuery for Mut<'__w, T> {
+         assert!(
+             !access.access().has_component_read(component_id),
+             "Mut<{}> conflicts with a previous access in this query. Mutable component access mut be unique.",
+-            core::any::type_name::<T>(),
++            DebugName::type_name::<T>(),
+         );
+         access.add_component_write(component_id);
+     }
+@@ -2401,7 +2402,7 @@ pub struct Has<T>(PhantomData<T>);
+ 
+ impl<T> core::fmt::Debug for Has<T> {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+-        write!(f, "Has<{}>", core::any::type_name::<T>())
++        write!(f, "Has<{}>", DebugName::type_name::<T>())
+     }
+ }
+ 
+diff --git a/crates/bevy_ecs/src/query/filter.rs b/crates/bevy_ecs/src/query/filter.rs
+index a75acf3e97fc1..f5700a33c6b17 100644
+--- a/crates/bevy_ecs/src/query/filter.rs
++++ b/crates/bevy_ecs/src/query/filter.rs
+@@ -7,6 +7,7 @@ use crate::{
+     world::{unsafe_world_cell::UnsafeWorldCell, World},
+ };
+ use bevy_ptr::{ThinSlicePtr, UnsafeCellDeref};
++use bevy_utils::prelude::DebugName;
+ use core::{cell::UnsafeCell, marker::PhantomData};
+ use variadics_please::all_tuples;
+ 
+@@ -792,7 +793,7 @@ unsafe impl<T: Component> WorldQuery for Added<T> {
+     #[inline]
+     fn update_component_access(&id: &ComponentId, access: &mut FilteredAccess<ComponentId>) {
+         if access.access().has_component_write(id) {
+-            panic!("$state_name<{}> conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.",core::any::type_name::<T>());
++            panic!("$state_name<{}> conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.", DebugName::type_name::<T>());
+         }
+         access.add_component_read(id);
+     }
+@@ -1020,7 +1021,7 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
+     #[inline]
+     fn update_component_access(&id: &ComponentId, access: &mut FilteredAccess<ComponentId>) {
+         if access.access().has_component_write(id) {
+-            panic!("$state_name<{}> conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.",core::any::type_name::<T>());
++            panic!("$state_name<{}> conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.", DebugName::type_name::<T>());
+         }
+         access.add_component_read(id);
+     }
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index 005e324cbbf07..63ae1134a5745 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -14,6 +14,7 @@ use crate::{
+ use crate::entity::UniqueEntityEquivalentSlice;
+ 
+ use alloc::vec::Vec;
++use bevy_utils::prelude::DebugName;
+ use core::{fmt, ptr};
+ use fixedbitset::FixedBitSet;
+ use log::warn;
+@@ -672,7 +673,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         assert!(
+             component_access.is_subset(&self_access),
+             "Transmuted state for {} attempts to access terms that are not allowed by original state {}.",
+-            core::any::type_name::<(NewD, NewF)>(), core::any::type_name::<(D, F)>()
++            DebugName::type_name::<(NewD, NewF)>(), DebugName::type_name::<(D, F)>()
+         );
+ 
+         QueryState {
+@@ -791,7 +792,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         assert!(
+             component_access.is_subset(&joined_component_access),
+             "Joined state for {} attempts to access terms that are not allowed by state {} joined with {}.",
+-            core::any::type_name::<(NewD, NewF)>(), core::any::type_name::<(D, F)>(), core::any::type_name::<(OtherD, OtherF)>()
++            DebugName::type_name::<(NewD, NewF)>(), DebugName::type_name::<(D, F)>(), DebugName::type_name::<(OtherD, OtherF)>()
+         );
+ 
+         if self.archetype_generation != other.archetype_generation {
+diff --git a/crates/bevy_ecs/src/reflect/bundle.rs b/crates/bevy_ecs/src/reflect/bundle.rs
+index ee02aff86e7fe..133591c405ebf 100644
+--- a/crates/bevy_ecs/src/reflect/bundle.rs
++++ b/crates/bevy_ecs/src/reflect/bundle.rs
+@@ -5,6 +5,7 @@
+ //!
+ //! Same as [`super::component`], but for bundles.
+ use alloc::boxed::Box;
++use bevy_utils::prelude::DebugName;
+ use core::any::{Any, TypeId};
+ 
+ use crate::{
+@@ -172,7 +173,7 @@ impl<B: Bundle + Reflect + TypePath + BundleFromComponents> FromType<B> for Refl
+                         _ => panic!(
+                             "expected bundle `{}` to be named struct or tuple",
+                             // FIXME: once we have unique reflect, use `TypePath`.
+-                            core::any::type_name::<B>(),
++                            DebugName::type_name::<B>(),
+                         ),
+                     }
+                 }
+@@ -215,7 +216,7 @@ impl<B: Bundle + Reflect + TypePath + BundleFromComponents> FromType<B> for Refl
+                         _ => panic!(
+                             "expected bundle `{}` to be a named struct or tuple",
+                             // FIXME: once we have unique reflect, use `TypePath`.
+-                            core::any::type_name::<B>(),
++                            DebugName::type_name::<B>(),
+                         ),
+                     }
+                 }
+diff --git a/crates/bevy_ecs/src/reflect/component.rs b/crates/bevy_ecs/src/reflect/component.rs
+index 893e9b13fa8e3..8a5c17179e1ff 100644
+--- a/crates/bevy_ecs/src/reflect/component.rs
++++ b/crates/bevy_ecs/src/reflect/component.rs
+@@ -70,7 +70,7 @@ use crate::{
+     },
+ };
+ use bevy_reflect::{FromReflect, FromType, PartialReflect, Reflect, TypePath, TypeRegistry};
+-use disqualified::ShortName;
++use bevy_utils::prelude::DebugName;
+ 
+ /// A struct used to operate on reflected [`Component`] trait of a type.
+ ///
+@@ -308,7 +308,8 @@ impl<C: Component + Reflect + TypePath> FromType<C> for ReflectComponent {
+             },
+             apply: |mut entity, reflected_component| {
+                 if !C::Mutability::MUTABLE {
+-                    let name = ShortName::of::<C>();
++                    let name = DebugName::type_name::<C>();
++                    let name = name.shortname();
+                     panic!("Cannot call `ReflectComponent::apply` on component {name}. It is immutable, and cannot modified through reflection");
+                 }
+ 
+@@ -357,7 +358,8 @@ impl<C: Component + Reflect + TypePath> FromType<C> for ReflectComponent {
+             reflect: |entity| entity.get::<C>().map(|c| c as &dyn Reflect),
+             reflect_mut: |entity| {
+                 if !C::Mutability::MUTABLE {
+-                    let name = ShortName::of::<C>();
++                    let name = DebugName::type_name::<C>();
++                    let name = name.shortname();
+                     panic!("Cannot call `ReflectComponent::reflect_mut` on component {name}. It is immutable, and cannot modified through reflection");
+                 }
+ 
+@@ -370,7 +372,8 @@ impl<C: Component + Reflect + TypePath> FromType<C> for ReflectComponent {
+             },
+             reflect_unchecked_mut: |entity| {
+                 if !C::Mutability::MUTABLE {
+-                    let name = ShortName::of::<C>();
++                    let name = DebugName::type_name::<C>();
++                    let name = name.shortname();
+                     panic!("Cannot call `ReflectComponent::reflect_unchecked_mut` on component {name}. It is immutable, and cannot modified through reflection");
+                 }
+ 
+diff --git a/crates/bevy_ecs/src/reflect/mod.rs b/crates/bevy_ecs/src/reflect/mod.rs
+index b630f587197d7..24e1449e61a8d 100644
+--- a/crates/bevy_ecs/src/reflect/mod.rs
++++ b/crates/bevy_ecs/src/reflect/mod.rs
+@@ -18,6 +18,7 @@ mod from_world;
+ mod map_entities;
+ mod resource;
+ 
++use bevy_utils::prelude::DebugName;
+ pub use bundle::{ReflectBundle, ReflectBundleFns};
+ pub use component::{ReflectComponent, ReflectComponentFns};
+ pub use entity_commands::ReflectCommandExt;
+@@ -136,7 +137,7 @@ pub fn from_reflect_with_fallback<T: Reflect + TypePath>(
+             `Default` or `FromWorld` traits. Are you perhaps missing a `#[reflect(Default)]` \
+             or `#[reflect(FromWorld)]`?",
+             // FIXME: once we have unique reflect, use `TypePath`.
+-            core::any::type_name::<T>(),
++            DebugName::type_name::<T>(),
+         );
+     };
+ 
+diff --git a/crates/bevy_ecs/src/relationship/mod.rs b/crates/bevy_ecs/src/relationship/mod.rs
+index 00334cb6d0063..d570b9fabc670 100644
+--- a/crates/bevy_ecs/src/relationship/mod.rs
++++ b/crates/bevy_ecs/src/relationship/mod.rs
+@@ -6,6 +6,7 @@ mod relationship_source_collection;
+ 
+ use alloc::format;
+ 
++use bevy_utils::prelude::DebugName;
+ pub use related_methods::*;
+ pub use relationship_query::*;
+ pub use relationship_source_collection::*;
+@@ -105,8 +106,8 @@ pub trait Relationship: Component + Sized {
+             warn!(
+                 "{}The {}({target_entity:?}) relationship on entity {entity:?} points to itself. The invalid {} relationship has been removed.",
+                 caller.map(|location|format!("{location}: ")).unwrap_or_default(),
+-                core::any::type_name::<Self>(),
+-                core::any::type_name::<Self>()
++                DebugName::type_name::<Self>(),
++                DebugName::type_name::<Self>()
+             );
+             world.commands().entity(entity).remove::<Self>();
+             return;
+@@ -125,8 +126,8 @@ pub trait Relationship: Component + Sized {
+             warn!(
+                 "{}The {}({target_entity:?}) relationship on entity {entity:?} relates to an entity that does not exist. The invalid {} relationship has been removed.",
+                 caller.map(|location|format!("{location}: ")).unwrap_or_default(),
+-                core::any::type_name::<Self>(),
+-                core::any::type_name::<Self>()
++                DebugName::type_name::<Self>(),
++                DebugName::type_name::<Self>()
+             );
+             world.commands().entity(entity).remove::<Self>();
+         }
+diff --git a/crates/bevy_ecs/src/schedule/condition.rs b/crates/bevy_ecs/src/schedule/condition.rs
+index 4983804dab9c5..9a7ce5d507df1 100644
+--- a/crates/bevy_ecs/src/schedule/condition.rs
++++ b/crates/bevy_ecs/src/schedule/condition.rs
+@@ -1,4 +1,5 @@
+-use alloc::{borrow::Cow, boxed::Box, format};
++use alloc::{boxed::Box, format};
++use bevy_utils::prelude::DebugName;
+ use core::ops::Not;
+ 
+ use crate::system::{
+@@ -154,7 +155,7 @@ pub trait SystemCondition<Marker, In: SystemInput = (), Out = bool>:
+         let a = IntoSystem::into_system(self);
+         let b = IntoSystem::into_system(and);
+         let name = format!("{} && {}", a.name(), b.name());
+-        CombinatorSystem::new(a, b, Cow::Owned(name))
++        CombinatorSystem::new(a, b, DebugName::owned(name))
+     }
+ 
+     /// Returns a new run condition that only returns `false`
+@@ -206,7 +207,7 @@ pub trait SystemCondition<Marker, In: SystemInput = (), Out = bool>:
+         let a = IntoSystem::into_system(self);
+         let b = IntoSystem::into_system(nand);
+         let name = format!("!({} && {})", a.name(), b.name());
+-        CombinatorSystem::new(a, b, Cow::Owned(name))
++        CombinatorSystem::new(a, b, DebugName::owned(name))
+     }
+ 
+     /// Returns a new run condition that only returns `true`
+@@ -258,7 +259,7 @@ pub trait SystemCondition<Marker, In: SystemInput = (), Out = bool>:
+         let a = IntoSystem::into_system(self);
+         let b = IntoSystem::into_system(nor);
+         let name = format!("!({} || {})", a.name(), b.name());
+-        CombinatorSystem::new(a, b, Cow::Owned(name))
++        CombinatorSystem::new(a, b, DebugName::owned(name))
+     }
+ 
+     /// Returns a new run condition that returns `true`
+@@ -305,7 +306,7 @@ pub trait SystemCondition<Marker, In: SystemInput = (), Out = bool>:
+         let a = IntoSystem::into_system(self);
+         let b = IntoSystem::into_system(or);
+         let name = format!("{} || {}", a.name(), b.name());
+-        CombinatorSystem::new(a, b, Cow::Owned(name))
++        CombinatorSystem::new(a, b, DebugName::owned(name))
+     }
+ 
+     /// Returns a new run condition that only returns `true`
+@@ -357,7 +358,7 @@ pub trait SystemCondition<Marker, In: SystemInput = (), Out = bool>:
+         let a = IntoSystem::into_system(self);
+         let b = IntoSystem::into_system(xnor);
+         let name = format!("!({} ^ {})", a.name(), b.name());
+-        CombinatorSystem::new(a, b, Cow::Owned(name))
++        CombinatorSystem::new(a, b, DebugName::owned(name))
+     }
+ 
+     /// Returns a new run condition that only returns `true`
+@@ -399,7 +400,7 @@ pub trait SystemCondition<Marker, In: SystemInput = (), Out = bool>:
+         let a = IntoSystem::into_system(self);
+         let b = IntoSystem::into_system(xor);
+         let name = format!("({} ^ {})", a.name(), b.name());
+-        CombinatorSystem::new(a, b, Cow::Owned(name))
++        CombinatorSystem::new(a, b, DebugName::owned(name))
+     }
+ }
+ 
+diff --git a/crates/bevy_ecs/src/schedule/executor/mod.rs b/crates/bevy_ecs/src/schedule/executor/mod.rs
+index c1fac6a9f1f3d..9156fc34a35a6 100644
+--- a/crates/bevy_ecs/src/schedule/executor/mod.rs
++++ b/crates/bevy_ecs/src/schedule/executor/mod.rs
+@@ -3,7 +3,8 @@ mod multi_threaded;
+ mod simple;
+ mod single_threaded;
+ 
+-use alloc::{borrow::Cow, vec, vec::Vec};
++use alloc::{vec, vec::Vec};
++use bevy_utils::prelude::DebugName;
+ use core::any::TypeId;
+ 
+ #[expect(deprecated, reason = "We still need to support this.")]
+@@ -158,8 +159,8 @@ impl System for ApplyDeferred {
+     type In = ();
+     type Out = Result<()>;
+ 
+-    fn name(&self) -> Cow<'static, str> {
+-        Cow::Borrowed("bevy_ecs::apply_deferred")
++    fn name(&self) -> DebugName {
++        DebugName::borrowed("bevy_ecs::apply_deferred")
+     }
+ 
+     fn flags(&self) -> SystemStateFlags {
+diff --git a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+index fe205b19f79b6..b6036ee76b744 100644
+--- a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+@@ -342,7 +342,7 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
+             #[cfg(feature = "std")]
+             #[expect(clippy::print_stderr, reason = "Allowed behind `std` feature gate.")]
+             {
+-                eprintln!("Encountered a panic in system `{}`!", &*system.name());
++                eprintln!("Encountered a panic in system `{}`!", system.name());
+             }
+             // set the payload to propagate the error
+             {
+@@ -799,7 +799,7 @@ fn apply_deferred(
+             {
+                 eprintln!(
+                     "Encountered a panic when applying buffers for system `{}`!",
+-                    &*system.name()
++                    system.name()
+                 );
+             }
+             return Err(payload);
+diff --git a/crates/bevy_ecs/src/schedule/executor/simple.rs b/crates/bevy_ecs/src/schedule/executor/simple.rs
+index 144be7f5748fc..f0d655eab8ce7 100644
+--- a/crates/bevy_ecs/src/schedule/executor/simple.rs
++++ b/crates/bevy_ecs/src/schedule/executor/simple.rs
+@@ -73,7 +73,7 @@ impl SystemExecutor for SimpleExecutor {
+             #[cfg(feature = "trace")]
+             let name = schedule.systems[system_index].system.name();
+             #[cfg(feature = "trace")]
+-            let should_run_span = info_span!("check_conditions", name = &*name).entered();
++            let should_run_span = info_span!("check_conditions", name = name.as_string()).entered();
+ 
+             let mut should_run = !self.completed_systems.contains(system_index);
+             for set_idx in schedule.sets_with_conditions_of_systems[system_index].ones() {
+@@ -161,7 +161,7 @@ impl SystemExecutor for SimpleExecutor {
+             #[expect(clippy::print_stderr, reason = "Allowed behind `std` feature gate.")]
+             {
+                 if let Err(payload) = std::panic::catch_unwind(f) {
+-                    eprintln!("Encountered a panic in system `{}`!", &*system.name());
++                    eprintln!("Encountered a panic in system `{}`!", system.name());
+                     std::panic::resume_unwind(payload);
+                 }
+             }
+diff --git a/crates/bevy_ecs/src/schedule/executor/single_threaded.rs b/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
+index d7d46abb93640..21b8d2289dd0e 100644
+--- a/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
+@@ -74,7 +74,7 @@ impl SystemExecutor for SingleThreadedExecutor {
+             #[cfg(feature = "trace")]
+             let name = schedule.systems[system_index].system.name();
+             #[cfg(feature = "trace")]
+-            let should_run_span = info_span!("check_conditions", name = &*name).entered();
++            let should_run_span = info_span!("check_conditions", name = name.as_string()).entered();
+ 
+             let mut should_run = !self.completed_systems.contains(system_index);
+             for set_idx in schedule.sets_with_conditions_of_systems[system_index].ones() {
+@@ -166,7 +166,7 @@ impl SystemExecutor for SingleThreadedExecutor {
+             #[expect(clippy::print_stderr, reason = "Allowed behind `std` feature gate.")]
+             {
+                 if let Err(payload) = std::panic::catch_unwind(f) {
+-                    eprintln!("Encountered a panic in system `{}`!", &*system.name());
++                    eprintln!("Encountered a panic in system `{}`!", system.name());
+                     std::panic::resume_unwind(payload);
+                 }
+             }
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index 0e4f530be0397..3c67f1ea0782e 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -2,7 +2,6 @@
+     clippy::module_inception,
+     reason = "This instance of module inception is being discussed; see #17344."
+ )]
+-use alloc::borrow::Cow;
+ use alloc::{
+     boxed::Box,
+     collections::{BTreeMap, BTreeSet},
+@@ -12,12 +11,11 @@ use alloc::{
+     vec::Vec,
+ };
+ use bevy_platform::collections::{HashMap, HashSet};
+-use bevy_utils::{default, TypeIdMap};
++use bevy_utils::{default, prelude::DebugName, TypeIdMap};
+ use core::{
+     any::{Any, TypeId},
+     fmt::{Debug, Write},
+ };
+-use disqualified::ShortName;
+ use fixedbitset::FixedBitSet;
+ use log::{error, info, warn};
+ use pass::ScheduleBuildPassObj;
+@@ -1694,14 +1692,14 @@ impl ScheduleGraph {
+ 
+     #[inline]
+     fn get_node_name_inner(&self, id: &NodeId, report_sets: bool) -> String {
+-        let name = match id {
++        match id {
+             NodeId::System(_) => {
+-                let name = self.systems[id.index()]
+-                    .get()
+-                    .unwrap()
+-                    .system
+-                    .name()
+-                    .to_string();
++                let name = self.systems[id.index()].get().unwrap().system.name();
++                let name = if self.settings.use_shortnames {
++                    name.shortname().to_string()
++                } else {
++                    name.to_string()
++                };
+                 if report_sets {
+                     let sets = self.names_of_sets_containing_node(id);
+                     if sets.is_empty() {
+@@ -1723,11 +1721,6 @@ impl ScheduleGraph {
+                     set.name()
+                 }
+             }
+-        };
+-        if self.settings.use_shortnames {
+-            ShortName(&name).to_string()
+-        } else {
+-            name
+         }
+     }
+ 
+@@ -2007,7 +2000,7 @@ impl ScheduleGraph {
+         &'a self,
+         ambiguities: &'a [(NodeId, NodeId, Vec<ComponentId>)],
+         components: &'a Components,
+-    ) -> impl Iterator<Item = (String, String, Vec<Cow<'a, str>>)> + 'a {
++    ) -> impl Iterator<Item = (String, String, Vec<DebugName>)> + 'a {
+         ambiguities
+             .iter()
+             .map(move |(system_a, system_b, conflicts)| {
+diff --git a/crates/bevy_ecs/src/schedule/set.rs b/crates/bevy_ecs/src/schedule/set.rs
+index 2243e5019f91b..da91f616e9b42 100644
+--- a/crates/bevy_ecs/src/schedule/set.rs
++++ b/crates/bevy_ecs/src/schedule/set.rs
+@@ -1,4 +1,5 @@
+ use alloc::boxed::Box;
++use bevy_utils::prelude::DebugName;
+ use core::{
+     any::TypeId,
+     fmt::Debug,
+@@ -196,7 +197,7 @@ impl<T: 'static> SystemTypeSet<T> {
+ impl<T> Debug for SystemTypeSet<T> {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+         f.debug_tuple("SystemTypeSet")
+-            .field(&format_args!("fn {}()", &core::any::type_name::<T>()))
++            .field(&format_args!("fn {}()", DebugName::type_name::<T>()))
+             .finish()
+     }
+ }
+diff --git a/crates/bevy_ecs/src/schedule/stepping.rs b/crates/bevy_ecs/src/schedule/stepping.rs
+index b6de7c8215463..b0d8b57fb0dcd 100644
+--- a/crates/bevy_ecs/src/schedule/stepping.rs
++++ b/crates/bevy_ecs/src/schedule/stepping.rs
+@@ -895,9 +895,9 @@ mod tests {
+         ($schedule:expr, $skipped_systems:expr, $($system:expr),*) => {
+             // pull an ordered list of systems in the schedule, and save the
+             // system TypeId, and name.
+-            let systems: Vec<(TypeId, alloc::borrow::Cow<'static, str>)> = $schedule.systems().unwrap()
++            let systems: Vec<(TypeId, alloc::string::String)> = $schedule.systems().unwrap()
+                 .map(|(_, system)| {
+-                    (system.type_id(), system.name())
++                    (system.type_id(), system.name().as_string())
+                 })
+             .collect();
+ 
+diff --git a/crates/bevy_ecs/src/storage/resource.rs b/crates/bevy_ecs/src/storage/resource.rs
+index fc9100069c466..29752ae2e5518 100644
+--- a/crates/bevy_ecs/src/storage/resource.rs
++++ b/crates/bevy_ecs/src/storage/resource.rs
+@@ -3,8 +3,8 @@ use crate::{
+     component::{CheckChangeTicks, ComponentId, ComponentTicks, Components, Tick, TickCells},
+     storage::{blob_vec::BlobVec, SparseSet},
+ };
+-use alloc::string::String;
+ use bevy_ptr::{OwningPtr, Ptr, UnsafeCellDeref};
++use bevy_utils::prelude::DebugName;
+ use core::{cell::UnsafeCell, mem::ManuallyDrop, panic::Location};
+ 
+ #[cfg(feature = "std")]
+@@ -23,7 +23,7 @@ pub struct ResourceData<const SEND: bool> {
+         not(feature = "std"),
+         expect(dead_code, reason = "currently only used with the std feature")
+     )]
+-    type_name: String,
++    type_name: DebugName,
+     #[cfg(feature = "std")]
+     origin_thread_id: Option<ThreadId>,
+     changed_by: MaybeLocation<UnsafeCell<&'static Location<'static>>>,
+@@ -385,7 +385,7 @@ impl<const SEND: bool> Resources<SEND> {
+                 data: ManuallyDrop::new(data),
+                 added_ticks: UnsafeCell::new(Tick::new(0)),
+                 changed_ticks: UnsafeCell::new(Tick::new(0)),
+-                type_name: String::from(component_info.name()),
++                type_name: component_info.name(),
+                 #[cfg(feature = "std")]
+                 origin_thread_id: None,
+                 changed_by: MaybeLocation::caller().map(UnsafeCell::new),
+diff --git a/crates/bevy_ecs/src/system/adapter_system.rs b/crates/bevy_ecs/src/system/adapter_system.rs
+index ff63a3e8ce996..c655ed9407f41 100644
+--- a/crates/bevy_ecs/src/system/adapter_system.rs
++++ b/crates/bevy_ecs/src/system/adapter_system.rs
+@@ -1,4 +1,5 @@
+-use alloc::{borrow::Cow, vec::Vec};
++use alloc::vec::Vec;
++use bevy_utils::prelude::DebugName;
+ 
+ use super::{IntoSystem, ReadOnlySystem, System, SystemParamValidationError};
+ use crate::{
+@@ -101,7 +102,7 @@ where
+ pub struct AdapterSystem<Func, S> {
+     func: Func,
+     system: S,
+-    name: Cow<'static, str>,
++    name: DebugName,
+ }
+ 
+ impl<Func, S> AdapterSystem<Func, S>
+@@ -110,7 +111,7 @@ where
+     S: System,
+ {
+     /// Creates a new [`System`] that uses `func` to adapt `system`, via the [`Adapt`] trait.
+-    pub const fn new(func: Func, system: S, name: Cow<'static, str>) -> Self {
++    pub const fn new(func: Func, system: S, name: DebugName) -> Self {
+         Self { func, system, name }
+     }
+ }
+@@ -123,7 +124,7 @@ where
+     type In = Func::In;
+     type Out = Func::Out;
+ 
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.name.clone()
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index 976d654a5979a..d48c599f2dc32 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -1,4 +1,5 @@
+-use alloc::{borrow::Cow, format, vec::Vec};
++use alloc::{format, vec::Vec};
++use bevy_utils::prelude::DebugName;
+ use core::marker::PhantomData;
+ 
+ use crate::{
+@@ -55,7 +56,7 @@ use super::{IntoSystem, ReadOnlySystem, System};
+ ///     IntoSystem::into_system(resource_equals(A(1))),
+ ///     IntoSystem::into_system(resource_equals(B(1))),
+ ///     // The name of the combined system.
+-///     std::borrow::Cow::Borrowed("a ^ b"),
++///     "a ^ b".into(),
+ /// )));
+ /// # fn my_system(mut flag: ResMut<RanFlag>) { flag.0 = true; }
+ /// #
+@@ -112,14 +113,14 @@ pub struct CombinatorSystem<Func, A, B> {
+     _marker: PhantomData<fn() -> Func>,
+     a: A,
+     b: B,
+-    name: Cow<'static, str>,
++    name: DebugName,
+ }
+ 
+ impl<Func, A, B> CombinatorSystem<Func, A, B> {
+     /// Creates a new system that combines two inner systems.
+     ///
+     /// The returned system will only be usable if `Func` implements [`Combine<A, B>`].
+-    pub fn new(a: A, b: B, name: Cow<'static, str>) -> Self {
++    pub fn new(a: A, b: B, name: DebugName) -> Self {
+         Self {
+             _marker: PhantomData,
+             a,
+@@ -138,7 +139,7 @@ where
+     type In = Func::In;
+     type Out = Func::Out;
+ 
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.name.clone()
+     }
+ 
+@@ -271,7 +272,7 @@ where
+         let system_a = IntoSystem::into_system(this.a);
+         let system_b = IntoSystem::into_system(this.b);
+         let name = format!("Pipe({}, {})", system_a.name(), system_b.name());
+-        PipeSystem::new(system_a, system_b, Cow::Owned(name))
++        PipeSystem::new(system_a, system_b, DebugName::owned(name))
+     }
+ }
+ 
+@@ -317,7 +318,7 @@ where
+ pub struct PipeSystem<A, B> {
+     a: A,
+     b: B,
+-    name: Cow<'static, str>,
++    name: DebugName,
+ }
+ 
+ impl<A, B> PipeSystem<A, B>
+@@ -327,7 +328,7 @@ where
+     for<'a> B::In: SystemInput<Inner<'a> = A::Out>,
+ {
+     /// Creates a new system that pipes two inner systems.
+-    pub fn new(a: A, b: B, name: Cow<'static, str>) -> Self {
++    pub fn new(a: A, b: B, name: DebugName) -> Self {
+         Self { a, b, name }
+     }
+ }
+@@ -341,7 +342,7 @@ where
+     type In = A::In;
+     type Out = B::Out;
+ 
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.name.clone()
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/exclusive_function_system.rs b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+index c6bdb002c29b2..3a053f89d5ac4 100644
+--- a/crates/bevy_ecs/src/system/exclusive_function_system.rs
++++ b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+@@ -10,6 +10,7 @@ use crate::{
+ };
+ 
+ use alloc::{borrow::Cow, vec, vec::Vec};
++use bevy_utils::prelude::DebugName;
+ use core::marker::PhantomData;
+ use variadics_please::all_tuples;
+ 
+@@ -42,7 +43,7 @@ where
+     ///
+     /// Useful to give closure systems more readable and unique names for debugging and tracing.
+     pub fn with_name(mut self, new_name: impl Into<Cow<'static, str>>) -> Self {
+-        self.system_meta.set_name(new_name.into());
++        self.system_meta.set_name(new_name);
+         self
+     }
+ }
+@@ -83,7 +84,7 @@ where
+     type Out = F::Out;
+ 
+     #[inline]
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.system_meta.name.clone()
+     }
+ 
+@@ -181,7 +182,7 @@ where
+         check_system_change_tick(
+             &mut self.system_meta.last_run,
+             check,
+-            self.system_meta.name.as_ref(),
++            self.system_meta.name.clone(),
+         );
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index 4720860b23179..6009662809fa5 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -11,6 +11,7 @@ use crate::{
+ };
+ 
+ use alloc::{borrow::Cow, vec, vec::Vec};
++use bevy_utils::prelude::DebugName;
+ use core::marker::PhantomData;
+ use variadics_please::all_tuples;
+ 
+@@ -24,7 +25,7 @@ use super::{
+ /// The metadata of a [`System`].
+ #[derive(Clone)]
+ pub struct SystemMeta {
+-    pub(crate) name: Cow<'static, str>,
++    pub(crate) name: DebugName,
+     // NOTE: this must be kept private. making a SystemMeta non-send is irreversible to prevent
+     // SystemParams from overriding each other
+     flags: SystemStateFlags,
+@@ -37,21 +38,21 @@ pub struct SystemMeta {
+ 
+ impl SystemMeta {
+     pub(crate) fn new<T>() -> Self {
+-        let name = core::any::type_name::<T>();
++        let name = DebugName::type_name::<T>();
+         Self {
+-            name: name.into(),
+-            flags: SystemStateFlags::empty(),
+-            last_run: Tick::new(0),
+             #[cfg(feature = "trace")]
+-            system_span: info_span!("system", name = name),
++            system_span: info_span!("system", name = name.clone().as_string()),
+             #[cfg(feature = "trace")]
+-            commands_span: info_span!("system_commands", name = name),
++            commands_span: info_span!("system_commands", name = name.clone().as_string()),
++            name,
++            flags: SystemStateFlags::empty(),
++            last_run: Tick::new(0),
+         }
+     }
+ 
+     /// Returns the system's name
+     #[inline]
+-    pub fn name(&self) -> &str {
++    pub fn name(&self) -> &DebugName {
+         &self.name
+     }
+ 
+@@ -67,7 +68,7 @@ impl SystemMeta {
+             self.system_span = info_span!("system", name = name);
+             self.commands_span = info_span!("system_commands", name = name);
+         }
+-        self.name = new_name;
++        self.name = new_name.into();
+     }
+ 
+     /// Returns true if the system is [`Send`].
+@@ -600,7 +601,7 @@ where
+     type Out = F::Out;
+ 
+     #[inline]
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.system_meta.name.clone()
+     }
+ 
+@@ -712,7 +713,7 @@ where
+         check_system_change_tick(
+             &mut self.system_meta.last_run,
+             check,
+-            self.system_meta.name.as_ref(),
++            self.system_meta.name.clone(),
+         );
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/observer_system.rs b/crates/bevy_ecs/src/system/observer_system.rs
+index e99a86b64c30e..8e927d9529a32 100644
+--- a/crates/bevy_ecs/src/system/observer_system.rs
++++ b/crates/bevy_ecs/src/system/observer_system.rs
+@@ -1,4 +1,5 @@
+-use alloc::{borrow::Cow, vec::Vec};
++use alloc::vec::Vec;
++use bevy_utils::prelude::DebugName;
+ use core::marker::PhantomData;
+ 
+ use crate::{
+@@ -112,7 +113,7 @@ where
+     type Out = Result;
+ 
+     #[inline]
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.observer.name()
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/query.rs b/crates/bevy_ecs/src/system/query.rs
+index 2664d3a44f616..b29436debbeb4 100644
+--- a/crates/bevy_ecs/src/system/query.rs
++++ b/crates/bevy_ecs/src/system/query.rs
+@@ -1,3 +1,5 @@
++use bevy_utils::prelude::DebugName;
++
+ use crate::{
+     batching::BatchingStrategy,
+     component::Tick,
+@@ -1949,8 +1951,8 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+ 
+         match (first, extra) {
+             (Some(r), false) => Ok(r),
+-            (None, _) => Err(QuerySingleError::NoEntities(core::any::type_name::<Self>())),
+-            (Some(_), _) => Err(QuerySingleError::MultipleEntities(core::any::type_name::<
++            (None, _) => Err(QuerySingleError::NoEntities(DebugName::type_name::<Self>())),
++            (Some(_), _) => Err(QuerySingleError::MultipleEntities(DebugName::type_name::<
+                 Self,
+             >())),
+         }
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index b7b07ca184cc8..ca4bdd4460c1e 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -1,4 +1,5 @@
+-use alloc::{borrow::Cow, vec::Vec};
++use alloc::vec::Vec;
++use bevy_utils::prelude::DebugName;
+ 
+ use crate::{
+     component::{CheckChangeTicks, ComponentId, Tick},
+@@ -25,7 +26,7 @@ impl<S: System<In = ()>> System for InfallibleSystemWrapper<S> {
+     type Out = Result;
+ 
+     #[inline]
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.0.name()
+     }
+ 
+@@ -139,7 +140,7 @@ where
+     type In = ();
+     type Out = S::Out;
+ 
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.system.name()
+     }
+ 
+@@ -232,7 +233,7 @@ where
+     type In = ();
+     type Out = S::Out;
+ 
+-    fn name(&self) -> Cow<'static, str> {
++    fn name(&self) -> DebugName {
+         self.system.name()
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index 3b4c99858f6ed..8527f3d3b84ce 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -2,6 +2,7 @@
+     clippy::module_inception,
+     reason = "This instance of module inception is being discussed; see #17353."
+ )]
++use bevy_utils::prelude::DebugName;
+ use bitflags::bitflags;
+ use core::fmt::Debug;
+ use log::warn;
+@@ -15,7 +16,7 @@ use crate::{
+     world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, World},
+ };
+ 
+-use alloc::{borrow::Cow, boxed::Box, vec::Vec};
++use alloc::{boxed::Box, vec::Vec};
+ use core::any::TypeId;
+ 
+ use super::{IntoSystem, SystemParamValidationError};
+@@ -49,8 +50,9 @@ pub trait System: Send + Sync + 'static {
+     type In: SystemInput;
+     /// The system's output.
+     type Out;
++
+     /// Returns the system's name.
+-    fn name(&self) -> Cow<'static, str>;
++    fn name(&self) -> DebugName;
+     /// Returns the [`TypeId`] of the underlying system type.
+     #[inline]
+     fn type_id(&self) -> TypeId {
+@@ -227,7 +229,7 @@ pub type BoxedSystem<In = (), Out = ()> = Box<dyn System<In = In, Out = Out>>;
+ pub(crate) fn check_system_change_tick(
+     last_run: &mut Tick,
+     check: CheckChangeTicks,
+-    system_name: &str,
++    system_name: DebugName,
+ ) {
+     if last_run.check_tick(check) {
+         let age = check.present_tick().relative_to(*last_run).get();
+@@ -398,7 +400,7 @@ pub enum RunSystemError {
+     #[error("System {system} did not run due to failed parameter validation: {err}")]
+     InvalidParams {
+         /// The identifier of the system that was run.
+-        system: Cow<'static, str>,
++        system: DebugName,
+         /// The returned parameter validation error.
+         err: SystemParamValidationError,
+     },
+diff --git a/crates/bevy_ecs/src/system/system_name.rs b/crates/bevy_ecs/src/system/system_name.rs
+index 1205ff055c953..f38a5eb1aa72d 100644
+--- a/crates/bevy_ecs/src/system/system_name.rs
++++ b/crates/bevy_ecs/src/system/system_name.rs
+@@ -5,9 +5,8 @@ use crate::{
+     system::{ExclusiveSystemParam, ReadOnlySystemParam, SystemMeta, SystemParam},
+     world::unsafe_world_cell::UnsafeWorldCell,
+ };
+-use alloc::borrow::Cow;
+-use core::ops::Deref;
+-use derive_more::derive::{AsRef, Display, Into};
++use bevy_utils::prelude::DebugName;
++use derive_more::derive::{Display, Into};
+ 
+ /// [`SystemParam`] that returns the name of the system which it is used in.
+ ///
+@@ -35,21 +34,13 @@ use derive_more::derive::{AsRef, Display, Into};
+ ///     logger.log("Hello");
+ /// }
+ /// ```
+-#[derive(Debug, Into, Display, AsRef)]
+-#[as_ref(str)]
+-pub struct SystemName(Cow<'static, str>);
++#[derive(Debug, Into, Display)]
++pub struct SystemName(DebugName);
+ 
+ impl SystemName {
+     /// Gets the name of the system.
+-    pub fn name(&self) -> &str {
+-        &self.0
+-    }
+-}
+-
+-impl Deref for SystemName {
+-    type Target = str;
+-    fn deref(&self) -> &Self::Target {
+-        self.name()
++    pub fn name(&self) -> DebugName {
++        self.0.clone()
+     }
+ }
+ 
+@@ -104,7 +95,7 @@ mod tests {
+     #[test]
+     fn test_system_name_regular_param() {
+         fn testing(name: SystemName) -> String {
+-            name.name().to_owned()
++            name.name().as_string()
+         }
+ 
+         let mut world = World::default();
+@@ -116,7 +107,7 @@ mod tests {
+     #[test]
+     fn test_system_name_exclusive_param() {
+         fn testing(_world: &mut World, name: SystemName) -> String {
+-            name.name().to_owned()
++            name.name().as_string()
+         }
+ 
+         let mut world = World::default();
+@@ -130,7 +121,7 @@ mod tests {
+         let mut world = World::default();
+         let system =
+             IntoSystem::into_system(|name: SystemName| name.name().to_owned()).with_name("testing");
+-        let name = world.run_system_once(system).unwrap();
++        let name = world.run_system_once(system).unwrap().as_string();
+         assert_eq!(name, "testing");
+     }
+ 
+@@ -140,7 +131,7 @@ mod tests {
+         let system =
+             IntoSystem::into_system(|_world: &mut World, name: SystemName| name.name().to_owned())
+                 .with_name("testing");
+-        let name = world.run_system_once(system).unwrap();
++        let name = world.run_system_once(system).unwrap().as_string();
+         assert_eq!(name, "testing");
+     }
+ }
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index ac2637ed7aeb1..65fecaf564f74 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -25,6 +25,7 @@ use alloc::{
+ pub use bevy_ecs_macros::SystemParam;
+ use bevy_platform::cell::SyncCell;
+ use bevy_ptr::UnsafeCellDeref;
++use bevy_utils::prelude::DebugName;
+ use core::{
+     any::Any,
+     fmt::{Debug, Display},
+@@ -32,7 +33,6 @@ use core::{
+     ops::{Deref, DerefMut},
+     panic::Location,
+ };
+-use disqualified::ShortName;
+ use thiserror::Error;
+ 
+ use super::Populated;
+@@ -343,8 +343,8 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Qu
+     ) {
+         assert_component_access_compatibility(
+             &system_meta.name,
+-            core::any::type_name::<D>(),
+-            core::any::type_name::<F>(),
++            DebugName::type_name::<D>(),
++            DebugName::type_name::<F>(),
+             component_access_set,
+             &state.component_access,
+             world,
+@@ -368,9 +368,9 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Qu
+ }
+ 
+ fn assert_component_access_compatibility(
+-    system_name: &str,
+-    query_type: &'static str,
+-    filter_type: &'static str,
++    system_name: &DebugName,
++    query_type: DebugName,
++    filter_type: DebugName,
+     system_access: &FilteredAccessSet<ComponentId>,
+     current: &FilteredAccess<ComponentId>,
+     world: &World,
+@@ -384,7 +384,7 @@ fn assert_component_access_compatibility(
+     if !accesses.is_empty() {
+         accesses.push(' ');
+     }
+-    panic!("error[B0001]: Query<{}, {}> in system {system_name} accesses component(s) {accesses}in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevy.org/learn/errors/b0001", ShortName(query_type), ShortName(filter_type));
++    panic!("error[B0001]: Query<{}, {}> in system {system_name} accesses component(s) {accesses}in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevy.org/learn/errors/b0001", query_type.shortname(), filter_type.shortname());
+ }
+ 
+ // SAFETY: Relevant query ComponentId access is applied to SystemMeta. If
+@@ -767,9 +767,10 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+         assert!(
+             !combined_access.has_resource_write(component_id),
+             "error[B0002]: Res<{}> in system {} conflicts with a previous ResMut<{0}> access. Consider removing the duplicate access. See: https://bevy.org/learn/errors/b0002",
+-            core::any::type_name::<T>(),
++            DebugName::type_name::<T>(),
+             system_meta.name,
+         );
++
+         component_access_set.add_unfiltered_resource_read(component_id);
+     }
+ 
+@@ -807,8 +808,8 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+                     panic!(
+                         "Resource requested by {} does not exist: {}",
+                         system_meta.name,
+-                        core::any::type_name::<T>()
+-                    )
++                        DebugName::type_name::<T>()
++                    );
+                 });
+         Res {
+             value: ptr.deref(),
+@@ -843,11 +844,11 @@ unsafe impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
+         if combined_access.has_resource_write(component_id) {
+             panic!(
+                 "error[B0002]: ResMut<{}> in system {} conflicts with a previous ResMut<{0}> access. Consider removing the duplicate access. See: https://bevy.org/learn/errors/b0002",
+-                core::any::type_name::<T>(), system_meta.name);
++                DebugName::type_name::<T>(), system_meta.name);
+         } else if combined_access.has_resource_read(component_id) {
+             panic!(
+                 "error[B0002]: ResMut<{}> in system {} conflicts with a previous Res<{0}> access. Consider removing the duplicate access. See: https://bevy.org/learn/errors/b0002",
+-                core::any::type_name::<T>(), system_meta.name);
++                DebugName::type_name::<T>(), system_meta.name);
+         }
+         component_access_set.add_unfiltered_resource_write(component_id);
+     }
+@@ -885,8 +886,8 @@ unsafe impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
+                 panic!(
+                     "Resource requested by {} does not exist: {}",
+                     system_meta.name,
+-                    core::any::type_name::<T>()
+-                )
++                    DebugName::type_name::<T>()
++                );
+             });
+         ResMut {
+             value: value.value.deref_mut::<T>(),
+@@ -1435,7 +1436,7 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+         assert!(
+             !combined_access.has_resource_write(component_id),
+             "error[B0002]: NonSend<{}> in system {} conflicts with a previous mutable resource access ({0}). Consider removing the duplicate access. See: https://bevy.org/learn/errors/b0002",
+-            core::any::type_name::<T>(),
++            DebugName::type_name::<T>(),
+             system_meta.name,
+         );
+         component_access_set.add_unfiltered_resource_read(component_id);
+@@ -1475,7 +1476,7 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+                     panic!(
+                         "Non-send resource requested by {} does not exist: {}",
+                         system_meta.name,
+-                        core::any::type_name::<T>()
++                        DebugName::type_name::<T>()
+                     )
+                 });
+ 
+@@ -1511,11 +1512,11 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+         if combined_access.has_component_write(component_id) {
+             panic!(
+                 "error[B0002]: NonSendMut<{}> in system {} conflicts with a previous mutable resource access ({0}). Consider removing the duplicate access. See: https://bevy.org/learn/errors/b0002",
+-                core::any::type_name::<T>(), system_meta.name);
++                DebugName::type_name::<T>(), system_meta.name);
+         } else if combined_access.has_component_read(component_id) {
+             panic!(
+                 "error[B0002]: NonSendMut<{}> in system {} conflicts with a previous immutable resource access ({0}). Consider removing the duplicate access. See: https://bevy.org/learn/errors/b0002",
+-                core::any::type_name::<T>(), system_meta.name);
++                DebugName::type_name::<T>(), system_meta.name);
+         }
+         component_access_set.add_unfiltered_resource_write(component_id);
+     }
+@@ -1554,8 +1555,8 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+                     panic!(
+                         "Non-send resource requested by {} does not exist: {}",
+                         system_meta.name,
+-                        core::any::type_name::<T>()
+-                    )
++                        DebugName::type_name::<T>()
++                    );
+                 });
+         NonSendMut {
+             value: ptr.assert_unique().deref_mut(),
+@@ -2786,7 +2787,7 @@ pub struct SystemParamValidationError {
+ 
+     /// A string identifying the invalid parameter.
+     /// This is usually the type name of the parameter.
+-    pub param: Cow<'static, str>,
++    pub param: DebugName,
+ 
+     /// A string identifying the field within a parameter using `#[derive(SystemParam)]`.
+     /// This will be an empty string for other parameters.
+@@ -2818,7 +2819,7 @@ impl SystemParamValidationError {
+         Self {
+             skipped,
+             message: message.into(),
+-            param: Cow::Borrowed(core::any::type_name::<T>()),
++            param: DebugName::type_name::<T>(),
+             field: field.into(),
+         }
+     }
+@@ -2829,7 +2830,7 @@ impl Display for SystemParamValidationError {
+         write!(
+             fmt,
+             "Parameter `{}{}` failed validation: {}",
+-            ShortName(&self.param),
++            self.param.shortname(),
+             self.field,
+             self.message
+         )?;
+diff --git a/crates/bevy_ecs/src/world/deferred_world.rs b/crates/bevy_ecs/src/world/deferred_world.rs
+index 2a8d1ac8e8386..edf4b186a37d5 100644
+--- a/crates/bevy_ecs/src/world/deferred_world.rs
++++ b/crates/bevy_ecs/src/world/deferred_world.rs
+@@ -1,5 +1,7 @@
+ use core::ops::Deref;
+ 
++use bevy_utils::prelude::DebugName;
++
+ use crate::{
+     archetype::Archetype,
+     change_detection::{MaybeLocation, MutUntyped},
+@@ -451,7 +453,7 @@ impl<'w> DeferredWorld<'w> {
+                 Did you forget to add it using `app.insert_resource` / `app.init_resource`?
+                 Resources are also implicitly added via `app.add_event`,
+                 and can be added by plugins.",
+-                core::any::type_name::<R>()
++                DebugName::type_name::<R>()
+             ),
+         }
+     }
+@@ -480,7 +482,7 @@ impl<'w> DeferredWorld<'w> {
+                 "Requested non-send resource {} does not exist in the `World`.
+                 Did you forget to add it using `app.insert_non_send_resource` / `app.init_non_send_resource`?
+                 Non-send resources can also be added by plugins.",
+-                core::any::type_name::<R>()
++                DebugName::type_name::<R>()
+             ),
+         }
+     }
+@@ -523,7 +525,7 @@ impl<'w> DeferredWorld<'w> {
+         let Some(mut events_resource) = self.get_resource_mut::<Events<E>>() else {
+             log::error!(
+                 "Unable to send event `{}`\n\tEvent must be added to the app with `add_event()`\n\thttps://docs.rs/bevy/*/bevy/app/struct.App.html#method.add_event ",
+-                core::any::type_name::<E>()
++                DebugName::type_name::<E>()
+             );
+             return None;
+         };
+diff --git a/crates/bevy_ecs/src/world/error.rs b/crates/bevy_ecs/src/world/error.rs
+index 3527967942a94..03574331f2329 100644
+--- a/crates/bevy_ecs/src/world/error.rs
++++ b/crates/bevy_ecs/src/world/error.rs
+@@ -1,6 +1,7 @@
+ //! Contains error types returned by bevy's schedule.
+ 
+ use alloc::vec::Vec;
++use bevy_utils::prelude::DebugName;
+ 
+ use crate::{
+     component::ComponentId,
+@@ -24,7 +25,7 @@ pub struct TryRunScheduleError(pub InternedScheduleLabel);
+ #[error("Could not insert bundles of type {bundle_type} into the entities with the following IDs because they do not exist: {entities:?}")]
+ pub struct TryInsertBatchError {
+     /// The bundles' type name.
+-    pub bundle_type: &'static str,
++    pub bundle_type: DebugName,
+     /// The IDs of the provided entities that do not exist.
+     pub entities: Vec<Entity>,
+ }
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 95accb20b5553..fca9091dd5f96 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -24,6 +24,7 @@ use crate::{
+     prelude::{Add, Despawn, Insert, Remove, Replace},
+ };
+ pub use bevy_ecs_macros::FromWorld;
++use bevy_utils::prelude::DebugName;
+ pub use deferred_world::DeferredWorld;
+ pub use entity_fetch::{EntityFetcher, WorldEntityFetch};
+ pub use entity_ref::{
+@@ -1948,7 +1949,7 @@ impl World {
+                 Did you forget to add it using `app.insert_resource` / `app.init_resource`?
+                 Resources are also implicitly added via `app.add_event`,
+                 and can be added by plugins.",
+-                core::any::type_name::<R>()
++                DebugName::type_name::<R>()
+             ),
+         }
+     }
+@@ -1972,7 +1973,7 @@ impl World {
+                 Did you forget to add it using `app.insert_resource` / `app.init_resource`?
+                 Resources are also implicitly added via `app.add_event`,
+                 and can be added by plugins.",
+-                core::any::type_name::<R>()
++                DebugName::type_name::<R>()
+             ),
+         }
+     }
+@@ -1996,7 +1997,7 @@ impl World {
+                 Did you forget to add it using `app.insert_resource` / `app.init_resource`?
+                 Resources are also implicitly added via `app.add_event`,
+                 and can be added by plugins.",
+-                core::any::type_name::<R>()
++                DebugName::type_name::<R>()
+             ),
+         }
+     }
+@@ -2160,7 +2161,7 @@ impl World {
+                 "Requested non-send resource {} does not exist in the `World`.
+                 Did you forget to add it using `app.insert_non_send_resource` / `app.init_non_send_resource`?
+                 Non-send resources can also be added by plugins.",
+-                core::any::type_name::<R>()
++                DebugName::type_name::<R>()
+             ),
+         }
+     }
+@@ -2182,7 +2183,7 @@ impl World {
+                 "Requested non-send resource {} does not exist in the `World`.
+                 Did you forget to add it using `app.insert_non_send_resource` / `app.init_non_send_resource`?
+                 Non-send resources can also be added by plugins.",
+-                core::any::type_name::<R>()
++                DebugName::type_name::<R>()
+             ),
+         }
+     }
+@@ -2349,11 +2350,11 @@ impl World {
+                             )
+                         };
+                     } else {
+-                        panic!("error[B0003]: Could not insert a bundle (of type `{}`) for entity {entity}, which {}. See: https://bevy.org/learn/errors/b0003", core::any::type_name::<B>(), self.entities.entity_does_not_exist_error_details(entity));
++                        panic!("error[B0003]: Could not insert a bundle (of type `{}`) for entity {entity}, which {}. See: https://bevy.org/learn/errors/b0003", DebugName::type_name::<B>(), self.entities.entity_does_not_exist_error_details(entity));
+                     }
+                 }
+             } else {
+-                panic!("error[B0003]: Could not insert a bundle (of type `{}`) for entity {first_entity}, which {}. See: https://bevy.org/learn/errors/b0003", core::any::type_name::<B>(), self.entities.entity_does_not_exist_error_details(first_entity));
++                panic!("error[B0003]: Could not insert a bundle (of type `{}`) for entity {first_entity}, which {}. See: https://bevy.org/learn/errors/b0003", DebugName::type_name::<B>(), self.entities.entity_does_not_exist_error_details(first_entity));
+             }
+         }
+     }
+@@ -2517,7 +2518,7 @@ impl World {
+             Ok(())
+         } else {
+             Err(TryInsertBatchError {
+-                bundle_type: core::any::type_name::<B>(),
++                bundle_type: DebugName::type_name::<B>(),
+                 entities: invalid_entities,
+             })
+         }
+@@ -2551,7 +2552,7 @@ impl World {
+     #[track_caller]
+     pub fn resource_scope<R: Resource, U>(&mut self, f: impl FnOnce(&mut World, Mut<R>) -> U) -> U {
+         self.try_resource_scope(f)
+-            .unwrap_or_else(|| panic!("resource does not exist: {}", core::any::type_name::<R>()))
++            .unwrap_or_else(|| panic!("resource does not exist: {}", DebugName::type_name::<R>()))
+     }
+ 
+     /// Temporarily removes the requested resource from this [`World`] if it exists, runs custom user code,
+@@ -2591,7 +2592,7 @@ impl World {
+         assert!(!self.contains_resource::<R>(),
+             "Resource `{}` was inserted during a call to World::resource_scope.\n\
+             This is not allowed as the original resource is reinserted to the world after the closure is invoked.",
+-            core::any::type_name::<R>());
++            DebugName::type_name::<R>());
+ 
+         OwningPtr::make(value, |ptr| {
+             // SAFETY: pointer is of type R
+@@ -2632,7 +2633,7 @@ impl World {
+         let Some(mut events_resource) = self.get_resource_mut::<Events<E>>() else {
+             log::error!(
+                 "Unable to send event `{}`\n\tEvent must be added to the app with `add_event()`\n\thttps://docs.rs/bevy/*/bevy/app/struct.App.html#method.add_event ",
+-                core::any::type_name::<E>()
++                DebugName::type_name::<E>()
+             );
+             return None;
+         };
+@@ -3633,6 +3634,7 @@ mod tests {
+     };
+     use bevy_ecs_macros::Component;
+     use bevy_platform::collections::{HashMap, HashSet};
++    use bevy_utils::prelude::DebugName;
+     use core::{
+         any::TypeId,
+         panic,
+@@ -3816,12 +3818,12 @@ mod tests {
+         let mut iter = world.iter_resources();
+ 
+         let (info, ptr) = iter.next().unwrap();
+-        assert_eq!(info.name(), core::any::type_name::<TestResource>());
++        assert_eq!(info.name(), DebugName::type_name::<TestResource>());
+         // SAFETY: We know that the resource is of type `TestResource`
+         assert_eq!(unsafe { ptr.deref::<TestResource>().0 }, 42);
+ 
+         let (info, ptr) = iter.next().unwrap();
+-        assert_eq!(info.name(), core::any::type_name::<TestResource2>());
++        assert_eq!(info.name(), DebugName::type_name::<TestResource2>());
+         assert_eq!(
+             // SAFETY: We know that the resource is of type `TestResource2`
+             unsafe { &ptr.deref::<TestResource2>().0 },
+@@ -3844,14 +3846,14 @@ mod tests {
+         let mut iter = world.iter_resources_mut();
+ 
+         let (info, mut mut_untyped) = iter.next().unwrap();
+-        assert_eq!(info.name(), core::any::type_name::<TestResource>());
++        assert_eq!(info.name(), DebugName::type_name::<TestResource>());
+         // SAFETY: We know that the resource is of type `TestResource`
+         unsafe {
+             mut_untyped.as_mut().deref_mut::<TestResource>().0 = 43;
+         };
+ 
+         let (info, mut mut_untyped) = iter.next().unwrap();
+-        assert_eq!(info.name(), core::any::type_name::<TestResource2>());
++        assert_eq!(info.name(), DebugName::type_name::<TestResource2>());
+         // SAFETY: We know that the resource is of type `TestResource2`
+         unsafe {
+             mut_untyped.as_mut().deref_mut::<TestResource2>().0 = "Hello, world?".to_string();
+diff --git a/crates/bevy_ecs/src/world/reflect.rs b/crates/bevy_ecs/src/world/reflect.rs
+index 5ecdf881563e4..aada63bf6131c 100644
+--- a/crates/bevy_ecs/src/world/reflect.rs
++++ b/crates/bevy_ecs/src/world/reflect.rs
+@@ -4,8 +4,8 @@ use core::any::TypeId;
+ 
+ use thiserror::Error;
+ 
+-use alloc::string::{String, ToString};
+ use bevy_reflect::{Reflect, ReflectFromPtr};
++use bevy_utils::prelude::DebugName;
+ 
+ use crate::{prelude::*, world::ComponentId};
+ 
+@@ -77,10 +77,7 @@ impl World {
+         };
+ 
+         let Some(comp_ptr) = self.get_by_id(entity, component_id) else {
+-            let component_name = self
+-                .components()
+-                .get_name(component_id)
+-                .map(|name| name.to_string());
++            let component_name = self.components().get_name(component_id);
+ 
+             return Err(GetComponentReflectError::EntityDoesNotHaveComponent {
+                 entity,
+@@ -166,10 +163,7 @@ impl World {
+ 
+         // HACK: Only required for the `None`-case/`else`-branch, but it borrows `self`, which will
+         // already be mutably borrowed by `self.get_mut_by_id()`, and I didn't find a way around it.
+-        let component_name = self
+-            .components()
+-            .get_name(component_id)
+-            .map(|name| name.to_string());
++        let component_name = self.components().get_name(component_id).clone();
+ 
+         let Some(comp_mut_untyped) = self.get_mut_by_id(entity, component_id) else {
+             return Err(GetComponentReflectError::EntityDoesNotHaveComponent {
+@@ -223,7 +217,7 @@ pub enum GetComponentReflectError {
+         component_id: ComponentId,
+         /// The name corresponding to the [`Component`] with the given [`TypeId`], or `None`
+         /// if not available.
+-        component_name: Option<String>,
++        component_name: Option<DebugName>,
+     },
+ 
+     /// The [`World`] was missing the [`AppTypeRegistry`] resource.
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 54b9d7ffc2d61..c9639f1950aec 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -346,6 +346,8 @@ web = [
+ 
+ hotpatching = ["bevy_app/hotpatching", "bevy_ecs/hotpatching"]
+ 
++debug = ["bevy_utils/debug"]
++
+ [dependencies]
+ # bevy (no_std)
+ bevy_app = { path = "../bevy_app", version = "0.16.0-dev", default-features = false, features = [
+diff --git a/crates/bevy_remote/Cargo.toml b/crates/bevy_remote/Cargo.toml
+index ca84c2916e972..176e5ed47f179 100644
+--- a/crates/bevy_remote/Cargo.toml
++++ b/crates/bevy_remote/Cargo.toml
+@@ -21,7 +21,9 @@ bevy_ecs = { path = "../bevy_ecs", version = "0.16.0-dev", features = [
+ ] }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.16.0-dev" }
+ bevy_tasks = { path = "../bevy_tasks", version = "0.16.0-dev" }
+-bevy_utils = { path = "../bevy_utils", version = "0.16.0-dev" }
++bevy_utils = { path = "../bevy_utils", version = "0.16.0-dev", features = [
++  "debug",
++] }
+ bevy_platform = { path = "../bevy_platform", version = "0.16.0-dev", default-features = false, features = [
+   "std",
+   "serialize",
+diff --git a/crates/bevy_remote/src/builtin_methods.rs b/crates/bevy_remote/src/builtin_methods.rs
+index 62ba8af661cbe..e390f448c4489 100644
+--- a/crates/bevy_remote/src/builtin_methods.rs
++++ b/crates/bevy_remote/src/builtin_methods.rs
+@@ -1130,7 +1130,7 @@ pub fn process_remote_list_request(In(params): In<Option<Value>>, world: &World)
+             let Some(component_info) = world.components().get_info(component_id) else {
+                 continue;
+             };
+-            response.push(component_info.name().to_owned());
++            response.push(component_info.name().to_string());
+         }
+     }
+     // If `None`, list all registered components.
+@@ -1189,7 +1189,7 @@ pub fn process_remote_list_watching_request(
+             let Some(component_info) = world.components().get_info(component_id) else {
+                 continue;
+             };
+-            response.added.push(component_info.name().to_owned());
++            response.added.push(component_info.name().to_string());
+         }
+     }
+ 
+@@ -1202,7 +1202,7 @@ pub fn process_remote_list_watching_request(
+                 let Some(component_info) = world.components().get_info(*component_id) else {
+                     continue;
+                 };
+-                response.removed.push(component_info.name().to_owned());
++                response.removed.push(component_info.name().to_string());
+             }
+         }
+     }
+diff --git a/crates/bevy_scene/src/scene.rs b/crates/bevy_scene/src/scene.rs
+index 1d684c9dac2bb..2293beef1e9a2 100644
+--- a/crates/bevy_scene/src/scene.rs
++++ b/crates/bevy_scene/src/scene.rs
+@@ -93,7 +93,7 @@ impl Scene {
+                 type_registry
+                     .get(type_id)
+                     .ok_or_else(|| SceneSpawnError::UnregisteredType {
+-                        std_type_name: component_info.name().to_string(),
++                        std_type_name: component_info.name(),
+                     })?;
+             let reflect_resource = registration.data::<ReflectResource>().ok_or_else(|| {
+                 SceneSpawnError::UnregisteredResource {
+@@ -133,7 +133,7 @@ impl Scene {
+                     let registration = type_registry
+                         .get(component_info.type_id().unwrap())
+                         .ok_or_else(|| SceneSpawnError::UnregisteredType {
+-                            std_type_name: component_info.name().to_string(),
++                            std_type_name: component_info.name(),
+                         })?;
+                     let reflect_component =
+                         registration.data::<ReflectComponent>().ok_or_else(|| {
+diff --git a/crates/bevy_scene/src/scene_spawner.rs b/crates/bevy_scene/src/scene_spawner.rs
+index a15d00f116568..71cd848751894 100644
+--- a/crates/bevy_scene/src/scene_spawner.rs
++++ b/crates/bevy_scene/src/scene_spawner.rs
+@@ -10,6 +10,7 @@ use bevy_ecs::{
+ };
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_reflect::Reflect;
++use bevy_utils::prelude::DebugName;
+ use thiserror::Error;
+ use uuid::Uuid;
+ 
+@@ -105,7 +106,7 @@ pub enum SceneSpawnError {
+     )]
+     UnregisteredType {
+         /// The [type name](std::any::type_name) for the unregistered type.
+-        std_type_name: String,
++        std_type_name: DebugName,
+     },
+     /// Scene contains an unregistered type which has a `TypePath`.
+     #[error(
+diff --git a/crates/bevy_utils/Cargo.toml b/crates/bevy_utils/Cargo.toml
+index 53eda0d3584e8..aaf6a0834e4dc 100644
+--- a/crates/bevy_utils/Cargo.toml
++++ b/crates/bevy_utils/Cargo.toml
+@@ -16,9 +16,14 @@ wgpu_wrapper = ["dep:send_wrapper"]
+ # Provides access to the `Parallel` type.
+ parallel = ["bevy_platform/std", "dep:thread_local"]
+ 
++std = ["disqualified/alloc"]
++
++debug = []
++
+ [dependencies]
+ bevy_platform = { path = "../bevy_platform", version = "0.16.0-dev", default-features = false }
+ 
++disqualified = { version = "1.0", default-features = false }
+ thread_local = { version = "1.0", optional = true }
+ 
+ [target.'cfg(all(target_arch = "wasm32", target_feature = "atomics"))'.dependencies]
+diff --git a/crates/bevy_utils/src/debug_info.rs b/crates/bevy_utils/src/debug_info.rs
+new file mode 100644
+index 0000000000000..c79c5ebe60754
+--- /dev/null
++++ b/crates/bevy_utils/src/debug_info.rs
+@@ -0,0 +1,102 @@
++use alloc::{borrow::Cow, fmt, string::String};
++#[cfg(feature = "debug")]
++use core::any::type_name;
++use disqualified::ShortName;
++
++#[cfg(not(feature = "debug"))]
++const FEATURE_DISABLED: &'static str = "Enable the debug feature to see the name";
++
++/// Wrapper to help debugging ECS issues. This is used to display the names of systems, components, ...
++///
++/// * If the `debug` feature is enabled, the actual name will be used
++/// * If it is disabled, a string mentioning the disabled feature will be used
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DebugName {
++    #[cfg(feature = "debug")]
++    name: Cow<'static, str>,
++}
++
++impl fmt::Display for DebugName {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        #[cfg(feature = "debug")]
++        f.write_str(self.name.as_ref())?;
++        #[cfg(not(feature = "debug"))]
++        f.write_str(FEATURE_DISABLED)?;
++
++        Ok(())
++    }
++}
++
++impl DebugName {
++    /// Create a new `DebugName` from a `&str`
++    ///
++    /// The value will be ignored if the `debug` feature is not enabled
++    #[cfg_attr(not(feature = "debug"), expect(unused_variables))]
++    pub fn borrowed(value: &'static str) -> Self {
++        DebugName {
++            #[cfg(feature = "debug")]
++            name: Cow::Borrowed(value),
++        }
++    }
++
++    /// Create a new `DebugName` from a `String`
++    ///
++    /// The value will be ignored if the `debug` feature is not enabled
++    #[cfg_attr(not(feature = "debug"), expect(unused_variables))]
++    pub fn owned(value: String) -> Self {
++        DebugName {
++            #[cfg(feature = "debug")]
++            name: Cow::Owned(value),
++        }
++    }
++
++    /// Create a new `DebugName` from a type by using its [`core::any::type_name`]
++    ///
++    /// The value will be ignored if the `debug` feature is not enabled
++    pub fn type_name<T>() -> Self {
++        DebugName {
++            #[cfg(feature = "debug")]
++            name: Cow::Borrowed(type_name::<T>()),
++        }
++    }
++
++    /// Get the [`ShortName`] corresping to this debug name
++    ///
++    /// The value will be a static string if the `debug` feature is not enabled
++    pub fn shortname(&self) -> ShortName {
++        #[cfg(feature = "debug")]
++        return ShortName(self.name.as_ref());
++        #[cfg(not(feature = "debug"))]
++        return ShortName(FEATURE_DISABLED);
++    }
++
++    /// Return the string hold by this `DebugName`
++    ///
++    /// This is intended for debugging purpose, and only available if the `debug` feature is enabled
++    #[cfg(feature = "debug")]
++    pub fn as_string(&self) -> String {
++        self.name.clone().into_owned()
++    }
++}
++
++impl From<Cow<'static, str>> for DebugName {
++    #[cfg_attr(not(feature = "debug"), expect(unused_variables))]
++    fn from(value: Cow<'static, str>) -> Self {
++        Self {
++            #[cfg(feature = "debug")]
++            name: value,
++        }
++    }
++}
++
++impl From<String> for DebugName {
++    fn from(value: String) -> Self {
++        Self::owned(value)
++    }
++}
++
++impl From<&'static str> for DebugName {
++    fn from(value: &'static str) -> Self {
++        Self::borrowed(value)
++    }
++}
+diff --git a/crates/bevy_utils/src/lib.rs b/crates/bevy_utils/src/lib.rs
+index e3bb07a5122b3..58979139bbebf 100644
+--- a/crates/bevy_utils/src/lib.rs
++++ b/crates/bevy_utils/src/lib.rs
+@@ -43,12 +43,14 @@ cfg::parallel! {
+ ///
+ /// This includes the most common types in this crate, re-exported for your convenience.
+ pub mod prelude {
++    pub use crate::debug_info::DebugName;
+     pub use crate::default;
+ }
+ 
+ #[cfg(feature = "wgpu_wrapper")]
+ mod wgpu_wrapper;
+ 
++mod debug_info;
+ mod default;
+ mod once;
+ 
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 52e9441688ad6..5998d8cb905d7 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -41,6 +41,7 @@ The default feature set enables most of the expected features of a game engine,
+ |bevy_window|Windowing layer|
+ |bevy_winit|winit window and input backend|
+ |custom_cursor|Enable winit custom cursor support|
++|debug|Enable collecting debug information about systems and components to help with diagnostics|
+ |default_font|Include a default font, containing only ASCII characters, at the cost of a 20kB binary size increase|
+ |hdr|HDR image format support|
+ |ktx2|KTX2 compressed texture support|
+diff --git a/examples/games/stepping.rs b/examples/games/stepping.rs
+index 653b7a12ff8f3..dce37d0842dc2 100644
+--- a/examples/games/stepping.rs
++++ b/examples/games/stepping.rs
+@@ -104,7 +104,10 @@ fn build_ui(
+     mut state: ResMut<State>,
+ ) {
+     let mut text_spans = Vec::new();
+-    let mut always_run = Vec::new();
++    let mut always_run: Vec<(
++        bevy_ecs::intern::Interned<dyn ScheduleLabel + 'static>,
++        NodeId,
++    )> = Vec::new();
+ 
+     let Ok(schedule_order) = stepping.schedules() else {
+         return;
+@@ -131,7 +134,8 @@ fn build_ui(
+ 
+         for (node_id, system) in systems {
+             // skip bevy default systems; we don't want to step those
+-            if system.name().starts_with("bevy") {
++            #[cfg(feature = "debug")]
++            if system.name().as_string().starts_with("bevy") {
+                 always_run.push((*label, node_id));
+                 continue;
+             }

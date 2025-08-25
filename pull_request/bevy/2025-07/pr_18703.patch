@@ -1,0 +1,1627 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 46b8238596313..c954993953c01 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -151,6 +151,7 @@ default = [
+   "bevy_text",
+   "bevy_ui",
+   "bevy_ui_picking_backend",
++  "bevy_ui_render",
+   "bevy_window",
+   "bevy_winit",
+   "custom_cursor",
+@@ -279,6 +280,9 @@ bevy_ui = [
+   "bevy_anti_aliasing",
+ ]
+ 
++# Provides rendering functionality for bevy_ui
++bevy_ui_render = ["bevy_internal/bevy_ui_render", "bevy_render", "bevy_ui"]
++
+ # Windowing layer
+ bevy_window = ["bevy_internal/bevy_window"]
+ 
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index c2ca527d7a657..afa16fdfcbeaf 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -196,6 +196,7 @@ bevy_anti_aliasing = ["dep:bevy_anti_aliasing", "bevy_image"]
+ bevy_gizmos = ["dep:bevy_gizmos", "bevy_image"]
+ bevy_gltf = ["dep:bevy_gltf", "bevy_image"]
+ bevy_ui = ["dep:bevy_ui", "bevy_image"]
++bevy_ui_render = ["dep:bevy_ui_render"]
+ bevy_image = ["dep:bevy_image"]
+ 
+ # Used to disable code that is unsupported when Bevy is dynamically linked
+@@ -273,7 +274,7 @@ bevy_sprite_picking_backend = [
+ bevy_ui_picking_backend = ["bevy_picking", "bevy_ui/bevy_ui_picking_backend"]
+ 
+ # Provides a UI debug overlay
+-bevy_ui_debug = ["bevy_ui?/bevy_ui_debug"]
++bevy_ui_debug = ["bevy_ui_render?/bevy_ui_debug"]
+ 
+ # Enable built in global state machines
+ bevy_state = ["dep:bevy_state"]
+@@ -443,6 +444,7 @@ bevy_state = { path = "../bevy_state", optional = true, version = "0.17.0-dev",
+ ] }
+ bevy_text = { path = "../bevy_text", optional = true, version = "0.17.0-dev" }
+ bevy_ui = { path = "../bevy_ui", optional = true, version = "0.17.0-dev" }
++bevy_ui_render = { path = "../bevy_ui_render", optional = true, version = "0.17.0-dev" }
+ bevy_window = { path = "../bevy_window", optional = true, version = "0.17.0-dev", default-features = false, features = [
+   "bevy_reflect",
+ ] }
+diff --git a/crates/bevy_internal/src/default_plugins.rs b/crates/bevy_internal/src/default_plugins.rs
+index 93ba3cb8899c2..cdb59921dcc74 100644
+--- a/crates/bevy_internal/src/default_plugins.rs
++++ b/crates/bevy_internal/src/default_plugins.rs
+@@ -46,6 +46,8 @@ plugin_group! {
+         bevy_text:::TextPlugin,
+         #[cfg(feature = "bevy_ui")]
+         bevy_ui:::UiPlugin,
++        #[cfg(feature = "bevy_ui_render")]
++        bevy_ui_render:::UiRenderPlugin,
+         #[cfg(feature = "bevy_pbr")]
+         bevy_pbr:::PbrPlugin,
+         // NOTE: Load this after renderer initialization so that it knows about the supported
+diff --git a/crates/bevy_internal/src/lib.rs b/crates/bevy_internal/src/lib.rs
+index 107c84b180241..5bc3d5b349901 100644
+--- a/crates/bevy_internal/src/lib.rs
++++ b/crates/bevy_internal/src/lib.rs
+@@ -77,6 +77,8 @@ pub use bevy_time as time;
+ pub use bevy_transform as transform;
+ #[cfg(feature = "bevy_ui")]
+ pub use bevy_ui as ui;
++#[cfg(feature = "bevy_ui_render")]
++pub use bevy_ui_render as ui_render;
+ pub use bevy_utils as utils;
+ #[cfg(feature = "bevy_window")]
+ pub use bevy_window as window;
+diff --git a/crates/bevy_internal/src/prelude.rs b/crates/bevy_internal/src/prelude.rs
+index 26d5c7e2af0f5..c8ba27ea82c1e 100644
+--- a/crates/bevy_internal/src/prelude.rs
++++ b/crates/bevy_internal/src/prelude.rs
+@@ -63,6 +63,10 @@ pub use crate::text::prelude::*;
+ #[cfg(feature = "bevy_ui")]
+ pub use crate::ui::prelude::*;
+ 
++#[doc(hidden)]
++#[cfg(feature = "bevy_ui_render")]
++pub use crate::ui_render::prelude::*;
++
+ #[doc(hidden)]
+ #[cfg(feature = "bevy_gizmos")]
+ pub use crate::gizmos::prelude::*;
+diff --git a/crates/bevy_ui/Cargo.toml b/crates/bevy_ui/Cargo.toml
+index 3ffe730fbda4b..d26226eb2ef0a 100644
+--- a/crates/bevy_ui/Cargo.toml
++++ b/crates/bevy_ui/Cargo.toml
+@@ -54,7 +54,6 @@ serialize = [
+   "bevy_render/serialize",
+ ]
+ bevy_ui_picking_backend = ["bevy_picking", "dep:uuid"]
+-bevy_ui_debug = []
+ 
+ # Experimental features
+ ghost_nodes = []
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index 03c7cc523922c..d3f9cbd279016 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -12,7 +12,6 @@
+ 
+ pub mod interaction_states;
+ pub mod measurement;
+-pub mod ui_material;
+ pub mod update;
+ pub mod widget;
+ 
+@@ -32,7 +31,6 @@ pub mod experimental;
+ mod focus;
+ mod geometry;
+ mod layout;
+-mod render;
+ mod stack;
+ mod ui_node;
+ 
+@@ -42,8 +40,6 @@ pub use gradients::*;
+ pub use interaction_states::{Checkable, Checked, InteractionDisabled, Pressed};
+ pub use layout::*;
+ pub use measurement::*;
+-pub use render::*;
+-pub use ui_material::*;
+ pub use ui_node::*;
+ pub use ui_transform::*;
+ 
+@@ -53,24 +49,20 @@ use widget::{ImageNode, ImageNodeSize, ViewportNode};
+ ///
+ /// This includes the most common types in this crate, re-exported for your convenience.
+ pub mod prelude {
+-    #[cfg(feature = "bevy_ui_picking_backend")]
+     #[doc(hidden)]
++    #[cfg(feature = "bevy_ui_picking_backend")]
+     pub use crate::picking_backend::{UiPickingCamera, UiPickingPlugin, UiPickingSettings};
+     #[doc(hidden)]
+-    #[cfg(feature = "bevy_ui_debug")]
+-    pub use crate::render::UiDebugOptions;
+-    #[doc(hidden)]
+     pub use crate::widget::{Text, TextShadow, TextUiReader, TextUiWriter};
+     #[doc(hidden)]
+     pub use {
+         crate::{
+             geometry::*,
+             gradients::*,
+-            ui_material::*,
+             ui_node::*,
+             ui_transform::*,
+             widget::{Button, ImageNode, Label, NodeImageMode, ViewportNode},
+-            Interaction, MaterialNode, UiMaterialPlugin, UiScale,
++            Interaction, UiScale,
+         },
+         // `bevy_sprite` re-exports for texture slicing
+         bevy_sprite::{BorderRect, SliceScaleMode, SpriteImageMode, TextureSlicer},
+@@ -81,7 +73,7 @@ pub mod prelude {
+ use bevy_app::{prelude::*, AnimationSystems};
+ use bevy_ecs::prelude::*;
+ use bevy_input::InputSystems;
+-use bevy_render::{camera::CameraUpdateSystems, RenderApp};
++use bevy_render::camera::CameraUpdateSystems;
+ use bevy_transform::TransformSystems;
+ use layout::ui_surface::UiSurface;
+ use stack::ui_stack_system;
+@@ -89,19 +81,8 @@ pub use stack::UiStack;
+ use update::{update_clipping_system, update_ui_context_system};
+ 
+ /// The basic plugin for Bevy UI
+-pub struct UiPlugin {
+-    /// If set to false, the UI's rendering systems won't be added to the `RenderApp` and no UI elements will be drawn.
+-    /// The layout and interaction components will still be updated as normal.
+-    pub enable_rendering: bool,
+-}
+-
+-impl Default for UiPlugin {
+-    fn default() -> Self {
+-        Self {
+-            enable_rendering: true,
+-        }
+-    }
+-}
++#[derive(Default)]
++pub struct UiPlugin;
+ 
+ /// The label enum labeling the types of systems in the Bevy UI
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+@@ -182,8 +163,6 @@ impl Plugin for UiPlugin {
+             .register_type::<ZIndex>()
+             .register_type::<GlobalZIndex>()
+             .register_type::<Outline>()
+-            .register_type::<BoxShadowSamples>()
+-            .register_type::<UiAntiAlias>()
+             .register_type::<ColorStop>()
+             .register_type::<AngularColorStop>()
+             .register_type::<UiPosition>()
+@@ -256,27 +235,6 @@ impl Plugin for UiPlugin {
+         );
+ 
+         build_text_interop(app);
+-
+-        if !self.enable_rendering {
+-            return;
+-        }
+-
+-        #[cfg(feature = "bevy_ui_debug")]
+-        app.init_resource::<UiDebugOptions>();
+-
+-        build_ui_render(app);
+-    }
+-
+-    fn finish(&self, app: &mut App) {
+-        if !self.enable_rendering {
+-            return;
+-        }
+-
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app.init_resource::<UiPipeline>();
+     }
+ }
+ 
+diff --git a/crates/bevy_ui/src/ui_material.rs b/crates/bevy_ui/src/ui_material.rs
+index 89a8df948cb3e..b4a7e9a6b6416 100644
+--- a/crates/bevy_ui/src/ui_material.rs
++++ b/crates/bevy_ui/src/ui_material.rs
+@@ -146,7 +146,7 @@ where
+     }
+ }
+ 
+-impl<M: UiMaterial> Hash for UiMaterialKey<M>
++impl<M: UiMaterial> core::hash::Hash for UiMaterialKey<M>
+ where
+     M::Data: Hash,
+ {
+diff --git a/crates/bevy_ui/src/ui_node.rs b/crates/bevy_ui/src/ui_node.rs
+index f6b8ee27b3142..7aed57931cb60 100644
+--- a/crates/bevy_ui/src/ui_node.rs
++++ b/crates/bevy_ui/src/ui_node.rs
+@@ -2591,6 +2591,17 @@ impl ResolvedBorderRadius {
+     };
+ }
+ 
++impl From<ResolvedBorderRadius> for [f32; 4] {
++    fn from(radius: ResolvedBorderRadius) -> Self {
++        [
++            radius.top_left,
++            radius.top_right,
++            radius.bottom_right,
++            radius.bottom_left,
++        ]
++    }
++}
++
+ #[derive(Component, Clone, Debug, Default, PartialEq, Reflect, Deref, DerefMut)]
+ #[reflect(Component, PartialEq, Default, Clone)]
+ #[cfg_attr(
+@@ -2771,61 +2782,6 @@ impl<'w, 's> DefaultUiCamera<'w, 's> {
+     }
+ }
+ 
+-/// Marker for controlling whether Ui is rendered with or without anti-aliasing
+-/// in a camera. By default, Ui is always anti-aliased.
+-///
+-/// **Note:** This does not affect text anti-aliasing. For that, use the `font_smoothing` property of the [`TextFont`](bevy_text::TextFont) component.
+-///
+-/// ```
+-/// use bevy_core_pipeline::prelude::*;
+-/// use bevy_ecs::prelude::*;
+-/// use bevy_ui::prelude::*;
+-///
+-/// fn spawn_camera(mut commands: Commands) {
+-///     commands.spawn((
+-///         Camera2d,
+-///         // This will cause all Ui in this camera to be rendered without
+-///         // anti-aliasing
+-///         UiAntiAlias::Off,
+-///     ));
+-/// }
+-/// ```
+-#[derive(Component, Clone, Copy, Default, Debug, Reflect, Eq, PartialEq)]
+-#[reflect(Component, Default, PartialEq, Clone)]
+-pub enum UiAntiAlias {
+-    /// UI will render with anti-aliasing
+-    #[default]
+-    On,
+-    /// UI will render without anti-aliasing
+-    Off,
+-}
+-
+-/// Number of shadow samples.
+-/// A larger value will result in higher quality shadows.
+-/// Default is 4, values higher than ~10 offer diminishing returns.
+-///
+-/// ```
+-/// use bevy_core_pipeline::prelude::*;
+-/// use bevy_ecs::prelude::*;
+-/// use bevy_ui::prelude::*;
+-///
+-/// fn spawn_camera(mut commands: Commands) {
+-///     commands.spawn((
+-///         Camera2d,
+-///         BoxShadowSamples(6),
+-///     ));
+-/// }
+-/// ```
+-#[derive(Component, Clone, Copy, Debug, Reflect, Eq, PartialEq)]
+-#[reflect(Component, Default, PartialEq, Clone)]
+-pub struct BoxShadowSamples(pub u32);
+-
+-impl Default for BoxShadowSamples {
+-    fn default() -> Self {
+-        Self(4)
+-    }
+-}
+-
+ /// Derived information about the camera target for this UI node.
+ #[derive(Component, Clone, Copy, Debug, Reflect, PartialEq)]
+ #[reflect(Component, Default, PartialEq, Clone)]
+diff --git a/crates/bevy_ui_render/Cargo.toml b/crates/bevy_ui_render/Cargo.toml
+new file mode 100644
+index 0000000000000..4f01fdf57097c
+--- /dev/null
++++ b/crates/bevy_ui_render/Cargo.toml
+@@ -0,0 +1,60 @@
++[package]
++name = "bevy_ui_render"
++version = "0.17.0-dev"
++edition = "2024"
++description = "Provides rendering functionality for Bevy UI"
++homepage = "https://bevyengine.org"
++repository = "https://github.com/bevyengine/bevy"
++license = "MIT OR Apache-2.0"
++keywords = ["bevy"]
++
++[dependencies]
++# bevy
++bevy_app = { path = "../bevy_app", version = "0.17.0-dev" }
++bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
++bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
++bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.17.0-dev" }
++bevy_derive = { path = "../bevy_derive", version = "0.17.0-dev" }
++bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
++bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
++bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
++bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
++bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
++bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev" }
++bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev", optional = true }
++bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
++bevy_window = { path = "../bevy_window", version = "0.17.0-dev" }
++bevy_utils = { path = "../bevy_utils", version = "0.17.0-dev" }
++bevy_platform = { path = "../bevy_platform", version = "0.17.0-dev", default-features = false, features = [
++  "std",
++] }
++bevy_ui = { path = "../bevy_ui", version = "0.17.0-dev" }
++bevy_text = { path = "../bevy_text", version = "0.17.0-dev", default-features = false }
++
++# other
++serde = { version = "1", features = ["derive"], optional = true }
++bytemuck = { version = "1.5", features = ["derive"] }
++thiserror = { version = "2", default-features = false }
++derive_more = { version = "1", default-features = false, features = ["from"] }
++nonmax = "0.5"
++smallvec = "1.11"
++accesskit = "0.18"
++tracing = { version = "0.1", default-features = false, features = ["std"] }
++
++[features]
++default = []
++serialize = [
++  "serde",
++  "smallvec/serde",
++  "bevy_math/serialize",
++  "bevy_platform/serialize",
++]
++bevy_ui_picking_backend = ["bevy_picking"]
++bevy_ui_debug = []
++
++[lints]
++workspace = true
++
++[package.metadata.docs.rs]
++rustdoc-args = ["-Zunstable-options", "--generate-link-to-definition"]
++all-features = true
+diff --git a/crates/bevy_ui_render/LICENSE-APACHE b/crates/bevy_ui_render/LICENSE-APACHE
+new file mode 100644
+index 0000000000000..d9a10c0d8e868
+--- /dev/null
++++ b/crates/bevy_ui_render/LICENSE-APACHE
+@@ -0,0 +1,176 @@
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
+diff --git a/crates/bevy_ui_render/LICENSE-MIT b/crates/bevy_ui_render/LICENSE-MIT
+new file mode 100644
+index 0000000000000..9cf106272ac3b
+--- /dev/null
++++ b/crates/bevy_ui_render/LICENSE-MIT
+@@ -0,0 +1,19 @@
++MIT License
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/crates/bevy_ui_render/README.md b/crates/bevy_ui_render/README.md
+new file mode 100644
+index 0000000000000..b1e0a47e919d2
+--- /dev/null
++++ b/crates/bevy_ui_render/README.md
+@@ -0,0 +1,7 @@
++# Bevy Render UI
++
++[![License](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/bevyengine/bevy#license)
++[![Crates.io](https://img.shields.io/crates/v/bevy_ui_render.svg)](https://crates.io/crates/bevy_ui_render)
++[![Downloads](https://img.shields.io/crates/d/bevy_ui_render.svg)](https://crates.io/crates/bevy_ui_render)
++[![Docs](https://docs.rs/bevy_ui_render/badge.svg)](https://docs.rs/bevy_ui_render/latest/bevy_ui_render/)
++[![Discord](https://img.shields.io/discord/691052431525675048.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/bevy)
+diff --git a/crates/bevy_ui/src/render/box_shadow.rs b/crates/bevy_ui_render/src/box_shadow.rs
+similarity index 96%
+rename from crates/bevy_ui/src/render/box_shadow.rs
+rename to crates/bevy_ui_render/src/box_shadow.rs
+index d3167adb5690a..87c223ec8e5b0 100644
+--- a/crates/bevy_ui/src/render/box_shadow.rs
++++ b/crates/bevy_ui_render/src/box_shadow.rs
+@@ -2,12 +2,6 @@
+ 
+ use core::{hash::Hash, ops::Range};
+ 
+-use super::{stack_z_offsets, UiCameraMap, UiCameraView, QUAD_INDICES, QUAD_VERTEX_POSITIONS};
+-use crate::prelude::UiGlobalTransform;
+-use crate::{
+-    BoxShadow, BoxShadowSamples, CalculatedClip, ComputedNode, ComputedNodeTarget, RenderUiSystems,
+-    ResolvedBorderRadius, TransparentUi, Val,
+-};
+ use bevy_app::prelude::*;
+ use bevy_asset::*;
+ use bevy_color::{Alpha, ColorToComponents, LinearRgba};
+@@ -21,19 +15,26 @@ use bevy_ecs::{
+ };
+ use bevy_image::BevyDefault as _;
+ use bevy_math::{vec2, Affine2, FloatOrd, Rect, Vec2};
+-use bevy_render::sync_world::MainEntity;
++use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
+ use bevy_render::RenderApp;
+ use bevy_render::{
+     render_phase::*,
+     render_resource::{binding_types::uniform_buffer, *},
+     renderer::{RenderDevice, RenderQueue},
+-    sync_world::TemporaryRenderEntity,
+     view::*,
+     Extract, ExtractSchedule, Render, RenderSystems,
+ };
++use bevy_ui::{
++    BoxShadow, CalculatedClip, ComputedNode, ComputedNodeTarget, ResolvedBorderRadius,
++    UiGlobalTransform, Val,
++};
+ use bevy_utils::default;
+ use bytemuck::{Pod, Zeroable};
+ 
++use crate::{BoxShadowSamples, RenderUiSystems, TransparentUi, UiCameraMap};
++
++use super::{stack_z_offsets, UiCameraView, QUAD_INDICES, QUAD_VERTEX_POSITIONS};
++
+ /// A plugin that enables the rendering of box shadows.
+ pub struct BoxShadowPlugin;
+ 
+@@ -241,8 +242,7 @@ pub fn extract_shadows(
+             continue;
+         };
+ 
+-        let ui_physical_viewport_size = camera.physical_size.as_vec2();
+-
++        let ui_physical_viewport_size = camera.physical_size().as_vec2();
+         let scale_factor = uinode.inverse_scale_factor.recip();
+ 
+         for drop_shadow in box_shadow.iter() {
+@@ -448,13 +448,6 @@ pub fn prepare_shadows(
+                         }
+                     }
+ 
+-                    let radius = [
+-                        box_shadow.radius.top_left,
+-                        box_shadow.radius.top_right,
+-                        box_shadow.radius.bottom_right,
+-                        box_shadow.radius.bottom_left,
+-                    ];
+-
+                     let uvs = [
+                         Vec2::new(positions_diff[0].x, positions_diff[0].y),
+                         Vec2::new(
+@@ -478,7 +471,7 @@ pub fn prepare_shadows(
+                             uvs: uvs[i].into(),
+                             vertex_color: box_shadow.color.to_f32_array(),
+                             size: box_shadow.size.into(),
+-                            radius,
++                            radius: box_shadow.radius.into(),
+                             blur: box_shadow.blur_radius,
+                             bounds: rect_size.into(),
+                         });
+diff --git a/crates/bevy_ui/src/render/box_shadow.wgsl b/crates/bevy_ui_render/src/box_shadow.wgsl
+similarity index 100%
+rename from crates/bevy_ui/src/render/box_shadow.wgsl
+rename to crates/bevy_ui_render/src/box_shadow.wgsl
+diff --git a/crates/bevy_ui/src/render/debug_overlay.rs b/crates/bevy_ui_render/src/debug_overlay.rs
+similarity index 95%
+rename from crates/bevy_ui/src/render/debug_overlay.rs
+rename to crates/bevy_ui_render/src/debug_overlay.rs
+index 4bf9e2dd93523..fb06bb48a9b3f 100644
+--- a/crates/bevy_ui/src/render/debug_overlay.rs
++++ b/crates/bevy_ui_render/src/debug_overlay.rs
+@@ -4,11 +4,6 @@ use super::ExtractedUiNodes;
+ use super::NodeType;
+ use super::UiCameraMap;
+ use crate::shader_flags;
+-use crate::ui_node::ComputedNodeTarget;
+-use crate::ui_transform::UiGlobalTransform;
+-use crate::CalculatedClip;
+-use crate::ComputedNode;
+-use crate::UiStack;
+ use bevy_asset::AssetId;
+ use bevy_color::Hsla;
+ use bevy_ecs::entity::Entity;
+@@ -23,6 +18,11 @@ use bevy_render::sync_world::TemporaryRenderEntity;
+ use bevy_render::view::InheritedVisibility;
+ use bevy_render::Extract;
+ use bevy_sprite::BorderRect;
++use bevy_ui::ui_transform::UiGlobalTransform;
++use bevy_ui::CalculatedClip;
++use bevy_ui::ComputedNode;
++use bevy_ui::ComputedNodeTarget;
++use bevy_ui::UiStack;
+ 
+ /// Configuration for the UI debug overlay
+ #[derive(Resource)]
+diff --git a/crates/bevy_ui/src/render/gradient.rs b/crates/bevy_ui_render/src/gradient.rs
+similarity index 98%
+rename from crates/bevy_ui/src/render/gradient.rs
+rename to crates/bevy_ui_render/src/gradient.rs
+index 9bf7e1ede3028..11de56eddaedf 100644
+--- a/crates/bevy_ui/src/render/gradient.rs
++++ b/crates/bevy_ui_render/src/gradient.rs
+@@ -31,6 +31,10 @@ use bevy_render::{
+     Extract, ExtractSchedule, Render, RenderSystems,
+ };
+ use bevy_sprite::BorderRect;
++use bevy_ui::{
++    BackgroundGradient, BorderGradient, ColorStop, ConicGradient, Gradient,
++    InterpolationColorSpace, LinearGradient, RadialGradient, ResolvedBorderRadius, Val,
++};
+ use bevy_utils::default;
+ use bytemuck::{Pod, Zeroable};
+ 
+@@ -431,9 +435,9 @@ pub fn extract_gradients(
+ 
+                         compute_color_stops(
+                             stops,
+-                            target.scale_factor,
++                            target.scale_factor(),
+                             length,
+-                            target.physical_size.as_vec2(),
++                            target.physical_size().as_vec2(),
+                             &mut sorted_stops,
+                             &mut extracted_color_stops.0,
+                         );
+@@ -464,16 +468,16 @@ pub fn extract_gradients(
+                         stops,
+                     }) => {
+                         let c = center.resolve(
+-                            target.scale_factor,
++                            target.scale_factor(),
+                             uinode.size,
+-                            target.physical_size.as_vec2(),
++                            target.physical_size().as_vec2(),
+                         );
+ 
+                         let size = shape.resolve(
+                             c,
+-                            target.scale_factor,
++                            target.scale_factor(),
+                             uinode.size,
+-                            target.physical_size.as_vec2(),
++                            target.physical_size().as_vec2(),
+                         );
+ 
+                         let length = size.x;
+@@ -481,9 +485,9 @@ pub fn extract_gradients(
+                         let range_start = extracted_color_stops.0.len();
+                         compute_color_stops(
+                             stops,
+-                            target.scale_factor,
++                            target.scale_factor(),
+                             length,
+-                            target.physical_size.as_vec2(),
++                            target.physical_size().as_vec2(),
+                             &mut sorted_stops,
+                             &mut extracted_color_stops.0,
+                         );
+diff --git a/crates/bevy_ui/src/render/gradient.wgsl b/crates/bevy_ui_render/src/gradient.wgsl
+similarity index 100%
+rename from crates/bevy_ui/src/render/gradient.wgsl
+rename to crates/bevy_ui_render/src/gradient.wgsl
+diff --git a/crates/bevy_ui/src/render/mod.rs b/crates/bevy_ui_render/src/lib.rs
+similarity index 88%
+rename from crates/bevy_ui/src/render/mod.rs
+rename to crates/bevy_ui_render/src/lib.rs
+index 58de0c766a207..a06426c255ab4 100644
+--- a/crates/bevy_ui/src/render/mod.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -1,20 +1,31 @@
++#![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
++#![cfg_attr(docsrs, feature(doc_auto_cfg))]
++#![doc(
++    html_logo_url = "https://bevyengine.org/assets/icon.png",
++    html_favicon_url = "https://bevyengine.org/assets/icon.png"
++)]
++
++//! Provides rendering functionality for `bevy_ui`.
++
+ pub mod box_shadow;
++mod gradient;
+ mod pipeline;
+ mod render_pass;
++pub mod ui_material;
+ mod ui_material_pipeline;
+ pub mod ui_texture_slice_pipeline;
+ 
+ #[cfg(feature = "bevy_ui_debug")]
+ mod debug_overlay;
+-mod gradient;
+ 
+-use crate::prelude::UiGlobalTransform;
+-use crate::widget::{ImageNode, TextShadow, ViewportNode};
+-
+-use crate::{
+-    BackgroundColor, BorderColor, BoxShadowSamples, CalculatedClip, ComputedNode,
+-    ComputedNodeTarget, Outline, ResolvedBorderRadius, UiAntiAlias,
++use bevy_reflect::prelude::ReflectDefault;
++use bevy_reflect::Reflect;
++use bevy_ui::widget::{ImageNode, TextShadow, ViewportNode};
++use bevy_ui::{
++    BackgroundColor, BorderColor, CalculatedClip, ComputedNode, ComputedNodeTarget, Display, Node,
++    Outline, ResolvedBorderRadius, UiGlobalTransform,
+ };
++
+ use bevy_app::prelude::*;
+ use bevy_asset::{AssetEvent, AssetId, Assets};
+ use bevy_color::{Alpha, ColorToComponents, LinearRgba};
+@@ -31,7 +42,7 @@ use bevy_render::render_phase::ViewSortedRenderPhases;
+ use bevy_render::renderer::RenderContext;
+ use bevy_render::sync_world::MainEntity;
+ use bevy_render::texture::TRANSPARENT_IMAGE_HANDLE;
+-use bevy_render::view::{Hdr, RetainedViewEntity};
++use bevy_render::view::{Hdr, InheritedVisibility, RetainedViewEntity};
+ use bevy_render::{
+     camera::Camera,
+     render_asset::RenderAssets,
+@@ -46,7 +57,6 @@ use bevy_render::{
+     render_phase::{PhaseItem, PhaseItemExtraIndex},
+     sync_world::{RenderEntity, TemporaryRenderEntity},
+     texture::GpuImage,
+-    view::InheritedVisibility,
+     ExtractSchedule, Render,
+ };
+ use bevy_sprite::{BorderRect, SpriteAssetEvents};
+@@ -54,7 +64,6 @@ use bevy_sprite::{BorderRect, SpriteAssetEvents};
+ pub use debug_overlay::UiDebugOptions;
+ use gradient::GradientPlugin;
+ 
+-use crate::{Display, Node};
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_text::{
+     ComputedTextBlock, PositionedGlyph, TextBackgroundColor, TextColor, TextLayoutInfo,
+@@ -63,6 +72,7 @@ use bevy_transform::components::GlobalTransform;
+ use box_shadow::BoxShadowPlugin;
+ use bytemuck::{Pod, Zeroable};
+ use core::ops::Range;
++
+ use graph::{NodeUi, SubGraphUi};
+ pub use pipeline::*;
+ pub use render_pass::*;
+@@ -81,6 +91,15 @@ pub mod graph {
+     }
+ }
+ 
++pub mod prelude {
++    #[cfg(feature = "bevy_ui_debug")]
++    pub use crate::debug_overlay::UiDebugOptions;
++
++    pub use crate::{
++        ui_material::*, ui_material_pipeline::UiMaterialPlugin, BoxShadowSamples, UiAntiAlias,
++    };
++}
++
+ /// Local Z offsets of "extracted nodes" for a given entity. These exist to allow rendering multiple "extracted nodes"
+ /// for a given source entity (ex: render both a background color _and_ a custom material for a given node).
+ ///
+@@ -122,90 +141,165 @@ pub enum RenderUiSystems {
+     ExtractGradient,
+ }
+ 
++/// Marker for controlling whether UI is rendered with or without anti-aliasing
++/// in a camera. By default, UI is always anti-aliased.
++///
++/// **Note:** This does not affect text anti-aliasing. For that, use the `font_smoothing` property of the [`TextFont`](bevy_text::TextFont) component.
++///
++/// ```
++/// use bevy_core_pipeline::prelude::*;
++/// use bevy_ecs::prelude::*;
++/// use bevy_ui::prelude::*;
++/// use bevy_ui_render::prelude::*;
++///
++/// fn spawn_camera(mut commands: Commands) {
++///     commands.spawn((
++///         Camera2d,
++///         // This will cause all UI in this camera to be rendered without
++///         // anti-aliasing
++///         UiAntiAlias::Off,
++///     ));
++/// }
++/// ```
++#[derive(Component, Clone, Copy, Default, Debug, Reflect, Eq, PartialEq)]
++#[reflect(Component, Default, PartialEq, Clone)]
++pub enum UiAntiAlias {
++    /// UI will render with anti-aliasing
++    #[default]
++    On,
++    /// UI will render without anti-aliasing
++    Off,
++}
++
++/// Number of shadow samples.
++/// A larger value will result in higher quality shadows.
++/// Default is 4, values higher than ~10 offer diminishing returns.
++///
++/// ```
++/// use bevy_core_pipeline::prelude::*;
++/// use bevy_ecs::prelude::*;
++/// use bevy_ui::prelude::*;
++/// use bevy_ui_render::prelude::*;
++///
++/// fn spawn_camera(mut commands: Commands) {
++///     commands.spawn((
++///         Camera2d,
++///         BoxShadowSamples(6),
++///     ));
++/// }
++/// ```
++#[derive(Component, Clone, Copy, Debug, Reflect, Eq, PartialEq)]
++#[reflect(Component, Default, PartialEq, Clone)]
++pub struct BoxShadowSamples(pub u32);
++
++impl Default for BoxShadowSamples {
++    fn default() -> Self {
++        Self(4)
++    }
++}
++
+ /// Deprecated alias for [`RenderUiSystems`].
+ #[deprecated(since = "0.17.0", note = "Renamed to `RenderUiSystems`.")]
+ pub type RenderUiSystem = RenderUiSystems;
+ 
+-pub fn build_ui_render(app: &mut App) {
+-    load_shader_library!(app, "ui.wgsl");
++#[derive(Default)]
++pub struct UiRenderPlugin;
+ 
+-    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-        return;
+-    };
++impl Plugin for UiRenderPlugin {
++    fn build(&self, app: &mut App) {
++        load_shader_library!(app, "ui.wgsl");
++        app.register_type::<BoxShadowSamples>()
++            .register_type::<UiAntiAlias>();
+ 
+-    render_app
+-        .init_resource::<SpecializedRenderPipelines<UiPipeline>>()
+-        .init_resource::<ImageNodeBindGroups>()
+-        .init_resource::<UiMeta>()
+-        .init_resource::<ExtractedUiNodes>()
+-        .allow_ambiguous_resource::<ExtractedUiNodes>()
+-        .init_resource::<DrawFunctions<TransparentUi>>()
+-        .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
+-        .add_render_command::<TransparentUi, DrawUi>()
+-        .configure_sets(
+-            ExtractSchedule,
+-            (
+-                RenderUiSystems::ExtractCameraViews,
+-                RenderUiSystems::ExtractBoxShadows,
+-                RenderUiSystems::ExtractBackgrounds,
+-                RenderUiSystems::ExtractImages,
+-                RenderUiSystems::ExtractTextureSlice,
+-                RenderUiSystems::ExtractBorders,
+-                RenderUiSystems::ExtractTextBackgrounds,
+-                RenderUiSystems::ExtractTextShadows,
+-                RenderUiSystems::ExtractText,
+-                RenderUiSystems::ExtractDebug,
++        #[cfg(feature = "bevy_ui_debug")]
++        app.init_resource::<UiDebugOptions>();
++
++        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
++            return;
++        };
++
++        render_app
++            .init_resource::<SpecializedRenderPipelines<UiPipeline>>()
++            .init_resource::<ImageNodeBindGroups>()
++            .init_resource::<UiMeta>()
++            .init_resource::<ExtractedUiNodes>()
++            .allow_ambiguous_resource::<ExtractedUiNodes>()
++            .init_resource::<DrawFunctions<TransparentUi>>()
++            .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
++            .add_render_command::<TransparentUi, DrawUi>()
++            .configure_sets(
++                ExtractSchedule,
++                (
++                    RenderUiSystems::ExtractCameraViews,
++                    RenderUiSystems::ExtractBoxShadows,
++                    RenderUiSystems::ExtractBackgrounds,
++                    RenderUiSystems::ExtractImages,
++                    RenderUiSystems::ExtractTextureSlice,
++                    RenderUiSystems::ExtractBorders,
++                    RenderUiSystems::ExtractTextBackgrounds,
++                    RenderUiSystems::ExtractTextShadows,
++                    RenderUiSystems::ExtractText,
++                    RenderUiSystems::ExtractDebug,
++                )
++                    .chain(),
+             )
+-                .chain(),
+-        )
+-        .add_systems(
+-            ExtractSchedule,
+-            (
+-                extract_ui_camera_view.in_set(RenderUiSystems::ExtractCameraViews),
+-                extract_uinode_background_colors.in_set(RenderUiSystems::ExtractBackgrounds),
+-                extract_uinode_images.in_set(RenderUiSystems::ExtractImages),
+-                extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
+-                extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
+-                extract_text_background_colors.in_set(RenderUiSystems::ExtractTextBackgrounds),
+-                extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
+-                extract_text_sections.in_set(RenderUiSystems::ExtractText),
+-                #[cfg(feature = "bevy_ui_debug")]
+-                debug_overlay::extract_debug_overlay.in_set(RenderUiSystems::ExtractDebug),
+-            ),
+-        )
+-        .add_systems(
+-            Render,
+-            (
+-                queue_uinodes.in_set(RenderSystems::Queue),
+-                sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
+-                prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
+-            ),
+-        );
++            .add_systems(
++                ExtractSchedule,
++                (
++                    extract_ui_camera_view.in_set(RenderUiSystems::ExtractCameraViews),
++                    extract_uinode_background_colors.in_set(RenderUiSystems::ExtractBackgrounds),
++                    extract_uinode_images.in_set(RenderUiSystems::ExtractImages),
++                    extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
++                    extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
++                    extract_text_background_colors.in_set(RenderUiSystems::ExtractTextBackgrounds),
++                    extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
++                    extract_text_sections.in_set(RenderUiSystems::ExtractText),
++                    #[cfg(feature = "bevy_ui_debug")]
++                    debug_overlay::extract_debug_overlay.in_set(RenderUiSystems::ExtractDebug),
++                ),
++            )
++            .add_systems(
++                Render,
++                (
++                    queue_uinodes.in_set(RenderSystems::Queue),
++                    sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
++                    prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
++                ),
++            );
+ 
+-    // Render graph
+-    let ui_graph_2d = get_ui_graph(render_app);
+-    let ui_graph_3d = get_ui_graph(render_app);
+-    let mut graph = render_app.world_mut().resource_mut::<RenderGraph>();
+-
+-    if let Some(graph_2d) = graph.get_sub_graph_mut(Core2d) {
+-        graph_2d.add_sub_graph(SubGraphUi, ui_graph_2d);
+-        graph_2d.add_node(NodeUi::UiPass, RunUiSubgraphOnUiViewNode);
+-        graph_2d.add_node_edge(Node2d::EndMainPass, NodeUi::UiPass);
+-        graph_2d.add_node_edge(Node2d::EndMainPassPostProcessing, NodeUi::UiPass);
+-        graph_2d.add_node_edge(NodeUi::UiPass, Node2d::Upscaling);
+-    }
++        // Render graph
++        let ui_graph_2d = get_ui_graph(render_app);
++        let ui_graph_3d = get_ui_graph(render_app);
++        let mut graph = render_app.world_mut().resource_mut::<RenderGraph>();
++
++        if let Some(graph_2d) = graph.get_sub_graph_mut(Core2d) {
++            graph_2d.add_sub_graph(SubGraphUi, ui_graph_2d);
++            graph_2d.add_node(NodeUi::UiPass, RunUiSubgraphOnUiViewNode);
++            graph_2d.add_node_edge(Node2d::EndMainPass, NodeUi::UiPass);
++            graph_2d.add_node_edge(Node2d::EndMainPassPostProcessing, NodeUi::UiPass);
++            graph_2d.add_node_edge(NodeUi::UiPass, Node2d::Upscaling);
++        }
++
++        if let Some(graph_3d) = graph.get_sub_graph_mut(Core3d) {
++            graph_3d.add_sub_graph(SubGraphUi, ui_graph_3d);
++            graph_3d.add_node(NodeUi::UiPass, RunUiSubgraphOnUiViewNode);
++            graph_3d.add_node_edge(Node3d::EndMainPass, NodeUi::UiPass);
++            graph_3d.add_node_edge(Node3d::EndMainPassPostProcessing, NodeUi::UiPass);
++            graph_3d.add_node_edge(NodeUi::UiPass, Node3d::Upscaling);
++        }
+ 
+-    if let Some(graph_3d) = graph.get_sub_graph_mut(Core3d) {
+-        graph_3d.add_sub_graph(SubGraphUi, ui_graph_3d);
+-        graph_3d.add_node(NodeUi::UiPass, RunUiSubgraphOnUiViewNode);
+-        graph_3d.add_node_edge(Node3d::EndMainPass, NodeUi::UiPass);
+-        graph_3d.add_node_edge(Node3d::EndMainPassPostProcessing, NodeUi::UiPass);
+-        graph_3d.add_node_edge(NodeUi::UiPass, Node3d::Upscaling);
++        app.add_plugins(UiTextureSlicerPlugin);
++        app.add_plugins(GradientPlugin);
++        app.add_plugins(BoxShadowPlugin);
+     }
+ 
+-    app.add_plugins(UiTextureSlicerPlugin);
+-    app.add_plugins(GradientPlugin);
+-    app.add_plugins(BoxShadowPlugin);
++    fn finish(&self, app: &mut App) {
++        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
++            return;
++        };
++
++        render_app.init_resource::<UiPipeline>();
++    }
+ }
+ 
+ fn get_ui_graph(render_app: &mut SubApp) -> RenderGraph {
+@@ -215,6 +309,46 @@ fn get_ui_graph(render_app: &mut SubApp) -> RenderGraph {
+     ui_graph
+ }
+ 
++#[derive(SystemParam)]
++pub struct UiCameraMap<'w, 's> {
++    mapping: Query<'w, 's, RenderEntity>,
++}
++
++impl<'w, 's> UiCameraMap<'w, 's> {
++    /// Get the default camera and create the mapper
++    pub fn get_mapper(&'w self) -> UiCameraMapper<'w, 's> {
++        UiCameraMapper {
++            mapping: &self.mapping,
++            camera_entity: Entity::PLACEHOLDER,
++            render_entity: Entity::PLACEHOLDER,
++        }
++    }
++}
++
++pub struct UiCameraMapper<'w, 's> {
++    mapping: &'w Query<'w, 's, RenderEntity>,
++    camera_entity: Entity,
++    render_entity: Entity,
++}
++
++impl<'w, 's> UiCameraMapper<'w, 's> {
++    /// Returns the render entity corresponding to the given `UiTargetCamera` or the default camera if `None`.
++    pub fn map(&mut self, computed_target: &ComputedNodeTarget) -> Option<Entity> {
++        let camera_entity = computed_target.camera()?;
++        if self.camera_entity != camera_entity {
++            let new_render_camera_entity = self.mapping.get(camera_entity).ok()?;
++            self.render_entity = new_render_camera_entity;
++            self.camera_entity = camera_entity;
++        }
++
++        Some(self.render_entity)
++    }
++
++    pub fn current_camera(&self) -> Entity {
++        self.camera_entity
++    }
++}
++
+ pub struct ExtractedUiNode {
+     pub z_order: f32,
+     pub color: LinearRgba,
+@@ -275,48 +409,6 @@ impl ExtractedUiNodes {
+     }
+ }
+ 
+-#[derive(SystemParam)]
+-pub struct UiCameraMap<'w, 's> {
+-    mapping: Query<'w, 's, RenderEntity>,
+-}
+-
+-impl<'w, 's> UiCameraMap<'w, 's> {
+-    /// Get the default camera and create the mapper
+-    pub fn get_mapper(&'w self) -> UiCameraMapper<'w, 's> {
+-        UiCameraMapper {
+-            mapping: &self.mapping,
+-            camera_entity: Entity::PLACEHOLDER,
+-            render_entity: Entity::PLACEHOLDER,
+-        }
+-    }
+-}
+-
+-pub struct UiCameraMapper<'w, 's> {
+-    mapping: &'w Query<'w, 's, RenderEntity>,
+-    camera_entity: Entity,
+-    render_entity: Entity,
+-}
+-
+-impl<'w, 's> UiCameraMapper<'w, 's> {
+-    /// Returns the render entity corresponding to the given `UiTargetCamera` or the default camera if `None`.
+-    pub fn map(&mut self, computed_target: &ComputedNodeTarget) -> Option<Entity> {
+-        let camera_entity = computed_target.camera;
+-        if self.camera_entity != camera_entity {
+-            let Ok(new_render_camera_entity) = self.mapping.get(camera_entity) else {
+-                return None;
+-            };
+-            self.render_entity = new_render_camera_entity;
+-            self.camera_entity = camera_entity;
+-        }
+-
+-        Some(self.render_entity)
+-    }
+-
+-    pub fn current_camera(&self) -> Entity {
+-        self.camera_entity
+-    }
+-}
+-
+ /// A [`RenderGraphNode`] that executes the UI rendering subgraph on the UI
+ /// view.
+ struct RunUiSubgraphOnUiViewNode;
+@@ -1106,7 +1198,9 @@ pub struct UiBatch {
+ 
+ /// The values here should match the values for the constants in `ui.wgsl`
+ pub mod shader_flags {
++    /// Texture should be ignored
+     pub const UNTEXTURED: u32 = 0;
++    /// Textured
+     pub const TEXTURED: u32 = 1;
+     /// Ordering: top left, top right, bottom right, bottom left.
+     pub const CORNERS: [u32; 4] = [0, 2, 2 | 4, 4];
+@@ -1437,12 +1531,7 @@ pub fn prepare_uinodes(
+                                     uv: uvs[i].into(),
+                                     color,
+                                     flags: flags | shader_flags::CORNERS[i],
+-                                    radius: [
+-                                        border_radius.top_left,
+-                                        border_radius.top_right,
+-                                        border_radius.bottom_right,
+-                                        border_radius.bottom_left,
+-                                    ],
++                                    radius: (*border_radius).into(),
+                                     border: [border.left, border.top, border.right, border.bottom],
+                                     size: rect_size.into(),
+                                     point: points[i].into(),
+diff --git a/crates/bevy_ui/src/render/pipeline.rs b/crates/bevy_ui_render/src/pipeline.rs
+similarity index 100%
+rename from crates/bevy_ui/src/render/pipeline.rs
+rename to crates/bevy_ui_render/src/pipeline.rs
+diff --git a/crates/bevy_ui/src/render/render_pass.rs b/crates/bevy_ui_render/src/render_pass.rs
+similarity index 99%
+rename from crates/bevy_ui/src/render/render_pass.rs
+rename to crates/bevy_ui_render/src/render_pass.rs
+index e0b3b20fab2b2..59cbd8e4da00d 100644
+--- a/crates/bevy_ui/src/render/render_pass.rs
++++ b/crates/bevy_ui_render/src/render_pass.rs
+@@ -1,6 +1,7 @@
+ use core::ops::Range;
+ 
+ use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
++
+ use crate::UiCameraView;
+ use bevy_ecs::{
+     prelude::*,
+diff --git a/crates/bevy_ui/src/render/ui.wgsl b/crates/bevy_ui_render/src/ui.wgsl
+similarity index 100%
+rename from crates/bevy_ui/src/render/ui.wgsl
+rename to crates/bevy_ui_render/src/ui.wgsl
+diff --git a/crates/bevy_ui_render/src/ui_material.rs b/crates/bevy_ui_render/src/ui_material.rs
+new file mode 100644
+index 0000000000000..82080775446ac
+--- /dev/null
++++ b/crates/bevy_ui_render/src/ui_material.rs
+@@ -0,0 +1,182 @@
++use crate::Node;
++use bevy_asset::{Asset, AssetId, Handle};
++use bevy_derive::{Deref, DerefMut};
++use bevy_ecs::{component::Component, reflect::ReflectComponent};
++use bevy_reflect::{prelude::ReflectDefault, Reflect};
++use bevy_render::{
++    extract_component::ExtractComponent,
++    render_resource::{AsBindGroup, RenderPipelineDescriptor, ShaderRef},
++};
++use derive_more::derive::From;
++
++/// Materials are used alongside [`UiMaterialPlugin`](crate::UiMaterialPlugin) and [`MaterialNode`]
++/// to spawn entities that are rendered with a specific [`UiMaterial`] type. They serve as an easy to use high level
++/// way to render `Node` entities with custom shader logic.
++///
++/// `UiMaterials` must implement [`AsBindGroup`] to define how data will be transferred to the GPU and bound in shaders.
++/// [`AsBindGroup`] can be derived, which makes generating bindings straightforward. See the [`AsBindGroup`] docs for details.
++///
++/// Materials must also implement [`Asset`] so they can be treated as such.
++///
++/// If you are only using the fragment shader, make sure your shader imports the `UiVertexOutput`
++/// from `bevy_ui::ui_vertex_output` and uses it as the input of your fragment shader like the
++/// example below does.
++///
++/// # Example
++///
++/// Here is a simple [`UiMaterial`] implementation. The [`AsBindGroup`] derive has many features. To see what else is available,
++/// check out the [`AsBindGroup`] documentation.
++/// ```
++/// # use bevy_ui::prelude::*;
++/// # use bevy_ecs::prelude::*;
++/// # use bevy_image::Image;
++/// # use bevy_reflect::TypePath;
++/// # use bevy_render::render_resource::{AsBindGroup, ShaderRef};
++/// # use bevy_color::LinearRgba;
++/// # use bevy_asset::{Handle, AssetServer, Assets, Asset};
++/// # use bevy_ui_render::prelude::*;
++///
++/// #[derive(AsBindGroup, Asset, TypePath, Debug, Clone)]
++/// pub struct CustomMaterial {
++///     // Uniform bindings must implement `ShaderType`, which will be used to convert the value to
++///     // its shader-compatible equivalent. Most core math types already implement `ShaderType`.
++///     #[uniform(0)]
++///     color: LinearRgba,
++///     // Images can be bound as textures in shaders. If the Image's sampler is also needed, just
++///     // add the sampler attribute with a different binding index.
++///     #[texture(1)]
++///     #[sampler(2)]
++///     color_texture: Handle<Image>,
++/// }
++///
++/// // All functions on `UiMaterial` have default impls. You only need to implement the
++/// // functions that are relevant for your material.
++/// impl UiMaterial for CustomMaterial {
++///     fn fragment_shader() -> ShaderRef {
++///         "shaders/custom_material.wgsl".into()
++///     }
++/// }
++///
++/// // Spawn an entity using `CustomMaterial`.
++/// fn setup(mut commands: Commands, mut materials: ResMut<Assets<CustomMaterial>>, asset_server: Res<AssetServer>) {
++///     commands.spawn((
++///         MaterialNode(materials.add(CustomMaterial {
++///             color: LinearRgba::RED,
++///             color_texture: asset_server.load("some_image.png"),
++///         })),
++///         Node {
++///             width: Val::Percent(100.0),
++///             ..Default::default()
++///         },
++///     ));
++/// }
++/// ```
++/// In WGSL shaders, the material's binding would look like this:
++///
++/// If you only use the fragment shader make sure to import `UiVertexOutput` from
++/// `bevy_ui::ui_vertex_output` in your wgsl shader.
++/// Also note that bind group 0 is always bound to the [`View Uniform`](bevy_render::view::ViewUniform)
++/// and the [`Globals Uniform`](bevy_render::globals::GlobalsUniform).
++///
++/// ```wgsl
++/// #import bevy_ui::ui_vertex_output UiVertexOutput
++///
++/// struct CustomMaterial {
++///     color: vec4<f32>,
++/// }
++///
++/// @group(1) @binding(0)
++/// var<uniform> material: CustomMaterial;
++/// @group(1) @binding(1)
++/// var color_texture: texture_2d<f32>;
++/// @group(1) @binding(2)
++/// var color_sampler: sampler;
++///
++/// @fragment
++/// fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
++///
++/// }
++/// ```
++pub trait UiMaterial: AsBindGroup + Asset + Clone + Sized {
++    /// Returns this materials vertex shader. If [`ShaderRef::Default`] is returned, the default UI
++    /// vertex shader will be used.
++    fn vertex_shader() -> ShaderRef {
++        ShaderRef::Default
++    }
++
++    /// Returns this materials fragment shader. If [`ShaderRef::Default`] is returned, the default
++    /// UI fragment shader will be used.
++    fn fragment_shader() -> ShaderRef {
++        ShaderRef::Default
++    }
++
++    #[expect(
++        unused_variables,
++        reason = "The parameters here are intentionally unused by the default implementation; however, putting underscores here will result in the underscores being copied by rust-analyzer's tab completion."
++    )]
++    #[inline]
++    fn specialize(descriptor: &mut RenderPipelineDescriptor, key: UiMaterialKey<Self>) {}
++}
++
++pub struct UiMaterialKey<M: UiMaterial> {
++    pub hdr: bool,
++    pub bind_group_data: M::Data,
++}
++
++impl<M: UiMaterial> Eq for UiMaterialKey<M> where M::Data: PartialEq {}
++
++impl<M: UiMaterial> PartialEq for UiMaterialKey<M>
++where
++    M::Data: PartialEq,
++{
++    fn eq(&self, other: &Self) -> bool {
++        self.hdr == other.hdr && self.bind_group_data == other.bind_group_data
++    }
++}
++
++impl<M: UiMaterial> Clone for UiMaterialKey<M>
++where
++    M::Data: Clone,
++{
++    fn clone(&self) -> Self {
++        Self {
++            hdr: self.hdr,
++            bind_group_data: self.bind_group_data,
++        }
++    }
++}
++
++impl<M: UiMaterial> core::hash::Hash for UiMaterialKey<M>
++where
++    M::Data: core::hash::Hash,
++{
++    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
++        self.hdr.hash(state);
++        self.bind_group_data.hash(state);
++    }
++}
++
++#[derive(
++    Component, Clone, Debug, Deref, DerefMut, Reflect, PartialEq, Eq, ExtractComponent, From,
++)]
++#[reflect(Component, Default)]
++#[require(Node)]
++pub struct MaterialNode<M: UiMaterial>(pub Handle<M>);
++
++impl<M: UiMaterial> Default for MaterialNode<M> {
++    fn default() -> Self {
++        Self(Handle::default())
++    }
++}
++
++impl<M: UiMaterial> From<MaterialNode<M>> for AssetId<M> {
++    fn from(material: MaterialNode<M>) -> Self {
++        material.id()
++    }
++}
++
++impl<M: UiMaterial> From<&MaterialNode<M>> for AssetId<M> {
++    fn from(material: &MaterialNode<M>) -> Self {
++        material.id()
++    }
++}
+diff --git a/crates/bevy_ui/src/render/ui_material.wgsl b/crates/bevy_ui_render/src/ui_material.wgsl
+similarity index 100%
+rename from crates/bevy_ui/src/render/ui_material.wgsl
+rename to crates/bevy_ui_render/src/ui_material.wgsl
+diff --git a/crates/bevy_ui/src/render/ui_material_pipeline.rs b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+similarity index 97%
+rename from crates/bevy_ui/src/render/ui_material_pipeline.rs
+rename to crates/bevy_ui_render/src/ui_material_pipeline.rs
+index 84f3067b1708b..5dc045381634f 100644
+--- a/crates/bevy_ui/src/render/ui_material_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+@@ -1,3 +1,4 @@
++use crate::ui_material::{MaterialNode, UiMaterial, UiMaterialKey};
+ use crate::*;
+ use bevy_asset::*;
+ use bevy_ecs::{
+@@ -7,11 +8,12 @@ use bevy_ecs::{
+         lifetimeless::{Read, SRes},
+         *,
+     },
++    world::{FromWorld, World},
+ };
+ use bevy_image::BevyDefault as _;
+ use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
++use bevy_render::RenderApp;
+ use bevy_render::{
+-    extract_component::ExtractComponentPlugin,
+     globals::{GlobalsBuffer, GlobalsUniform},
+     load_shader_library,
+     render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
+@@ -47,9 +49,9 @@ where
+         embedded_asset!(app, "ui_material.wgsl");
+ 
+         app.init_asset::<M>()
+-            .register_type::<MaterialNode<M>>()
++            //.register_type::<MaterialNode<M>>()
+             .add_plugins((
+-                ExtractComponentPlugin::<MaterialNode<M>>::extract_visible(),
++                //ExtractComponentPlugin::<MaterialNode<M>>::extract_visible(),
+                 RenderAssetPlugin::<PreparedUiMaterial<M>>::default(),
+             ));
+ 
+@@ -304,7 +306,7 @@ pub struct ExtractedUiMaterialNode<M: UiMaterial> {
+     pub transform: Affine2,
+     pub rect: Rect,
+     pub border: BorderRect,
+-    pub border_radius: ResolvedBorderRadius,
++    pub border_radius: [f32; 4],
+     pub material: AssetId<M>,
+     pub clip: Option<Rect>,
+     // Camera to render this UI node to. By the time it is extracted,
+@@ -312,7 +314,7 @@ pub struct ExtractedUiMaterialNode<M: UiMaterial> {
+     // Nodes with ambiguous camera will be ignored.
+     pub extracted_camera_entity: Entity,
+     pub main_entity: MainEntity,
+-    render_entity: Entity,
++    pub render_entity: Entity,
+ }
+ 
+ #[derive(Resource)]
+@@ -374,7 +376,7 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
+                 max: computed_node.size(),
+             },
+             border: computed_node.border(),
+-            border_radius: computed_node.border_radius(),
++            border_radius: computed_node.border_radius().into(),
+             clip: clip.map(|clip| clip.clip),
+             extracted_camera_entity,
+             main_entity: entity.into(),
+@@ -520,12 +522,7 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
+                             position: positions_clipped[i].into(),
+                             uv: uvs[i].into(),
+                             size: extracted_uinode.rect.size().into(),
+-                            radius: [
+-                                extracted_uinode.border_radius.top_left,
+-                                extracted_uinode.border_radius.top_right,
+-                                extracted_uinode.border_radius.bottom_right,
+-                                extracted_uinode.border_radius.bottom_left,
+-                            ],
++                            radius: extracted_uinode.border_radius,
+                             border: [
+                                 extracted_uinode.border.left,
+                                 extracted_uinode.border.top,
+diff --git a/crates/bevy_ui/src/render/ui_texture_slice.wgsl b/crates/bevy_ui_render/src/ui_texture_slice.wgsl
+similarity index 100%
+rename from crates/bevy_ui/src/render/ui_texture_slice.wgsl
+rename to crates/bevy_ui_render/src/ui_texture_slice.wgsl
+diff --git a/crates/bevy_ui/src/render/ui_texture_slice_pipeline.rs b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+similarity index 99%
+rename from crates/bevy_ui/src/render/ui_texture_slice_pipeline.rs
+rename to crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+index b217b052ec690..547db6b06ca67 100644
+--- a/crates/bevy_ui/src/render/ui_texture_slice_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+@@ -1,9 +1,8 @@
+ use core::{hash::Hash, ops::Range};
+ 
+-use crate::prelude::UiGlobalTransform;
+ use crate::*;
+ use bevy_asset::*;
+-use bevy_color::{Alpha, ColorToComponents, LinearRgba};
++use bevy_color::{ColorToComponents, LinearRgba};
+ use bevy_ecs::{
+     prelude::Component,
+     system::{
+@@ -20,16 +19,15 @@ use bevy_render::{
+     render_phase::*,
+     render_resource::{binding_types::uniform_buffer, *},
+     renderer::{RenderDevice, RenderQueue},
+-    sync_world::TemporaryRenderEntity,
+-    texture::{GpuImage, TRANSPARENT_IMAGE_HANDLE},
++    texture::GpuImage,
+     view::*,
+     Extract, ExtractSchedule, Render, RenderSystems,
+ };
+ use bevy_sprite::{SliceScaleMode, SpriteAssetEvents, SpriteImageMode, TextureSlicer};
++use bevy_ui::widget;
+ use bevy_utils::default;
+ use binding_types::{sampler, texture_2d};
+ use bytemuck::{Pod, Zeroable};
+-use widget::ImageNode;
+ 
+ pub struct UiTextureSlicerPlugin;
+ 
+diff --git a/crates/bevy_ui/src/render/ui_vertex_output.wgsl b/crates/bevy_ui_render/src/ui_vertex_output.wgsl
+similarity index 100%
+rename from crates/bevy_ui/src/render/ui_vertex_output.wgsl
+rename to crates/bevy_ui_render/src/ui_vertex_output.wgsl
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 70030ce26d043..120c461efe378 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -38,6 +38,7 @@ The default feature set enables most of the expected features of a game engine,
+ |bevy_text|Provides text functionality|
+ |bevy_ui|A custom ECS-driven UI framework|
+ |bevy_ui_picking_backend|Provides an implementation for picking UI|
++|bevy_ui_render|Provides rendering functionality for bevy_ui|
+ |bevy_window|Windowing layer|
+ |bevy_winit|winit window and input backend|
+ |custom_cursor|Enable winit custom cursor support|
+diff --git a/release-content/migration-guides/bevy_ui_render_crate.md b/release-content/migration-guides/bevy_ui_render_crate.md
+new file mode 100644
+index 0000000000000..313a223b32ee5
+--- /dev/null
++++ b/release-content/migration-guides/bevy_ui_render_crate.md
+@@ -0,0 +1,8 @@
++---
++title: `bevy_ui_render` crate
++pull_requests: [18703]
++---
++
++The `render` and `ui_material` modules have been removed from `bevy_ui` and placed into a new crate `bevy_ui_render`.
++
++As a result, `UiPlugin` no longer has any fields: add or skip adding `UiRenderPlugin` to control whether or not UI is rendered.
+diff --git a/release-content/release-notes/bevy_ui_render_crate.md b/release-content/release-notes/bevy_ui_render_crate.md
+new file mode 100644
+index 0000000000000..2e26519f9d61a
+--- /dev/null
++++ b/release-content/release-notes/bevy_ui_render_crate.md
+@@ -0,0 +1,7 @@
++---
++title: `bevy_ui_render` crate
++authors: ["@Ickshonpe"]
++pull_requests: [18703]
++---
++
++The `render` and `ui_material` modules have been removed from `bevy_ui` and placed into a new crate `bevy_ui_render`.
