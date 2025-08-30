@@ -1,0 +1,639 @@
+diff --git a/examples/2d/mesh2d_manual.rs b/examples/2d/mesh2d_manual.rs
+index 58ec9b5cebcb0..f61f540ef30b4 100644
+--- a/examples/2d/mesh2d_manual.rs
++++ b/examples/2d/mesh2d_manual.rs
+@@ -27,7 +27,7 @@ use bevy::{
+         sync_component::SyncComponentPlugin,
+         sync_world::{MainEntityHashMap, RenderEntity},
+         view::{ExtractedView, RenderVisibleEntities, ViewTarget},
+-        Extract, Render, RenderApp, RenderSystems,
++        Extract, Render, RenderApp, RenderStartup, RenderSystems,
+     },
+     sprite::{
+         extract_mesh2d, DrawMesh2d, Material2dBindGroupId, Mesh2dPipeline, Mesh2dPipelineKey,
+@@ -132,14 +132,16 @@ pub struct ColoredMesh2dPipeline {
+     shader: Handle<Shader>,
+ }
+ 
+-impl FromWorld for ColoredMesh2dPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        Self {
+-            mesh2d_pipeline: Mesh2dPipeline::from_world(world),
+-            // Get the shader from the shader resource we inserted in the plugin.
+-            shader: world.resource::<ColoredMesh2dShader>().0.clone(),
+-        }
+-    }
++fn init_colored_mesh_2d_pipeline(
++    mut commands: Commands,
++    mesh2d_pipeline: Res<Mesh2dPipeline>,
++    colored_mesh2d_shader: Res<ColoredMesh2dShader>,
++) {
++    commands.insert_resource(ColoredMesh2dPipeline {
++        mesh2d_pipeline: mesh2d_pipeline.clone(),
++        // Clone the shader from the shader resource we inserted in the plugin.
++        shader: colored_mesh2d_shader.0.clone(),
++    });
+ }
+ 
+ // We implement `SpecializedPipeline` to customize the default rendering from `Mesh2dPipeline`
+@@ -307,6 +309,7 @@ impl Plugin for ColoredMesh2dPlugin {
+             .add_render_command::<Transparent2d, DrawColoredMesh2d>()
+             .init_resource::<SpecializedRenderPipelines<ColoredMesh2dPipeline>>()
+             .init_resource::<RenderColoredMesh2dInstances>()
++            .add_systems(RenderStartup, init_colored_mesh_2d_pipeline)
+             .add_systems(
+                 ExtractSchedule,
+                 extract_colored_mesh2d.after(extract_mesh2d),
+@@ -316,13 +319,6 @@ impl Plugin for ColoredMesh2dPlugin {
+                 queue_colored_mesh2d.in_set(RenderSystems::QueueMeshes),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        // Register our custom pipeline
+-        app.get_sub_app_mut(RenderApp)
+-            .unwrap()
+-            .init_resource::<ColoredMesh2dPipeline>();
+-    }
+ }
+ 
+ /// Extract the [`ColoredMesh2d`] marker component into the render app
+diff --git a/examples/3d/manual_material.rs b/examples/3d/manual_material.rs
+index f93265a50a296..8d90fe9ad79f5 100644
+--- a/examples/3d/manual_material.rs
++++ b/examples/3d/manual_material.rs
+@@ -29,7 +29,7 @@ use bevy::{
+         sync_world::MainEntity,
+         texture::GpuImage,
+         view::ExtractedView,
+-        Extract, RenderApp,
++        Extract, RenderApp, RenderStartup,
+     },
+     utils::Parallel,
+ };
+@@ -55,52 +55,46 @@ impl Plugin for ImageMaterialPlugin {
+                 check_entities_needing_specialization.after(AssetEventSystems),
+             )
+             .init_resource::<EntitiesNeedingSpecialization<ImageMaterial>>();
+-    }
+ 
+-    fn finish(&self, app: &mut App) {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+ 
+-        render_app.add_systems(
+-            ExtractSchedule,
++        render_app
++            .add_systems(RenderStartup, init_image_material_resources)
++            .add_systems(
++                ExtractSchedule,
++                (
++                    extract_image_materials,
++                    extract_image_materials_needing_specialization,
++                ),
++            );
++    }
++}
++
++fn init_image_material_resources(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    mut bind_group_allocators: ResMut<MaterialBindGroupAllocators>,
++) {
++    let bind_group_layout = render_device.create_bind_group_layout(
++        "image_material_layout",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
+             (
+-                extract_image_materials,
+-                extract_image_materials_needing_specialization,
++                texture_2d(TextureSampleType::Float { filterable: false }),
++                sampler(SamplerBindingType::NonFiltering),
+             ),
+-        );
+-
+-        render_app.world_mut().resource_scope(
+-            |world: &mut World, mut bind_group_allocators: Mut<MaterialBindGroupAllocators>| {
+-                world.resource_scope(|world: &mut World, render_device: Mut<RenderDevice>| {
+-                    let bind_group_layout = render_device.create_bind_group_layout(
+-                        "image_material_layout",
+-                        &BindGroupLayoutEntries::sequential(
+-                            ShaderStages::FRAGMENT,
+-                            (
+-                                texture_2d(TextureSampleType::Float { filterable: false }),
+-                                sampler(SamplerBindingType::NonFiltering),
+-                            ),
+-                        ),
+-                    );
+-                    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
+-                    world.insert_resource(ImageMaterialBindGroupLayout(bind_group_layout.clone()));
+-                    world.insert_resource(ImageMaterialBindGroupSampler(sampler));
++        ),
++    );
++    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
++    commands.insert_resource(ImageMaterialBindGroupLayout(bind_group_layout.clone()));
++    commands.insert_resource(ImageMaterialBindGroupSampler(sampler));
+ 
+-                    bind_group_allocators.insert(
+-                        TypeId::of::<ImageMaterial>(),
+-                        MaterialBindGroupAllocator::new(
+-                            &render_device,
+-                            None,
+-                            None,
+-                            bind_group_layout,
+-                            None,
+-                        ),
+-                    );
+-                });
+-            },
+-        );
+-    }
++    bind_group_allocators.insert(
++        TypeId::of::<ImageMaterial>(),
++        MaterialBindGroupAllocator::new(&render_device, None, None, bind_group_layout, None),
++    );
+ }
+ 
+ #[derive(Resource)]
+diff --git a/examples/shader/compute_shader_game_of_life.rs b/examples/shader/compute_shader_game_of_life.rs
+index aa10ccf4bfb6c..575a09f1d1d78 100644
+--- a/examples/shader/compute_shader_game_of_life.rs
++++ b/examples/shader/compute_shader_game_of_life.rs
+@@ -12,7 +12,7 @@ use bevy::{
+         render_resource::{binding_types::texture_storage_2d, *},
+         renderer::{RenderContext, RenderDevice},
+         texture::GpuImage,
+-        Render, RenderApp, RenderSystems,
++        Render, RenderApp, RenderStartup, RenderSystems,
+     },
+ };
+ use std::borrow::Cow;
+@@ -103,20 +103,17 @@ impl Plugin for GameOfLifeComputePlugin {
+         // for operation on by the compute shader and display on the sprite.
+         app.add_plugins(ExtractResourcePlugin::<GameOfLifeImages>::default());
+         let render_app = app.sub_app_mut(RenderApp);
+-        render_app.add_systems(
+-            Render,
+-            prepare_bind_group.in_set(RenderSystems::PrepareBindGroups),
+-        );
++        render_app
++            .add_systems(RenderStartup, init_game_of_life_pipeline)
++            .add_systems(
++                Render,
++                prepare_bind_group.in_set(RenderSystems::PrepareBindGroups),
++            );
+ 
+         let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
+         render_graph.add_node(GameOfLifeLabel, GameOfLifeNode::default());
+         render_graph.add_node_edge(GameOfLifeLabel, bevy::render::graph::CameraDriverLabel);
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let render_app = app.sub_app_mut(RenderApp);
+-        render_app.init_resource::<GameOfLifePipeline>();
+-    }
+ }
+ 
+ #[derive(Resource, Clone, ExtractResource)]
+@@ -157,40 +154,41 @@ struct GameOfLifePipeline {
+     update_pipeline: CachedComputePipelineId,
+ }
+ 
+-impl FromWorld for GameOfLifePipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let texture_bind_group_layout = render_device.create_bind_group_layout(
+-            "GameOfLifeImages",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::COMPUTE,
+-                (
+-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
+-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+-                ),
++fn init_game_of_life_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    asset_server: Res<AssetServer>,
++    pipeline_cache: Res<PipelineCache>,
++) {
++    let texture_bind_group_layout = render_device.create_bind_group_layout(
++        "GameOfLifeImages",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::COMPUTE,
++            (
++                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
++                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+             ),
+-        );
+-        let shader = world.load_asset(SHADER_ASSET_PATH);
+-        let pipeline_cache = world.resource::<PipelineCache>();
+-        let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+-            layout: vec![texture_bind_group_layout.clone()],
+-            shader: shader.clone(),
+-            entry_point: Some(Cow::from("init")),
+-            ..default()
+-        });
+-        let update_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+-            layout: vec![texture_bind_group_layout.clone()],
+-            shader,
+-            entry_point: Some(Cow::from("update")),
+-            ..default()
+-        });
++        ),
++    );
++    let shader = asset_server.load(SHADER_ASSET_PATH);
++    let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
++        layout: vec![texture_bind_group_layout.clone()],
++        shader: shader.clone(),
++        entry_point: Some(Cow::from("init")),
++        ..default()
++    });
++    let update_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
++        layout: vec![texture_bind_group_layout.clone()],
++        shader,
++        entry_point: Some(Cow::from("update")),
++        ..default()
++    });
+ 
+-        GameOfLifePipeline {
+-            texture_bind_group_layout,
+-            init_pipeline,
+-            update_pipeline,
+-        }
+-    }
++    commands.insert_resource(GameOfLifePipeline {
++        texture_bind_group_layout,
++        init_pipeline,
++        update_pipeline,
++    });
+ }
+ 
+ enum GameOfLifeState {
+diff --git a/examples/shader/custom_render_phase.rs b/examples/shader/custom_render_phase.rs
+index 89f5ce6d6703a..9993de341cdde 100644
+--- a/examples/shader/custom_render_phase.rs
++++ b/examples/shader/custom_render_phase.rs
+@@ -55,7 +55,7 @@ use bevy::{
+         renderer::RenderContext,
+         sync_world::MainEntity,
+         view::{ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewTarget},
+-        Extract, Render, RenderApp, RenderDebugFlags, RenderSystems,
++        Extract, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
+     },
+ };
+ use nonmax::NonMaxU32;
+@@ -127,6 +127,7 @@ impl Plugin for MeshStencilPhasePlugin {
+             .init_resource::<DrawFunctions<Stencil3d>>()
+             .add_render_command::<Stencil3d, DrawMesh3dStencil>()
+             .init_resource::<ViewSortedRenderPhases<Stencil3d>>()
++            .add_systems(RenderStartup, init_stencil_pipeline)
+             .add_systems(ExtractSchedule, extract_camera_phases)
+             .add_systems(
+                 Render,
+@@ -143,16 +144,6 @@ impl Plugin for MeshStencilPhasePlugin {
+             // Tell the node to run after the main pass
+             .add_render_graph_edges(Core3d, (Node3d::MainOpaquePass, CustomDrawPassLabel));
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        // We need to get the render app from the main app
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        // The pipeline needs the RenderDevice to be created and it's only available once plugins
+-        // are initialized
+-        render_app.init_resource::<StencilPipeline>();
+-    }
+ }
+ 
+ #[derive(Resource)]
+@@ -167,13 +158,15 @@ struct StencilPipeline {
+     shader_handle: Handle<Shader>,
+ }
+ 
+-impl FromWorld for StencilPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        Self {
+-            mesh_pipeline: MeshPipeline::from_world(world),
+-            shader_handle: world.resource::<AssetServer>().load(SHADER_ASSET_PATH),
+-        }
+-    }
++fn init_stencil_pipeline(
++    mut commands: Commands,
++    mesh_pipeline: Res<MeshPipeline>,
++    asset_server: Res<AssetServer>,
++) {
++    commands.insert_resource(StencilPipeline {
++        mesh_pipeline: mesh_pipeline.clone(),
++        shader_handle: asset_server.load(SHADER_ASSET_PATH),
++    });
+ }
+ 
+ // For more information on how SpecializedMeshPipeline work, please look at the
+diff --git a/examples/shader/custom_shader_instancing.rs b/examples/shader/custom_shader_instancing.rs
+index 358a2beac7039..4a578dc5c6e04 100644
+--- a/examples/shader/custom_shader_instancing.rs
++++ b/examples/shader/custom_shader_instancing.rs
+@@ -32,7 +32,7 @@ use bevy::{
+         renderer::RenderDevice,
+         sync_world::MainEntity,
+         view::{ExtractedView, NoFrustumCulling, NoIndirectDrawing},
+-        Render, RenderApp, RenderSystems,
++        Render, RenderApp, RenderStartup, RenderSystems,
+     },
+ };
+ use bytemuck::{Pod, Zeroable};
+@@ -102,6 +102,7 @@ impl Plugin for CustomMaterialPlugin {
+         app.sub_app_mut(RenderApp)
+             .add_render_command::<Transparent3d, DrawCustom>()
+             .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
++            .add_systems(RenderStartup, init_custom_pipeline)
+             .add_systems(
+                 Render,
+                 (
+@@ -110,10 +111,6 @@ impl Plugin for CustomMaterialPlugin {
+                 ),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        app.sub_app_mut(RenderApp).init_resource::<CustomPipeline>();
+-    }
+ }
+ 
+ #[derive(Clone, Copy, Pod, Zeroable)]
+@@ -203,15 +200,15 @@ struct CustomPipeline {
+     mesh_pipeline: MeshPipeline,
+ }
+ 
+-impl FromWorld for CustomPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let mesh_pipeline = world.resource::<MeshPipeline>();
+-
+-        CustomPipeline {
+-            shader: world.load_asset(SHADER_ASSET_PATH),
+-            mesh_pipeline: mesh_pipeline.clone(),
+-        }
+-    }
++fn init_custom_pipeline(
++    mut commands: Commands,
++    asset_server: Res<AssetServer>,
++    mesh_pipeline: Res<MeshPipeline>,
++) {
++    commands.insert_resource(CustomPipeline {
++        shader: asset_server.load(SHADER_ASSET_PATH),
++        mesh_pipeline: mesh_pipeline.clone(),
++    });
+ }
+ 
+ impl SpecializedMeshPipeline for CustomPipeline {
+diff --git a/examples/shader/gpu_readback.rs b/examples/shader/gpu_readback.rs
+index 964776291eb2a..07473e199e90c 100644
+--- a/examples/shader/gpu_readback.rs
++++ b/examples/shader/gpu_readback.rs
+@@ -15,7 +15,7 @@ use bevy::{
+         renderer::{RenderContext, RenderDevice},
+         storage::{GpuShaderStorageBuffer, ShaderStorageBuffer},
+         texture::GpuImage,
+-        Render, RenderApp, RenderSystems,
++        Render, RenderApp, RenderStartup, RenderSystems,
+     },
+ };
+ 
+@@ -41,24 +41,22 @@ fn main() {
+ // We need a plugin to organize all the systems and render node required for this example
+ struct GpuReadbackPlugin;
+ impl Plugin for GpuReadbackPlugin {
+-    fn build(&self, _app: &mut App) {}
+-
+-    fn finish(&self, app: &mut App) {
+-        let render_app = app.sub_app_mut(RenderApp);
+-        render_app.init_resource::<ComputePipeline>().add_systems(
+-            Render,
+-            prepare_bind_group
+-                .in_set(RenderSystems::PrepareBindGroups)
+-                // We don't need to recreate the bind group every frame
+-                .run_if(not(resource_exists::<GpuBufferBindGroup>)),
+-        );
+-
+-        // Add the compute node as a top level node to the render graph
+-        // This means it will only execute once per frame
++    fn build(&self, app: &mut App) {
++        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
++            return;
++        };
+         render_app
+-            .world_mut()
+-            .resource_mut::<RenderGraph>()
+-            .add_node(ComputeNodeLabel, ComputeNode::default());
++            .add_systems(
++                RenderStartup,
++                (init_compute_pipeline, add_compute_render_graph_node),
++            )
++            .add_systems(
++                Render,
++                prepare_bind_group
++                    .in_set(RenderSystems::PrepareBindGroups)
++                    // We don't need to recreate the bind group every frame
++                    .run_if(not(resource_exists::<GpuBufferBindGroup>)),
++            );
+     }
+ }
+ 
+@@ -127,6 +125,13 @@ fn setup(
+     commands.insert_resource(ReadbackImage(image));
+ }
+ 
++fn add_compute_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
++    // Add the compute node as a top-level node to the render graph. This means it will only execute
++    // once per frame. Normally, adding a node would use the `RenderGraphApp::add_render_graph_node`
++    // method, but it does not allow adding as a top-level node.
++    render_graph.add_node(ComputeNodeLabel, ComputeNode::default());
++}
++
+ #[derive(Resource)]
+ struct GpuBufferBindGroup(BindGroup);
+ 
+@@ -158,29 +163,30 @@ struct ComputePipeline {
+     pipeline: CachedComputePipelineId,
+ }
+ 
+-impl FromWorld for ComputePipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let layout = render_device.create_bind_group_layout(
+-            None,
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::COMPUTE,
+-                (
+-                    storage_buffer::<Vec<u32>>(false),
+-                    texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::WriteOnly),
+-                ),
++fn init_compute_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    asset_server: Res<AssetServer>,
++    pipeline_cache: Res<PipelineCache>,
++) {
++    let layout = render_device.create_bind_group_layout(
++        None,
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::COMPUTE,
++            (
++                storage_buffer::<Vec<u32>>(false),
++                texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::WriteOnly),
+             ),
+-        );
+-        let shader = world.load_asset(SHADER_ASSET_PATH);
+-        let pipeline_cache = world.resource::<PipelineCache>();
+-        let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+-            label: Some("GPU readback compute shader".into()),
+-            layout: vec![layout.clone()],
+-            shader: shader.clone(),
+-            ..default()
+-        });
+-        ComputePipeline { layout, pipeline }
+-    }
++        ),
++    );
++    let shader = asset_server.load(SHADER_ASSET_PATH);
++    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
++        label: Some("GPU readback compute shader".into()),
++        layout: vec![layout.clone()],
++        shader: shader.clone(),
++        ..default()
++    });
++    commands.insert_resource(ComputePipeline { layout, pipeline });
+ }
+ 
+ /// Label to identify the node in the render graph
+diff --git a/examples/shader/specialized_mesh_pipeline.rs b/examples/shader/specialized_mesh_pipeline.rs
+index f9aebcda7ed82..3b5d95f0b5915 100644
+--- a/examples/shader/specialized_mesh_pipeline.rs
++++ b/examples/shader/specialized_mesh_pipeline.rs
+@@ -39,7 +39,7 @@ use bevy::{
+         },
+         view::NoIndirectDrawing,
+         view::{self, ExtractedView, RenderVisibleEntities, ViewTarget, VisibilityClass},
+-        Render, RenderApp, RenderSystems,
++        Render, RenderApp, RenderStartup, RenderSystems,
+     },
+ };
+ 
+@@ -118,20 +118,12 @@ impl Plugin for CustomRenderedMeshPipelinePlugin {
+             .init_resource::<SpecializedMeshPipelines<CustomMeshPipeline>>()
+             // We need to use a custom draw command so we need to register it
+             .add_render_command::<Opaque3d, DrawSpecializedPipelineCommands>()
++            .add_systems(RenderStartup, init_custom_mesh_pipeline)
+             .add_systems(
+                 Render,
+                 queue_custom_mesh_pipeline.in_set(RenderSystems::Queue),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        // Creating this pipeline needs the RenderDevice and RenderQueue
+-        // which are only available once rendering plugins are initialized.
+-        render_app.init_resource::<CustomMeshPipeline>();
+-    }
+ }
+ 
+ /// A marker component that represents an entity that is to be rendered using
+@@ -174,15 +166,17 @@ struct CustomMeshPipeline {
+     shader_handle: Handle<Shader>,
+ }
+ 
+-impl FromWorld for CustomMeshPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        // Load the shader
+-        let shader_handle: Handle<Shader> = world.resource::<AssetServer>().load(SHADER_ASSET_PATH);
+-        Self {
+-            mesh_pipeline: MeshPipeline::from_world(world),
+-            shader_handle,
+-        }
+-    }
++fn init_custom_mesh_pipeline(
++    mut commands: Commands,
++    asset_server: Res<AssetServer>,
++    mesh_pipeline: Res<MeshPipeline>,
++) {
++    // Load the shader
++    let shader_handle: Handle<Shader> = asset_server.load(SHADER_ASSET_PATH);
++    commands.insert_resource(CustomMeshPipeline {
++        mesh_pipeline: mesh_pipeline.clone(),
++        shader_handle,
++    });
+ }
+ 
+ impl SpecializedMeshPipeline for CustomMeshPipeline {
+diff --git a/examples/shader/texture_binding_array.rs b/examples/shader/texture_binding_array.rs
+index bfb439d81f818..f18d08e8d3f73 100644
+--- a/examples/shader/texture_binding_array.rs
++++ b/examples/shader/texture_binding_array.rs
+@@ -13,7 +13,7 @@ use bevy::{
+         },
+         renderer::RenderDevice,
+         texture::{FallbackImage, GpuImage},
+-        RenderApp,
++        RenderApp, RenderStartup,
+     },
+ };
+ use std::{num::NonZero, process::exit};
+@@ -40,28 +40,12 @@ const TILE_ID: [usize; 16] = [
+ struct GpuFeatureSupportChecker;
+ 
+ impl Plugin for GpuFeatureSupportChecker {
+-    fn build(&self, _app: &mut App) {}
+-
+-    fn finish(&self, app: &mut App) {
++    fn build(&self, app: &mut App) {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+ 
+-        let render_device = render_app.world().resource::<RenderDevice>();
+-
+-        // Check if the device support the required feature. If not, exit the example.
+-        // In a real application, you should setup a fallback for the missing feature
+-        if !render_device
+-            .features()
+-            .contains(WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING)
+-        {
+-            error!(
+-                "Render device doesn't support feature \
+-SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING, \
+-which is required for texture binding arrays"
+-            );
+-            exit(1);
+-        }
++        render_app.add_systems(RenderStartup, verify_required_features);
+     }
+ }
+ 
+@@ -89,6 +73,22 @@ fn setup(
+     ));
+ }
+ 
++fn verify_required_features(render_device: Res<RenderDevice>) {
++    // Check if the device support the required feature. If not, exit the example. In a real
++    // application, you should setup a fallback for the missing feature
++    if !render_device
++        .features()
++        .contains(WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING)
++    {
++        error!(
++            "Render device doesn't support feature \
++SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING, \
++which is required for texture binding arrays"
++        );
++        exit(1);
++    }
++}
++
+ #[derive(Asset, TypePath, Debug, Clone)]
+ struct BindlessMaterial {
+     textures: Vec<Handle<Image>>,
