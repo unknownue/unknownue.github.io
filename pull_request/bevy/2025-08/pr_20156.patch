@@ -1,0 +1,322 @@
+diff --git a/crates/bevy_solari/src/realtime/node.rs b/crates/bevy_solari/src/realtime/node.rs
+index 52f86908b0c9b..02ec72e729bab 100644
+--- a/crates/bevy_solari/src/realtime/node.rs
++++ b/crates/bevy_solari/src/realtime/node.rs
+@@ -22,7 +22,7 @@ use bevy_render::{
+         },
+         BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, CachedComputePipelineId,
+         ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache, PushConstantRange,
+-        ShaderStages, StorageTextureAccess, TextureSampleType,
++        ShaderStages, StorageTextureAccess, TextureFormat, TextureSampleType,
+     },
+     renderer::{RenderContext, RenderDevice},
+     view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+@@ -132,8 +132,8 @@ impl ViewNode for SolariLightingNode {
+                 view_target.get_unsampled_color_attachment().view,
+                 s.light_tile_samples.as_entire_binding(),
+                 s.light_tile_resolved_samples.as_entire_binding(),
+-                s.di_reservoirs_a.as_entire_binding(),
+-                s.di_reservoirs_b.as_entire_binding(),
++                &s.di_reservoirs_a.1,
++                &s.di_reservoirs_b.1,
+                 s.gi_reservoirs_a.as_entire_binding(),
+                 s.gi_reservoirs_b.as_entire_binding(),
+                 gbuffer,
+@@ -300,8 +300,8 @@ impl FromWorld for SolariLightingNode {
+                     ),
+                     storage_buffer_sized(false, None),
+                     storage_buffer_sized(false, None),
+-                    storage_buffer_sized(false, None),
+-                    storage_buffer_sized(false, None),
++                    texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
++                    texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
+                     storage_buffer_sized(false, None),
+                     storage_buffer_sized(false, None),
+                     texture_2d(TextureSampleType::Uint),
+diff --git a/crates/bevy_solari/src/realtime/prepare.rs b/crates/bevy_solari/src/realtime/prepare.rs
+index 0b1606257da9a..68e8af9dd26b4 100644
+--- a/crates/bevy_solari/src/realtime/prepare.rs
++++ b/crates/bevy_solari/src/realtime/prepare.rs
+@@ -13,7 +13,7 @@ use bevy_render::{
+     camera::ExtractedCamera,
+     render_resource::{
+         Buffer, BufferDescriptor, BufferUsages, Texture, TextureDescriptor, TextureDimension,
+-        TextureUsages, TextureView, TextureViewDescriptor,
++        TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+     },
+     renderer::RenderDevice,
+ };
+@@ -24,9 +24,6 @@ const LIGHT_SAMPLE_STRUCT_SIZE: u64 = 8;
+ /// Size of the `ResolvedLightSamplePacked` shader struct in bytes.
+ const RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE: u64 = 24;
+ 
+-/// Size of the DI `Reservoir` shader struct in bytes.
+-const DI_RESERVOIR_STRUCT_SIZE: u64 = 16;
+-
+ /// Size of the GI `Reservoir` shader struct in bytes.
+ const GI_RESERVOIR_STRUCT_SIZE: u64 = 48;
+ 
+@@ -41,8 +38,8 @@ pub const WORLD_CACHE_SIZE: u64 = 2u64.pow(20);
+ pub struct SolariLightingResources {
+     pub light_tile_samples: Buffer,
+     pub light_tile_resolved_samples: Buffer,
+-    pub di_reservoirs_a: Buffer,
+-    pub di_reservoirs_b: Buffer,
++    pub di_reservoirs_a: (Texture, TextureView),
++    pub di_reservoirs_b: (Texture, TextureView),
+     pub gi_reservoirs_a: Buffer,
+     pub gi_reservoirs_b: Buffer,
+     pub previous_gbuffer: (Texture, TextureView),
+@@ -101,33 +98,33 @@ pub fn prepare_solari_lighting_resources(
+             mapped_at_creation: false,
+         });
+ 
+-        let di_reservoirs_a = render_device.create_buffer(&BufferDescriptor {
+-            label: Some("solari_lighting_di_reservoirs_a"),
+-            size: (view_size.x * view_size.y) as u64 * DI_RESERVOIR_STRUCT_SIZE,
+-            usage: BufferUsages::STORAGE,
+-            mapped_at_creation: false,
+-        });
+-
+-        let di_reservoirs_b = render_device.create_buffer(&BufferDescriptor {
+-            label: Some("solari_lighting_di_reservoirs_b"),
+-            size: (view_size.x * view_size.y) as u64 * DI_RESERVOIR_STRUCT_SIZE,
+-            usage: BufferUsages::STORAGE,
+-            mapped_at_creation: false,
+-        });
+-
+-        let gi_reservoirs_a = render_device.create_buffer(&BufferDescriptor {
+-            label: Some("solari_lighting_gi_reservoirs_a"),
+-            size: (view_size.x * view_size.y) as u64 * GI_RESERVOIR_STRUCT_SIZE,
+-            usage: BufferUsages::STORAGE,
+-            mapped_at_creation: false,
+-        });
++        let di_reservoirs = |name| {
++            let tex = render_device.create_texture(&TextureDescriptor {
++                label: Some(name),
++                size: view_size.to_extents(),
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: TextureDimension::D2,
++                format: TextureFormat::Rgba32Uint,
++                usage: TextureUsages::STORAGE_BINDING,
++                view_formats: &[],
++            });
++            let view = tex.create_view(&TextureViewDescriptor::default());
++            (tex, view)
++        };
++        let di_reservoirs_a = di_reservoirs("solari_lighting_di_reservoirs_a");
++        let di_reservoirs_b = di_reservoirs("solari_lighting_di_reservoirs_b");
+ 
+-        let gi_reservoirs_b = render_device.create_buffer(&BufferDescriptor {
+-            label: Some("solari_lighting_gi_reservoirs_b"),
+-            size: (view_size.x * view_size.y) as u64 * GI_RESERVOIR_STRUCT_SIZE,
+-            usage: BufferUsages::STORAGE,
+-            mapped_at_creation: false,
+-        });
++        let gi_reservoirs = |name| {
++            render_device.create_buffer(&BufferDescriptor {
++                label: Some(name),
++                size: (view_size.x * view_size.y) as u64 * GI_RESERVOIR_STRUCT_SIZE,
++                usage: BufferUsages::STORAGE,
++                mapped_at_creation: false,
++            })
++        };
++        let gi_reservoirs_a = gi_reservoirs("solari_lighting_gi_reservoirs_a");
++        let gi_reservoirs_b = gi_reservoirs("solari_lighting_gi_reservoirs_b");
+ 
+         let previous_gbuffer = render_device.create_texture(&TextureDescriptor {
+             label: Some("solari_lighting_previous_gbuffer"),
+diff --git a/crates/bevy_solari/src/realtime/restir_di.wgsl b/crates/bevy_solari/src/realtime/restir_di.wgsl
+index e6527cc514d05..53c27bd583333 100644
+--- a/crates/bevy_solari/src/realtime/restir_di.wgsl
++++ b/crates/bevy_solari/src/realtime/restir_di.wgsl
+@@ -15,8 +15,8 @@
+ @group(1) @binding(0) var view_output: texture_storage_2d<rgba16float, read_write>;
+ @group(1) @binding(1) var<storage, read_write> light_tile_samples: array<LightSample>;
+ @group(1) @binding(2) var<storage, read_write> light_tile_resolved_samples: array<ResolvedLightSamplePacked>;
+-@group(1) @binding(3) var<storage, read_write> di_reservoirs_a: array<Reservoir>;
+-@group(1) @binding(4) var<storage, read_write> di_reservoirs_b: array<Reservoir>;
++@group(1) @binding(3) var di_reservoirs_a: texture_storage_2d<rgba32uint, read_write>;
++@group(1) @binding(4) var di_reservoirs_b: texture_storage_2d<rgba32uint, read_write>;
+ @group(1) @binding(7) var gbuffer: texture_2d<u32>;
+ @group(1) @binding(8) var depth_buffer: texture_depth_2d;
+ @group(1) @binding(9) var motion_vectors: texture_2d<f32>;
+@@ -42,7 +42,7 @@ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin
+ 
+     let depth = textureLoad(depth_buffer, global_id.xy, 0);
+     if depth == 0.0 {
+-        di_reservoirs_b[pixel_index] = empty_reservoir();
++        store_reservoir_b(global_id.xy, empty_reservoir());
+         return;
+     }
+     let gpixel = textureLoad(gbuffer, global_id.xy, 0);
+@@ -55,7 +55,7 @@ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin
+     let temporal_reservoir = load_temporal_reservoir(global_id.xy, depth, world_position, world_normal);
+     let merge_result = merge_reservoirs(initial_reservoir, temporal_reservoir, world_position, world_normal, diffuse_brdf, &rng);
+ 
+-    di_reservoirs_b[pixel_index] = merge_result.merged_reservoir;
++    store_reservoir_b(global_id.xy, merge_result.merged_reservoir);
+ }
+ 
+ @compute @workgroup_size(8, 8, 1)
+@@ -67,7 +67,7 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
+ 
+     let depth = textureLoad(depth_buffer, global_id.xy, 0);
+     if depth == 0.0 {
+-        di_reservoirs_a[pixel_index] = empty_reservoir();
++        store_reservoir_a(global_id.xy, empty_reservoir());
+         textureStore(view_output, global_id.xy, vec4(vec3(0.0), 1.0));
+         return;
+     }
+@@ -78,12 +78,12 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
+     let diffuse_brdf = base_color / PI;
+     let emissive = rgb9e5_to_vec3_(gpixel.g);
+ 
+-    let input_reservoir = di_reservoirs_b[pixel_index];
++    let input_reservoir = load_reservoir_b(global_id.xy);
+     let spatial_reservoir = load_spatial_reservoir(global_id.xy, depth, world_position, world_normal, &rng);
+     let merge_result = merge_reservoirs(input_reservoir, spatial_reservoir, world_position, world_normal, diffuse_brdf, &rng);
+     let combined_reservoir = merge_result.merged_reservoir;
+ 
+-    di_reservoirs_a[pixel_index] = combined_reservoir;
++    store_reservoir_a(global_id.xy, combined_reservoir);
+ 
+     var pixel_color = merge_result.selected_sample_radiance * combined_reservoir.unbiased_contribution_weight;
+     pixel_color *= view.exposure;
+@@ -155,8 +155,7 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
+         return empty_reservoir();
+     }
+ 
+-    let temporal_pixel_index = temporal_pixel_id.x + temporal_pixel_id.y * u32(view.main_pass_viewport.z);
+-    var temporal_reservoir = di_reservoirs_a[temporal_pixel_index];
++    var temporal_reservoir = load_reservoir_a(temporal_pixel_id);
+ 
+     // Check if the light selected in the previous frame no longer exists in the current frame (e.g. entity despawned)
+     let previous_light_id = temporal_reservoir.sample.light_id >> 16u;
+@@ -183,8 +182,7 @@ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<
+         return empty_reservoir();
+     }
+ 
+-    let spatial_pixel_index = spatial_pixel_id.x + spatial_pixel_id.y * u32(view.main_pass_viewport.z);
+-    var spatial_reservoir = di_reservoirs_b[spatial_pixel_index];
++    var spatial_reservoir = load_reservoir_b(spatial_pixel_id);
+ 
+     if reservoir_valid(spatial_reservoir) {
+         let resolved_light_sample = resolve_light_sample(spatial_reservoir.sample, light_sources[spatial_reservoir.sample.light_id >> 16u]);
+@@ -234,7 +232,6 @@ fn depth_ndc_to_view_z(ndc_depth: f32) -> f32 {
+ #endif
+ }
+ 
+-// Don't adjust the size of this struct without also adjusting DI_RESERVOIR_STRUCT_SIZE.
+ struct Reservoir {
+     sample: LightSample,
+     confidence_weight: f32,
+@@ -253,6 +250,32 @@ fn reservoir_valid(reservoir: Reservoir) -> bool {
+     return reservoir.sample.light_id != NULL_RESERVOIR_SAMPLE;
+ }
+ 
++fn pack_reservoir(reservoir: Reservoir) -> vec4<u32> {
++    let weights = bitcast<vec2<u32>>(vec2<f32>(reservoir.confidence_weight, reservoir.unbiased_contribution_weight));
++    return vec4<u32>(reservoir.sample.light_id, reservoir.sample.seed, weights);
++}
++
++fn store_reservoir_a(pixel: vec2<u32>, reservoir: Reservoir) {
++    textureStore(di_reservoirs_a, pixel, pack_reservoir(reservoir));
++}
++
++fn store_reservoir_b(pixel: vec2<u32>, reservoir: Reservoir) {
++    textureStore(di_reservoirs_b, pixel, pack_reservoir(reservoir));
++}
++
++fn unpack_reservoir(packed: vec4<u32>) -> Reservoir {
++    let weights = bitcast<vec2<f32>>(packed.zw);
++    return Reservoir(LightSample(packed.x, packed.y), weights.x, weights.y);
++}
++
++fn load_reservoir_a(pixel: vec2<u32>) -> Reservoir {
++    return unpack_reservoir(textureLoad(di_reservoirs_a, pixel));
++}
++
++fn load_reservoir_b(pixel: vec2<u32>) -> Reservoir {
++    return unpack_reservoir(textureLoad(di_reservoirs_b, pixel));
++}
++
+ struct ReservoirMergeResult {
+     merged_reservoir: Reservoir,
+     selected_sample_radiance: vec3<f32>,
+diff --git a/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl b/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
+index 7359ad9063e2d..9e346bbf2d783 100644
+--- a/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
++++ b/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
+@@ -152,21 +152,38 @@ fn resolve_ray_hit_full(ray_hit: RayIntersection) -> ResolvedRayHitFull {
+     return resolve_triangle_data_full(ray_hit.instance_index, ray_hit.primitive_index, barycentrics);
+ }
+ 
+-fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedRayHitFull {
+-    let instance_geometry_ids = geometry_ids[instance_id];
+-    let material_id = material_ids[instance_id];
+-
++fn load_vertices(instance_geometry_ids: InstanceGeometryIds, triangle_id: u32) -> array<Vertex, 3> {
+     let index_buffer = &index_buffers[instance_geometry_ids.index_buffer_id].indices;
+     let vertex_buffer = &vertex_buffers[instance_geometry_ids.vertex_buffer_id].vertices;
+-    let material = materials[material_id];
+ 
+     let indices_i = (triangle_id * 3u) + vec3(0u, 1u, 2u) + instance_geometry_ids.index_buffer_offset;
+     let indices = vec3((*index_buffer)[indices_i.x], (*index_buffer)[indices_i.y], (*index_buffer)[indices_i.z]) + instance_geometry_ids.vertex_buffer_offset;
+-    let vertices = array<Vertex, 3>(unpack_vertex((*vertex_buffer)[indices.x]), unpack_vertex((*vertex_buffer)[indices.y]), unpack_vertex((*vertex_buffer)[indices.z]));
+ 
++    return array<Vertex, 3>(
++        unpack_vertex((*vertex_buffer)[indices.x]),
++        unpack_vertex((*vertex_buffer)[indices.y]),
++        unpack_vertex((*vertex_buffer)[indices.z])
++    );
++}
++
++fn transform_positions(transform: mat4x4<f32>, vertices: array<Vertex, 3>) -> array<vec3<f32>, 3> {
++    return array<vec3<f32>, 3>(
++        (transform * vec4(vertices[0].position, 1.0)).xyz,
++        (transform * vec4(vertices[1].position, 1.0)).xyz,
++        (transform * vec4(vertices[2].position, 1.0)).xyz
++    );
++}
++
++fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedRayHitFull {
++    let material_id = material_ids[instance_id];
++    let material = materials[material_id];
++
++    let instance_geometry_ids = geometry_ids[instance_id];
++    let vertices = load_vertices(instance_geometry_ids, triangle_id);
+     let transform = transforms[instance_id];
+-    let local_position = mat3x3(vertices[0].position, vertices[1].position, vertices[2].position) * barycentrics;
+-    let world_position = (transform * vec4(local_position, 1.0)).xyz;
++    let world_vertices = transform_positions(transform, vertices);
++
++    let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
+ 
+     let uv = mat3x2(vertices[0].uv, vertices[1].uv, vertices[2].uv) * barycentrics;
+ 
+@@ -188,8 +205,8 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics:
+         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
+     }
+ 
+-    let triangle_edge0 = vertices[0].position - vertices[1].position;
+-    let triangle_edge1 = vertices[0].position - vertices[2].position;
++    let triangle_edge0 = world_vertices[0] - world_vertices[1];
++    let triangle_edge1 = world_vertices[0] - world_vertices[2];
+     let triangle_area = length(cross(triangle_edge0, triangle_edge1)) / 2.0;
+ 
+     let resolved_material = resolve_material(material, uv);
+diff --git a/release-content/release-notes/bevy_solari.md b/release-content/release-notes/bevy_solari.md
+index 32ae3231ae700..d569cd065fd4a 100644
+--- a/release-content/release-notes/bevy_solari.md
++++ b/release-content/release-notes/bevy_solari.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Initial raytraced lighting progress (bevy_solari)
+ authors: ["@JMS55", "@SparkyPotato"]
+-pull_requests: [19058, 19620, 19790, 20020, 20113, 20213, 20242, 20259, 20406]
++pull_requests: [19058, 19620, 19790, 20020, 20113, 20156, 20213, 20242, 20259, 20406]
+ ---
+ 
+ (TODO: Embed solari example screenshot here)

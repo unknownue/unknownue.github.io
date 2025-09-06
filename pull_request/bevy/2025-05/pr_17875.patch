@@ -1,0 +1,300 @@
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index ebcf49744a9b9..02c14f4197117 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -97,11 +97,15 @@ mod vertex_attributes;
+ 
+ extern crate alloc;
+ 
++use alloc::sync::Arc;
++use std::sync::Mutex;
++
+ use bevy_platform::collections::HashMap;
+ 
+ use bevy_app::prelude::*;
+ use bevy_asset::AssetApp;
+-use bevy_image::CompressedImageFormats;
++use bevy_ecs::prelude::Resource;
++use bevy_image::{CompressedImageFormats, ImageSamplerDescriptor};
+ use bevy_mesh::MeshVertexAttribute;
+ use bevy_render::renderer::RenderDevice;
+ 
+@@ -115,10 +119,57 @@ pub mod prelude {
+ 
+ pub use {assets::*, label::GltfAssetLabel, loader::*};
+ 
++// Has to store an Arc<Mutex<...>> as there is no other way to mutate fields of asset loaders.
++/// Stores default [`ImageSamplerDescriptor`] in main world.
++#[derive(Resource)]
++pub struct DefaultGltfImageSampler(Arc<Mutex<ImageSamplerDescriptor>>);
++
++impl DefaultGltfImageSampler {
++    /// Creates a new [`DefaultGltfImageSampler`].
++    pub fn new(descriptor: &ImageSamplerDescriptor) -> Self {
++        Self(Arc::new(Mutex::new(descriptor.clone())))
++    }
++
++    /// Returns the current default [`ImageSamplerDescriptor`].
++    pub fn get(&self) -> ImageSamplerDescriptor {
++        self.0.lock().unwrap().clone()
++    }
++
++    /// Makes a clone of internal [`Arc`] pointer.
++    ///
++    /// Intended only to be used by code with no access to ECS.
++    pub fn get_internal(&self) -> Arc<Mutex<ImageSamplerDescriptor>> {
++        self.0.clone()
++    }
++
++    /// Replaces default [`ImageSamplerDescriptor`].
++    ///
++    /// Doesn't apply to samplers already built on top of it, i.e. `GltfLoader`'s output.
++    /// Assets need to manually be reloaded.
++    pub fn set(&self, descriptor: &ImageSamplerDescriptor) {
++        *self.0.lock().unwrap() = descriptor.clone();
++    }
++}
++
+ /// Adds support for glTF file loading to the app.
+-#[derive(Default)]
+ pub struct GltfPlugin {
+-    custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
++    /// The default image sampler to lay glTF sampler data on top of.
++    ///
++    /// Can be modified with [`DefaultGltfImageSampler`] resource.
++    pub default_sampler: ImageSamplerDescriptor,
++    /// Registry for custom vertex attributes.
++    ///
++    /// To specify, use [`GltfPlugin::add_custom_vertex_attribute`].
++    pub custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
++}
++
++impl Default for GltfPlugin {
++    fn default() -> Self {
++        GltfPlugin {
++            default_sampler: ImageSamplerDescriptor::linear(),
++            custom_vertex_attributes: HashMap::default(),
++        }
++    }
+ }
+ 
+ impl GltfPlugin {
+@@ -157,9 +208,13 @@ impl Plugin for GltfPlugin {
+             Some(render_device) => CompressedImageFormats::from_features(render_device.features()),
+             None => CompressedImageFormats::NONE,
+         };
++        let default_sampler_resource = DefaultGltfImageSampler::new(&self.default_sampler);
++        let default_sampler = default_sampler_resource.get_internal();
++        app.insert_resource(default_sampler_resource);
+         app.register_asset_loader(GltfLoader {
+             supported_compressed_formats,
+             custom_vertex_attributes: self.custom_vertex_attributes.clone(),
++            default_sampler,
+         });
+     }
+ }
+diff --git a/crates/bevy_gltf/src/loader/gltf_ext/texture.rs b/crates/bevy_gltf/src/loader/gltf_ext/texture.rs
+index 5fb5bcce0d4c0..f666752479bb6 100644
+--- a/crates/bevy_gltf/src/loader/gltf_ext/texture.rs
++++ b/crates/bevy_gltf/src/loader/gltf_ext/texture.rs
+@@ -39,48 +39,48 @@ pub(crate) fn texture_handle(
+ }
+ 
+ /// Extracts the texture sampler data from the glTF [`Texture`].
+-pub(crate) fn texture_sampler(texture: &Texture<'_>) -> ImageSamplerDescriptor {
++pub(crate) fn texture_sampler(
++    texture: &Texture<'_>,
++    default_sampler: &ImageSamplerDescriptor,
++) -> ImageSamplerDescriptor {
+     let gltf_sampler = texture.sampler();
++    let mut sampler = default_sampler.clone();
+ 
+-    ImageSamplerDescriptor {
+-        address_mode_u: address_mode(&gltf_sampler.wrap_s()),
+-        address_mode_v: address_mode(&gltf_sampler.wrap_t()),
+-
+-        mag_filter: gltf_sampler
+-            .mag_filter()
+-            .map(|mf| match mf {
+-                MagFilter::Nearest => ImageFilterMode::Nearest,
+-                MagFilter::Linear => ImageFilterMode::Linear,
+-            })
+-            .unwrap_or(ImageSamplerDescriptor::default().mag_filter),
+-
+-        min_filter: gltf_sampler
+-            .min_filter()
+-            .map(|mf| match mf {
+-                MinFilter::Nearest
+-                | MinFilter::NearestMipmapNearest
+-                | MinFilter::NearestMipmapLinear => ImageFilterMode::Nearest,
+-                MinFilter::Linear
+-                | MinFilter::LinearMipmapNearest
+-                | MinFilter::LinearMipmapLinear => ImageFilterMode::Linear,
+-            })
+-            .unwrap_or(ImageSamplerDescriptor::default().min_filter),
++    sampler.address_mode_u = address_mode(&gltf_sampler.wrap_s());
++    sampler.address_mode_v = address_mode(&gltf_sampler.wrap_t());
+ 
+-        mipmap_filter: gltf_sampler
+-            .min_filter()
+-            .map(|mf| match mf {
+-                MinFilter::Nearest
+-                | MinFilter::Linear
+-                | MinFilter::NearestMipmapNearest
+-                | MinFilter::LinearMipmapNearest => ImageFilterMode::Nearest,
+-                MinFilter::NearestMipmapLinear | MinFilter::LinearMipmapLinear => {
+-                    ImageFilterMode::Linear
+-                }
+-            })
+-            .unwrap_or(ImageSamplerDescriptor::default().mipmap_filter),
+-
+-        ..Default::default()
++    // Shouldn't parse filters when anisotropic filtering is on, because trilinear is then required by wgpu.
++    // We also trust user to have provided a valid sampler.
++    if sampler.anisotropy_clamp != 1 {
++        if let Some(mag_filter) = gltf_sampler.mag_filter().map(|mf| match mf {
++            MagFilter::Nearest => ImageFilterMode::Nearest,
++            MagFilter::Linear => ImageFilterMode::Linear,
++        }) {
++            sampler.mag_filter = mag_filter;
++        }
++        if let Some(min_filter) = gltf_sampler.min_filter().map(|mf| match mf {
++            MinFilter::Nearest
++            | MinFilter::NearestMipmapNearest
++            | MinFilter::NearestMipmapLinear => ImageFilterMode::Nearest,
++            MinFilter::Linear | MinFilter::LinearMipmapNearest | MinFilter::LinearMipmapLinear => {
++                ImageFilterMode::Linear
++            }
++        }) {
++            sampler.min_filter = min_filter;
++        }
++        if let Some(mipmap_filter) = gltf_sampler.min_filter().map(|mf| match mf {
++            MinFilter::Nearest
++            | MinFilter::Linear
++            | MinFilter::NearestMipmapNearest
++            | MinFilter::LinearMipmapNearest => ImageFilterMode::Nearest,
++            MinFilter::NearestMipmapLinear | MinFilter::LinearMipmapLinear => {
++                ImageFilterMode::Linear
++            }
++        }) {
++            sampler.mipmap_filter = mipmap_filter;
++        }
+     }
++    sampler
+ }
+ 
+ pub(crate) fn texture_label(texture: &Texture<'_>) -> GltfAssetLabel {
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index a4e25475b74fd..f85a739b2e01f 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -1,9 +1,11 @@
+ mod extensions;
+ mod gltf_ext;
+ 
++use alloc::sync::Arc;
+ use std::{
+     io::Error,
+     path::{Path, PathBuf},
++    sync::Mutex,
+ };
+ 
+ #[cfg(feature = "bevy_animation")]
+@@ -146,6 +148,8 @@ pub struct GltfLoader {
+     /// See [this section of the glTF specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#meshes-overview)
+     /// for additional details on custom attributes.
+     pub custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
++    /// Arc to default [`ImageSamplerDescriptor`].
++    pub default_sampler: Arc<Mutex<ImageSamplerDescriptor>>,
+ }
+ 
+ /// Specifies optional settings for processing gltfs at load time. By default, all recognized contents of
+@@ -181,6 +185,12 @@ pub struct GltfLoaderSettings {
+     pub load_lights: bool,
+     /// If true, the loader will include the root of the gltf root node.
+     pub include_source: bool,
++    /// Overrides the default sampler. Data from sampler node is added on top of that.
++    ///
++    /// If None, uses global default which is stored in `DefaultGltfImageSampler` resource.
++    pub default_sampler: Option<ImageSamplerDescriptor>,
++    /// If true, the loader will ignore sampler data from gltf and use the default sampler.
++    pub override_sampler: bool,
+ }
+ 
+ impl Default for GltfLoaderSettings {
+@@ -191,6 +201,8 @@ impl Default for GltfLoaderSettings {
+             load_cameras: true,
+             load_lights: true,
+             include_source: false,
++            default_sampler: None,
++            override_sampler: false,
+         }
+     }
+ }
+@@ -506,6 +518,10 @@ async fn load_gltf<'a, 'b, 'c>(
+         (animations, named_animations, animation_roots)
+     };
+ 
++    let default_sampler = match settings.default_sampler.as_ref() {
++        Some(sampler) => sampler,
++        None => &loader.default_sampler.lock().unwrap().clone(),
++    };
+     // We collect handles to ensure loaded images from paths are not unloaded before they are used elsewhere
+     // in the loader. This prevents "reloads", but it also prevents dropping the is_srgb context on reload.
+     //
+@@ -522,7 +538,8 @@ async fn load_gltf<'a, 'b, 'c>(
+                 &linear_textures,
+                 parent_path,
+                 loader.supported_compressed_formats,
+-                settings.load_materials,
++                default_sampler,
++                settings,
+             )
+             .await?;
+             image.process_loaded_texture(load_context, &mut _texture_handles);
+@@ -542,7 +559,8 @@ async fn load_gltf<'a, 'b, 'c>(
+                             linear_textures,
+                             parent_path,
+                             loader.supported_compressed_formats,
+-                            settings.load_materials,
++                            default_sampler,
++                            settings,
+                         )
+                         .await
+                     });
+@@ -958,10 +976,15 @@ async fn load_image<'a, 'b>(
+     linear_textures: &HashSet<usize>,
+     parent_path: &'b Path,
+     supported_compressed_formats: CompressedImageFormats,
+-    render_asset_usages: RenderAssetUsages,
++    default_sampler: &ImageSamplerDescriptor,
++    settings: &GltfLoaderSettings,
+ ) -> Result<ImageOrPath, GltfError> {
+     let is_srgb = !linear_textures.contains(&gltf_texture.index());
+-    let sampler_descriptor = texture_sampler(&gltf_texture);
++    let sampler_descriptor = if settings.override_sampler {
++        default_sampler.clone()
++    } else {
++        texture_sampler(&gltf_texture, default_sampler)
++    };
+ 
+     match gltf_texture.source().source() {
+         Source::View { view, mime_type } => {
+@@ -974,7 +997,7 @@ async fn load_image<'a, 'b>(
+                 supported_compressed_formats,
+                 is_srgb,
+                 ImageSampler::Descriptor(sampler_descriptor),
+-                render_asset_usages,
++                settings.load_materials,
+             )?;
+             Ok(ImageOrPath::Image {
+                 image,
+@@ -996,7 +1019,7 @@ async fn load_image<'a, 'b>(
+                         supported_compressed_formats,
+                         is_srgb,
+                         ImageSampler::Descriptor(sampler_descriptor),
+-                        render_asset_usages,
++                        settings.load_materials,
+                     )?,
+                     label: GltfAssetLabel::Texture(gltf_texture.index()),
+                 })

@@ -1,0 +1,102 @@
+diff --git a/crates/bevy_ecs/src/component.rs b/crates/bevy_ecs/src/component.rs
+index e7c14d1c3e32b..743854ee61bb9 100644
+--- a/crates/bevy_ecs/src/component.rs
++++ b/crates/bevy_ecs/src/component.rs
+@@ -15,6 +15,7 @@ use crate::{
+ use alloc::boxed::Box;
+ use alloc::{borrow::Cow, format, vec::Vec};
+ pub use bevy_ecs_macros::Component;
++use bevy_ecs_macros::Event;
+ use bevy_platform::sync::Arc;
+ use bevy_platform::{
+     collections::{HashMap, HashSet},
+@@ -2616,7 +2617,7 @@ impl Tick {
+     ///
+     /// Returns `true` if wrapping was performed. Otherwise, returns `false`.
+     #[inline]
+-    pub(crate) fn check_tick(&mut self, tick: Tick) -> bool {
++    pub fn check_tick(&mut self, tick: Tick) -> bool {
+         let age = tick.relative_to(*self);
+         // This comparison assumes that `age` has not overflowed `u32::MAX` before, which will be true
+         // so long as this check always runs before that can happen.
+@@ -2629,6 +2630,41 @@ impl Tick {
+     }
+ }
+ 
++/// An observer [`Event`] that can be used to maintain [`Tick`]s in custom data structures, enabling to make
++/// use of bevy's periodic checks that clamps ticks to a certain range, preventing overflows and thus
++/// keeping methods like [`Tick::is_newer_than`] reliably return `false` for ticks that got too old.
++///
++/// # Example
++///
++/// Here a schedule is stored in a custom resource. This way the systems in it would not have their change
++/// ticks automatically updated via [`World::check_change_ticks`], possibly causing `Tick`-related bugs on
++/// long-running apps.
++///
++/// To fix that, add an observer for this event that calls the schedule's
++/// [`Schedule::check_change_ticks`](bevy_ecs::schedule::Schedule::check_change_ticks).
++///
++/// ```
++/// use bevy_ecs::prelude::*;
++/// use bevy_ecs::component::CheckChangeTicks;
++///
++/// #[derive(Resource)]
++/// struct CustomSchedule(Schedule);
++///
++/// # let mut world = World::new();
++/// world.add_observer(|tick: Trigger<CheckChangeTicks>, mut schedule: ResMut<CustomSchedule>| {
++///     schedule.0.check_change_ticks(tick.get());
++/// });
++/// ```
++#[derive(Debug, Clone, Copy, Event)]
++pub struct CheckChangeTicks(pub(crate) Tick);
++
++impl CheckChangeTicks {
++    /// Get the `Tick` that can be used as the parameter of [`Tick::check_tick`].
++    pub fn get(self) -> Tick {
++        self.0
++    }
++}
++
+ /// Interior-mutable access to the [`Tick`]s for a single component or resource.
+ #[derive(Copy, Clone, Debug)]
+ pub struct TickCells<'a> {
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index a754f1e1d4bce..be6ef7b4e4be7 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -511,7 +511,7 @@ impl Schedule {
+     /// Iterates the change ticks of all systems in the schedule and clamps any older than
+     /// [`MAX_CHANGE_AGE`](crate::change_detection::MAX_CHANGE_AGE).
+     /// This prevents overflow and thus prevents false positives.
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub fn check_change_ticks(&mut self, change_tick: Tick) {
+         for system in &mut self.executable.systems {
+             if !is_apply_deferred(system) {
+                 system.check_change_tick(change_tick);
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 87340551af477..66b1f1b29527b 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -38,9 +38,9 @@ use crate::{
+     },
+     change_detection::{MaybeLocation, MutUntyped, TicksMut},
+     component::{
+-        Component, ComponentDescriptor, ComponentHooks, ComponentId, ComponentIds, ComponentInfo,
+-        ComponentTicks, Components, ComponentsQueuedRegistrator, ComponentsRegistrator, Mutable,
+-        RequiredComponents, RequiredComponentsError, Tick,
++        CheckChangeTicks, Component, ComponentDescriptor, ComponentHooks, ComponentId,
++        ComponentIds, ComponentInfo, ComponentTicks, Components, ComponentsQueuedRegistrator,
++        ComponentsRegistrator, Mutable, RequiredComponents, RequiredComponentsError, Tick,
+     },
+     entity::{Entities, Entity, EntityDoesNotExistError, EntityLocation},
+     entity_disabling::DefaultQueryFilters,
+@@ -2981,6 +2981,8 @@ impl World {
+             schedules.check_change_ticks(change_tick);
+         }
+ 
++        self.trigger(CheckChangeTicks(change_tick));
++
+         self.last_check_tick = change_tick;
+     }
+ 
