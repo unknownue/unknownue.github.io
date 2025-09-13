@@ -1,0 +1,204 @@
+diff --git a/crates/bevy_state/macros/src/states.rs b/crates/bevy_state/macros/src/states.rs
+index 52c133f6ee204..57c997156b548 100644
+--- a/crates/bevy_state/macros/src/states.rs
++++ b/crates/bevy_state/macros/src/states.rs
+@@ -1,6 +1,6 @@
+ use proc_macro::TokenStream;
+ use quote::{format_ident, quote};
+-use syn::{parse_macro_input, spanned::Spanned, DeriveInput, Pat, Path, Result};
++use syn::{parse_macro_input, spanned::Spanned, DeriveInput, LitBool, Pat, Path, Result};
+ 
+ use crate::bevy_state_path;
+ 
+@@ -13,14 +13,16 @@ struct StatesAttrs {
+ 
+ fn parse_states_attr(ast: &DeriveInput) -> Result<StatesAttrs> {
+     let mut attrs = StatesAttrs {
+-        scoped_entities_enabled: false,
++        scoped_entities_enabled: true,
+     };
+ 
+     for attr in ast.attrs.iter() {
+         if attr.path().is_ident(STATES) {
+             attr.parse_nested_meta(|nested| {
+                 if nested.path.is_ident(SCOPED_ENTITIES) {
+-                    attrs.scoped_entities_enabled = true;
++                    if let Ok(value) = nested.value() {
++                        attrs.scoped_entities_enabled = value.parse::<LitBool>()?.value();
++                    }
+                     Ok(())
+                 } else {
+                     Err(nested.error("Unsupported attribute"))
+diff --git a/crates/bevy_state/src/app.rs b/crates/bevy_state/src/app.rs
+index bd72c60cadf5c..05116cbcc5053 100644
+--- a/crates/bevy_state/src/app.rs
++++ b/crates/bevy_state/src/app.rs
+@@ -59,10 +59,11 @@ pub trait AppExtStates {
+ 
+     /// Enable state-scoped entity clearing for state `S`.
+     ///
+-    /// If the [`States`] trait was derived with the `#[states(scoped_entities)]` attribute, it
+-    /// will be called automatically.
++    /// This is enabled by default. If you don't want this behavior, add the `#[states(scoped_entities = false)]`
++    /// attribute when deriving the [`States`] trait.
+     ///
+     /// For more information refer to [`crate::state_scoped`].
++    #[doc(hidden)]
+     fn enable_state_scoped_entities<S: States>(&mut self) -> &mut Self;
+ 
+     #[cfg(feature = "bevy_reflect")]
+@@ -214,6 +215,7 @@ impl AppExtStates for SubApp {
+         self
+     }
+ 
++    #[doc(hidden)]
+     fn enable_state_scoped_entities<S: States>(&mut self) -> &mut Self {
+         if !self
+             .world()
+@@ -285,6 +287,7 @@ impl AppExtStates for App {
+         self
+     }
+ 
++    #[doc(hidden)]
+     fn enable_state_scoped_entities<S: States>(&mut self) -> &mut Self {
+         self.main_mut().enable_state_scoped_entities::<S>();
+         self
+diff --git a/crates/bevy_state/src/state_scoped.rs b/crates/bevy_state/src/state_scoped.rs
+index c591d0c1081c4..1abf0975ea7f5 100644
+--- a/crates/bevy_state/src/state_scoped.rs
++++ b/crates/bevy_state/src/state_scoped.rs
+@@ -14,8 +14,7 @@ use crate::state::{StateTransitionEvent, States};
+ /// Entities marked with this component will be removed
+ /// when the world's state of the matching type no longer matches the supplied value.
+ ///
+-/// To enable this feature remember to add the attribute `#[states(scoped_entities)]` when deriving [`States`].
+-/// It's also possible to enable it when adding the state to an app with [`enable_state_scoped_entities`](crate::app::AppExtStates::enable_state_scoped_entities).
++/// If you need to disable this behavior, add the attribute `#[states(scoped_entities = false)]` when deriving [`States`].
+ ///
+ /// ```
+ /// use bevy_state::prelude::*;
+@@ -23,7 +22,6 @@ use crate::state::{StateTransitionEvent, States};
+ /// use bevy_ecs::system::ScheduleSystem;
+ ///
+ /// #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, States)]
+-/// #[states(scoped_entities)]
+ /// enum GameState {
+ ///     #[default]
+ ///     MainMenu,
+@@ -44,7 +42,6 @@ use crate::state::{StateTransitionEvent, States};
+ /// # struct AppMock;
+ /// # impl AppMock {
+ /// #     fn init_state<S>(&mut self) {}
+-/// #     fn enable_state_scoped_entities<S>(&mut self) {}
+ /// #     fn add_systems<S, M>(&mut self, schedule: S, systems: impl IntoScheduleConfigs<ScheduleSystem, M>) {}
+ /// # }
+ /// # struct Update;
+@@ -123,14 +120,12 @@ pub fn despawn_entities_on_exit_state<S: States>(
+ /// # struct AppMock;
+ /// # impl AppMock {
+ /// #     fn init_state<S>(&mut self) {}
+-/// #     fn enable_state_scoped_entities<S>(&mut self) {}
+ /// #     fn add_systems<S, M>(&mut self, schedule: S, systems: impl IntoScheduleConfigs<ScheduleSystem, M>) {}
+ /// # }
+ /// # struct Update;
+ /// # let mut app = AppMock;
+ ///
+ /// app.init_state::<GameState>();
+-/// app.enable_state_scoped_entities::<GameState>();
+ /// app.add_systems(OnEnter(GameState::InGame), spawn_player);
+ /// ```
+ #[derive(Component, Clone)]
+diff --git a/examples/ecs/state_scoped.rs b/examples/ecs/state_scoped.rs
+index e0844b119d188..0dfcd48fad074 100644
+--- a/examples/ecs/state_scoped.rs
++++ b/examples/ecs/state_scoped.rs
+@@ -10,7 +10,6 @@ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins)
+         .init_state::<GameState>()
+-        .enable_state_scoped_entities::<GameState>()
+         .add_systems(Startup, setup_camera)
+         .add_systems(OnEnter(GameState::A), on_a_enter)
+         .add_systems(OnEnter(GameState::B), on_b_enter)
+diff --git a/examples/games/alien_cake_addict.rs b/examples/games/alien_cake_addict.rs
+index 5051c390f876c..cf452977c62c3 100644
+--- a/examples/games/alien_cake_addict.rs
++++ b/examples/games/alien_cake_addict.rs
+@@ -25,7 +25,6 @@ fn main() {
+             TimerMode::Repeating,
+         )))
+         .init_state::<GameState>()
+-        .enable_state_scoped_entities::<GameState>()
+         .add_systems(Startup, setup_cameras)
+         .add_systems(OnEnter(GameState::Playing), setup)
+         .add_systems(
+diff --git a/examples/state/computed_states.rs b/examples/state/computed_states.rs
+index edcb4b4ef15bc..4b59232762f8a 100644
+--- a/examples/state/computed_states.rs
++++ b/examples/state/computed_states.rs
+@@ -184,9 +184,6 @@ fn main() {
+         // We only want to run the [`setup_game`] function when we enter the [`AppState::InGame`] state, regardless
+         // of whether the game is paused or not.
+         .add_systems(OnEnter(InGame), setup_game)
+-        // And we only want to run the [`clear_game`] function when we leave the [`AppState::InGame`] state, regardless
+-        // of whether we're paused.
+-        .enable_state_scoped_entities::<InGame>()
+         // We want the color change, toggle_pause and quit_to_menu systems to ignore the paused condition, so we can use the [`InGame`] derived
+         // state here as well.
+         .add_systems(
+@@ -200,15 +197,12 @@ fn main() {
+         )
+         // We can continue setting things up, following all the same patterns used above and in the `states` example.
+         .add_systems(OnEnter(IsPaused::Paused), setup_paused_screen)
+-        .enable_state_scoped_entities::<IsPaused>()
+         .add_systems(OnEnter(TurboMode), setup_turbo_text)
+-        .enable_state_scoped_entities::<TurboMode>()
+         .add_systems(
+             OnEnter(Tutorial::MovementInstructions),
+             movement_instructions,
+         )
+         .add_systems(OnEnter(Tutorial::PauseInstructions), pause_instructions)
+-        .enable_state_scoped_entities::<Tutorial>()
+         .add_systems(
+             Update,
+             (
+diff --git a/examples/testbed/2d.rs b/examples/testbed/2d.rs
+index 7d80aae91f8d3..130d32c57bfe7 100644
+--- a/examples/testbed/2d.rs
++++ b/examples/testbed/2d.rs
+@@ -26,7 +26,6 @@ fn main() {
+ }
+ 
+ #[derive(Debug, Clone, Eq, PartialEq, Hash, States, Default)]
+-#[states(scoped_entities)]
+ enum Scene {
+     #[default]
+     Shapes,
+diff --git a/examples/testbed/3d.rs b/examples/testbed/3d.rs
+index dff29d06cab9d..573eae229fb55 100644
+--- a/examples/testbed/3d.rs
++++ b/examples/testbed/3d.rs
+@@ -26,7 +26,6 @@ fn main() {
+ }
+ 
+ #[derive(Debug, Clone, Eq, PartialEq, Hash, States, Default)]
+-#[states(scoped_entities)]
+ enum Scene {
+     #[default]
+     Light,
+diff --git a/release-content/migration-guides/state_scoped_entities_by_default.md b/release-content/migration-guides/state_scoped_entities_by_default.md
+new file mode 100644
+index 0000000000000..471e245b46d4b
+--- /dev/null
++++ b/release-content/migration-guides/state_scoped_entities_by_default.md
+@@ -0,0 +1,10 @@
++---
++title: Entities are now state scoped by default
++pull_requests: [19354]
++---
++
++State scoped entities is now enabled by default, and you don't need to call `app.enable_state_scoped_entities::<State>()` anymore.
++
++If you were previously adding the `#[states(scoped_entities)]` attribute when deriving the `States` trait, you can remove it.
++
++If you want to keep the previous behavior, you must add the attribute `#[states(scoped_entities = false)]`.

@@ -1,0 +1,411 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 6757a0c8b49f9..97bbfdddb0152 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -604,11 +604,6 @@ web = ["bevy_internal/web"]
+ # Enable hotpatching of Bevy systems
+ hotpatching = ["bevy_internal/hotpatching"]
+ 
+-# Enable converting glTF coordinates to Bevy's coordinate system by default. This will be Bevy's default behavior starting in 0.18.
+-gltf_convert_coordinates_default = [
+-  "bevy_internal/gltf_convert_coordinates_default",
+-]
+-
+ # Enable collecting debug information about systems and components to help with diagnostics
+ debug = ["bevy_internal/debug"]
+ 
+diff --git a/crates/bevy_gltf/Cargo.toml b/crates/bevy_gltf/Cargo.toml
+index c8b486f41d13d..f30f56dc067a6 100644
+--- a/crates/bevy_gltf/Cargo.toml
++++ b/crates/bevy_gltf/Cargo.toml
+@@ -15,7 +15,6 @@ pbr_multi_layer_material_textures = [
+ ]
+ pbr_anisotropy_texture = ["bevy_pbr/pbr_anisotropy_texture"]
+ pbr_specular_textures = ["bevy_pbr/pbr_specular_textures"]
+-gltf_convert_coordinates_default = []
+ 
+ [dependencies]
+ # bevy
+@@ -64,6 +63,8 @@ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0.140"
+ smallvec = { version = "1", default-features = false }
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
++
++[dev-dependencies]
+ bevy_log = { path = "../bevy_log", version = "0.17.0-dev" }
+ 
+ [lints]
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index c53e1a6b7617e..46c61d2b9f35e 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -159,20 +159,17 @@ pub struct GltfPlugin {
+     /// Can be modified with the [`DefaultGltfImageSampler`] resource.
+     pub default_sampler: ImageSamplerDescriptor,
+ 
+-    /// Whether to convert glTF coordinates to Bevy's coordinate system by default.
+-    /// If set to `true`, the loader will convert the coordinate system of loaded glTF assets to Bevy's coordinate system
+-    /// such that objects looking forward in glTF will also look forward in Bevy.
++    /// How to convert glTF coordinates on import. Assuming glTF cameras, glTF lights, and glTF meshes had global identity transforms,
++    /// their Bevy [`Transform::forward`](bevy_transform::components::Transform::forward) will be pointing in the following global directions:
++    /// - When set to `false`
++    ///   - glTF cameras and glTF lights: global -Z,
++    ///   - glTF models: global +Z.
++    /// - When set to `true`
++    ///   - glTF cameras and glTF lights: global +Z,
++    ///   - glTF models: global -Z.
+     ///
+-    /// The exact coordinate system conversion is as follows:
+-    /// - glTF:
+-    ///   - forward: Z
+-    ///   - up: Y
+-    ///   - right: -X
+-    /// - Bevy:
+-    ///   - forward: -Z
+-    ///   - up: Y
+-    ///   - right: X
+-    pub convert_coordinates: bool,
++    /// The default is `false`.
++    pub use_model_forward_direction: bool,
+ 
+     /// Registry for custom vertex attributes.
+     ///
+@@ -185,7 +182,7 @@ impl Default for GltfPlugin {
+         GltfPlugin {
+             default_sampler: ImageSamplerDescriptor::linear(),
+             custom_vertex_attributes: HashMap::default(),
+-            convert_coordinates: cfg!(feature = "gltf_convert_coordinates_default"),
++            use_model_forward_direction: false,
+         }
+     }
+ }
+@@ -235,7 +232,7 @@ impl Plugin for GltfPlugin {
+             supported_compressed_formats,
+             custom_vertex_attributes: self.custom_vertex_attributes.clone(),
+             default_sampler,
+-            default_convert_coordinates: self.convert_coordinates,
++            default_use_model_forward_direction: self.use_model_forward_direction,
+         });
+     }
+ }
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index 3eed903cca8ee..87e2b43199d63 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -2,7 +2,6 @@ mod extensions;
+ mod gltf_ext;
+ 
+ use alloc::sync::Arc;
+-use bevy_log::warn_once;
+ use std::{
+     io::Error,
+     path::{Path, PathBuf},
+@@ -148,20 +147,17 @@ pub struct GltfLoader {
+     pub custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
+     /// Arc to default [`ImageSamplerDescriptor`].
+     pub default_sampler: Arc<Mutex<ImageSamplerDescriptor>>,
+-    /// Whether to convert glTF coordinates to Bevy's coordinate system by default.
+-    /// If set to `true`, the loader will convert the coordinate system of loaded glTF assets to Bevy's coordinate system
+-    /// such that objects looking forward in glTF will also look forward in Bevy.
++    /// How to convert glTF coordinates on import. Assuming glTF cameras, glTF lights, and glTF meshes had global identity transforms,
++    /// their Bevy [`Transform::forward`](bevy_transform::components::Transform::forward) will be pointing in the following global directions:
++    /// - When set to `false`
++    ///   - glTF cameras and glTF lights: global -Z,
++    ///   - glTF models: global +Z.
++    /// - When set to `true`
++    ///   - glTF cameras and glTF lights: global +Z,
++    ///   - glTF models: global -Z.
+     ///
+-    /// The exact coordinate system conversion is as follows:
+-    /// - glTF:
+-    ///   - forward: Z
+-    ///   - up: Y
+-    ///   - right: -X
+-    /// - Bevy:
+-    ///   - forward: -Z
+-    ///   - up: Y
+-    ///   - right: X
+-    pub default_convert_coordinates: bool,
++    /// The default is `false`.
++    pub default_use_model_forward_direction: bool,
+ }
+ 
+ /// Specifies optional settings for processing gltfs at load time. By default, all recognized contents of
+@@ -203,23 +199,17 @@ pub struct GltfLoaderSettings {
+     pub default_sampler: Option<ImageSamplerDescriptor>,
+     /// If true, the loader will ignore sampler data from gltf and use the default sampler.
+     pub override_sampler: bool,
+-    /// Overrides the default glTF coordinate conversion setting.
++    /// How to convert glTF coordinates on import. Assuming glTF cameras, glTF lights, and glTF meshes had global unit transforms,
++    /// their Bevy [`Transform::forward`](bevy_transform::components::Transform::forward) will be pointing in the following global directions:
++    /// - When set to `false`
++    ///   - glTF cameras and glTF lights: global -Z,
++    ///   - glTF models: global +Z.
++    /// - When set to `true`
++    ///   - glTF cameras and glTF lights: global +Z,
++    ///   - glTF models: global -Z.
+     ///
+-    /// If set to `Some(true)`, the loader will convert the coordinate system of loaded glTF assets to Bevy's coordinate system
+-    /// such that objects looking forward in glTF will also look forward in Bevy.
+-    ///
+-    /// The exact coordinate system conversion is as follows:
+-    /// - glTF:
+-    ///   - forward: Z
+-    ///   - up: Y
+-    ///   - right: -X
+-    /// - Bevy:
+-    ///   - forward: -Z
+-    ///   - up: Y
+-    ///   - right: X
+-    ///
+-    /// If `None`, uses the global default set by [`GltfPlugin::convert_coordinates`](crate::GltfPlugin::convert_coordinates).
+-    pub convert_coordinates: Option<bool>,
++    /// If `None`, uses the global default set by [`GltfPlugin::use_model_forward_direction`](crate::GltfPlugin::use_model_forward_direction).
++    pub use_model_forward_direction: Option<bool>,
+ }
+ 
+ impl Default for GltfLoaderSettings {
+@@ -232,7 +222,7 @@ impl Default for GltfLoaderSettings {
+             include_source: false,
+             default_sampler: None,
+             override_sampler: false,
+-            convert_coordinates: None,
++            use_model_forward_direction: None,
+         }
+     }
+ }
+@@ -272,20 +262,9 @@ impl GltfLoader {
+             paths
+         };
+ 
+-        let convert_coordinates = match settings.convert_coordinates {
++        let convert_coordinates = match settings.use_model_forward_direction {
+             Some(convert_coordinates) => convert_coordinates,
+-            None => {
+-                let convert_by_default = loader.default_convert_coordinates;
+-                if !convert_by_default && !cfg!(feature = "gltf_convert_coordinates_default") {
+-                    warn_once!(
+-                    "Starting from Bevy 0.18, by default all imported glTF models will be rotated by 180 degrees around the Y axis to align with Bevy's coordinate system. \
+-                    You are currently importing glTF files using the old behavior. Consider opting-in to the new import behavior by enabling the `gltf_convert_coordinates_default` feature. \
+-                    If you encounter any issues please file a bug! \
+-                    If you want to continue using the old behavior going forward (even when the default changes in 0.18), manually set the corresponding option in the `GltfPlugin` or `GltfLoaderSettings`. See the migration guide for more details."
+-                );
+-                }
+-                convert_by_default
+-            }
++            None => loader.default_use_model_forward_direction,
+         };
+ 
+         #[cfg(feature = "bevy_animation")]
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index beeaecd654c82..658f1a45ffd8e 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -396,10 +396,6 @@ web = ["bevy_app/web", "bevy_platform/web", "bevy_reflect/web"]
+ 
+ hotpatching = ["bevy_app/hotpatching", "bevy_ecs/hotpatching"]
+ 
+-gltf_convert_coordinates_default = [
+-  "bevy_gltf?/gltf_convert_coordinates_default",
+-]
+-
+ debug = ["bevy_utils/debug"]
+ 
+ [dependencies]
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 88fc087e2353a..0451cbf0985c0 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -97,7 +97,6 @@ The default feature set enables most of the expected features of a game engine,
+ |ghost_nodes|Experimental support for nodes that are ignored for UI layouting|
+ |gif|GIF image format support|
+ |glam_assert|Enable assertions to check the validity of parameters passed to glam|
+-|gltf_convert_coordinates_default|Enable converting glTF coordinates to Bevy's coordinate system by default. This will be Bevy's default behavior starting in 0.18.|
+ |hotpatching|Enable hotpatching of Bevy systems|
+ |ico|ICO image format support|
+ |jpeg|JPEG image format support|
+diff --git a/examples/3d/skybox.rs b/examples/3d/skybox.rs
+index dd797473bf57d..22be77c4e7369 100644
+--- a/examples/3d/skybox.rs
++++ b/examples/3d/skybox.rs
+@@ -4,8 +4,10 @@
+ mod camera_controller;
+ 
+ use bevy::{
++    anti_aliasing::taa::TemporalAntiAliasing,
+     core_pipeline::Skybox,
+     image::CompressedImageFormats,
++    pbr::ScreenSpaceAmbientOcclusion,
+     prelude::*,
+     render::{
+         render_resource::{TextureViewDescriptor, TextureViewDimension},
+@@ -71,6 +73,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     // camera
+     commands.spawn((
+         Camera3d::default(),
++        Msaa::Off,
++        TemporalAntiAliasing::default(),
++        ScreenSpaceAmbientOcclusion::default(),
+         Transform::from_xyz(0.0, 0.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+         CameraController::default(),
+         Skybox {
+diff --git a/release-content/migration-guides/convert-coordinates.md b/release-content/migration-guides/convert-coordinates.md
+deleted file mode 100644
+index 85ab80ed2053e..0000000000000
+--- a/release-content/migration-guides/convert-coordinates.md
++++ /dev/null
+@@ -1,90 +0,0 @@
+----
+-title: Allow importing glTFs with a corrected coordinate system
+-authors: ["@janhohenheim"]
+-pull_requests: [19633, 19685, 19816]
+----
+-
+-glTF uses the following coordinate system:
+-
+-- forward: Z
+-- up: Y
+-- right: -X
+-
+-and Bevy uses:
+-
+-- forward: -Z
+-- up: Y
+-- right: X
+-
+-This means that to correctly import glTFs into Bevy, vertex data should be rotated by 180 degrees around the Y axis.  
+-For the longest time, Bevy has simply ignored this distinction. That caused issues when working across programs, as most software respects the
+-glTF coordinate system when importing and exporting glTFs. Your scene might have looked correct in Blender, Maya, TrenchBroom, etc. but everything would be flipped when importing it into Bevy!
+-
+-Long-term, we'd like to fix our glTF imports to use the correct coordinate system by default.
+-But changing the import behavior would mean that *all* imported glTFs of *all* users would suddenly look different, breaking their scenes!
+-Not to mention that any bugs in the conversion code would be incredibly frustating for users.
+-
+-This is why we are now gradually rolling out support for corrected glTF imports. You will now be greeted by the following warning when using the old behavior:
+-
+-> Starting from Bevy 0.18, by default all imported glTF models will be rotated by 180 degrees around the Y axis to align with Bevy's coordinate system.
+-> You are currently importing glTF files using the old behavior. Consider opting-in to the new import behavior by enabling the `gltf_convert_coordinates_default` feature.
+-> If you encounter any issues please file a bug!
+-> If you want to continue using the old behavior going forward (even when the default changes in 0.18), manually set the corresponding option in the `GltfPlugin` or `GltfLoaderSettings`.
+-> See the migration guide for more details.
+-
+-As the warning says, you can opt into the new behavior by enabling the `gltf_convert_coordinates_default` feature in your `Cargo.toml`:
+-
+-```toml
+-# old behavior, ignores glTF's coordinate system
+-[dependencies]
+-bevy = "0.17.0"
+-
+-# new behavior, converts the coordinate system of all glTF assets into Bevy's coordinate system
+-[dependencies]
+-bevy = { version = "0.17.0", features = ["gltf_convert_coordinates_default"] }
+-```
+-
+-If you prefer, you can also do this in code by setting `convert_coordinates` on `GltfPlugin`:
+-
+-```rust
+-// old behavior, ignores glTF's coordinate system
+-App::new()
+-    .add_plugins(DefaultPlugins)
+-    .run();
+-
+-// new behavior, converts the coordinate system of all glTF assets into Bevy's coordinate system
+-App::new()
+-    .add_plugins(DefaultPlugins.set(GltfPlugin {
+-        convert_coordinates: true,
+-        ..default()
+-    }))
+-    .run();
+-```
+-
+-If you want to continue using the old behavior in the future, you can silence the warning by enabling the `gltf_convert_coordinates_default` feature
+-and explicitly setting `convert_coordinates: false` on `GltfPlugin`.
+-
+-You can also control this on a per-asset-level:
+-
+-```rust
+-// Use the global default
+-let handle = asset_server.load("fox.gltf#Scene0");
+-
+-// Manually opt in or out of coordinate conversion for an individual asset
+-let handle = asset_server.load_with_settings(
+-    "fox.gltf#Scene0",
+-    |settings: &mut GltfLoaderSettings| {
+-        settings.convert_coordinates = Some(true);
+-    },
+-);
+-```
+-
+-After opting into the new behavior, your scene will be oriented such that your modeling software's forward direction correctly corresponds to Bevy's forward direction.
+-
+-For example, Blender assumes -Y to be forward, so exporting the following model to glTF and loading it in Bevy with the new settings will ensure everything is
+-oriented the right way across all programs in your pipeline:
+-
+-<!-- TODO: Add png from PR description -->
+-![Blender Coordinate System](blender-coords.png)
+-
+-If you opt into this, please let us know how it's working out! Is your scene looking like you expected? Are the animations playing correctly? Is the camera at the right place? Are the lights shining from the right spots?
+diff --git a/release-content/release-notes/convert-coordinates.md b/release-content/release-notes/convert-coordinates.md
+new file mode 100644
+index 0000000000000..e3aa7b440e627
+--- /dev/null
++++ b/release-content/release-notes/convert-coordinates.md
+@@ -0,0 +1,58 @@
++---
++title: Allow importing glTFs with corrected model forward semantics
++authors: ["@janhohenheim"]
++pull_requests: [19633, 19685, 19816, 20131, 20122]
++---
++
++Bevy uses the following coordinate system for all worldspace entities that have a `Transform`:
++
++- forward: -Z
++- up: Y
++- right: X
++
++But glTF is a bit more complicated. Models in glTF scenes use the following coordinate system:
++
++- forward: Z
++- up: Y
++- right: -X
++
++but cameras and lights in glTF scenes use the following coordinate system:
++
++- forward: -Z
++- up: Y
++- right: X
++
++As you can see, this clashes with Bevy assumption that everything in the world uses the same coordinate system.
++In the past, we only imported glTFs using the camera / light coordinate system for everything, as that is already aligned with Bevy.
++In other words, the glTF importer simply assumed that glTF models used -Z as their forward direction, even though they use +Z.
++
++But that meant that on the Bevy side, a glTF model's `Transform::forward()` would actually point backwards from the point of view of the model,
++which is counterintuitive and very annoying when working across different art pipelines.
++
++To remedy this, users can now change the import behavior to instead favor correct `Transform::forward()` semantics for models.
++The downside is that glTF cameras and lights that have a global identity transform in glTF will now look to +Z instead of -Z in Bevy.
++This should not be a problem in many cases, as the whole scene is rotated so that the end result on your screen will be rendered the exact same way.
++
++To globally opt into the behavior that favors glTF models over glTF cameras, you can set `GltfPlugin::use_model_forward_direction`:
++
++```rust
++App::new()
++    .add_plugins(DefaultPlugins.set(GltfPlugin {
++        use_model_forward_direction: true,
++        ..default()
++    }))
++    .run();
++```
++
++You can also control this on a per-asset-level:
++
++```rust
++let handle = asset_server.load_with_settings(
++    "fox.gltf#Scene0",
++    |settings: &mut GltfLoaderSettings| {
++        settings.use_model_forward_direction = Some(true);
++    },
++);
++```
++
++Setting the above to `None` will fall back to the global setting taken from `GltfPlugin::use_model_forward_direction`.
