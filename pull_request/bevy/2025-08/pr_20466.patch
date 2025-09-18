@@ -1,0 +1,161 @@
+diff --git a/assets/shaders/game_of_life.wgsl b/assets/shaders/game_of_life.wgsl
+index 0eb5e32e6ec56..7ad264fc33f7a 100644
+--- a/assets/shaders/game_of_life.wgsl
++++ b/assets/shaders/game_of_life.wgsl
+@@ -4,9 +4,15 @@
+ // Two textures are needed for the game of life as each pixel of step N depends on the state of its
+ // neighbors at step N-1.
+ 
+-@group(0) @binding(0) var input: texture_storage_2d<r32float, read>;
++@group(0) @binding(0) var input: texture_storage_2d<rgba32float, read>;
+ 
+-@group(0) @binding(1) var output: texture_storage_2d<r32float, write>;
++@group(0) @binding(1) var output: texture_storage_2d<rgba32float, write>;
++
++@group(0) @binding(2) var<uniform> config: GameOfLifeUniforms;
++
++struct GameOfLifeUniforms {
++    alive_color: vec4<f32>,
++}
+ 
+ fn hash(value: u32) -> u32 {
+     var state = value;
+@@ -29,14 +35,15 @@ fn init(@builtin(global_invocation_id) invocation_id: vec3<u32>, @builtin(num_wo
+ 
+     let randomNumber = randomFloat((invocation_id.y << 16u) | invocation_id.x);
+     let alive = randomNumber > 0.9;
+-    let color = vec4<f32>(f32(alive));
++    // Use alpha channel to keep track of cell's state
++    let color = vec4(config.alive_color.rgb, f32(alive));
+ 
+     textureStore(output, location, color);
+ }
+ 
+ fn is_alive(location: vec2<i32>, offset_x: i32, offset_y: i32) -> i32 {
+     let value: vec4<f32> = textureLoad(input, location + vec2<i32>(offset_x, offset_y));
+-    return i32(value.x);
++    return i32(value.a);
+ }
+ 
+ fn count_alive(location: vec2<i32>) -> i32 {
+@@ -65,7 +72,7 @@ fn update(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
+     } else {
+         alive = false;
+     }
+-    let color = vec4<f32>(f32(alive));
++    let color = vec4(config.alive_color.rgb, f32(alive));
+ 
+     textureStore(output, location, color);
+ }
+diff --git a/examples/shader/compute_shader_game_of_life.rs b/examples/shader/compute_shader_game_of_life.rs
+index a11767f06ff0d..fb157e3091f2c 100644
+--- a/examples/shader/compute_shader_game_of_life.rs
++++ b/examples/shader/compute_shader_game_of_life.rs
+@@ -9,8 +9,11 @@ use bevy::{
+         extract_resource::{ExtractResource, ExtractResourcePlugin},
+         render_asset::{RenderAssetUsages, RenderAssets},
+         render_graph::{self, RenderGraph, RenderLabel},
+-        render_resource::{binding_types::texture_storage_2d, *},
+-        renderer::{RenderContext, RenderDevice},
++        render_resource::{
++            binding_types::{texture_storage_2d, uniform_buffer},
++            *,
++        },
++        renderer::{RenderContext, RenderDevice, RenderQueue},
+         texture::GpuImage,
+         Render, RenderApp, RenderStartup, RenderSystems,
+     },
+@@ -51,7 +54,7 @@ fn main() {
+ }
+ 
+ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+-    let mut image = Image::new_target_texture(SIZE.0, SIZE.1, TextureFormat::R32Float);
++    let mut image = Image::new_target_texture(SIZE.0, SIZE.1, TextureFormat::Rgba32Float);
+     image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+     image.texture_descriptor.usage =
+         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+@@ -72,6 +75,10 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+         texture_a: image0,
+         texture_b: image1,
+     });
++
++    commands.insert_resource(GameOfLifeUniforms {
++        alive_color: LinearRgba::RED,
++    });
+ }
+ 
+ // Switch texture to display every frame to show the one that was written to most recently.
+@@ -92,7 +99,10 @@ impl Plugin for GameOfLifeComputePlugin {
+     fn build(&self, app: &mut App) {
+         // Extract the game of life image resource from the main world into the render world
+         // for operation on by the compute shader and display on the sprite.
+-        app.add_plugins(ExtractResourcePlugin::<GameOfLifeImages>::default());
++        app.add_plugins((
++            ExtractResourcePlugin::<GameOfLifeImages>::default(),
++            ExtractResourcePlugin::<GameOfLifeUniforms>::default(),
++        ));
+         let render_app = app.sub_app_mut(RenderApp);
+         render_app
+             .add_systems(RenderStartup, init_game_of_life_pipeline)
+@@ -113,6 +123,11 @@ struct GameOfLifeImages {
+     texture_b: Handle<Image>,
+ }
+ 
++#[derive(Resource, Clone, ExtractResource, ShaderType)]
++struct GameOfLifeUniforms {
++    alive_color: LinearRgba,
++}
++
+ #[derive(Resource)]
+ struct GameOfLifeImageBindGroups([BindGroup; 2]);
+ 
+@@ -121,19 +136,35 @@ fn prepare_bind_group(
+     pipeline: Res<GameOfLifePipeline>,
+     gpu_images: Res<RenderAssets<GpuImage>>,
+     game_of_life_images: Res<GameOfLifeImages>,
++    game_of_life_uniforms: Res<GameOfLifeUniforms>,
+     render_device: Res<RenderDevice>,
++    queue: Res<RenderQueue>,
+ ) {
+     let view_a = gpu_images.get(&game_of_life_images.texture_a).unwrap();
+     let view_b = gpu_images.get(&game_of_life_images.texture_b).unwrap();
++
++    // Uniform buffer is used here to demonstrate how to set up a uniform in a compute shader
++    // Alternatives such as storage buffers or push constants may be more suitable for your use case
++    let mut uniform_buffer = UniformBuffer::from(game_of_life_uniforms.into_inner());
++    uniform_buffer.write_buffer(&render_device, &queue);
++
+     let bind_group_0 = render_device.create_bind_group(
+         None,
+         &pipeline.texture_bind_group_layout,
+-        &BindGroupEntries::sequential((&view_a.texture_view, &view_b.texture_view)),
++        &BindGroupEntries::sequential((
++            &view_a.texture_view,
++            &view_b.texture_view,
++            &uniform_buffer,
++        )),
+     );
+     let bind_group_1 = render_device.create_bind_group(
+         None,
+         &pipeline.texture_bind_group_layout,
+-        &BindGroupEntries::sequential((&view_b.texture_view, &view_a.texture_view)),
++        &BindGroupEntries::sequential((
++            &view_b.texture_view,
++            &view_a.texture_view,
++            &uniform_buffer,
++        )),
+     );
+     commands.insert_resource(GameOfLifeImageBindGroups([bind_group_0, bind_group_1]));
+ }
+@@ -156,8 +187,9 @@ fn init_game_of_life_pipeline(
+         &BindGroupLayoutEntries::sequential(
+             ShaderStages::COMPUTE,
+             (
+-                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
+-                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
++                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::ReadOnly),
++                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
++                uniform_buffer::<GameOfLifeUniforms>(false),
+             ),
+         ),
+     );
