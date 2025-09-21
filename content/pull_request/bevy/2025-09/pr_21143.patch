@@ -1,0 +1,1671 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index b67c5babf1f52..3d9bc2a99ba55 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -522,3 +522,14 @@ jobs:
+               echo " Example: 'use bevy::sprite::Mesh2d;' instead of 'bevy_internal::sprite::Mesh2d;'"
+               exit 1
+           fi
++
++  check-release-content:
++    runs-on: ubuntu-latest
++    timeout-minutes: 30
++    steps:
++      - uses: actions/checkout@v5
++      - uses: dtolnay/rust-toolchain@stable
++      - name: Check Release Content
++        shell: bash
++        run: |
++          cargo run --package export-content -- --check
+diff --git a/README.md b/README.md
+index 73cc0e7a8d51c..ace4b5fd414d9 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,4 @@
+-# [![Bevy](assets/branding/bevy_logo_light_dark_and_dimmed.svg)](https://bevy.org)
++# [![Bevy](https://bevy.org/assets/bevy_logo_light_dark_and_dimmed.svg)](https://bevy.org)
+ 
+ [![License](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/bevyengine/bevy#license)
+ [![Crates.io](https://img.shields.io/crates/v/bevy.svg)](https://crates.io/crates/bevy)
+diff --git a/crates/bevy_camera/src/camera.rs b/crates/bevy_camera/src/camera.rs
+index 35f165fc469a5..48e546a8bfced 100644
+--- a/crates/bevy_camera/src/camera.rs
++++ b/crates/bevy_camera/src/camera.rs
+@@ -162,7 +162,7 @@ impl Default for SubCameraView {
+ }
+ 
+ /// Information about the current [`RenderTarget`].
+-#[derive(Default, Debug, Clone)]
++#[derive(Debug, Clone)]
+ pub struct RenderTargetInfo {
+     /// The physical size of this render target (in physical pixels, ignoring scale factor).
+     pub physical_size: UVec2,
+@@ -173,6 +173,15 @@ pub struct RenderTargetInfo {
+     pub scale_factor: f32,
+ }
+ 
++impl Default for RenderTargetInfo {
++    fn default() -> Self {
++        Self {
++            physical_size: Default::default(),
++            scale_factor: 1.,
++        }
++    }
++}
++
+ /// Holds internally computed [`Camera`] values.
+ #[derive(Default, Debug, Clone)]
+ pub struct ComputedCameraValues {
+@@ -873,6 +882,8 @@ pub enum NormalizedRenderTarget {
+ }
+ 
+ /// A unique id that corresponds to a specific `ManualTextureView` in the `ManualTextureViews` collection.
++///
++/// See `ManualTextureViews` in `bevy_camera` for more details.
+ #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Component, Reflect)]
+ #[reflect(Component, Default, Debug, PartialEq, Hash, Clone)]
+ pub struct ManualTextureViewHandle(pub u32);
+diff --git a/crates/bevy_camera/src/visibility/mod.rs b/crates/bevy_camera/src/visibility/mod.rs
+index 8ac0ea4fe565d..c4e313428a9c6 100644
+--- a/crates/bevy_camera/src/visibility/mod.rs
++++ b/crates/bevy_camera/src/visibility/mod.rs
+@@ -150,11 +150,16 @@ impl InheritedVisibility {
+ /// When adding a new renderable component, you'll typically want to write an
+ /// add-component hook that adds the type ID of that component to the
+ /// [`VisibilityClass`] array. See `custom_phase_item` for an example.
++///
++/// `VisibilityClass` is automatically added by a hook on the `Mesh3d` and
++/// `Mesh2d` components. To avoid duplicating the `VisibilityClass` and
++/// causing issues when cloning, we use `#[component(clone_behavior=Ignore)]`
+ //
+ // Note: This can't be a `ComponentId` because the visibility classes are copied
+ // into the render world, and component IDs are per-world.
+ #[derive(Clone, Component, Default, Reflect, Deref, DerefMut)]
+ #[reflect(Component, Default, Clone)]
++#[component(clone_behavior=Ignore)]
+ pub struct VisibilityClass(pub SmallVec<[TypeId; 1]>);
+ 
+ /// Algorithmically-computed indication of whether an entity is visible and should be extracted for rendering.
+@@ -988,4 +993,27 @@ mod test {
+         assert_eq!(1, size_of::<Visibility>());
+         assert_eq!(1, size_of::<Option<Visibility>>());
+     }
++
++    #[derive(Component, Default, Clone, Reflect)]
++    #[require(VisibilityClass)]
++    #[reflect(Component, Default, Clone)]
++    #[component(on_add = add_visibility_class::<Self>)]
++    struct TestVisibilityClassHook;
++
++    #[test]
++    fn test_add_visibility_class_hook() {
++        let mut world = World::new();
++        let entity = world.spawn(TestVisibilityClassHook).id();
++        let entity_clone = world.spawn_empty().id();
++        world
++            .entity_mut(entity)
++            .clone_with_opt_out(entity_clone, |_| {});
++
++        let entity_visibility_class = world.entity(entity).get::<VisibilityClass>().unwrap();
++        assert_eq!(entity_visibility_class.len(), 1);
++
++        let entity_clone_visibility_class =
++            world.entity(entity_clone).get::<VisibilityClass>().unwrap();
++        assert_eq!(entity_clone_visibility_class.len(), 1);
++    }
+ }
+diff --git a/crates/bevy_dev_tools/src/fps_overlay.rs b/crates/bevy_dev_tools/src/fps_overlay.rs
+index 3c573611f70b3..ea5c0fde4318b 100644
+--- a/crates/bevy_dev_tools/src/fps_overlay.rs
++++ b/crates/bevy_dev_tools/src/fps_overlay.rs
+@@ -2,18 +2,16 @@
+ 
+ use bevy_app::{Plugin, Startup, Update};
+ use bevy_asset::{Assets, Handle};
+-use bevy_camera::visibility::Visibility;
+ use bevy_color::Color;
+ use bevy_diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+ use bevy_ecs::{
+-    change_detection::DetectChangesMut,
+     component::Component,
+     entity::Entity,
+     prelude::Local,
+-    query::With,
++    query::{With, Without},
+     resource::Resource,
+     schedule::{common_conditions::resource_changed, IntoScheduleConfigs},
+-    system::{Commands, Query, Res, ResMut},
++    system::{Commands, Query, Res, ResMut, Single},
+ };
+ use bevy_picking::Pickable;
+ use bevy_render::storage::ShaderStorageBuffer;
+@@ -247,26 +245,23 @@ fn customize_overlay(
+ 
+ fn toggle_display(
+     overlay_config: Res<FpsOverlayConfig>,
+-    mut query: Query<&mut Visibility, With<FpsText>>,
+-    mut graph_style: Query<&mut Node, With<FrameTimeGraph>>,
++    mut text_node: Single<&mut Node, (With<FpsText>, Without<FrameTimeGraph>)>,
++    mut graph_node: Single<&mut Node, (With<FrameTimeGraph>, Without<FpsText>)>,
+ ) {
+-    for mut visibility in &mut query {
+-        visibility.set_if_neq(match overlay_config.enabled {
+-            true => Visibility::Visible,
+-            false => Visibility::Hidden,
+-        });
++    if overlay_config.enabled {
++        text_node.display = bevy_ui::Display::DEFAULT;
++    } else {
++        text_node.display = bevy_ui::Display::None;
+     }
+ 
+-    if let Ok(mut graph_style) = graph_style.single_mut() {
+-        if overlay_config.frame_time_graph_config.enabled {
+-            // Scale the frame time graph based on the font size of the overlay
+-            let font_size = overlay_config.text_config.font_size;
+-            graph_style.width = Val::Px(font_size * FRAME_TIME_GRAPH_WIDTH_SCALE);
+-            graph_style.height = Val::Px(font_size * FRAME_TIME_GRAPH_HEIGHT_SCALE);
++    if overlay_config.frame_time_graph_config.enabled {
++        // Scale the frame time graph based on the font size of the overlay
++        let font_size = overlay_config.text_config.font_size;
++        graph_node.width = Val::Px(font_size * FRAME_TIME_GRAPH_WIDTH_SCALE);
++        graph_node.height = Val::Px(font_size * FRAME_TIME_GRAPH_HEIGHT_SCALE);
+ 
+-            graph_style.display = bevy_ui::Display::DEFAULT;
+-        } else {
+-            graph_style.display = bevy_ui::Display::None;
+-        }
++        graph_node.display = bevy_ui::Display::DEFAULT;
++    } else {
++        graph_node.display = bevy_ui::Display::None;
+     }
+ }
+diff --git a/crates/bevy_ecs/src/archetype.rs b/crates/bevy_ecs/src/archetype.rs
+index 9a9f80aa0d995..1885c801e8802 100644
+--- a/crates/bevy_ecs/src/archetype.rs
++++ b/crates/bevy_ecs/src/archetype.rs
+@@ -25,6 +25,7 @@ use crate::{
+     entity::{Entity, EntityLocation},
+     event::Event,
+     observer::Observers,
++    query::DebugCheckedUnwrap,
+     storage::{ImmutableSparseSet, SparseArray, SparseSet, TableId, TableRow},
+ };
+ use alloc::{boxed::Box, vec::Vec};
+@@ -142,24 +143,27 @@ pub(crate) struct ArchetypeAfterBundleInsert {
+     ///
+     /// The initial values are determined based on the provided constructor, falling back to the `Default` trait if none is given.
+     pub required_components: Box<[RequiredComponentConstructor]>,
+-    /// The components added by this bundle. This includes any Required Components that are inserted when adding this bundle.
+-    pub(crate) added: Box<[ComponentId]>,
+-    /// The components that were explicitly contributed by this bundle, but already existed in the archetype. This _does not_ include any
+-    /// Required Components.
+-    pub(crate) existing: Box<[ComponentId]>,
++    /// The components inserted by this bundle, with added components before existing ones.
++    /// Added components includes any Required Components that are inserted when adding this bundle,
++    /// but existing components only includes ones explicitly contributed by this bundle.
++    inserted: Box<[ComponentId]>,
++    /// The number of components added by this bundle, including Required Components.
++    added_len: usize,
+ }
+ 
+ impl ArchetypeAfterBundleInsert {
+-    pub(crate) fn iter_inserted(&self) -> impl Iterator<Item = ComponentId> + Clone + '_ {
+-        self.added.iter().chain(self.existing.iter()).copied()
++    pub(crate) fn inserted(&self) -> &[ComponentId] {
++        &self.inserted
+     }
+ 
+-    pub(crate) fn iter_added(&self) -> impl Iterator<Item = ComponentId> + Clone + '_ {
+-        self.added.iter().copied()
++    pub(crate) fn added(&self) -> &[ComponentId] {
++        // SAFETY: `added_len` is always in range `0..=inserted.len()`
++        unsafe { self.inserted.get(..self.added_len).debug_checked_unwrap() }
+     }
+ 
+-    pub(crate) fn iter_existing(&self) -> impl Iterator<Item = ComponentId> + Clone + '_ {
+-        self.existing.iter().copied()
++    pub(crate) fn existing(&self) -> &[ComponentId] {
++        // SAFETY: `added_len` is always in range `0..=inserted.len()`
++        unsafe { self.inserted.get(self.added_len..).debug_checked_unwrap() }
+     }
+ }
+ 
+@@ -244,17 +248,21 @@ impl Edges {
+         archetype_id: ArchetypeId,
+         bundle_status: impl Into<Box<[ComponentStatus]>>,
+         required_components: impl Into<Box<[RequiredComponentConstructor]>>,
+-        added: impl Into<Box<[ComponentId]>>,
+-        existing: impl Into<Box<[ComponentId]>>,
++        mut added: Vec<ComponentId>,
++        existing: Vec<ComponentId>,
+     ) {
++        let added_len = added.len();
++        // Make sure `extend` doesn't over-reserve, since the conversion to `Box<[_]>` would reallocate to shrink.
++        added.reserve_exact(existing.len());
++        added.extend(existing);
+         self.insert_bundle.insert(
+             bundle_id,
+             ArchetypeAfterBundleInsert {
+                 archetype_id,
+                 bundle_status: bundle_status.into(),
+                 required_components: required_components.into(),
+-                added: added.into(),
+-                existing: existing.into(),
++                added_len,
++                inserted: added.into(),
+             },
+         );
+     }
+diff --git a/crates/bevy_ecs/src/bundle/insert.rs b/crates/bevy_ecs/src/bundle/insert.rs
+index e104265380088..69c669d6406f3 100644
+--- a/crates/bevy_ecs/src/bundle/insert.rs
++++ b/crates/bevy_ecs/src/bundle/insert.rs
+@@ -174,7 +174,7 @@ impl<'w> BundleInserter<'w> {
+                         REPLACE,
+                         &mut Replace { entity },
+                         &mut EntityComponentsTrigger {
+-                            components: &archetype_after_insert.existing,
++                            components: archetype_after_insert.existing(),
+                         },
+                         caller,
+                     );
+@@ -182,7 +182,7 @@ impl<'w> BundleInserter<'w> {
+                 deferred_world.trigger_on_replace(
+                     archetype,
+                     entity,
+-                    archetype_after_insert.iter_existing(),
++                    archetype_after_insert.existing().iter().copied(),
+                     caller,
+                     relationship_hook_mode,
+                 );
+@@ -353,7 +353,7 @@ impl<'w> BundleInserter<'w> {
+             deferred_world.trigger_on_add(
+                 new_archetype,
+                 entity,
+-                archetype_after_insert.iter_added(),
++                archetype_after_insert.added().iter().copied(),
+                 caller,
+             );
+             if new_archetype.has_add_observer() {
+@@ -362,7 +362,7 @@ impl<'w> BundleInserter<'w> {
+                     ADD,
+                     &mut Add { entity },
+                     &mut EntityComponentsTrigger {
+-                        components: &archetype_after_insert.added,
++                        components: archetype_after_insert.added(),
+                     },
+                     caller,
+                 );
+@@ -373,7 +373,7 @@ impl<'w> BundleInserter<'w> {
+                     deferred_world.trigger_on_insert(
+                         new_archetype,
+                         entity,
+-                        archetype_after_insert.iter_inserted(),
++                        archetype_after_insert.inserted().iter().copied(),
+                         caller,
+                         relationship_hook_mode,
+                     );
+@@ -382,12 +382,8 @@ impl<'w> BundleInserter<'w> {
+                         deferred_world.trigger_raw(
+                             INSERT,
+                             &mut Insert { entity },
+-                            // PERF: this is not a regression from what we were doing before, but ideally we don't
+-                            // need to collect here
+                             &mut EntityComponentsTrigger {
+-                                components: &archetype_after_insert
+-                                    .iter_inserted()
+-                                    .collect::<Vec<_>>(),
++                                components: archetype_after_insert.inserted(),
+                             },
+                             caller,
+                         );
+@@ -399,7 +395,7 @@ impl<'w> BundleInserter<'w> {
+                     deferred_world.trigger_on_insert(
+                         new_archetype,
+                         entity,
+-                        archetype_after_insert.iter_added(),
++                        archetype_after_insert.added().iter().copied(),
+                         caller,
+                         relationship_hook_mode,
+                     );
+@@ -409,7 +405,7 @@ impl<'w> BundleInserter<'w> {
+                             INSERT,
+                             &mut Insert { entity },
+                             &mut EntityComponentsTrigger {
+-                                components: &archetype_after_insert.added,
++                                components: archetype_after_insert.added(),
+                             },
+                             caller,
+                         );
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index f16319318f8d2..f8e6b3ce7b934 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -218,7 +218,7 @@ impl EntityGeneration {
+     /// Gets some bits that represent this value.
+     /// The bits are opaque and should not be regarded as meaningful.
+     #[inline(always)]
+-    const fn to_bits(self) -> u32 {
++    pub const fn to_bits(self) -> u32 {
+         self.0
+     }
+ 
+@@ -226,7 +226,7 @@ impl EntityGeneration {
+     ///
+     /// Only useful when applied to results from `to_bits` in the same instance of an application.
+     #[inline]
+-    const fn from_bits(bits: u32) -> Self {
++    pub const fn from_bits(bits: u32) -> Self {
+         Self(bits)
+     }
+ 
+diff --git a/crates/bevy_ecs/src/event/trigger.rs b/crates/bevy_ecs/src/event/trigger.rs
+index 45b5e52b06b7b..9492380b63159 100644
+--- a/crates/bevy_ecs/src/event/trigger.rs
++++ b/crates/bevy_ecs/src/event/trigger.rs
+@@ -7,7 +7,7 @@ use crate::{
+     world::DeferredWorld,
+ };
+ use bevy_ptr::PtrMut;
+-use core::marker::PhantomData;
++use core::{fmt, marker::PhantomData};
+ 
+ /// [`Trigger`] determines _how_ an [`Event`] is triggered when [`World::trigger`](crate::world::World::trigger) is called.
+ /// This decides which [`Observer`](crate::observer::Observer)s will run, what data gets passed to them, and the order they will
+@@ -57,7 +57,7 @@ pub unsafe trait Trigger<E: Event> {
+ /// that matches the given [`Event`].
+ ///
+ /// The [`Event`] derive defaults to using this [`Trigger`], and it is usable for any [`Event`] type.
+-#[derive(Default)]
++#[derive(Default, Debug)]
+ pub struct GlobalTrigger;
+ 
+ // SAFETY:
+@@ -127,7 +127,7 @@ impl GlobalTrigger {
+ /// The [`EntityEvent`] derive defaults to using this [`Trigger`], and it is usable for any [`EntityEvent`] type.
+ ///
+ /// [`Observer`]: crate::observer::Observer
+-#[derive(Default)]
++#[derive(Default, Debug)]
+ pub struct EntityTrigger;
+ 
+ // SAFETY:
+@@ -251,6 +251,18 @@ impl<const AUTO_PROPAGATE: bool, E: EntityEvent, T: Traversal<E>> Default
+     }
+ }
+ 
++impl<const AUTO_PROPAGATE: bool, E: EntityEvent, T: Traversal<E>> fmt::Debug
++    for PropagateEntityTrigger<AUTO_PROPAGATE, E, T>
++{
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("PropagateEntityTrigger")
++            .field("original_event_target", &self.original_event_target)
++            .field("propagate", &self.propagate)
++            .field("_marker", &self._marker)
++            .finish()
++    }
++}
++
+ // SAFETY:
+ // - `E`'s [`Event::Trigger`] is constrained to [`PropagateEntityTrigger<E>`]
+ unsafe impl<
+diff --git a/crates/bevy_ecs/src/hierarchy.rs b/crates/bevy_ecs/src/hierarchy.rs
+index d325d5756cb1c..ad390db97bf72 100644
+--- a/crates/bevy_ecs/src/hierarchy.rs
++++ b/crates/bevy_ecs/src/hierarchy.rs
+@@ -808,6 +808,9 @@ mod tests {
+     fn spawn_many_children() {
+         let mut world = World::new();
+ 
++        // ensure an empty set can be mentioned
++        world.spawn(children![]);
++
+         // 12 children should result in a flat tuple
+         let id = world
+             .spawn(children![(), (), (), (), (), (), (), (), (), (), (), ()])
+diff --git a/crates/bevy_ecs/src/observer/mod.rs b/crates/bevy_ecs/src/observer/mod.rs
+index 43edfdd4ccef6..d268085c40e8f 100644
+--- a/crates/bevy_ecs/src/observer/mod.rs
++++ b/crates/bevy_ecs/src/observer/mod.rs
+@@ -1119,4 +1119,17 @@ mod tests {
+             .component_observers()
+             .contains_key(&a));
+     }
++
++    #[test]
++    #[expect(deprecated, reason = "We still need to test `On::target`")]
++    fn observer_target() {
++        let mut world = World::new();
++        let entity = world
++            .spawn_empty()
++            .observe(|event: On<EntityEventA>| {
++                assert_eq!(event.target(), event.event_target());
++            })
++            .id();
++        world.trigger(EntityEventA(entity));
++    }
+ }
+diff --git a/crates/bevy_ecs/src/observer/system_param.rs b/crates/bevy_ecs/src/observer/system_param.rs
+index d7cbbd5240a6e..3391d3eb4d26c 100644
+--- a/crates/bevy_ecs/src/observer/system_param.rs
++++ b/crates/bevy_ecs/src/observer/system_param.rs
+@@ -129,15 +129,7 @@ impl<'w, 't, E: Event, B: Bundle> On<'w, 't, E, B> {
+     }
+ }
+ 
+-impl<
+-        'w,
+-        't,
+-        const AUTO_PROPAGATE: bool,
+-        E: EntityEvent + for<'a> Event<Trigger<'a> = PropagateEntityTrigger<AUTO_PROPAGATE, E, T>>,
+-        B: Bundle,
+-        T: Traversal<E>,
+-    > On<'w, 't, E, B>
+-{
++impl<'w, 't, E: EntityEvent, B: Bundle> On<'w, 't, E, B> {
+     /// A deprecated way to retrieve the entity that this [`EntityEvent`] targeted at.
+     ///
+     /// Access the event via [`On::event`], then read the entity that the event was targeting.
+@@ -150,7 +142,17 @@ impl<
+     pub fn target(&self) -> Entity {
+         self.event.event_target()
+     }
++}
+ 
++impl<
++        'w,
++        't,
++        const AUTO_PROPAGATE: bool,
++        E: EntityEvent + for<'a> Event<Trigger<'a> = PropagateEntityTrigger<AUTO_PROPAGATE, E, T>>,
++        B: Bundle,
++        T: Traversal<E>,
++    > On<'w, 't, E, B>
++{
+     /// Returns the original [`Entity`] that this [`EntityEvent`] targeted via [`EntityEvent::event_target`] when it was _first_ triggered,
+     /// prior to any propagation logic.
+     pub fn original_event_target(&self) -> Entity {
+diff --git a/crates/bevy_ecs/src/relationship/mod.rs b/crates/bevy_ecs/src/relationship/mod.rs
+index 8590797550cd8..b234318ea8947 100644
+--- a/crates/bevy_ecs/src/relationship/mod.rs
++++ b/crates/bevy_ecs/src/relationship/mod.rs
+@@ -541,9 +541,12 @@ mod tests {
+ 
+     #[test]
+     fn relationship_with_multiple_non_target_fields_compiles() {
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Component)]
+         #[relationship(relationship_target=Target)]
+-        #[expect(dead_code, reason = "test struct")]
+         struct Source {
+             #[relationship]
+             target: Entity,
+@@ -551,6 +554,10 @@ mod tests {
+             bar: u8,
+         }
+ 
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Component)]
+         #[relationship_target(relationship=Source)]
+         struct Target(Vec<Entity>);
+@@ -559,13 +566,20 @@ mod tests {
+     }
+     #[test]
+     fn relationship_target_with_multiple_non_target_fields_compiles() {
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Component)]
+         #[relationship(relationship_target=Target)]
+         struct Source(Entity);
+ 
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Component)]
+         #[relationship_target(relationship=Source)]
+-        #[expect(dead_code, reason = "test struct")]
+         struct Target {
+             #[relationship]
+             target: Vec<Entity>,
+@@ -578,10 +592,18 @@ mod tests {
+ 
+     #[test]
+     fn relationship_with_multiple_unnamed_non_target_fields_compiles() {
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Component)]
+         #[relationship(relationship_target=Target<T>)]
+         struct Source<T: Send + Sync + 'static>(#[relationship] Entity, PhantomData<T>);
+ 
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Component)]
+         #[relationship_target(relationship=Source<T>)]
+         struct Target<T: Send + Sync + 'static>(#[relationship] Vec<Entity>, PhantomData<T>);
+diff --git a/crates/bevy_ecs/src/spawn.rs b/crates/bevy_ecs/src/spawn.rs
+index e4b7340c9ccfc..b127c7f7dccb7 100644
+--- a/crates/bevy_ecs/src/spawn.rs
++++ b/crates/bevy_ecs/src/spawn.rs
+@@ -513,6 +513,7 @@ macro_rules! related {
+ #[doc(hidden)]
+ macro_rules! recursive_spawn {
+     // direct expansion
++    () => { () };
+     ($a:expr) => {
+         $crate::spawn::Spawn($a)
+     };
+diff --git a/crates/bevy_ecs/src/storage/table/mod.rs b/crates/bevy_ecs/src/storage/table/mod.rs
+index ee79cb9e280a0..3eda97ead1010 100644
+--- a/crates/bevy_ecs/src/storage/table/mod.rs
++++ b/crates/bevy_ecs/src/storage/table/mod.rs
+@@ -561,7 +561,7 @@ impl Table {
+     /// - `current_column_capacity` is indeed the capacity of the columns
+     ///
+     /// The capacity of all columns is determined by that of the `entities` Vec. This means that
+-    /// it must be the correct capacity to allocate, reallocate, and deallocate all columnts. This
++    /// it must be the correct capacity to allocate, reallocate, and deallocate all columns. This
+     /// means the safety invariant must be enforced even in `TableBuilder`.
+     unsafe fn realloc_columns(
+         &mut self,
+diff --git a/crates/bevy_ecs/src/world/command_queue.rs b/crates/bevy_ecs/src/world/command_queue.rs
+index 3d0c22f468ed9..fa541af1d7e7c 100644
+--- a/crates/bevy_ecs/src/world/command_queue.rs
++++ b/crates/bevy_ecs/src/world/command_queue.rs
+@@ -1,7 +1,10 @@
++#[cfg(feature = "track_location")]
++use crate::change_detection::MaybeLocation;
+ use crate::{
+     system::{Command, SystemBuffer, SystemMeta},
+     world::{DeferredWorld, World},
+ };
++
+ use alloc::{boxed::Box, vec::Vec};
+ use bevy_ptr::{OwningPtr, Unaligned};
+ use core::{
+@@ -29,7 +32,6 @@ struct CommandMeta {
+ // entities/components/resources, and it's not currently possible to parallelize these
+ // due to mutable [`World`] access, maximizing performance for [`CommandQueue`] is
+ // preferred to simplicity of implementation.
+-#[derive(Default)]
+ pub struct CommandQueue {
+     // This buffer densely stores all queued commands.
+     //
+@@ -39,6 +41,21 @@ pub struct CommandQueue {
+     pub(crate) bytes: Vec<MaybeUninit<u8>>,
+     pub(crate) cursor: usize,
+     pub(crate) panic_recovery: Vec<MaybeUninit<u8>>,
++    #[cfg(feature = "track_location")]
++    pub(crate) caller: MaybeLocation,
++}
++
++impl Default for CommandQueue {
++    #[track_caller]
++    fn default() -> Self {
++        Self {
++            bytes: Default::default(),
++            cursor: Default::default(),
++            panic_recovery: Default::default(),
++            #[cfg(feature = "track_location")]
++            caller: MaybeLocation::caller(),
++        }
++    }
+ }
+ 
+ /// Wraps pointers to a [`CommandQueue`], used internally to avoid stacked borrow rules when
+@@ -57,9 +74,13 @@ pub(crate) struct RawCommandQueue {
+ // So instead, the manual impl just prints the length of vec.
+ impl Debug for CommandQueue {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        f.debug_struct("CommandQueue")
+-            .field("len_bytes", &self.bytes.len())
+-            .finish_non_exhaustive()
++        let mut binding = f.debug_struct("CommandQueue");
++        binding.field("len_bytes", &self.bytes.len());
++
++        #[cfg(feature = "track_location")]
++        binding.field("caller", &self.caller.into_option());
++
++        binding.finish_non_exhaustive()
+     }
+ }
+ 
+@@ -311,6 +332,9 @@ impl RawCommandQueue {
+ impl Drop for CommandQueue {
+     fn drop(&mut self) {
+         if !self.bytes.is_empty() {
++            #[cfg(feature = "track_location")]
++            warn!("CommandQueue has un-applied commands being dropped. Did you forget to call SystemState::apply? caller:{:?}",self.caller.into_option());
++            #[cfg(not(feature = "track_location"))]
+             warn!("CommandQueue has un-applied commands being dropped. Did you forget to call SystemState::apply?");
+         }
+         // SAFETY: A reference is always a valid pointer
+diff --git a/crates/bevy_ptr/src/lib.rs b/crates/bevy_ptr/src/lib.rs
+index 3a69d3c94b51f..ddd98770209c5 100644
+--- a/crates/bevy_ptr/src/lib.rs
++++ b/crates/bevy_ptr/src/lib.rs
+@@ -1212,7 +1212,7 @@ macro_rules! move_as_ptr {
+         //   it is impossible to refer to the original value, preventing further access after
+         //   the `MovingPtr` has been used. `MaybeUninit` also prevents the compiler from
+         //   dropping the original value.
+-        let $value = unsafe { bevy_ptr::MovingPtr::from_value(&mut $value) };
++        let $value = unsafe { $crate::MovingPtr::from_value(&mut $value) };
+     };
+ }
+ 
+diff --git a/crates/bevy_reflect/src/lib.rs b/crates/bevy_reflect/src/lib.rs
+index 022fcd2a41067..359b8aaad3b03 100644
+--- a/crates/bevy_reflect/src/lib.rs
++++ b/crates/bevy_reflect/src/lib.rs
+@@ -1069,6 +1069,11 @@ mod tests {
+         expected = "the dynamic type `bevy_reflect::DynamicStruct` does not support hashing"
+     )]
+     fn reflect_map_no_hash_dynamic() {
++        #[allow(
++            clippy::allow_attributes,
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Reflect, Hash)]
+         #[reflect(Hash)]
+         struct Foo {
+@@ -1126,12 +1131,24 @@ mod tests {
+             }
+         }
+ 
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Reflect)]
+         struct Foo<A>(A);
+ 
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Reflect)]
+         struct Bar<A, B>(A, B);
+ 
++        #[expect(
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Reflect)]
+         struct Baz<A, B, C>(A, B, C);
+     }
+@@ -2751,6 +2768,11 @@ bevy_reflect::tests::Test {
+         #[reflect(where U: core::ops::Add<T>)]
+         struct Foo<T, U>(T, U);
+ 
++        #[allow(
++            clippy::allow_attributes,
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Reflect)]
+         struct Baz {
+             a: Foo<i32, i32>,
+@@ -3184,6 +3206,11 @@ bevy_reflect::tests::Test {
+             pub mod external_crate {
+                 use alloc::string::String;
+ 
++                #[allow(
++                    clippy::allow_attributes,
++                    dead_code,
++                    reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++                )]
+                 pub struct TheirType {
+                     pub value: String,
+                 }
+@@ -3195,6 +3222,11 @@ bevy_reflect::tests::Test {
+             }
+         }
+ 
++        #[allow(
++            clippy::allow_attributes,
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Reflect)]
+         struct ContainerStruct {
+             #[reflect(remote = wrapper::MyType)]
+diff --git a/crates/bevy_remote/src/lib.rs b/crates/bevy_remote/src/lib.rs
+index b8e5813177067..9c5a4fbc498df 100644
+--- a/crates/bevy_remote/src/lib.rs
++++ b/crates/bevy_remote/src/lib.rs
+@@ -153,7 +153,7 @@
+ //! - `has`: A map associating each type name from `has` to a boolean value indicating whether or not the
+ //!   entity has that component. If `has` was empty or omitted, this key will be omitted in the response.
+ //!
+-//! ### Example
++//! #### Example
+ //! To use the query API and retrieve Transform data for all entities that have a Transform
+ //! use this query:
+ //!
+@@ -455,6 +455,32 @@
+ //!
+ //! `result`: An array of [fully-qualified type names] of registered resource types.
+ //!
++//! ### `registry.schema`
++//!
++//! Retrieve schema information about registered types in the Bevy app's type registry.
++//!
++//! `params` (optional):
++//! - `with_crates`: An array of crate names to include in the results. When empty or omitted, types from all crates will be included.
++//! - `without_crates`: An array of crate names to exclude from the results. When empty or omitted, no crates will be excluded.
++//! - `type_limit`: Additional type constraints:
++//!   - `with`: An array of [fully-qualified type names] that must be present for a type to be included
++//!   - `without`: An array of [fully-qualified type names] that must not be present for a type to be excluded
++//!
++//! `result`: A map associating each type's [fully-qualified type name] to a [`JsonSchemaBevyType`](crate::schemas::json_schema::JsonSchemaBevyType).
++//! This contains schema information about that type, including field definitions, type information, reflect type information, and other metadata
++//! helpful for understanding the structure of the type.
++//!
++//! ### `rpc.discover`
++//!
++//! Discover available remote methods and server information. This follows the [`OpenRPC` specification for service discovery](https://spec.open-rpc.org/#service-discovery-method).
++//!
++//! This method takes no parameters.
++//!
++//! `result`: An `OpenRPC` document containing:
++//! - Information about all available remote methods
++//! - Server connection information (when using HTTP transport)
++//! - `OpenRPC` specification version
++//!
+ //! ## Custom methods
+ //!
+ //! In addition to the provided methods, the Bevy Remote Protocol can be extended to include custom
+diff --git a/crates/bevy_render/src/camera.rs b/crates/bevy_render/src/camera.rs
+index 65b8edfe6eb1f..e1837d2740d16 100644
+--- a/crates/bevy_render/src/camera.rs
++++ b/crates/bevy_render/src/camera.rs
+@@ -87,7 +87,8 @@ impl Plugin for CameraPlugin {
+ 
+ fn warn_on_no_render_graph(world: DeferredWorld, HookContext { entity, caller, .. }: HookContext) {
+     if !world.entity(entity).contains::<CameraRenderGraph>() {
+-        warn!("{}Entity {entity} has a `Camera` component, but it doesn't have a render graph configured. Consider adding a `Camera2d` or `Camera3d` component, or manually adding a `CameraRenderGraph` component if you need a custom render graph.", caller.map(|location|format!("{location}: ")).unwrap_or_default());
++        warn!("{}Entity {entity} has a `Camera` component, but it doesn't have a render graph configured. Usually, adding a `Camera2d` or `Camera3d` component will work.
++        However, you may instead need to enable `bevy_core_pipeline`, or may want to manually add a `CameraRenderGraph` component to create a custom render graph.", caller.map(|location|format!("{location}: ")).unwrap_or_default());
+     }
+ }
+ 
+diff --git a/crates/bevy_render/src/texture/manual_texture_view.rs b/crates/bevy_render/src/texture/manual_texture_view.rs
+index 1f0659a1fdc22..57cb5e2d15056 100644
+--- a/crates/bevy_render/src/texture/manual_texture_view.rs
++++ b/crates/bevy_render/src/texture/manual_texture_view.rs
+@@ -26,7 +26,30 @@ impl ManualTextureView {
+     }
+ }
+ 
+-/// Stores manually managed [`ManualTextureView`]s for use as a [`bevy_camera::RenderTarget`].
++/// Resource that stores manually managed [`ManualTextureView`]s for use as a [`RenderTarget`](bevy_camera::RenderTarget).
++/// This type dereferences to a `HashMap<ManualTextureViewHandle, ManualTextureView>`.
++/// To add a new texture view, pick a new [`ManualTextureViewHandle`] and insert it into the map.
++/// Then, to render to the view, set a [`Camera`](bevy_camera::Camera)s `target` to `RenderTarget::TextureView(handle)`.
++/// ```ignore
++/// # use bevy_ecs::prelude::*;
++/// # let mut world = World::default();
++/// # world.insert_resource(ManualTextureViews::default());
++/// # let texture_view = todo!();
++/// let manual_views = world.resource_mut::<ManualTextureViews>();
++/// let manual_view = ManualTextureView::with_default_format(texture_view, UVec2::new(1024, 1024));
++///
++/// // Choose an unused handle value; it's likely only you are inserting manual views.
++/// const MANUAL_VIEW_HANDLE: ManualTextureViewHandle = ManualTextureViewHandle::new(42);
++/// manual_views.insert(MANUAL_VIEW_HANDLE, manual_view);
++///
++/// // Now you can spawn a Cemera that renders to the manual view:
++/// # use bevy_camera::{Camera, RenderTarget};
++/// world.spawn(Camera {
++///     target: RenderTarget::TextureView(MANUAL_VIEW_HANDLE),
++///     ..Default::default()
++/// });
++/// ```
++/// Bevy will then use the `ManualTextureViews` resource to find your texture view and render to it.
+ #[derive(Default, Clone, Resource, ExtractResource)]
+ pub struct ManualTextureViews(HashMap<ManualTextureViewHandle, ManualTextureView>);
+ 
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index 81874f37af24f..d1ebee1935101 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -33,7 +33,7 @@ pub mod prelude {
+     pub use crate::{
+         sprite::{Sprite, SpriteImageMode},
+         texture_slice::{BorderRect, SliceScaleMode, TextureSlice, TextureSlicer},
+-        ScalingMode,
++        SpriteScalingMode,
+     };
+ }
+ 
+diff --git a/crates/bevy_sprite/src/sprite.rs b/crates/bevy_sprite/src/sprite.rs
+index c4e4469dc2178..02bed0b7d8678 100644
+--- a/crates/bevy_sprite/src/sprite.rs
++++ b/crates/bevy_sprite/src/sprite.rs
+@@ -169,7 +169,7 @@ pub enum SpriteImageMode {
+     Auto,
+     /// The texture will be scaled to fit the rect bounds defined in [`Sprite::custom_size`].
+     /// Otherwise no scaling will be applied.
+-    Scale(ScalingMode),
++    Scale(SpriteScalingMode),
+     /// The texture will be cut in 9 slices, keeping the texture in proportions on resize
+     Sliced(TextureSlicer),
+     /// The texture will be repeated if stretched beyond `stretched_value`
+@@ -194,10 +194,10 @@ impl SpriteImageMode {
+         )
+     }
+ 
+-    /// Returns [`ScalingMode`] if scale is presented or [`Option::None`] otherwise.
++    /// Returns [`SpriteScalingMode`] if scale is presented or [`Option::None`] otherwise.
+     #[inline]
+     #[must_use]
+-    pub const fn scale(&self) -> Option<ScalingMode> {
++    pub const fn scale(&self) -> Option<SpriteScalingMode> {
+         if let SpriteImageMode::Scale(scale) = self {
+             Some(*scale)
+         } else {
+@@ -211,7 +211,7 @@ impl SpriteImageMode {
+ /// Can be used in [`SpriteImageMode::Scale`].
+ #[derive(Debug, Clone, Copy, PartialEq, Default, Reflect)]
+ #[reflect(Debug, Default, Clone)]
+-pub enum ScalingMode {
++pub enum SpriteScalingMode {
+     /// Scale the texture uniformly (maintain the texture's aspect ratio)
+     /// so that both dimensions (width and height) of the texture will be equal
+     /// to or larger than the corresponding dimension of the target rectangle.
+diff --git a/crates/bevy_sprite_render/src/lib.rs b/crates/bevy_sprite_render/src/lib.rs
+index e902f13dee004..fe7ca6951669c 100644
+--- a/crates/bevy_sprite_render/src/lib.rs
++++ b/crates/bevy_sprite_render/src/lib.rs
+@@ -45,7 +45,7 @@ use bevy_render::{
+ use bevy_sprite::Sprite;
+ 
+ #[cfg(feature = "bevy_text")]
+-use crate::text2d::extract_text2d_sprite;
++pub use crate::text2d::extract_text2d_sprite;
+ 
+ /// Adds support for 2D sprite rendering.
+ #[derive(Default)]
+diff --git a/crates/bevy_sprite_render/src/render/mod.rs b/crates/bevy_sprite_render/src/render/mod.rs
+index b80a524cc7a42..ad73fa3e4fd1d 100644
+--- a/crates/bevy_sprite_render/src/render/mod.rs
++++ b/crates/bevy_sprite_render/src/render/mod.rs
+@@ -39,7 +39,7 @@ use bevy_render::{
+     Extract,
+ };
+ use bevy_shader::{Shader, ShaderDefVal};
+-use bevy_sprite::{Anchor, ScalingMode, Sprite};
++use bevy_sprite::{Anchor, Sprite, SpriteScalingMode};
+ use bevy_transform::components::GlobalTransform;
+ use bevy_utils::default;
+ use bytemuck::{Pod, Zeroable};
+@@ -334,7 +334,7 @@ pub enum ExtractedSpriteKind {
+     Single {
+         anchor: Vec2,
+         rect: Option<Rect>,
+-        scaling_mode: Option<ScalingMode>,
++        scaling_mode: Option<SpriteScalingMode>,
+         custom_size: Option<Vec2>,
+     },
+     /// Indexes into the list of [`ExtractedSlice`]s stored in the [`ExtractedSlices`] resource
+@@ -965,7 +965,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawSpriteBatch {
+ 
+ /// Scales a texture to fit within a given quad size with keeping the aspect ratio.
+ fn apply_scaling(
+-    scaling_mode: ScalingMode,
++    scaling_mode: SpriteScalingMode,
+     texture_size: Vec2,
+     quad_size: &mut Vec2,
+     quad_translation: &mut Vec2,
+@@ -977,7 +977,7 @@ fn apply_scaling(
+     let quad_tex_scale = quad_ratio / texture_ratio;
+ 
+     match scaling_mode {
+-        ScalingMode::FillCenter => {
++        SpriteScalingMode::FillCenter => {
+             if quad_ratio > texture_ratio {
+                 // offset texture to center by y coordinate
+                 uv_offset_scale.y += (uv_offset_scale.w - uv_offset_scale.w * tex_quad_scale) * 0.5;
+@@ -989,7 +989,7 @@ fn apply_scaling(
+                 uv_offset_scale.z *= quad_tex_scale;
+             };
+         }
+-        ScalingMode::FillStart => {
++        SpriteScalingMode::FillStart => {
+             if quad_ratio > texture_ratio {
+                 uv_offset_scale.y += uv_offset_scale.w - uv_offset_scale.w * tex_quad_scale;
+                 uv_offset_scale.w *= tex_quad_scale;
+@@ -997,7 +997,7 @@ fn apply_scaling(
+                 uv_offset_scale.z *= quad_tex_scale;
+             }
+         }
+-        ScalingMode::FillEnd => {
++        SpriteScalingMode::FillEnd => {
+             if quad_ratio > texture_ratio {
+                 uv_offset_scale.w *= tex_quad_scale;
+             } else {
+@@ -1005,7 +1005,7 @@ fn apply_scaling(
+                 uv_offset_scale.z *= quad_tex_scale;
+             }
+         }
+-        ScalingMode::FitCenter => {
++        SpriteScalingMode::FitCenter => {
+             if texture_ratio > quad_ratio {
+                 // Scale based on width
+                 quad_size.y *= quad_tex_scale;
+@@ -1014,7 +1014,7 @@ fn apply_scaling(
+                 quad_size.x *= tex_quad_scale;
+             }
+         }
+-        ScalingMode::FitStart => {
++        SpriteScalingMode::FitStart => {
+             if texture_ratio > quad_ratio {
+                 // The quad is scaled to match the image ratio, and the quad translation is adjusted
+                 // to start of the quad within the original quad size.
+@@ -1031,7 +1031,7 @@ fn apply_scaling(
+                 *quad_size = new_quad;
+             }
+         }
+-        ScalingMode::FitEnd => {
++        SpriteScalingMode::FitEnd => {
+             if texture_ratio > quad_ratio {
+                 let scale = Vec2::new(1.0, quad_tex_scale);
+                 let new_quad = *quad_size * scale;
+diff --git a/crates/bevy_state/src/lib.rs b/crates/bevy_state/src/lib.rs
+index 1ca9f01bffeb7..2b2874a2c44fa 100644
+--- a/crates/bevy_state/src/lib.rs
++++ b/crates/bevy_state/src/lib.rs
+@@ -82,6 +82,13 @@ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::reflect::{ReflectFreelyMutableState, ReflectState};
+ 
++    #[doc(hidden)]
++    #[expect(
++        deprecated,
++        reason = "Temporarily re-exporting deprecated type for transition"
++    )]
++    pub use crate::state_scoped::StateScoped;
++
+     #[doc(hidden)]
+     pub use crate::{
+         commands::CommandsStatesExt,
+diff --git a/crates/bevy_state/src/state_scoped.rs b/crates/bevy_state/src/state_scoped.rs
+index 51c1817224915..a7d47b050861b 100644
+--- a/crates/bevy_state/src/state_scoped.rs
++++ b/crates/bevy_state/src/state_scoped.rs
+@@ -63,6 +63,10 @@ where
+     }
+ }
+ 
++/// A deprecated alias for [`DespawnOnExit`].
++#[deprecated(since = "0.17.0", note = "use DespawnOnExit instead")]
++pub type StateScoped<S> = DespawnOnExit<S>;
++
+ /// Despawns entities marked with [`DespawnOnExit<S>`] when their state no
+ /// longer matches the world state.
+ pub fn despawn_entities_on_exit_state<S: States>(
+diff --git a/crates/bevy_tasks/Cargo.toml b/crates/bevy_tasks/Cargo.toml
+index 7974e0c82cb23..32cdc9ff9e906 100644
+--- a/crates/bevy_tasks/Cargo.toml
++++ b/crates/bevy_tasks/Cargo.toml
+@@ -55,7 +55,7 @@ crossbeam-queue = { version = "0.3", default-features = false, features = [
+ 
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ pin-project = "1"
+-async-channel = "2.3.0"
++async-channel = { version = "2.3.0", default-features = false }
+ 
+ [target.'cfg(not(all(target_has_atomic = "8", target_has_atomic = "16", target_has_atomic = "32", target_has_atomic = "64", target_has_atomic = "ptr")))'.dependencies]
+ async-task = { version = "4.4.0", default-features = false, features = [
+diff --git a/crates/bevy_tasks/src/task.rs b/crates/bevy_tasks/src/task.rs
+index dd649ba47dca3..e70ab1d18b3c8 100644
+--- a/crates/bevy_tasks/src/task.rs
++++ b/crates/bevy_tasks/src/task.rs
+@@ -39,7 +39,7 @@ cfg::web! {
+                     // Catch any panics that occur when polling the future so they can
+                     // be propagated back to the task handle.
+                     let value = CatchUnwind(AssertUnwindSafe(future)).await;
+-                    let _ = sender.send(value);
++                    let _ = sender.send(value).await;
+                 });
+                 Self(receiver)
+             }
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index 3c04cbd1d68d1..e4da3288d43c0 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -214,6 +214,7 @@ impl From<String> for TextSpan {
+ /// [`TextBounds`](super::bounds::TextBounds) component with an explicit `width` value.
+ #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Reflect, Serialize, Deserialize)]
+ #[reflect(Serialize, Deserialize, Clone, PartialEq, Hash)]
++#[doc(alias = "JustifyText")]
+ pub enum Justify {
+     /// Leftmost character is immediately to the right of the render position.
+     /// Bounds start from the render position and advance rightwards.
+diff --git a/crates/bevy_ui_render/Cargo.toml b/crates/bevy_ui_render/Cargo.toml
+index 74f037b9fde29..e6429f5202d04 100644
+--- a/crates/bevy_ui_render/Cargo.toml
++++ b/crates/bevy_ui_render/Cargo.toml
+@@ -37,7 +37,7 @@ bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
+ 
+ # other
+ bytemuck = { version = "1.5", features = ["derive"] }
+-derive_more = { version = "1", default-features = false, features = ["from"] }
++derive_more = { version = "2", default-features = false, features = ["from"] }
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
+ 
+ [features]
+diff --git a/examples/2d/sprite_scale.rs b/examples/2d/sprite_scale.rs
+index 0194db7c81e94..aff8ab3b1be46 100644
+--- a/examples/2d/sprite_scale.rs
++++ b/examples/2d/sprite_scale.rs
+@@ -31,49 +31,49 @@ fn setup_sprites(mut commands: Commands, asset_server: Res<AssetServer>) {
+             text: "Fill Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(-450., 230., 0.)),
+             texture: square.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillCenter),
+         },
+         Rect {
+             size: Vec2::new(100., 225.),
+             text: "Fill Start".to_string(),
+             transform: Transform::from_translation(Vec3::new(-330., 230., 0.)),
+             texture: square.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillStart),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillStart),
+         },
+         Rect {
+             size: Vec2::new(100., 225.),
+             text: "Fill End".to_string(),
+             transform: Transform::from_translation(Vec3::new(-210., 230., 0.)),
+             texture: square.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillEnd),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillEnd),
+         },
+         Rect {
+             size: Vec2::new(300., 100.),
+             text: "Fill Start Horizontal".to_string(),
+             transform: Transform::from_translation(Vec3::new(10., 290., 0.)),
+             texture: square.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillStart),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillStart),
+         },
+         Rect {
+             size: Vec2::new(300., 100.),
+             text: "Fill End Horizontal".to_string(),
+             transform: Transform::from_translation(Vec3::new(10., 155., 0.)),
+             texture: square.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillEnd),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillEnd),
+         },
+         Rect {
+             size: Vec2::new(200., 200.),
+             text: "Fill Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(280., 230., 0.)),
+             texture: banner.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillCenter),
+         },
+         Rect {
+             size: Vec2::new(200., 100.),
+             text: "Fill Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(500., 230., 0.)),
+             texture: square.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillCenter),
+         },
+         Rect {
+             size: Vec2::new(100., 100.),
+@@ -87,28 +87,28 @@ fn setup_sprites(mut commands: Commands, asset_server: Res<AssetServer>) {
+             text: "Fit Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(-400., -40., 0.)),
+             texture: banner.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FitCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FitCenter),
+         },
+         Rect {
+             size: Vec2::new(200., 200.),
+             text: "Fit Start".to_string(),
+             transform: Transform::from_translation(Vec3::new(-180., -40., 0.)),
+             texture: banner.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FitStart),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FitStart),
+         },
+         Rect {
+             size: Vec2::new(200., 200.),
+             text: "Fit End".to_string(),
+             transform: Transform::from_translation(Vec3::new(40., -40., 0.)),
+             texture: banner.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FitEnd),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FitEnd),
+         },
+         Rect {
+             size: Vec2::new(100., 200.),
+             text: "Fit Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(210., -40., 0.)),
+             texture: banner.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FitCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FitCenter),
+         },
+     ];
+ 
+@@ -166,7 +166,7 @@ fn setup_texture_atlas(
+             text: "Fill Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(-570., -300., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillCenter),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -176,7 +176,7 @@ fn setup_texture_atlas(
+             text: "Fill Start".to_string(),
+             transform: Transform::from_translation(Vec3::new(-430., -200., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillStart),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillStart),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -186,7 +186,7 @@ fn setup_texture_atlas(
+             text: "Fill End".to_string(),
+             transform: Transform::from_translation(Vec3::new(-430., -300., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillEnd),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillEnd),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -196,7 +196,7 @@ fn setup_texture_atlas(
+             text: "Fill Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(-300., -250., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillCenter),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -206,7 +206,7 @@ fn setup_texture_atlas(
+             text: "Fill Start".to_string(),
+             transform: Transform::from_translation(Vec3::new(-190., -250., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillStart),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillStart),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -216,7 +216,7 @@ fn setup_texture_atlas(
+             text: "Fill End".to_string(),
+             transform: Transform::from_translation(Vec3::new(-90., -250., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FillEnd),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FillEnd),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -226,7 +226,7 @@ fn setup_texture_atlas(
+             text: "Fit Center".to_string(),
+             transform: Transform::from_translation(Vec3::new(20., -200., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FitCenter),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FitCenter),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -236,7 +236,7 @@ fn setup_texture_atlas(
+             text: "Fit Start".to_string(),
+             transform: Transform::from_translation(Vec3::new(20., -300., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FitStart),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FitStart),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+@@ -246,7 +246,7 @@ fn setup_texture_atlas(
+             text: "Fit End".to_string(),
+             transform: Transform::from_translation(Vec3::new(160., -200., 0.)),
+             texture: gabe.clone(),
+-            image_mode: SpriteImageMode::Scale(ScalingMode::FitEnd),
++            image_mode: SpriteImageMode::Scale(SpriteScalingMode::FitEnd),
+             atlas: gabe_atlas.clone(),
+             indices: animation_indices_gabe.clone(),
+             timer: AnimationTimer(Timer::from_seconds(0.1, TimerMode::Repeating)),
+diff --git a/examples/reflection/auto_register_static/src/lib.rs b/examples/reflection/auto_register_static/src/lib.rs
+index 3279bf77489b6..5573a8c1d770d 100644
+--- a/examples/reflection/auto_register_static/src/lib.rs
++++ b/examples/reflection/auto_register_static/src/lib.rs
+@@ -14,6 +14,11 @@ mod private {
+         use bevy::prelude::*;
+ 
+         // Works with private types too!
++        #[allow(
++            clippy::allow_attributes,
++            dead_code,
++            reason = "This struct is used as a compilation test to test the derive macros, and as such is intentionally never constructed."
++        )]
+         #[derive(Reflect)]
+         struct PrivateStruct {
+             a: i32,
+diff --git a/examples/reflection/reflection_types.rs b/examples/reflection/reflection_types.rs
+index 291eb7bd5c5df..63594ec8acd38 100644
+--- a/examples/reflection/reflection_types.rs
++++ b/examples/reflection/reflection_types.rs
+@@ -140,4 +140,8 @@ fn setup() {
+     let mut value: A = value.take::<A>().unwrap();
+     value.y.apply(&dynamic_list);
+     assert_eq!(value.y, vec![3u32, 4u32, 5u32]);
++
++    // reference types defined above that are only used to demonstrate reflect
++    // derive functionality:
++    _ = || -> (A, B, C, D, E, F) { unreachable!() };
+ }
+diff --git a/examples/ui/directional_navigation.rs b/examples/ui/directional_navigation.rs
+index 862d9140fd9c8..e0f303290cd09 100644
+--- a/examples/ui/directional_navigation.rs
++++ b/examples/ui/directional_navigation.rs
+@@ -15,7 +15,7 @@ use bevy::{
+         },
+         InputDispatchPlugin, InputFocus, InputFocusVisible,
+     },
+-    math::{CompassOctant, FloatOrd},
++    math::CompassOctant,
+     picking::{
+         backend::HitData,
+         pointer::{Location, PointerId},
+@@ -386,10 +386,10 @@ fn interact_with_focused_button(
+             pointer_id: PointerId::Mouse,
+             // This field isn't used, so we're just setting it to a placeholder value
+             pointer_location: Location {
+-                target: NormalizedRenderTarget::Image(bevy::camera::ImageRenderTarget {
+-                    handle: Handle::default(),
+-                    scale_factor: FloatOrd(1.0),
+-                }),
++                target: NormalizedRenderTarget::None {
++                    width: 0,
++                    height: 0,
++                },
+                 position: Vec2::ZERO,
+             },
+             event: Click {
+diff --git a/release-content/migration-guides/RenderTargetInfo_default.md b/release-content/migration-guides/RenderTargetInfo_default.md
+new file mode 100644
+index 0000000000000..f4f3815d58146
+--- /dev/null
++++ b/release-content/migration-guides/RenderTargetInfo_default.md
+@@ -0,0 +1,6 @@
++---
++title: "RenderTargetInfo's default `scale_factor` has been changed to `1.`"
++pull_requests: [21802]
++---
++
++The default for `RenderTargetInfo`'s `scale_factor` field is now `1.`.
+diff --git a/release-content/migration-guides/The_YAxisOrientation_component_has_been_removed b/release-content/migration-guides/The_YAxisOrientation_component_has_been_removed
+new file mode 100644
+index 0000000000000..6e4df4739d8b1
+--- /dev/null
++++ b/release-content/migration-guides/The_YAxisOrientation_component_has_been_removed
+@@ -0,0 +1,6 @@
++---
++title: "`YAxisOrientation` has been removed"
++pull_requests: [ 19077 ]
++---
++
++The `YAxisOrientation` component has been removed from `bevy_text`. The correct y-axis orientation is now chosen automatically by the text systems.
+diff --git a/release-content/migration-guides/bevy_render_reorganization.md b/release-content/migration-guides/bevy_render_reorganization.md
+index 1cfa7604d4caf..8e0fc89b6d41b 100644
+--- a/release-content/migration-guides/bevy_render_reorganization.md
++++ b/release-content/migration-guides/bevy_render_reorganization.md
+@@ -6,7 +6,7 @@ pull_requests: [20485, 20330, 18703, 20587, 20502, 19997, 19991, 20000, 19949, 1
+ You must now import `bevy_render::NormalizedRenderTargetExt` to use methods on `NormalizedRenderTarget`
+ `ManualTextureViews` is now in `bevy_render::texture`
+ 
+-Camera types such as `Camera`, `Camera3d`, `Camera2d`, `ClearColor`, `ClearColorConfig`, `Projection`, `PerspectiveProjection`, and `OrthographicProjection` have been moved to a new crate, `bevy_camera`.
++Camera types such as `Camera`, `Camera3d`, `Camera2d`, `ClearColor`, `ClearColorConfig`, `Exposure`, `Projection`, `PerspectiveProjection`, and `OrthographicProjection` have been moved to a new crate, `bevy_camera`.
+ Visibility types such as `Visibility`, `InheritedVisibility`, `ViewVisibility`, `VisibleEntities`, and `RenderLayers` have been moved to `bevy_camera::visibility`.
+ Culling primitives such as `Frustum`, `HalfSpace`, `Aabb`, and `Sphere` have been moved to `bevy_camera::primitives`.
+ Import them directly or from `bevy::camera` now.
+@@ -14,10 +14,10 @@ Import them directly or from `bevy::camera` now.
+ Shader types such as `Shader`, `ShaderRef`, `ShaderDef`, `ShaderCache`, and `PipelineCompilationError` have been moved to a new crate, `bevy_shader`.
+ Import them directly or from `bevy::shader` now.
+ 
+-Light types such `AmbientLight`, `PointLight`, `SpotLight`, `DirectionalLight`, `EnvironmentMapLight`, `GeneratedEnvironmentMapLight`, `LightProbe`, `IrradianceVolume`, `VolumetricFog`, `FogVolume`, and `light_consts` have been moved to a new crate, `bevy_light`.
++Light types such `AmbientLight`, `PointLight`, `SpotLight`, `DirectionalLight`, `EnvironmentMapLight`, `GeneratedEnvironmentMapLight`, `LightProbe`, `IrradianceVolume`, `VolumetricFog`, `FogVolume`, `CascadeShadowConfigBuilder`, `NotShadowCaster`, `NotShadowReceiver` and `light_consts` have been moved to a new crate, `bevy_light`.
+ Import them directly or from `bevy::light` now.
+ 
+-Mesh types such as `Mesh`, `Mesh3d`, `Mesh2d`, `MorphWeights`, `MeshBuilder`, and `Meshable` have been moved to a new crate, `bevy_mesh`.
++Mesh types such as `Mesh`, `Mesh3d`, `Mesh2d`, `MorphWeights`, `MeshBuilder`, `Indices`, and `Meshable` have been moved to a new crate, `bevy_mesh`.
+ Import them directly or from `bevy::mesh` now. This crate is actually present in the previous release, but its `bevy_render` re-exports have now been removed.
+ 
+ Image types such as `Image`, `ImagePlugin`, `ImageFormat`, `ImageSampler`, `ImageAddressMode`, `ImageSamplerDescriptor`, `ImageCompareFunction`, and `ImageSamplerBorderColor` have been moved to a new crate, `bevy_image`. This crate is actually present in the previous release, but its `bevy_render` re-exports have now been removed.
+diff --git a/release-content/migration-guides/border_color_all_takes_impl_into_color.md b/release-content/migration-guides/border_color_all_takes_impl_into_color.md
+deleted file mode 100644
+index ab20bfad64040..0000000000000
+--- a/release-content/migration-guides/border_color_all_takes_impl_into_color.md
++++ /dev/null
+@@ -1,6 +0,0 @@
+----
+-title: "`BorderColor::all` now accepts any `impl Into<Color>` type"
+-pull_requests: [20311]
+----
+-
+-`BorderColor`'s `all` constructor function is no longer const and its `color` parameter now accepts any `impl Into<Color>` type, not only `Color`.
+diff --git a/release-content/migration-guides/cursor-android.md b/release-content/migration-guides/cursor-android.md
+new file mode 100644
+index 0000000000000..ce3ade5e6ffb3
+--- /dev/null
++++ b/release-content/migration-guides/cursor-android.md
+@@ -0,0 +1,13 @@
++---
++title: Move cursor-related types from `bevy_winit` to `bevy_window`
++pull_requests: [20427]
++---
++
++In an effort to reduce and untangle dependencies, cursor-related types have been moved from the `bevy_winit` crate to the `bevy_window` crate.
++The following types have been moved as part of this change:
++
++- `CursorIcon` is now located at `bevy::window::CursorIcon`.
++- `CustomCursor` is now located at `bevy::window::CustomCursor`.
++- `CustomCursorImage` is now located at `bevy::window::CustomCursorImage`.
++- `CustomCursorUrl` is now located at `bevy::window::CustomCursorUrl`.
++- on the android platform, `ANDROID_APP` is now located in it's own crate and can be found at `bevy::android::ANDROID_APP`.
+diff --git a/release-content/migration-guides/hdr_component.md b/release-content/migration-guides/hdr_component.md
+index 8061b664f84b1..33d5e6b02c1fb 100644
+--- a/release-content/migration-guides/hdr_component.md
++++ b/release-content/migration-guides/hdr_component.md
+@@ -3,7 +3,7 @@ title: Split `Hdr` from `Camera`
+ pull_requests: [18873]
+ ---
+ 
+-`Camera.hdr` has been split out into a new marker component, `Hdr`
++`Camera.hdr` has been split out into a new marker component, `Hdr`, which can be found at `bevy::render::view::Hdr`.
+ 
+ - before: `commands.spawn((Camera3d, Camera { hdr: true, ..default() });`
+ - after: `commands.spawn((Camera3d, Hdr));`
+diff --git a/release-content/migration-guides/per-world-error-handler.md b/release-content/migration-guides/per-world-error-handler.md
+index c9a1f1dd8ee77..3565886df14ff 100644
+--- a/release-content/migration-guides/per-world-error-handler.md
++++ b/release-content/migration-guides/per-world-error-handler.md
+@@ -3,8 +3,12 @@ title: Changes to the default error handler mechanism
+ pull_requests: [18810]
+ ---
+ 
+-Worlds can now have different default error handlers, so there no longer is a global handler.
++We've improved the implementation of Bevy's default error handling.
++The performance overhead has been reduced, and as a result it is always enabled.
++The `configurable_error_handler` feature no longer exists: simply remove it from your list of enabled features.
+ 
+-Replace uses of `GLOBAL_ERROR_HANDLER` with `App`'s `.set_error_handler(handler)`.
++Additionally, worlds can now have different default error handlers, so there is no longer a truly global handler.
++
++Replace uses of `GLOBAL_ERROR_HANDLER` with `App::set_error_handler(handler)`.
+ For worlds that do not directly belong to an `App`/`SubApp`,
+ insert the `DefaultErrorHandler(handler)` resource.
+diff --git a/release-content/migration-guides/remove_text_font_from_constructor_methods.md b/release-content/migration-guides/remove_text_font_from_constructor_methods.md
+index 29abdae87a6ef..8ecc27a1fdee7 100644
+--- a/release-content/migration-guides/remove_text_font_from_constructor_methods.md
++++ b/release-content/migration-guides/remove_text_font_from_constructor_methods.md
+@@ -1,5 +1,5 @@
+ ---
+-title: `TextFont` constructor methods replaced with `From` impls
++title: Replaced `TextFont` constructor methods with `From` impls
+ pull_requests: [20335, 20450]
+ ---
+ 
+diff --git a/release-content/migration-guides/rename_bevy_sprite_ScalingMode_to_SpriteScalingMode.md b/release-content/migration-guides/rename_bevy_sprite_ScalingMode_to_SpriteScalingMode.md
+new file mode 100644
+index 0000000000000..d0cf079888218
+--- /dev/null
++++ b/release-content/migration-guides/rename_bevy_sprite_ScalingMode_to_SpriteScalingMode.md
+@@ -0,0 +1,8 @@
++---
++title: Rename `ScalingMode` to `SpriteScalingMode`
++pull_requests: [21100]
++---
++
++In the previous release, both `bevy_sprite::sprite` and `bevy_camera::projection` defined an enum named `ScalingMode`, in violation of our one-namespace rule.
++
++To resolve this, the `ScalingMode` enum from `bevy::sprite` has been renamed to `SpriteScalingMode`.
+diff --git a/release-content/migration-guides/specialized_ui_transform.md b/release-content/migration-guides/specialized_ui_transform.md
+index 7b78b84511ce4..47117a4fbd06b 100644
+--- a/release-content/migration-guides/specialized_ui_transform.md
++++ b/release-content/migration-guides/specialized_ui_transform.md
+@@ -26,7 +26,9 @@ UiTransform {
+     translation: Val2::px(x, y),
+     rotation: Rot2::from_rotation(radians),
+     scale: scale.xy(),
+-} 
++}
+ ```
+ 
+ In previous versions of Bevy `ui_layout_system` would overwrite UI node's `Transform::translation` each frame. `UiTransform`s aren't overwritten and there is no longer any need for systems that cache and rewrite the transform for translated UI elements.
++
++If you were relying on the `z` value of the `GlobalTransform`, this can be derived from `UiStack` instead.
+diff --git a/release-content/migration-guides/taa_non_experimental.md b/release-content/migration-guides/taa_non_experimental.md
+index 416ee164bfc06..6ad564dd0d785 100644
+--- a/release-content/migration-guides/taa_non_experimental.md
++++ b/release-content/migration-guides/taa_non_experimental.md
+@@ -7,4 +7,6 @@ TAA is no longer experimental.
+ 
+ `TemporalAntiAliasPlugin` no longer needs to be added to your app to use TAA. It is now part of `DefaultPlugins`, via `AntiAliasPlugin`.
+ 
++As part of this change, the import paths for `TemporalAntiAliasNode`, `TemporalAntiAliasing` and `TemporalAntiAliasPlugin` have changed from `bevy::anti_alias::experimental::taa` to `bevy::anti_alias::taa`: if you want to add `TemporalAntiAliasing` to a Camera, you can now find it at `bevy::anti_alias::taa::TemporalAntiAliasing`.
++
+ `TemporalAntiAliasing` now uses `MipBias` as a required component in the main world, instead of overriding it manually in the render world.
+diff --git a/release-content/migration-guides/ui-debug-overlay.md b/release-content/migration-guides/ui-debug-overlay.md
+new file mode 100644
+index 0000000000000..109b106a82704
+--- /dev/null
++++ b/release-content/migration-guides/ui-debug-overlay.md
+@@ -0,0 +1,20 @@
++---
++title: Move UI Debug Options from `bevy_ui` to `bevy_ui_render`
++pull_requests: [18703]
++---
++
++The `UiDebugOptions` resource used for controlling the UI Debug Overlay has been moved from the internal `bevy_ui` crate to the `bevy_ui_render` crate, and is now accessible from the prelude of `bevy_ui_render` and, as before, from the prelude of `bevy`:
++
++```rust
++// 0.16
++use bevy::prelude::*;
++// or
++use bevy::ui::UiDebugOptions;
++
++// 0.17
++use bevy::prelude::*;
++// or, if you are not using the full `bevy` crate:
++// use bevy_ui_render::prelude::*;
++
++let options = world.resource_mut::<UiDebugOptions>();
++```
+diff --git a/release-content/migration-guides/wayland.md b/release-content/migration-guides/wayland.md
+new file mode 100644
+index 0000000000000..2910b72005eaf
+--- /dev/null
++++ b/release-content/migration-guides/wayland.md
+@@ -0,0 +1,38 @@
++---
++title: Enable Wayland by default
++pull_requests: [19232]
++---
++
++Wayland has now been added to the default features of the `bevy` crate.
++
++```text
++  called `Result::unwrap()` on an `Err` value:
++  pkg-config exited with status code 1
++  > PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1 pkg-config --libs --cflags wayland-client
++
++  The system library `wayland-client` required by crate `wayland-sys` was not found.
++  The file `wayland-client.pc` needs to be installed and the PKG_CONFIG_PATH environment variable must contain its parent directory.
++  The PKG_CONFIG_PATH environment variable is not set.
++
++  HINT: if you have installed the library, try setting PKG_CONFIG_PATH to the directory containing `wayland-client.pc`.
++```
++
++If you've encountered an error message similar to the one above, this means that you will want to make the `wayland-client` library available to your build system, or disable default features, in order to successfully build Bevy on Linux.
++
++On Ubuntu, or other Debian-based distributions, install the `libwayland-dev` package:
++
++```sh
++sudo apt install libwayland-dev
++```
++
++On Arch Linux:
++
++```sh
++sudo pacman -S wayland
++```
++
++On Nix, add the `wayland` package to your `buildInputs`:
++
++```nix
++buildInputs = [ pkgs.wayland ];
++```
+diff --git a/release-content/release-notes/infinite-children.md b/release-content/release-notes/infinite-children.md
+new file mode 100644
+index 0000000000000..66c9cbe68b28e
+--- /dev/null
++++ b/release-content/release-notes/infinite-children.md
+@@ -0,0 +1,15 @@
++---
++title: Infinite Children
++authors: ["@CorvusPrudens"]
++pull_requests: [18865]
++---
++
++The `children!` macro is a convenient way to spawn children alongside their parents in Bevy code.
++When it was introduced in **Bevy 0.16** this was limited to 12 children, due to arbitrary limitations (Rust: please [support variadic generics!](https://blog.rust-lang.org/inside-rust/2025/09/11/program-management-update-2025-08/#variadic-generics)), and not implementing the requisite workarounds.
++When working with large UI hierarchies, this could be a real nuisance, forcing users to resort to ugly workarounds.
++
++We've rewritten the macro and lifted this unjust restriction. You are now only limited by Rust's recursion limit: around 1400 children at once.
++Rejoice!
++If you are manually spawning more than 1400 children in a single macro call, you should reconsider your strategy (such as using `SpawnIter` or `SpawnWith`).
++
++We've made the same change to the `related!` macro, allowing you to spawn huge numbers of related entities in a single call.
+diff --git a/tools/export-content/src/app.rs b/tools/export-content/src/app.rs
+index 2fb5e65bc38c7..d31b041f93453 100644
+--- a/tools/export-content/src/app.rs
++++ b/tools/export-content/src/app.rs
+@@ -1,4 +1,4 @@
+-use std::{env, fs, io::Write, path};
++use std::{env, fs, io::Write, path::PathBuf};
+ 
+ use miette::{diagnostic, Context, Diagnostic, IntoDiagnostic, NamedSource, Result};
+ use ratatui::{
+@@ -16,7 +16,7 @@ enum Mode {
+ }
+ 
+ pub struct App {
+-    content_dir: path::PathBuf,
++    content_dir: PathBuf,
+     release_notes: Vec<Entry>,
+     release_notes_state: ListState,
+     migration_guides: Vec<Entry>,
+@@ -26,8 +26,14 @@ pub struct App {
+     exit: bool,
+ }
+ 
+-impl App {
+-    pub fn new() -> Result<App> {
++pub struct Content {
++    content_dir: PathBuf,
++    migration_guides: Vec<Entry>,
++    release_notes: Vec<Entry>,
++}
++
++impl Content {
++    pub fn load() -> Result<Self> {
+         let exe_dir = env::current_exe()
+             .into_diagnostic()
+             .wrap_err("failed to determine path to binary")?;
+@@ -43,6 +49,21 @@ impl App {
+ 
+         let migration_guides_dir = content_dir.join("migration-guides");
+         let migration_guides = load_content(migration_guides_dir, "migration guide")?;
++        Ok(Content {
++            content_dir,
++            migration_guides,
++            release_notes,
++        })
++    }
++}
++
++impl App {
++    pub fn new() -> Result<App> {
++        let Content {
++            content_dir,
++            release_notes,
++            migration_guides,
++        } = Content::load()?;
+ 
+         Ok(App {
+             content_dir,
+@@ -284,7 +305,7 @@ impl Entry {
+ }
+ 
+ /// Loads release content from files in the specified directory
+-fn load_content(dir: path::PathBuf, kind: &'static str) -> Result<Vec<Entry>> {
++fn load_content(dir: PathBuf, kind: &'static str) -> Result<Vec<Entry>> {
+     let re = Regex::new(r"(?s)^---\s*\n(?<frontmatter>.*?)\s*\n---\s*\n(?<content>.*)").unwrap();
+ 
+     let mut entries = vec![];
+diff --git a/tools/export-content/src/main.rs b/tools/export-content/src/main.rs
+index f27c154e58f17..be7847e1e0a98 100644
+--- a/tools/export-content/src/main.rs
++++ b/tools/export-content/src/main.rs
+@@ -25,9 +25,17 @@ use ratatui::{
+     prelude::*,
+ };
+ 
++use crate::app::Content;
++
+ mod app;
+ 
+ fn main() -> Result<()> {
++    let check = std::env::args().any(|arg| arg == "--check");
++    if check {
++        Content::load().unwrap();
++        return Ok(());
++    }
++
+     init_panic_hook();
+     let mut terminal = init_terminal().unwrap();
+     let res = run_app(&mut terminal);
+diff --git a/tools/publish.sh b/tools/publish.sh
+deleted file mode 100644
+index c76d4c16d3122..0000000000000
+--- a/tools/publish.sh
++++ /dev/null
+@@ -1,19 +0,0 @@
+-if [ -n "$(git status --porcelain)" ]; then
+-    echo "You have local changes!"
+-    exit 1
+-fi
+-
+-pushd crates
+-
+-for crate in `cargo package --workspace 2>&1 | grep Packaging | sed 's_.*crates/\(.*\))_\1_' | grep -v Packaging`
+-do
+-  echo "Publishing ${crate}"
+-  pushd "$crate"
+-  cargo publish
+-  popd
+-done
+-
+-popd
+-
+-echo "Publishing root crate"
+-cargo publish
