@@ -1,0 +1,192 @@
+diff --git a/crates/bevy_pbr/src/light/mod.rs b/crates/bevy_pbr/src/light/mod.rs
+index 8273ae4b6deaf..e50ffcc0fc1b3 100644
+--- a/crates/bevy_pbr/src/light/mod.rs
++++ b/crates/bevy_pbr/src/light/mod.rs
+@@ -7,7 +7,7 @@ use bevy_ecs::{
+ use bevy_math::{ops, Mat4, Vec3A, Vec4};
+ use bevy_reflect::prelude::*;
+ use bevy_render::{
+-    camera::{Camera, CameraProjection, Projection},
++    camera::{Camera, Projection},
+     extract_component::ExtractComponent,
+     extract_resource::ExtractResource,
+     mesh::Mesh3d,
+diff --git a/crates/bevy_render/src/camera/camera.rs b/crates/bevy_render/src/camera/camera.rs
+index 2bddcd0d054b5..2732a4431659a 100644
+--- a/crates/bevy_render/src/camera/camera.rs
++++ b/crates/bevy_render/src/camera/camera.rs
+@@ -5,7 +5,7 @@
+ use super::{ClearColorConfig, Projection};
+ use crate::{
+     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
+-    camera::{CameraProjection, ManualTextureViewHandle, ManualTextureViews},
++    camera::{ManualTextureViewHandle, ManualTextureViews},
+     primitives::Frustum,
+     render_asset::RenderAssets,
+     render_graph::{InternedRenderSubGraph, RenderSubGraph},
+@@ -311,8 +311,8 @@ pub enum ViewportConversionError {
+     #[error("computed coordinate beyond `Camera`'s far plane")]
+     PastFarPlane,
+     /// The Normalized Device Coordinates could not be computed because the `camera_transform`, the
+-    /// `world_position`, or the projection matrix defined by [`CameraProjection`] contained `NAN`
+-    /// (see [`world_to_ndc`][Camera::world_to_ndc] and [`ndc_to_world`][Camera::ndc_to_world]).
++    /// `world_position`, or the projection matrix defined by [`Projection`] contained `NAN` (see
++    /// [`world_to_ndc`][Camera::world_to_ndc] and [`ndc_to_world`][Camera::ndc_to_world]).
+     #[error("found NaN while computing NDC")]
+     InvalidData,
+ }
+@@ -490,7 +490,7 @@ impl Camera {
+             .map(|t: &RenderTargetInfo| t.scale_factor)
+     }
+ 
+-    /// The projection matrix computed using this camera's [`CameraProjection`].
++    /// The projection matrix computed using this camera's [`Projection`].
+     #[inline]
+     pub fn clip_from_view(&self) -> Mat4 {
+         self.computed.clip_from_view
+@@ -655,7 +655,7 @@ impl Camera {
+     /// To get the coordinates in the render target's viewport dimensions, you should use
+     /// [`world_to_viewport`](Self::world_to_viewport).
+     ///
+-    /// Returns `None` if the `camera_transform`, the `world_position`, or the projection matrix defined by [`CameraProjection`] contain `NAN`.
++    /// Returns `None` if the `camera_transform`, the `world_position`, or the projection matrix defined by [`Projection`] contain `NAN`.
+     ///
+     /// # Panics
+     ///
+@@ -681,7 +681,7 @@ impl Camera {
+     /// To get the world space coordinates with the viewport position, you should use
+     /// [`world_to_viewport`](Self::world_to_viewport).
+     ///
+-    /// Returns `None` if the `camera_transform`, the `world_position`, or the projection matrix defined by [`CameraProjection`] contain `NAN`.
++    /// Returns `None` if the `camera_transform`, the `world_position`, or the projection matrix defined by [`Projection`] contain `NAN`.
+     ///
+     /// # Panics
+     ///
+diff --git a/crates/bevy_render/src/camera/projection.rs b/crates/bevy_render/src/camera/projection.rs
+index ee2a5080d2f9d..9fa8831432a0e 100644
+--- a/crates/bevy_render/src/camera/projection.rs
++++ b/crates/bevy_render/src/camera/projection.rs
+@@ -1,9 +1,9 @@
+ use core::fmt::Debug;
++use core::ops::{Deref, DerefMut};
+ 
+ use crate::{primitives::Frustum, view::VisibilitySystems};
+ use bevy_app::{App, Plugin, PostStartup, PostUpdate};
+ use bevy_asset::AssetEventSystems;
+-use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::prelude::*;
+ use bevy_math::{ops, AspectRatio, Mat4, Rect, Vec2, Vec3A, Vec4};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect, ReflectDeserialize, ReflectSerialize};
+@@ -131,11 +131,10 @@ mod sealed {
+ /// custom projection.
+ ///
+ /// The contained dynamic object can be downcast into a static type using [`CustomProjection::get`].
+-#[derive(Component, Debug, Reflect, Deref, DerefMut)]
++#[derive(Debug, Reflect)]
+ #[reflect(Default, Clone)]
+ pub struct CustomProjection {
+     #[reflect(ignore)]
+-    #[deref]
+     dyn_projection: Box<dyn sealed::DynCameraProjection>,
+ }
+ 
+@@ -204,6 +203,20 @@ impl CustomProjection {
+     }
+ }
+ 
++impl Deref for CustomProjection {
++    type Target = dyn CameraProjection;
++
++    fn deref(&self) -> &Self::Target {
++        self.dyn_projection.as_ref()
++    }
++}
++
++impl DerefMut for CustomProjection {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        self.dyn_projection.as_mut()
++    }
++}
++
+ /// Component that defines how to compute a [`Camera`]'s projection matrix.
+ ///
+ /// Common projections, like perspective and orthographic, are provided out of the box to handle the
+@@ -240,7 +253,7 @@ impl Projection {
+         // that, say, the `Debug` implementation is missing. Wrapping these traits behind a super
+         // trait or some other indirection will make the errors harder to understand.
+         //
+-        // For example, we don't use the `DynCameraProjection`` trait bound, because it is not the
++        // For example, we don't use the `DynCameraProjection` trait bound, because it is not the
+         // trait the user should be implementing - they only need to worry about implementing
+         // `CameraProjection`.
+         P: CameraProjection + Debug + Send + Sync + Clone + 'static,
+@@ -251,44 +264,24 @@ impl Projection {
+     }
+ }
+ 
+-impl CameraProjection for Projection {
+-    fn get_clip_from_view(&self) -> Mat4 {
+-        match self {
+-            Projection::Perspective(projection) => projection.get_clip_from_view(),
+-            Projection::Orthographic(projection) => projection.get_clip_from_view(),
+-            Projection::Custom(projection) => projection.get_clip_from_view(),
+-        }
+-    }
+-
+-    fn get_clip_from_view_for_sub(&self, sub_view: &super::SubCameraView) -> Mat4 {
+-        match self {
+-            Projection::Perspective(projection) => projection.get_clip_from_view_for_sub(sub_view),
+-            Projection::Orthographic(projection) => projection.get_clip_from_view_for_sub(sub_view),
+-            Projection::Custom(projection) => projection.get_clip_from_view_for_sub(sub_view),
+-        }
+-    }
+-
+-    fn update(&mut self, width: f32, height: f32) {
+-        match self {
+-            Projection::Perspective(projection) => projection.update(width, height),
+-            Projection::Orthographic(projection) => projection.update(width, height),
+-            Projection::Custom(projection) => projection.update(width, height),
+-        }
+-    }
++impl Deref for Projection {
++    type Target = dyn CameraProjection;
+ 
+-    fn far(&self) -> f32 {
++    fn deref(&self) -> &Self::Target {
+         match self {
+-            Projection::Perspective(projection) => projection.far(),
+-            Projection::Orthographic(projection) => projection.far(),
+-            Projection::Custom(projection) => projection.far(),
++            Projection::Perspective(projection) => projection,
++            Projection::Orthographic(projection) => projection,
++            Projection::Custom(projection) => projection.deref(),
+         }
+     }
++}
+ 
+-    fn get_frustum_corners(&self, z_near: f32, z_far: f32) -> [Vec3A; 8] {
++impl DerefMut for Projection {
++    fn deref_mut(&mut self) -> &mut Self::Target {
+         match self {
+-            Projection::Perspective(projection) => projection.get_frustum_corners(z_near, z_far),
+-            Projection::Orthographic(projection) => projection.get_frustum_corners(z_near, z_far),
+-            Projection::Custom(projection) => projection.get_frustum_corners(z_near, z_far),
++            Projection::Perspective(projection) => projection,
++            Projection::Orthographic(projection) => projection,
++            Projection::Custom(projection) => projection.deref_mut(),
+         }
+     }
+ }
+diff --git a/crates/bevy_render/src/view/visibility/mod.rs b/crates/bevy_render/src/view/visibility/mod.rs
+index 13b8ac74d439b..11abdd88034f1 100644
+--- a/crates/bevy_render/src/view/visibility/mod.rs
++++ b/crates/bevy_render/src/view/visibility/mod.rs
+@@ -20,7 +20,7 @@ use smallvec::SmallVec;
+ 
+ use super::NoCpuCulling;
+ use crate::{
+-    camera::{Camera, CameraProjection, Projection},
++    camera::{Camera, Projection},
+     mesh::{Mesh, Mesh3d, MeshAabb},
+     primitives::{Aabb, Frustum, Sphere},
+     sync_world::MainEntity,

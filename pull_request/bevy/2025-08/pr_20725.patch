@@ -1,0 +1,174 @@
+diff --git a/crates/bevy_camera/src/visibility/mod.rs b/crates/bevy_camera/src/visibility/mod.rs
+index f059beab829ef..8ac0ea4fe565d 100644
+--- a/crates/bevy_camera/src/visibility/mod.rs
++++ b/crates/bevy_camera/src/visibility/mod.rs
+@@ -23,7 +23,7 @@ use crate::{
+     primitives::{Aabb, Frustum, MeshAabb, Sphere},
+     Projection,
+ };
+-use bevy_mesh::{Mesh, Mesh2d, Mesh3d};
++use bevy_mesh::{mark_3d_meshes_as_changed_if_their_assets_changed, Mesh, Mesh2d, Mesh3d};
+ 
+ #[derive(Component, Default)]
+ pub struct NoCpuCulling;
+@@ -346,7 +346,12 @@ impl Plugin for VisibilityPlugin {
+             .register_required_components::<Mesh2d, VisibilityClass>()
+             .configure_sets(
+                 PostUpdate,
+-                (CalculateBounds, UpdateFrusta, VisibilityPropagate)
++                (
++                    CalculateBounds
++                        .ambiguous_with(mark_3d_meshes_as_changed_if_their_assets_changed),
++                    UpdateFrusta,
++                    VisibilityPropagate,
++                )
+                     .before(CheckVisibility)
+                     .after(TransformSystems::Propagate),
+             )
+diff --git a/crates/bevy_internal/src/default_plugins.rs b/crates/bevy_internal/src/default_plugins.rs
+index a314ab41b3612..a1ed441ffaf4d 100644
+--- a/crates/bevy_internal/src/default_plugins.rs
++++ b/crates/bevy_internal/src/default_plugins.rs
+@@ -35,6 +35,12 @@ plugin_group! {
+         // compressed texture formats.
+         #[cfg(feature = "bevy_image")]
+         bevy_image:::ImagePlugin,
++        #[cfg(feature = "bevy_mesh")]
++        bevy_mesh:::MeshPlugin,
++        #[cfg(feature = "bevy_camera")]
++        bevy_camera:::CameraPlugin,
++        #[cfg(feature = "bevy_light")]
++        bevy_light:::LightPlugin,
+         #[cfg(feature = "bevy_render")]
+         #[custom(cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded")))]
+         bevy_render::pipelined_rendering:::PipelinedRenderingPlugin,
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index caf132c42f54a..b4904d386ba87 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -127,6 +127,7 @@ pub mod light_consts {
+     }
+ }
+ 
++#[derive(Default)]
+ pub struct LightPlugin;
+ 
+ impl Plugin for LightPlugin {
+diff --git a/crates/bevy_mesh/Cargo.toml b/crates/bevy_mesh/Cargo.toml
+index 94dc06427bdd6..31b92b9beb28d 100644
+--- a/crates/bevy_mesh/Cargo.toml
++++ b/crates/bevy_mesh/Cargo.toml
+@@ -10,6 +10,7 @@ keywords = ["bevy"]
+ 
+ [dependencies]
+ # bevy
++bevy_app = { path = "../bevy_app", version = "0.17.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+diff --git a/crates/bevy_mesh/src/lib.rs b/crates/bevy_mesh/src/lib.rs
+index 848e9de505c30..6cb0fbe402b88 100644
+--- a/crates/bevy_mesh/src/lib.rs
++++ b/crates/bevy_mesh/src/lib.rs
+@@ -12,7 +12,9 @@ pub mod morph;
+ pub mod primitives;
+ pub mod skinning;
+ mod vertex;
+-use bevy_ecs::schedule::SystemSet;
++use bevy_app::{App, Plugin, PostUpdate};
++use bevy_asset::{AssetApp, AssetEventSystems};
++use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
+ use bitflags::bitflags;
+ pub use components::*;
+ pub use index::*;
+@@ -43,6 +45,20 @@ bitflags! {
+     }
+ }
+ 
++#[derive(Default)]
++pub struct MeshPlugin;
++
++impl Plugin for MeshPlugin {
++    fn build(&self, app: &mut App) {
++        app.init_asset::<Mesh>()
++            .register_asset_reflect::<Mesh>()
++            .add_systems(
++                PostUpdate,
++                mark_3d_meshes_as_changed_if_their_assets_changed.before(AssetEventSystems),
++            );
++    }
++}
++
+ impl BaseMeshPipelineKey {
+     pub const PRIMITIVE_TOPOLOGY_MASK_BITS: u64 = 0b111;
+     pub const PRIMITIVE_TOPOLOGY_SHIFT_BITS: u64 =
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index 4bba01c2f4954..a0bf22ba22c23 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -48,8 +48,8 @@ use bevy_color::{Color, LinearRgba};
+ 
+ pub use atmosphere::*;
+ use bevy_light::{
+-    AmbientLight, DirectionalLight, LightPlugin, PointLight, ShadowFilteringMethod,
+-    SimulationLightSystems, SpotLight,
++    AmbientLight, DirectionalLight, PointLight, ShadowFilteringMethod, SimulationLightSystems,
++    SpotLight,
+ };
+ use bevy_shader::{load_shader_library, ShaderRef};
+ pub use cluster::*;
+@@ -233,7 +233,6 @@ impl Plugin for PbrPlugin {
+                 SyncComponentPlugin::<ShadowFilteringMethod>::default(),
+                 LightmapPlugin,
+                 LightProbePlugin,
+-                LightPlugin,
+                 GpuMeshPreprocessPlugin {
+                     use_gpu_instance_buffer_builder: self.use_gpu_instance_buffer_builder,
+                 },
+diff --git a/crates/bevy_render/src/camera.rs b/crates/bevy_render/src/camera.rs
+index 2df4dbbd32895..b76bcff809531 100644
+--- a/crates/bevy_render/src/camera.rs
++++ b/crates/bevy_render/src/camera.rs
+@@ -60,7 +60,6 @@ impl Plugin for CameraPlugin {
+             .add_plugins((
+                 ExtractResourcePlugin::<ClearColor>::default(),
+                 ExtractComponentPlugin::<CameraMainTextureUsages>::default(),
+-                bevy_camera::CameraPlugin,
+             ))
+             .add_systems(PostStartup, camera_system.in_set(CameraUpdateSystems))
+             .add_systems(
+diff --git a/crates/bevy_render/src/mesh/mod.rs b/crates/bevy_render/src/mesh/mod.rs
+index cbc22c841f352..d8c7bc63e1ec4 100644
+--- a/crates/bevy_render/src/mesh/mod.rs
++++ b/crates/bevy_render/src/mesh/mod.rs
+@@ -7,8 +7,7 @@ use crate::{
+ };
+ use allocator::MeshAllocatorPlugin;
+ use bevy_app::{App, Plugin, PostUpdate};
+-use bevy_asset::{AssetApp, AssetEventSystems, AssetId, RenderAssetUsages};
+-use bevy_camera::visibility::VisibilitySystems;
++use bevy_asset::{AssetApp, AssetId, RenderAssetUsages};
+ use bevy_ecs::{
+     prelude::*,
+     system::{
+@@ -25,18 +24,10 @@ pub struct MeshPlugin;
+ 
+ impl Plugin for MeshPlugin {
+     fn build(&self, app: &mut App) {
+-        app.init_asset::<Mesh>()
+-            .init_asset::<skinning::SkinnedMeshInverseBindposes>()
+-            .register_asset_reflect::<Mesh>()
++        app.init_asset::<skinning::SkinnedMeshInverseBindposes>()
+             // 'Mesh' must be prepared after 'Image' as meshes rely on the morph target image being ready
+             .add_plugins(RenderAssetPlugin::<RenderMesh, GpuImage>::default())
+-            .add_plugins(MeshAllocatorPlugin)
+-            .add_systems(
+-                PostUpdate,
+-                mark_3d_meshes_as_changed_if_their_assets_changed
+-                    .ambiguous_with(VisibilitySystems::CalculateBounds)
+-                    .before(AssetEventSystems),
+-            );
++            .add_plugins(MeshAllocatorPlugin);
+ 
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
