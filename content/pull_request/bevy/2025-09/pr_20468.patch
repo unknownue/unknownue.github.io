@@ -1,0 +1,235 @@
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index ce511c2fed791..922294f0657f4 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -3154,7 +3154,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh {
+                     return RenderCommandResult::Skip;
+                 };
+ 
+-                pass.set_index_buffer(index_buffer_slice.buffer.slice(..), 0, *index_format);
++                pass.set_index_buffer(index_buffer_slice.buffer.slice(..), *index_format);
+ 
+                 match item.extra_index() {
+                     PhaseItemExtraIndex::None | PhaseItemExtraIndex::DynamicOffset(_) => {
+diff --git a/crates/bevy_render/src/render_phase/draw_state.rs b/crates/bevy_render/src/render_phase/draw_state.rs
+index 0bd2c45831b0f..167d493c8956c 100644
+--- a/crates/bevy_render/src/render_phase/draw_state.rs
++++ b/crates/bevy_render/src/render_phase/draw_state.rs
+@@ -15,6 +15,8 @@ use wgpu::{IndexFormat, QuerySet, RenderPass};
+ #[cfg(feature = "detailed_trace")]
+ use tracing::trace;
+ 
++type BufferSliceKey = (BufferId, wgpu::BufferAddress, wgpu::BufferSize);
++
+ /// Tracks the state of a [`TrackedRenderPass`].
+ ///
+ /// This is used to skip redundant operations on the [`TrackedRenderPass`] (e.g. setting an already
+@@ -25,8 +27,8 @@ struct DrawState {
+     pipeline: Option<RenderPipelineId>,
+     bind_groups: Vec<(Option<BindGroupId>, Vec<u32>)>,
+     /// List of vertex buffers by [`BufferId`], offset, and size. See [`DrawState::buffer_slice_key`]
+-    vertex_buffers: Vec<Option<(BufferId, wgpu::BufferAddress, wgpu::BufferSize)>>,
+-    index_buffer: Option<(BufferId, u64, IndexFormat)>,
++    vertex_buffers: Vec<Option<BufferSliceKey>>,
++    index_buffer: Option<(BufferSliceKey, IndexFormat)>,
+ 
+     /// Stores whether this state is populated or empty for quick state invalidation
+     stores_state: bool,
+@@ -87,10 +89,7 @@ impl DrawState {
+     }
+ 
+     /// Returns the value used for checking whether `BufferSlice`s are equivalent.
+-    fn buffer_slice_key(
+-        &self,
+-        buffer_slice: &BufferSlice,
+-    ) -> (BufferId, wgpu::BufferAddress, wgpu::BufferSize) {
++    fn buffer_slice_key(&self, buffer_slice: &BufferSlice) -> BufferSliceKey {
+         (
+             buffer_slice.id(),
+             buffer_slice.offset(),
+@@ -99,19 +98,14 @@ impl DrawState {
+     }
+ 
+     /// Marks the index `buffer` as bound.
+-    fn set_index_buffer(&mut self, buffer: BufferId, offset: u64, index_format: IndexFormat) {
+-        self.index_buffer = Some((buffer, offset, index_format));
++    fn set_index_buffer(&mut self, buffer_slice: &BufferSlice, index_format: IndexFormat) {
++        self.index_buffer = Some((self.buffer_slice_key(buffer_slice), index_format));
+         self.stores_state = true;
+     }
+ 
+     /// Checks, whether the index `buffer` is already bound.
+-    fn is_index_buffer_set(
+-        &self,
+-        buffer: BufferId,
+-        offset: u64,
+-        index_format: IndexFormat,
+-    ) -> bool {
+-        self.index_buffer == Some((buffer, offset, index_format))
++    fn is_index_buffer_set(&self, buffer: &BufferSlice, index_format: IndexFormat) -> bool {
++        self.index_buffer == Some((self.buffer_slice_key(buffer), index_format))
+     }
+ 
+     /// Resets tracking state
+@@ -259,29 +253,21 @@ impl<'a> TrackedRenderPass<'a> {
+     ///
+     /// Subsequent calls to [`TrackedRenderPass::draw_indexed`] will use the buffer referenced by
+     /// `buffer_slice` as the source index buffer.
+-    pub fn set_index_buffer(
+-        &mut self,
+-        buffer_slice: BufferSlice<'a>,
+-        offset: u64,
+-        index_format: IndexFormat,
+-    ) {
+-        if self
+-            .state
+-            .is_index_buffer_set(buffer_slice.id(), offset, index_format)
+-        {
+-            #[cfg(feature = "detailed_trace")]
+-            trace!(
+-                "set index buffer (already set): {:?} ({})",
+-                buffer_slice.id(),
+-                offset
+-            );
++    pub fn set_index_buffer(&mut self, buffer_slice: BufferSlice<'a>, index_format: IndexFormat) {
++        let already_set = self.state.is_index_buffer_set(&buffer_slice, index_format);
++        #[cfg(feature = "detailed_trace")]
++        trace!(
++            "set index buffer{}: {:?} (offset = {}, size = {})",
++            if already_set { " (already set)" } else { "" },
++            buffer_slice.id(),
++            buffer_slice.offset(),
++            buffer_slice.size(),
++        );
++        if already_set {
+             return;
+         }
+-        #[cfg(feature = "detailed_trace")]
+-        trace!("set index buffer: {:?} ({})", buffer_slice.id(), offset);
+         self.pass.set_index_buffer(*buffer_slice, index_format);
+-        self.state
+-            .set_index_buffer(buffer_slice.id(), offset, index_format);
++        self.state.set_index_buffer(&buffer_slice, index_format);
+     }
+ 
+     /// Draws primitives from the active vertex buffer(s).
+diff --git a/crates/bevy_sprite_render/src/mesh2d/mesh.rs b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+index 1eff9be1c2904..7b6032306cbde 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+@@ -862,7 +862,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh2d {
+                     return RenderCommandResult::Skip;
+                 };
+ 
+-                pass.set_index_buffer(index_buffer_slice.buffer.slice(..), 0, *index_format);
++                pass.set_index_buffer(index_buffer_slice.buffer.slice(..), *index_format);
+ 
+                 pass.draw_indexed(
+                     index_buffer_slice.range.start..(index_buffer_slice.range.start + count),
+diff --git a/crates/bevy_sprite_render/src/render/mod.rs b/crates/bevy_sprite_render/src/render/mod.rs
+index ad73fa3e4fd1d..675b5da471541 100644
+--- a/crates/bevy_sprite_render/src/render/mod.rs
++++ b/crates/bevy_sprite_render/src/render/mod.rs
+@@ -947,7 +947,6 @@ impl<P: PhaseItem> RenderCommand<P> for DrawSpriteBatch {
+ 
+         pass.set_index_buffer(
+             sprite_meta.sprite_index_buffer.buffer().unwrap().slice(..),
+-            0,
+             IndexFormat::Uint32,
+         );
+         pass.set_vertex_buffer(
+diff --git a/crates/bevy_ui_render/src/box_shadow.rs b/crates/bevy_ui_render/src/box_shadow.rs
+index 963e44575140e..6a8c3a3ac74be 100644
+--- a/crates/bevy_ui_render/src/box_shadow.rs
++++ b/crates/bevy_ui_render/src/box_shadow.rs
+@@ -559,7 +559,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawBoxShadow {
+         // Store the vertices
+         pass.set_vertex_buffer(0, vertices.slice(..));
+         // Define how to "connect" the vertices
+-        pass.set_index_buffer(indices.slice(..), 0, IndexFormat::Uint32);
++        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+         // Draw the vertices
+         pass.draw_indexed(batch.range.clone(), 0, 0..1);
+         RenderCommandResult::Success
+diff --git a/crates/bevy_ui_render/src/gradient.rs b/crates/bevy_ui_render/src/gradient.rs
+index 75d900fa273a9..a2fbc7663d2a0 100644
+--- a/crates/bevy_ui_render/src/gradient.rs
++++ b/crates/bevy_ui_render/src/gradient.rs
+@@ -966,7 +966,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGradient {
+         // Store the vertices
+         pass.set_vertex_buffer(0, vertices.slice(..));
+         // Define how to "connect" the vertices
+-        pass.set_index_buffer(indices.slice(..), 0, IndexFormat::Uint32);
++        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+         // Draw the vertices
+         pass.draw_indexed(batch.range.clone(), 0, 0..1);
+         RenderCommandResult::Success
+diff --git a/crates/bevy_ui_render/src/render_pass.rs b/crates/bevy_ui_render/src/render_pass.rs
+index 407f200e86b1c..642f69d9350e8 100644
+--- a/crates/bevy_ui_render/src/render_pass.rs
++++ b/crates/bevy_ui_render/src/render_pass.rs
+@@ -267,7 +267,6 @@ impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
+         // Define how to "connect" the vertices
+         pass.set_index_buffer(
+             indices.slice(..),
+-            0,
+             bevy_render::render_resource::IndexFormat::Uint32,
+         );
+         // Draw the vertices
+diff --git a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+index 62f15ea1c6dbf..2a417b6950afb 100644
+--- a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+@@ -706,7 +706,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawSlicer {
+         // Store the vertices
+         pass.set_vertex_buffer(0, vertices.slice(..));
+         // Define how to "connect" the vertices
+-        pass.set_index_buffer(indices.slice(..), 0, IndexFormat::Uint32);
++        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+         // Draw the vertices
+         pass.draw_indexed(batch.range.clone(), 0, 0..1);
+         RenderCommandResult::Success
+diff --git a/examples/shader_advanced/custom_phase_item.rs b/examples/shader_advanced/custom_phase_item.rs
+index 067c04fc7a8c0..b7bde3192d57f 100644
+--- a/examples/shader_advanced/custom_phase_item.rs
++++ b/examples/shader_advanced/custom_phase_item.rs
+@@ -93,7 +93,6 @@ where
+                 .buffer()
+                 .unwrap()
+                 .slice(..),
+-            0,
+             IndexFormat::Uint32,
+         );
+ 
+diff --git a/examples/shader_advanced/custom_shader_instancing.rs b/examples/shader_advanced/custom_shader_instancing.rs
+index ca4d1fdf986d7..4be7a37c2bda4 100644
+--- a/examples/shader_advanced/custom_shader_instancing.rs
++++ b/examples/shader_advanced/custom_shader_instancing.rs
+@@ -303,7 +303,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
+                     return RenderCommandResult::Skip;
+                 };
+ 
+-                pass.set_index_buffer(index_buffer_slice.buffer.slice(..), 0, *index_format);
++                pass.set_index_buffer(index_buffer_slice.buffer.slice(..), *index_format);
+                 pass.draw_indexed(
+                     index_buffer_slice.range.start..(index_buffer_slice.range.start + count),
+                     vertex_buffer_slice.range.start as i32,
+diff --git a/release-content/migration-guides/set_index_buffer.md b/release-content/migration-guides/set_index_buffer.md
+new file mode 100644
+index 0000000000000..f7c76026124b0
+--- /dev/null
++++ b/release-content/migration-guides/set_index_buffer.md
+@@ -0,0 +1,13 @@
++---
++title: "`TrackedRenderPass::set_index_buffer` no longer takes buffer offset"
++pull_requests: [20468]
++---
++
++`TrackedRenderPass::set_index_buffer` no longer takes a separate buffer offset argument, which wasn't actually forwarded to wgpu. You have already needed to pass a `BufferSlice` that is sliced to the desired offset/size.
++
++```rust
++// Before:
++pass.set_index_buffer(indices.slice(1..), 1, IndexFormat::Uint32);
++// After:
++pass.set_index_buffer(indices.slice(1..), IndexFormat::Uint32);
++```
