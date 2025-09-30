@@ -1,0 +1,322 @@
+diff --git a/crates/bevy_ui/src/focus.rs b/crates/bevy_ui/src/focus.rs
+index 0d0d5a2eeca76..ed61ce9e3cb1e 100644
+--- a/crates/bevy_ui/src/focus.rs
++++ b/crates/bevy_ui/src/focus.rs
+@@ -147,6 +147,7 @@ pub struct NodeQuery {
+ ///
+ /// Entities with a hidden [`InheritedVisibility`] are always treated as released.
+ pub fn ui_focus_system(
++    mut hovered_nodes: Local<Vec<Entity>>,
+     mut state: Local<State>,
+     camera_query: Query<(Entity, &Camera)>,
+     primary_window: Query<Entity, With<PrimaryWindow>>,
+@@ -215,17 +216,36 @@ pub fn ui_focus_system(
+     // prepare an iterator that contains all the nodes that have the cursor in their rect,
+     // from the top node to the bottom one. this will also reset the interaction to `None`
+     // for all nodes encountered that are no longer hovered.
+-    let mut hovered_nodes = ui_stack
+-        .uinodes
++
++    hovered_nodes.clear();
++    // reverse the iterator to traverse the tree from closest slice to furthest
++    for uinodes in ui_stack
++        .partition
+         .iter()
+-        // reverse the iterator to traverse the tree from closest nodes to furthest
+         .rev()
+-        .filter_map(|entity| {
+-            let Ok(node) = node_query.get_mut(*entity) else {
+-                return None;
++        .map(|range| &ui_stack.uinodes[range.clone()])
++    {
++        // Retrieve the first node and resolve its camera target.
++        // Only need to do this once per slice, as all the nodes in the slice share the same camera.
++        let Ok(root_node) = node_query.get_mut(uinodes[0]) else {
++            continue;
++        };
++
++        let Some(camera_entity) = root_node.target_camera.get() else {
++            continue;
++        };
++
++        let cursor_position = camera_cursor_positions.get(&camera_entity);
++
++        for entity in uinodes.iter().rev().cloned() {
++            let Ok(node) = node_query.get_mut(entity) else {
++                continue;
++            };
++
++            let Some(inherited_visibility) = node.inherited_visibility else {
++                continue;
+             };
+ 
+-            let inherited_visibility = node.inherited_visibility?;
+             // Nodes that are not rendered should not be interactable
+             if !inherited_visibility.get() {
+                 // Reset their interaction to None to avoid strange stuck state
+@@ -233,15 +253,12 @@ pub fn ui_focus_system(
+                     // We cannot simply set the interaction to None, as that will trigger change detection repeatedly
+                     interaction.set_if_neq(Interaction::None);
+                 }
+-                return None;
++                continue;
+             }
+-            let camera_entity = node.target_camera.get()?;
+-
+-            let cursor_position = camera_cursor_positions.get(&camera_entity);
+ 
+             let contains_cursor = cursor_position.is_some_and(|point| {
+                 node.node.contains_point(*node.transform, *point)
+-                    && clip_check_recursive(*point, *entity, &clipping_query, &child_of_query)
++                    && clip_check_recursive(*point, entity, &clipping_query, &child_of_query)
+             });
+ 
+             // The mouse position relative to the node
+@@ -270,7 +287,7 @@ pub fn ui_focus_system(
+             }
+ 
+             if contains_cursor {
+-                Some(*entity)
++                hovered_nodes.push(entity);
+             } else {
+                 if let Some(mut interaction) = node.interaction
+                     && (*interaction == Interaction::Hovered
+@@ -278,15 +295,14 @@ pub fn ui_focus_system(
+                 {
+                     interaction.set_if_neq(Interaction::None);
+                 }
+-                None
++                continue;
+             }
+-        })
+-        .collect::<Vec<Entity>>()
+-        .into_iter();
++        }
++    }
+ 
+     // set Pressed or Hovered on top nodes. as soon as a node with a `Block` focus policy is detected,
+     // the iteration will stop on it because it "captures" the interaction.
+-    let mut iter = node_query.iter_many_mut(hovered_nodes.by_ref());
++    let mut iter = node_query.iter_many_mut(hovered_nodes.iter());
+     while let Some(node) = iter.fetch_next() {
+         if let Some(mut interaction) = node.interaction {
+             if mouse_clicked {
+@@ -313,7 +329,7 @@ pub fn ui_focus_system(
+     }
+     // reset `Interaction` for the remaining lower nodes to `None`. those are the nodes that remain in
+     // `moused_over_nodes` after the previous loop is exited.
+-    let mut iter = node_query.iter_many_mut(hovered_nodes);
++    let mut iter = node_query.iter_many_mut(hovered_nodes.iter());
+     while let Some(node) = iter.fetch_next() {
+         if let Some(mut interaction) = node.interaction {
+             // don't reset pressed nodes because they're handled separately
+diff --git a/crates/bevy_ui/src/picking_backend.rs b/crates/bevy_ui/src/picking_backend.rs
+index bd94b9d82bed5..dc96199116528 100644
+--- a/crates/bevy_ui/src/picking_backend.rs
++++ b/crates/bevy_ui/src/picking_backend.rs
+@@ -158,59 +158,71 @@ pub fn ui_picking(
+     // prepare an iterator that contains all the nodes that have the cursor in their rect,
+     // from the top node to the bottom one. this will also reset the interaction to `None`
+     // for all nodes encountered that are no longer hovered.
+-    for node_entity in ui_stack
+-        .uinodes
++    // Reverse the iterator to traverse the tree from closest slice to furthest
++    for uinodes in ui_stack
++        .partition
+         .iter()
+-        // reverse the iterator to traverse the tree from closest nodes to furthest
+         .rev()
++        .map(|range| &ui_stack.uinodes[range.clone()])
+     {
+-        let Ok(node) = node_query.get(*node_entity) else {
++        // Retrieve the first node and resolve its camera target.
++        // Only need to do this once per slice, as all the nodes in the same slice share the same camera.
++        let Ok(uinode) = node_query.get(uinodes[0]) else {
+             continue;
+         };
+ 
+-        if settings.require_markers && node.pickable.is_none() {
+-            continue;
+-        }
+-
+-        // Nodes that are not rendered should not be interactable
+-        if node
+-            .inherited_visibility
+-            .map(|inherited_visibility| inherited_visibility.get())
+-            != Some(true)
+-        {
+-            continue;
+-        }
+-        let Some(camera_entity) = node.target_camera.get() else {
++        let Some(camera_entity) = uinode.target_camera.get() else {
+             continue;
+         };
+ 
+-        // Nodes with Display::None have a (0., 0.) logical rect and can be ignored
+-        if node.node.size() == Vec2::ZERO {
+-            continue;
+-        }
+-
+         let pointers_on_this_cam = pointer_pos_by_camera.get(&camera_entity);
+ 
+-        // Find the normalized cursor position relative to the node.
+-        // (±0., 0.) is the center with the corners at points (±0.5, ±0.5).
+-        // Coordinates are relative to the entire node, not just the visible region.
+-        for (pointer_id, cursor_position) in pointers_on_this_cam.iter().flat_map(|h| h.iter()) {
+-            if node.node.contains_point(*node.transform, *cursor_position)
+-                && clip_check_recursive(
+-                    *cursor_position,
+-                    *node_entity,
+-                    &clipping_query,
+-                    &child_of_query,
+-                )
++        // Reverse the iterator to traverse the tree from closest nodes to furthest
++        for node_entity in uinodes.iter().rev().cloned() {
++            let Ok(node) = node_query.get(node_entity) else {
++                continue;
++            };
++
++            if settings.require_markers && node.pickable.is_none() {
++                continue;
++            }
++
++            // Nodes that are not rendered should not be interactable
++            if node
++                .inherited_visibility
++                .map(|inherited_visibility| inherited_visibility.get())
++                != Some(true)
++            {
++                continue;
++            }
++
++            // Nodes with Display::None have a (0., 0.) logical rect and can be ignored
++            if node.node.size() == Vec2::ZERO {
++                continue;
++            }
++
++            // Find the normalized cursor position relative to the node.
++            // (±0., 0.) is the center with the corners at points (±0.5, ±0.5).
++            // Coordinates are relative to the entire node, not just the visible region.
++            for (pointer_id, cursor_position) in pointers_on_this_cam.iter().flat_map(|h| h.iter())
+             {
+-                hit_nodes
+-                    .entry((camera_entity, *pointer_id))
+-                    .or_default()
+-                    .push((
+-                        *node_entity,
+-                        node.transform.inverse().transform_point2(*cursor_position)
+-                            / node.node.size(),
+-                    ));
++                if node.node.contains_point(*node.transform, *cursor_position)
++                    && clip_check_recursive(
++                        *cursor_position,
++                        node_entity,
++                        &clipping_query,
++                        &child_of_query,
++                    )
++                {
++                    hit_nodes
++                        .entry((camera_entity, *pointer_id))
++                        .or_default()
++                        .push((
++                            node_entity,
++                            node.transform.inverse().transform_point2(*cursor_position)
++                                / node.node.size(),
++                        ));
++                }
+             }
+         }
+     }
+diff --git a/crates/bevy_ui/src/stack.rs b/crates/bevy_ui/src/stack.rs
+index d50311cbce9ed..c567c89f0d54e 100644
+--- a/crates/bevy_ui/src/stack.rs
++++ b/crates/bevy_ui/src/stack.rs
+@@ -1,12 +1,12 @@
+ //! This module contains the systems that update the stored UI nodes stack
+ 
+-use bevy_ecs::prelude::*;
+-use bevy_platform::collections::HashSet;
+-
+ use crate::{
+     experimental::{UiChildren, UiRootNodes},
+     ComputedNode, GlobalZIndex, ZIndex,
+ };
++use bevy_ecs::prelude::*;
++use bevy_platform::collections::HashSet;
++use core::ops::Range;
+ 
+ /// The current UI stack, which contains all UI nodes ordered by their depth (back-to-front).
+ ///
+@@ -14,6 +14,8 @@ use crate::{
+ /// while the last entry is the first node to receive interactions.
+ #[derive(Debug, Resource, Default)]
+ pub struct UiStack {
++    /// Partition of the `uinodes` list into disjoint slices of nodes that all share the same camera target.
++    pub partition: Vec<Range<usize>>,
+     /// List of UI nodes ordered from back-to-front
+     pub uinodes: Vec<Entity>,
+ }
+@@ -50,6 +52,7 @@ pub fn ui_stack_system(
+     zindex_query: Query<Option<&ZIndex>, (With<ComputedNode>, Without<GlobalZIndex>)>,
+     mut update_query: Query<&mut ComputedNode>,
+ ) {
++    ui_stack.partition.clear();
+     ui_stack.uinodes.clear();
+     visited_root_nodes.clear();
+ 
+@@ -81,6 +84,7 @@ pub fn ui_stack_system(
+     root_nodes.sort_by_key(|(_, z)| *z);
+ 
+     for (root_entity, _) in root_nodes.drain(..) {
++        let start = ui_stack.uinodes.len();
+         update_uistack_recursive(
+             &mut cache,
+             root_entity,
+@@ -88,6 +92,8 @@ pub fn ui_stack_system(
+             &zindex_query,
+             &mut ui_stack.uinodes,
+         );
++        let end = ui_stack.uinodes.len();
++        ui_stack.partition.push(start..end);
+     }
+ 
+     for (i, entity) in ui_stack.uinodes.iter().enumerate() {
+@@ -256,6 +262,27 @@ mod tests {
+             (Label("0")), // GlobalZIndex(2)
+         ];
+         assert_eq!(actual_result, expected_result);
++
++        // Test partitioning
++        let last_part = ui_stack.partition.last().unwrap();
++        assert_eq!(last_part.len(), 1);
++        let last_entity = ui_stack.uinodes[last_part.start];
++        assert_eq!(*query.get(&world, last_entity).unwrap(), Label("0"));
++
++        let actual_result = ui_stack.uinodes[ui_stack.partition[4].clone()]
++            .iter()
++            .map(|entity| query.get(&world, *entity).unwrap().clone())
++            .collect::<Vec<_>>();
++        let expected_result = vec![
++            (Label("1")), // ZIndex(1)
++            (Label("1-0")),
++            (Label("1-0-2")), // ZIndex(-1)
++            (Label("1-0-0")),
++            (Label("1-0-1")),
++            (Label("1-1")),
++            (Label("1-3")),
++        ];
++        assert_eq!(actual_result, expected_result);
+     }
+ 
+     #[test]
+@@ -305,5 +332,10 @@ mod tests {
+         ];
+ 
+         assert_eq!(actual_result, expected_result);
++
++        assert_eq!(ui_stack.partition.len(), expected_result.len());
++        for (i, part) in ui_stack.partition.iter().enumerate() {
++            assert_eq!(*part, i..i + 1);
++        }
+     }
+ }
