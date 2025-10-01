@@ -1,0 +1,424 @@
+diff --git a/crates/bevy_animation/src/lib.rs b/crates/bevy_animation/src/lib.rs
+index 75dfe8ad42692..6d4637fbd7c01 100644
+--- a/crates/bevy_animation/src/lib.rs
++++ b/crates/bevy_animation/src/lib.rs
+@@ -97,7 +97,7 @@ impl VariableCurve {
+ /// apply.
+ ///
+ /// Because animation clips refer to targets by UUID, they can target any
+-/// [`AnimationTarget`] with that ID.
++/// entity with that ID.
+ #[derive(Asset, Reflect, Clone, Debug, Default)]
+ #[reflect(Clone, Default)]
+ pub struct AnimationClip {
+@@ -158,20 +158,19 @@ type AnimationEvents = HashMap<AnimationEventTarget, Vec<TimedAnimationEvent>>;
+ /// animation curves.
+ pub type AnimationCurves = HashMap<AnimationTargetId, Vec<VariableCurve>, NoOpHash>;
+ 
+-/// A unique [UUID] for an animation target (e.g. bone in a skinned mesh).
++/// A component that identifies which parts of an [`AnimationClip`] asset can
++/// be applied to an entity. Typically used alongside the
++/// [`AnimatedBy`] component.
+ ///
+-/// The [`AnimationClip`] asset and the [`AnimationTarget`] component both use
+-/// this to refer to targets (e.g. bones in a skinned mesh) to be animated.
+-///
+-/// When importing an armature or an animation clip, asset loaders typically use
+-/// the full path name from the armature to the bone to generate these UUIDs.
+-/// The ID is unique to the full path name and based only on the names. So, for
+-/// example, any imported armature with a bone at the root named `Hips` will
+-/// assign the same [`AnimationTargetId`] to its root bone. Likewise, any
+-/// imported animation clip that animates a root bone named `Hips` will
+-/// reference the same [`AnimationTargetId`]. Any animation is playable on any
+-/// armature as long as the bone names match, which allows for easy animation
+-/// retargeting.
++/// `AnimationTargetId` is implemented as a [UUID]. When importing an armature
++/// or an animation clip, asset loaders typically use the full path name from
++/// the armature to the bone to generate these UUIDs. The ID is unique to the
++/// full path name and based only on the names. So, for example, any imported
++/// armature with a bone at the root named `Hips` will assign the same
++/// [`AnimationTargetId`] to its root bone. Likewise, any imported animation
++/// clip that animates a root bone named `Hips` will reference the same
++/// [`AnimationTargetId`]. Any animation is playable on any armature as long as
++/// the bone names match, which allows for easy animation retargeting.
+ ///
+ /// Note that asset loaders generally use the *full* path name to generate the
+ /// [`AnimationTargetId`]. Thus a bone named `Chest` directly connected to a
+@@ -179,8 +178,10 @@ pub type AnimationCurves = HashMap<AnimationTargetId, Vec<VariableCurve>, NoOpHa
+ /// connected to a bone named `Stomach`.
+ ///
+ /// [UUID]: https://en.wikipedia.org/wiki/Universally_unique_identifier
+-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Reflect, Debug, Serialize, Deserialize)]
+-#[reflect(Clone)]
++#[derive(
++    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Reflect, Debug, Serialize, Deserialize, Component,
++)]
++#[reflect(Component, Clone)]
+ pub struct AnimationTargetId(pub Uuid);
+ 
+ impl Hash for AnimationTargetId {
+@@ -190,39 +191,26 @@ impl Hash for AnimationTargetId {
+     }
+ }
+ 
+-/// An entity that can be animated by an [`AnimationPlayer`].
+-///
+-/// These are frequently referred to as *bones* or *joints*, because they often
+-/// refer to individually-animatable parts of an armature.
++/// A component that links an animated entity to an entity containing an
++/// [`AnimationPlayer`]. Typically used alongside the [`AnimationTargetId`]
++/// component - the linked `AnimationPlayer` plays [`AnimationClip`] assets, and
++/// the `AnimationTargetId` identifies which curves in the `AnimationClip` will
++/// affect the target entity.
+ ///
+-/// Asset loaders for armatures are responsible for adding these as necessary.
+-/// Typically, they're generated from hashed versions of the entire name path
+-/// from the root of the armature to the bone. See the [`AnimationTargetId`]
+-/// documentation for more details.
+-///
+-/// By convention, asset loaders add [`AnimationTarget`] components to the
++/// By convention, asset loaders add [`AnimationTargetId`] components to the
+ /// descendants of an [`AnimationPlayer`], as well as to the [`AnimationPlayer`]
+ /// entity itself, but Bevy doesn't require this in any way. So, for example,
+ /// it's entirely possible for an [`AnimationPlayer`] to animate a target that
+ /// it isn't an ancestor of. If you add a new bone to or delete a bone from an
+-/// armature at runtime, you may want to update the [`AnimationTarget`]
++/// armature at runtime, you may want to update the [`AnimationTargetId`]
+ /// component as appropriate, as Bevy won't do this automatically.
+ ///
+ /// Note that each entity can only be animated by one animation player at a
+-/// time. However, you can change [`AnimationTarget`]'s `player` property at
+-/// runtime to change which player is responsible for animating the entity.
+-#[derive(Clone, Copy, Component, Reflect)]
++/// time. However, you can change [`AnimatedBy`] components at runtime and
++/// link them to a different player.
++#[derive(Clone, Copy, Component, Reflect, Debug)]
+ #[reflect(Component, Clone)]
+-pub struct AnimationTarget {
+-    /// The ID of this animation target.
+-    ///
+-    /// Typically, this is derived from the path.
+-    pub id: AnimationTargetId,
+-
+-    /// The entity containing the [`AnimationPlayer`].
+-    #[entities]
+-    pub player: Entity,
+-}
++pub struct AnimatedBy(#[entities] pub Entity);
+ 
+ impl AnimationClip {
+     #[inline]
+@@ -271,8 +259,8 @@ impl AnimationClip {
+         self.duration = duration_sec;
+     }
+ 
+-    /// Adds an [`AnimationCurve`] to an [`AnimationTarget`] named by an
+-    /// [`AnimationTargetId`].
++    /// Adds an [`AnimationCurve`] that can target an entity with the given
++    /// [`AnimationTargetId`] component.
+     ///
+     /// If the curve extends beyond the current duration of this clip, this
+     /// method lengthens this clip to include the entire time span that the
+@@ -327,7 +315,7 @@ impl AnimationClip {
+             .push(variable_curve);
+     }
+ 
+-    /// Add an [`EntityEvent`] with no [`AnimationTarget`] to this [`AnimationClip`].
++    /// Add an [`EntityEvent`] with no [`AnimationTargetId`].
+     ///
+     /// The `event` will be cloned and triggered on the [`AnimationPlayer`] entity once the `time` (in seconds)
+     /// is reached in the animation.
+@@ -347,7 +335,7 @@ impl AnimationClip {
+         );
+     }
+ 
+-    /// Add an [`EntityEvent`] to an [`AnimationTarget`] named by an [`AnimationTargetId`].
++    /// Add an [`EntityEvent`] with an [`AnimationTargetId`].
+     ///
+     /// The `event` will be cloned and triggered on the entity matching the target once the `time` (in seconds)
+     /// is reached in the animation.
+@@ -373,7 +361,7 @@ impl AnimationClip {
+         );
+     }
+ 
+-    /// Add an event function with no [`AnimationTarget`] to this [`AnimationClip`].
++    /// Add an event function with no [`AnimationTargetId`] to this [`AnimationClip`].
+     ///
+     /// The `func` will trigger on the [`AnimationPlayer`] entity once the `time` (in seconds)
+     /// is reached in the animation.
+@@ -396,7 +384,7 @@ impl AnimationClip {
+         self.add_event_internal(AnimationEventTarget::Root, time, func);
+     }
+ 
+-    /// Add an event function to an [`AnimationTarget`] named by an [`AnimationTargetId`].
++    /// Add an event function with an [`AnimationTargetId`].
+     ///
+     /// The `func` will trigger on the entity matching the target once the `time` (in seconds)
+     /// is reached in the animation.
+@@ -1033,8 +1021,16 @@ pub fn advance_animations(
+ }
+ 
+ /// A type alias for [`EntityMutExcept`] as used in animation.
+-pub type AnimationEntityMut<'w, 's> =
+-    EntityMutExcept<'w, 's, (AnimationTarget, AnimationPlayer, AnimationGraphHandle)>;
++pub type AnimationEntityMut<'w, 's> = EntityMutExcept<
++    'w,
++    's,
++    (
++        AnimationTargetId,
++        AnimatedBy,
++        AnimationPlayer,
++        AnimationGraphHandle,
++    ),
++>;
+ 
+ /// A system that modifies animation targets (e.g. bones in a skinned mesh)
+ /// according to the currently-playing animations.
+@@ -1044,18 +1040,13 @@ pub fn animate_targets(
+     graphs: Res<Assets<AnimationGraph>>,
+     threaded_animation_graphs: Res<ThreadedAnimationGraphs>,
+     players: Query<(&AnimationPlayer, &AnimationGraphHandle)>,
+-    mut targets: Query<(Entity, &AnimationTarget, AnimationEntityMut)>,
++    mut targets: Query<(Entity, &AnimationTargetId, &AnimatedBy, AnimationEntityMut)>,
+     animation_evaluation_state: Local<ThreadLocal<RefCell<AnimationEvaluationState>>>,
+ ) {
+     // Evaluate all animation targets in parallel.
+     targets
+         .par_iter_mut()
+-        .for_each(|(entity, target, entity_mut)| {
+-            let &AnimationTarget {
+-                id: target_id,
+-                player: player_id,
+-            } = target;
+-
++        .for_each(|(entity, &target_id, &AnimatedBy(player_id), entity_mut)| {
+             let (animation_player, animation_graph_id) =
+                 if let Ok((player, graph_handle)) = players.get(player_id) {
+                     (player, graph_handle.id())
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index aeb0f791cf8d0..4c651b0dc9ac7 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -9,7 +9,7 @@ use std::{
+ };
+ 
+ #[cfg(feature = "bevy_animation")]
+-use bevy_animation::{prelude::*, AnimationTarget, AnimationTargetId};
++use bevy_animation::{prelude::*, AnimatedBy, AnimationTargetId};
+ use bevy_asset::{
+     io::Reader, AssetLoadError, AssetLoader, Handle, LoadContext, ReadAssetBytesError,
+     RenderAssetUsages,
+@@ -1439,10 +1439,10 @@ fn load_node(
+     if let Some(ref mut animation_context) = animation_context {
+         animation_context.path.push(name);
+ 
+-        node.insert(AnimationTarget {
+-            id: AnimationTargetId::from_names(animation_context.path.iter()),
+-            player: animation_context.root,
+-        });
++        node.insert((
++            AnimationTargetId::from_names(animation_context.path.iter()),
++            AnimatedBy(animation_context.root),
++        ));
+     }
+ 
+     if let Some(extras) = gltf_node.extras() {
+diff --git a/examples/animation/animated_transform.rs b/examples/animation/animated_transform.rs
+index 1b045f5f4d303..bd1b7b3c986e9 100644
+--- a/examples/animation/animated_transform.rs
++++ b/examples/animation/animated_transform.rs
+@@ -3,7 +3,7 @@
+ use std::f32::consts::PI;
+ 
+ use bevy::{
+-    animation::{animated_field, AnimationTarget, AnimationTargetId},
++    animation::{animated_field, AnimatedBy, AnimationTargetId},
+     prelude::*,
+ };
+ 
+@@ -152,26 +152,20 @@ fn setup(
+         ))
+         .id();
+     commands.entity(planet_entity).insert((
+-        AnimationTarget {
+-            id: planet_animation_target_id,
+-            player: planet_entity,
+-        },
++        planet_animation_target_id,
++        AnimatedBy(planet_entity),
+         children![(
+             Transform::default(),
+             Visibility::default(),
+             orbit_controller,
+-            AnimationTarget {
+-                id: orbit_controller_animation_target_id,
+-                player: planet_entity,
+-            },
++            orbit_controller_animation_target_id,
++            AnimatedBy(planet_entity),
+             children![(
+                 Mesh3d(meshes.add(Cuboid::new(0.5, 0.5, 0.5))),
+                 MeshMaterial3d(materials.add(Color::srgb(0.3, 0.9, 0.3))),
+                 Transform::from_xyz(1.5, 0.0, 0.0),
+-                AnimationTarget {
+-                    id: satellite_animation_target_id,
+-                    player: planet_entity,
+-                },
++                satellite_animation_target_id,
++                AnimatedBy(planet_entity),
+                 satellite,
+             )],
+         )],
+diff --git a/examples/animation/animated_ui.rs b/examples/animation/animated_ui.rs
+index 546577d82ae49..8243592034abc 100644
+--- a/examples/animation/animated_ui.rs
++++ b/examples/animation/animated_ui.rs
+@@ -2,8 +2,7 @@
+ 
+ use bevy::{
+     animation::{
+-        animated_field, AnimationEntityMut, AnimationEvaluationError, AnimationTarget,
+-        AnimationTargetId,
++        animated_field, AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId,
+     },
+     prelude::*,
+ };
+@@ -149,10 +148,8 @@ fn setup(
+         },
+         TextColor(Color::Srgba(Srgba::RED)),
+         TextLayout::new_with_justify(Justify::Center),
+-        AnimationTarget {
+-            id: animation_target_id,
+-            player,
+-        },
++        animation_target_id,
++        AnimatedBy(player),
+         animation_target_name,
+     )]);
+ }
+diff --git a/examples/animation/animation_masks.rs b/examples/animation/animation_masks.rs
+index c908dd7b5f0ae..4566d06034e33 100644
+--- a/examples/animation/animation_masks.rs
++++ b/examples/animation/animation_masks.rs
+@@ -1,7 +1,7 @@
+ //! Demonstrates how to use masks to limit the scope of animations.
+ 
+ use bevy::{
+-    animation::{AnimationTarget, AnimationTargetId},
++    animation::{AnimatedBy, AnimationTargetId},
+     color::palettes::css::{LIGHT_GRAY, WHITE},
+     prelude::*,
+ };
+@@ -342,7 +342,7 @@ fn setup_animation_graph_once_loaded(
+     asset_server: Res<AssetServer>,
+     mut animation_graphs: ResMut<Assets<AnimationGraph>>,
+     mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
+-    targets: Query<(Entity, &AnimationTarget)>,
++    targets: Query<(Entity, &AnimationTargetId)>,
+ ) {
+     for (entity, mut player) in &mut players {
+         // Load the animation clip from the glTF file.
+@@ -389,8 +389,11 @@ fn setup_animation_graph_once_loaded(
+         // don't do that, those bones will play all animations at once, which is
+         // ugly.
+         for (target_entity, target) in &targets {
+-            if !all_animation_target_ids.contains(&target.id) {
+-                commands.entity(target_entity).remove::<AnimationTarget>();
++            if !all_animation_target_ids.contains(target) {
++                commands
++                    .entity(target_entity)
++                    .remove::<AnimationTargetId>()
++                    .remove::<AnimatedBy>();
+             }
+         }
+ 
+diff --git a/examples/animation/eased_motion.rs b/examples/animation/eased_motion.rs
+index f6254cd65de35..cf44dfdd3b60e 100644
+--- a/examples/animation/eased_motion.rs
++++ b/examples/animation/eased_motion.rs
+@@ -3,7 +3,7 @@
+ use std::f32::consts::FRAC_PI_2;
+ 
+ use bevy::{
+-    animation::{animated_field, AnimationTarget, AnimationTargetId},
++    animation::{animated_field, AnimatedBy, AnimationTargetId},
+     color::palettes::css::{ORANGE, SILVER},
+     math::vec3,
+     prelude::*,
+@@ -47,10 +47,9 @@ fn setup(
+         ))
+         .id();
+ 
+-    commands.entity(cube_entity).insert(AnimationTarget {
+-        id: animation_target_id,
+-        player: cube_entity,
+-    });
++    commands
++        .entity(cube_entity)
++        .insert((animation_target_id, AnimatedBy(cube_entity)));
+ 
+     // Some light to see something
+     commands.spawn((
+diff --git a/examples/tools/scene_viewer/animation_plugin.rs b/examples/tools/scene_viewer/animation_plugin.rs
+index 65baff04d91c7..8a36d372d77d2 100644
+--- a/examples/tools/scene_viewer/animation_plugin.rs
++++ b/examples/tools/scene_viewer/animation_plugin.rs
+@@ -1,7 +1,7 @@
+ //! Control animations of entities in the loaded scene.
+ use std::collections::HashMap;
+ 
+-use bevy::{animation::AnimationTarget, ecs::entity::EntityHashMap, gltf::Gltf, prelude::*};
++use bevy::{animation::AnimationTargetId, ecs::entity::EntityHashMap, gltf::Gltf, prelude::*};
+ 
+ use crate::scene_viewer_plugin::SceneHandle;
+ 
+@@ -35,7 +35,7 @@ impl Clips {
+ /// the common case).
+ fn assign_clips(
+     mut players: Query<&mut AnimationPlayer>,
+-    targets: Query<(Entity, &AnimationTarget)>,
++    targets: Query<(&AnimationTargetId, Entity)>,
+     children: Query<&ChildOf>,
+     scene_handle: Res<SceneHandle>,
+     clips: Res<Assets<AnimationClip>>,
+@@ -64,10 +64,7 @@ fn assign_clips(
+     info!("Animation names: {names:?}");
+ 
+     // Map animation target IDs to entities.
+-    let animation_target_id_to_entity: HashMap<_, _> = targets
+-        .iter()
+-        .map(|(entity, target)| (target.id, entity))
+-        .collect();
++    let animation_target_id_to_entity: HashMap<_, _> = targets.iter().collect();
+ 
+     // Build up a list of all animation clips that belong to each player. A clip
+     // is considered to belong to an animation player if all targets of the clip
+diff --git a/release-content/migration-guides/animation-target-refactor.md b/release-content/migration-guides/animation-target-refactor.md
+new file mode 100644
+index 0000000000000..1e1fc631ae3fd
+--- /dev/null
++++ b/release-content/migration-guides/animation-target-refactor.md
+@@ -0,0 +1,23 @@
++---
++title: "`AnimationTarget` replaced by separate components"
++pull_requests: [20774]
++---
++
++The `AnimationTarget` component has been split into two separate components.
++`AnimationTarget::id` is now an `AnimationTargetId` component, and
++`AnimationTarget::player` is now an `AnimatedBy` component.
++
++This change was made to add flexibility. It's now possible to calculate the
++`AnimationTargetId` first, but defer the choice of player until later.
++
++Before:
++
++```rust
++entity.insert(AnimationTarget { id: AnimationTargetId(id), player: player_entity });
++```
++
++After:
++
++```rust
++entity.insert((AnimationTargetId(id), AnimatedBy(player_entity)));
++```
