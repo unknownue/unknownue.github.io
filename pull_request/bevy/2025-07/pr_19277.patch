@@ -1,0 +1,503 @@
+diff --git a/crates/bevy_dev_tools/Cargo.toml b/crates/bevy_dev_tools/Cargo.toml
+index 3f0efb1c21cdb..d31fe7ef220d9 100644
+--- a/crates/bevy_dev_tools/Cargo.toml
++++ b/crates/bevy_dev_tools/Cargo.toml
+@@ -18,12 +18,14 @@ bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
+ bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
+ bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.17.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
++bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_time = { path = "../bevy_time", version = "0.17.0-dev" }
+ bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
+ bevy_ui = { path = "../bevy_ui", version = "0.17.0-dev" }
++bevy_ui_render = { path = "../bevy_ui_render", version = "0.17.0-dev" }
+ bevy_window = { path = "../bevy_window", version = "0.17.0-dev" }
+ bevy_state = { path = "../bevy_state", version = "0.17.0-dev" }
+ 
+diff --git a/crates/bevy_dev_tools/src/fps_overlay.rs b/crates/bevy_dev_tools/src/fps_overlay.rs
+index 7c29ae3adc096..435a0d2faf0c6 100644
+--- a/crates/bevy_dev_tools/src/fps_overlay.rs
++++ b/crates/bevy_dev_tools/src/fps_overlay.rs
+@@ -1,7 +1,7 @@
+ //! Module containing logic for FPS overlay.
+ 
+ use bevy_app::{Plugin, Startup, Update};
+-use bevy_asset::Handle;
++use bevy_asset::{Assets, Handle};
+ use bevy_color::Color;
+ use bevy_diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+ use bevy_ecs::{
+@@ -12,22 +12,31 @@ use bevy_ecs::{
+     query::With,
+     resource::Resource,
+     schedule::{common_conditions::resource_changed, IntoScheduleConfigs},
+-    system::{Commands, Query, Res},
++    system::{Commands, Query, Res, ResMut},
+ };
+-use bevy_render::view::Visibility;
++use bevy_render::{storage::ShaderStorageBuffer, view::Visibility};
+ use bevy_text::{Font, TextColor, TextFont, TextSpan};
+ use bevy_time::Time;
+ use bevy_ui::{
+     widget::{Text, TextUiWriter},
+-    GlobalZIndex, Node, PositionType,
++    FlexDirection, GlobalZIndex, Node, PositionType, Val,
+ };
++use bevy_ui_render::prelude::MaterialNode;
+ use core::time::Duration;
+ 
++use crate::frame_time_graph::{
++    FrameTimeGraphConfigUniform, FrameTimeGraphPlugin, FrametimeGraphMaterial,
++};
++
+ /// [`GlobalZIndex`] used to render the fps overlay.
+ ///
+ /// We use a number slightly under `i32::MAX` so you can render on top of it if you really need to.
+ pub const FPS_OVERLAY_ZINDEX: i32 = i32::MAX - 32;
+ 
++// Used to scale the frame time graph based on the fps text size
++const FRAME_TIME_GRAPH_WIDTH_SCALE: f32 = 6.0;
++const FRAME_TIME_GRAPH_HEIGHT_SCALE: f32 = 2.0;
++
+ /// A plugin that adds an FPS overlay to the Bevy application.
+ ///
+ /// This plugin will add the [`FrameTimeDiagnosticsPlugin`] if it wasn't added before.
+@@ -47,12 +56,18 @@ impl Plugin for FpsOverlayPlugin {
+         if !app.is_plugin_added::<FrameTimeDiagnosticsPlugin>() {
+             app.add_plugins(FrameTimeDiagnosticsPlugin::default());
+         }
++
++        if !app.is_plugin_added::<FrameTimeGraphPlugin>() {
++            app.add_plugins(FrameTimeGraphPlugin);
++        }
++
+         app.insert_resource(self.config.clone())
+             .add_systems(Startup, setup)
+             .add_systems(
+                 Update,
+                 (
+-                    (customize_text, toggle_display).run_if(resource_changed::<FpsOverlayConfig>),
++                    (toggle_display, customize_overlay)
++                        .run_if(resource_changed::<FpsOverlayConfig>),
+                     update_text,
+                 ),
+             );
+@@ -72,6 +87,8 @@ pub struct FpsOverlayConfig {
+     ///
+     /// Defaults to once every 100 ms.
+     pub refresh_interval: Duration,
++    /// Configuration of the frame time graph
++    pub frame_time_graph_config: FrameTimeGraphConfig,
+ }
+ 
+ impl Default for FpsOverlayConfig {
+@@ -85,6 +102,43 @@ impl Default for FpsOverlayConfig {
+             text_color: Color::WHITE,
+             enabled: true,
+             refresh_interval: Duration::from_millis(100),
++            // TODO set this to display refresh rate if possible
++            frame_time_graph_config: FrameTimeGraphConfig::target_fps(60.0),
++        }
++    }
++}
++
++/// Configuration of the frame time graph
++#[derive(Clone, Copy)]
++pub struct FrameTimeGraphConfig {
++    /// Is the graph visible
++    pub enabled: bool,
++    /// The minimum acceptable FPS
++    ///
++    /// Anything below this will show a red bar
++    pub min_fps: f32,
++    /// The target FPS
++    ///
++    /// Anything above this will show a green bar
++    pub target_fps: f32,
++}
++
++impl FrameTimeGraphConfig {
++    /// Constructs a default config for a given target fps
++    pub fn target_fps(target_fps: f32) -> Self {
++        Self {
++            target_fps,
++            ..Self::default()
++        }
++    }
++}
++
++impl Default for FrameTimeGraphConfig {
++    fn default() -> Self {
++        Self {
++            enabled: true,
++            min_fps: 30.0,
++            target_fps: 60.0,
+         }
+     }
+ }
+@@ -92,12 +146,21 @@ impl Default for FpsOverlayConfig {
+ #[derive(Component)]
+ struct FpsText;
+ 
+-fn setup(mut commands: Commands, overlay_config: Res<FpsOverlayConfig>) {
++#[derive(Component)]
++struct FrameTimeGraph;
++
++fn setup(
++    mut commands: Commands,
++    overlay_config: Res<FpsOverlayConfig>,
++    mut frame_time_graph_materials: ResMut<Assets<FrametimeGraphMaterial>>,
++    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
++) {
+     commands
+         .spawn((
+             Node {
+                 // We need to make sure the overlay doesn't affect the position of other UI nodes
+                 position_type: PositionType::Absolute,
++                flex_direction: FlexDirection::Column,
+                 ..Default::default()
+             },
+             // Render overlay on top of everything
+@@ -111,6 +174,29 @@ fn setup(mut commands: Commands, overlay_config: Res<FpsOverlayConfig>) {
+                 FpsText,
+             ))
+             .with_child((TextSpan::default(), overlay_config.text_config.clone()));
++
++            let font_size = overlay_config.text_config.font_size;
++            p.spawn((
++                Node {
++                    width: Val::Px(font_size * FRAME_TIME_GRAPH_WIDTH_SCALE),
++                    height: Val::Px(font_size * FRAME_TIME_GRAPH_HEIGHT_SCALE),
++                    display: if overlay_config.frame_time_graph_config.enabled {
++                        bevy_ui::Display::DEFAULT
++                    } else {
++                        bevy_ui::Display::None
++                    },
++                    ..Default::default()
++                },
++                MaterialNode::from(frame_time_graph_materials.add(FrametimeGraphMaterial {
++                    values: buffers.add(ShaderStorageBuffer::default()),
++                    config: FrameTimeGraphConfigUniform::new(
++                        overlay_config.frame_time_graph_config.target_fps,
++                        overlay_config.frame_time_graph_config.min_fps,
++                        true,
++                    ),
++                })),
++                FrameTimeGraph,
++            ));
+         });
+ }
+ 
+@@ -135,7 +221,7 @@ fn update_text(
+     }
+ }
+ 
+-fn customize_text(
++fn customize_overlay(
+     overlay_config: Res<FpsOverlayConfig>,
+     query: Query<Entity, With<FpsText>>,
+     mut writer: TextUiWriter,
+@@ -151,6 +237,7 @@ fn customize_text(
+ fn toggle_display(
+     overlay_config: Res<FpsOverlayConfig>,
+     mut query: Query<&mut Visibility, With<FpsText>>,
++    mut graph_style: Query<&mut Node, With<FrameTimeGraph>>,
+ ) {
+     for mut visibility in &mut query {
+         visibility.set_if_neq(match overlay_config.enabled {
+@@ -158,4 +245,17 @@ fn toggle_display(
+             false => Visibility::Hidden,
+         });
+     }
++
++    if let Ok(mut graph_style) = graph_style.single_mut() {
++        if overlay_config.frame_time_graph_config.enabled {
++            // Scale the frame time graph based on the font size of the overlay
++            let font_size = overlay_config.text_config.font_size;
++            graph_style.width = Val::Px(font_size * FRAME_TIME_GRAPH_WIDTH_SCALE);
++            graph_style.height = Val::Px(font_size * FRAME_TIME_GRAPH_HEIGHT_SCALE);
++
++            graph_style.display = bevy_ui::Display::DEFAULT;
++        } else {
++            graph_style.display = bevy_ui::Display::None;
++        }
++    }
+ }
+diff --git a/crates/bevy_dev_tools/src/frame_time_graph/frame_time_graph.wgsl b/crates/bevy_dev_tools/src/frame_time_graph/frame_time_graph.wgsl
+new file mode 100644
+index 0000000000000..82b5a46cc71d6
+--- /dev/null
++++ b/crates/bevy_dev_tools/src/frame_time_graph/frame_time_graph.wgsl
+@@ -0,0 +1,68 @@
++#import bevy_ui::ui_vertex_output::UiVertexOutput
++
++@group(1) @binding(0) var<storage> values: array<f32>;
++struct Config {
++    dt_min: f32,
++    dt_max: f32,
++    dt_min_log2: f32,
++    dt_max_log2: f32,
++    proportional_width: u32,
++}
++@group(1) @binding(1) var<uniform> config: Config;
++
++const RED: vec4<f32> = vec4(1.0, 0.0, 0.0, 1.0);
++const GREEN: vec4<f32> = vec4(0.0, 1.0, 0.0, 1.0);
++
++// Gets a color based on the delta time
++// TODO use customizable gradient
++fn color_from_dt(dt: f32) -> vec4<f32> {
++    return mix(GREEN, RED, dt / config.dt_max);
++}
++
++// Draw an SDF square
++fn sdf_square(pos: vec2<f32>, half_size: vec2<f32>, offset: vec2<f32>) -> f32 {
++    let p = pos - offset;
++    let dist = abs(p) - half_size;
++    let outside_dist = length(max(dist, vec2<f32>(0.0, 0.0)));
++    let inside_dist = min(max(dist.x, dist.y), 0.0);
++    return outside_dist + inside_dist;
++}
++
++@fragment
++fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
++    let dt_min = config.dt_min;
++    let dt_max = config.dt_max;
++    let dt_min_log2 = config.dt_min_log2;
++    let dt_max_log2 = config.dt_max_log2;
++
++    // The general algorithm is highly inspired by
++    // <https://asawicki.info/news_1758_an_idea_for_visualization_of_frame_times>
++
++    let len = arrayLength(&values);
++    var graph_width = 0.0;
++    for (var i = 0u; i <= len; i += 1u) {
++        let dt = values[len - i];
++
++        var frame_width: f32;
++        if config.proportional_width == 1u {
++            frame_width = (dt / dt_min) / f32(len);
++        } else {
++            frame_width = 0.015;
++        }
++
++        let frame_height_factor = (log2(dt) - dt_min_log2) / (dt_max_log2 - dt_min_log2);
++        let frame_height_factor_norm = min(max(0.0, frame_height_factor), 1.0);
++        let frame_height = mix(0.0, 1.0, frame_height_factor_norm);
++
++        let size = vec2(frame_width, frame_height) / 2.0;
++        let offset = vec2(1.0 - graph_width - size.x, 1. - size.y);
++        if (sdf_square(in.uv, size, offset) < 0.0) {
++            return color_from_dt(dt);
++        }
++
++        graph_width += frame_width;
++    }
++
++    return vec4(0.0, 0.0, 0.0, 0.5);
++}
++
+diff --git a/crates/bevy_dev_tools/src/frame_time_graph/mod.rs b/crates/bevy_dev_tools/src/frame_time_graph/mod.rs
+new file mode 100644
+index 0000000000000..32f6c200061b9
+--- /dev/null
++++ b/crates/bevy_dev_tools/src/frame_time_graph/mod.rs
+@@ -0,0 +1,114 @@
++//! Module containing logic for the frame time graph
++
++use bevy_app::{Plugin, Update};
++use bevy_asset::{load_internal_asset, uuid_handle, Asset, Assets, Handle};
++use bevy_diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
++use bevy_ecs::system::{Res, ResMut};
++use bevy_math::ops::log2;
++use bevy_reflect::TypePath;
++use bevy_render::{
++    render_resource::{AsBindGroup, Shader, ShaderRef, ShaderType},
++    storage::ShaderStorageBuffer,
++};
++use bevy_ui_render::prelude::{UiMaterial, UiMaterialPlugin};
++
++use crate::fps_overlay::FpsOverlayConfig;
++
++const FRAME_TIME_GRAPH_SHADER_HANDLE: Handle<Shader> =
++    uuid_handle!("4e38163a-5782-47a5-af52-d9161472ab59");
++
++/// Plugin that sets up everything to render the frame time graph material
++pub struct FrameTimeGraphPlugin;
++
++impl Plugin for FrameTimeGraphPlugin {
++    fn build(&self, app: &mut bevy_app::App) {
++        load_internal_asset!(
++            app,
++            FRAME_TIME_GRAPH_SHADER_HANDLE,
++            "frame_time_graph.wgsl",
++            Shader::from_wgsl
++        );
++
++        // TODO: Use plugin dependencies, see https://github.com/bevyengine/bevy/issues/69
++        if !app.is_plugin_added::<FrameTimeDiagnosticsPlugin>() {
++            panic!("Requires FrameTimeDiagnosticsPlugin");
++            // app.add_plugins(FrameTimeDiagnosticsPlugin);
++        }
++
++        app.add_plugins(UiMaterialPlugin::<FrametimeGraphMaterial>::default())
++            .add_systems(Update, update_frame_time_values);
++    }
++}
++
++/// The config values sent to the frame time graph shader
++#[derive(Debug, Clone, Copy, ShaderType)]
++pub struct FrameTimeGraphConfigUniform {
++    // minimum expected delta time
++    dt_min: f32,
++    // maximum expected delta time
++    dt_max: f32,
++    dt_min_log2: f32,
++    dt_max_log2: f32,
++    // controls whether or not the bars width are proportional to their delta time
++    proportional_width: u32,
++}
++
++impl FrameTimeGraphConfigUniform {
++    /// `proportional_width`: controls whether or not the bars width are proportional to their delta time
++    pub fn new(target_fps: f32, min_fps: f32, proportional_width: bool) -> Self {
++        // we want an upper limit that is above the target otherwise the bars will disappear
++        let dt_min = 1. / (target_fps * 1.2);
++        let dt_max = 1. / min_fps;
++        Self {
++            dt_min,
++            dt_max,
++            dt_min_log2: log2(dt_min),
++            dt_max_log2: log2(dt_max),
++            proportional_width: u32::from(proportional_width),
++        }
++    }
++}
++
++/// The material used to render the frame time graph ui node
++#[derive(AsBindGroup, Asset, TypePath, Debug, Clone)]
++pub struct FrametimeGraphMaterial {
++    /// The history of the previous frame times value.
++    ///
++    /// This should be updated every frame to match the frame time history from the [`DiagnosticsStore`]
++    #[storage(0, read_only)]
++    pub values: Handle<ShaderStorageBuffer>, // Vec<f32>,
++    /// The configuration values used by the shader to control how the graph is rendered
++    #[uniform(1)]
++    pub config: FrameTimeGraphConfigUniform,
++}
++
++impl UiMaterial for FrametimeGraphMaterial {
++    fn fragment_shader() -> ShaderRef {
++        FRAME_TIME_GRAPH_SHADER_HANDLE.into()
++    }
++}
++
++/// A system that updates the frame time values sent to the frame time graph
++fn update_frame_time_values(
++    mut frame_time_graph_materials: ResMut<Assets<FrametimeGraphMaterial>>,
++    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
++    diagnostics_store: Res<DiagnosticsStore>,
++    config: Option<Res<FpsOverlayConfig>>,
++) {
++    if !config.is_none_or(|c| c.frame_time_graph_config.enabled) {
++        return;
++    }
++    let Some(frame_time) = diagnostics_store.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME) else {
++        return;
++    };
++    let frame_times = frame_time
++        .values()
++        // convert to millis
++        .map(|x| *x as f32 / 1000.0)
++        .collect::<Vec<_>>();
++    for (_, material) in frame_time_graph_materials.iter_mut() {
++        let buffer = buffers.get_mut(&material.values).unwrap();
++
++        buffer.set_data(frame_times.clone().as_slice());
++    }
++}
+diff --git a/crates/bevy_dev_tools/src/lib.rs b/crates/bevy_dev_tools/src/lib.rs
+index 5e826e3f9c024..8efea87f0007c 100644
+--- a/crates/bevy_dev_tools/src/lib.rs
++++ b/crates/bevy_dev_tools/src/lib.rs
+@@ -14,6 +14,7 @@ use bevy_app::prelude::*;
+ pub mod ci_testing;
+ 
+ pub mod fps_overlay;
++pub mod frame_time_graph;
+ 
+ pub mod picking_debug;
+ 
+diff --git a/examples/dev_tools/fps_overlay.rs b/examples/dev_tools/fps_overlay.rs
+index d79bd46e9d79f..5287df9962d8e 100644
+--- a/examples/dev_tools/fps_overlay.rs
++++ b/examples/dev_tools/fps_overlay.rs
+@@ -1,7 +1,7 @@
+ //! Showcase how to use and configure FPS overlay.
+ 
+ use bevy::{
+-    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin},
++    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
+     prelude::*,
+     text::FontSmoothing,
+ };
+@@ -33,6 +33,13 @@ fn main() {
+                     // We can also set the refresh interval for the FPS counter
+                     refresh_interval: core::time::Duration::from_millis(100),
+                     enabled: true,
++                    frame_time_graph_config: FrameTimeGraphConfig {
++                        enabled: true,
++                        // The minimum acceptable fps
++                        min_fps: 30.0,
++                        // The target fps
++                        target_fps: 144.0,
++                    },
+                 },
+             },
+         ))
+@@ -52,7 +59,8 @@ fn setup(mut commands: Commands) {
+             "Press 1 to toggle the overlay color.\n",
+             "Press 2 to decrease the overlay size.\n",
+             "Press 3 to increase the overlay size.\n",
+-            "Press 4 to toggle the overlay visibility."
++            "Press 4 to toggle the text visibility.\n",
++            "Press 5 to toggle the frame time graph."
+         )),
+         Node {
+             position_type: PositionType::Absolute,
+@@ -81,4 +89,7 @@ fn customize_config(input: Res<ButtonInput<KeyCode>>, mut overlay: ResMut<FpsOve
+     if input.just_pressed(KeyCode::Digit4) {
+         overlay.enabled = !overlay.enabled;
+     }
++    if input.just_released(KeyCode::Digit5) {
++        overlay.frame_time_graph_config.enabled = !overlay.frame_time_graph_config.enabled;
++    }
+ }
+diff --git a/release-content/release-notes/frame_time_graph.md b/release-content/release-notes/frame_time_graph.md
+new file mode 100644
+index 0000000000000..2fc1f8fb6c2c2
+--- /dev/null
++++ b/release-content/release-notes/frame_time_graph.md
+@@ -0,0 +1,18 @@
++---
++title: Frame Time Graph
++authors: ["@IceSentry", "@Zeophlite"]
++pull_requests: [12561, 19277]
++---
++
++(TODO: Embed frame time graph gif from 12561)
++
++Frame time is often more important to know than FPS but because of the temporal nature of it, just seeing a number is not enough.
++Seeing a graph that shows the history makes it easier to reason about performance.
++
++Enable the `bevy_dev_tools` feature, and add in `FpsOverlayPlugin` to add a bar graph of the frame time history.
++Each bar is scaled based on the frame time where a bigger frame time will give a taller and wider bar.
++
++The color also scales with that frame time where red is at or bellow the minimum target fps and green is at or above the target maximum frame rate.
++Anything between those 2 values will be interpolated between green and red based on the frame time.
++
++The algorithm is highly inspired by [Adam Sawicki's article on visualizing frame times](https://asawicki.info/news_1758_an_idea_for_visualization_of_frame_times).

@@ -1,0 +1,675 @@
+diff --git a/crates/bevy_camera/src/camera.rs b/crates/bevy_camera/src/camera.rs
+index 3c1dbde72bee3..0fad8f94fe626 100644
+--- a/crates/bevy_camera/src/camera.rs
++++ b/crates/bevy_camera/src/camera.rs
+@@ -80,14 +80,20 @@ impl Viewport {
+         }
+     }
+ 
+-    pub fn with_override(
+-        &self,
++    pub fn from_viewport_and_override(
++        viewport: Option<&Self>,
+         main_pass_resolution_override: Option<&MainPassResolutionOverride>,
+-    ) -> Self {
+-        let mut viewport = self.clone();
++    ) -> Option<Self> {
++        let mut viewport = viewport.cloned();
++
+         if let Some(override_size) = main_pass_resolution_override {
+-            viewport.physical_size = **override_size;
++            if viewport.is_none() {
++                viewport = Some(Viewport::default());
++            }
++
++            viewport.as_mut().unwrap().physical_size = **override_size;
+         }
++
+         viewport
+     }
+ }
+@@ -101,7 +107,8 @@ impl Viewport {
+ /// * Insert this component on a 3d camera entity in the render world.
+ /// * The resolution override must be smaller than the camera's viewport size.
+ /// * The resolution override is specified in physical pixels.
+-#[derive(Component, Reflect, Deref)]
++/// * In shaders, use `View::main_pass_viewport` instead of `View::viewport`.
++#[derive(Component, Reflect, Deref, Debug)]
+ #[reflect(Component)]
+ pub struct MainPassResolutionOverride(pub UVec2);
+ 
+diff --git a/crates/bevy_core_pipeline/src/core_3d/main_opaque_pass_3d_node.rs b/crates/bevy_core_pipeline/src/core_3d/main_opaque_pass_3d_node.rs
+index c5ee7a798db2e..0ee9144a954d1 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/main_opaque_pass_3d_node.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/main_opaque_pass_3d_node.rs
+@@ -2,6 +2,7 @@ use crate::{
+     core_3d::Opaque3d,
+     skybox::{SkyboxBindGroup, SkyboxPipelineId},
+ };
++use bevy_camera::Viewport;
+ use bevy_ecs::{prelude::World, query::QueryItem};
+ use bevy_render::{
+     camera::{ExtractedCamera, MainPassResolutionOverride},
+@@ -91,8 +92,10 @@ impl ViewNode for MainOpaquePass3dNode {
+             let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
+             let pass_span = diagnostics.pass_span(&mut render_pass, "main_opaque_pass_3d");
+ 
+-            if let Some(viewport) = camera.viewport.as_ref() {
+-                render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++            if let Some(viewport) =
++                Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++            {
++                render_pass.set_camera_viewport(&viewport);
+             }
+ 
+             // Opaque draws
+diff --git a/crates/bevy_core_pipeline/src/core_3d/main_transmissive_pass_3d_node.rs b/crates/bevy_core_pipeline/src/core_3d/main_transmissive_pass_3d_node.rs
+index 393167227f8db..ec108b8753924 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/main_transmissive_pass_3d_node.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/main_transmissive_pass_3d_node.rs
+@@ -1,5 +1,6 @@
+ use super::{Camera3d, ViewTransmissionTexture};
+ use crate::core_3d::Transmissive3d;
++use bevy_camera::Viewport;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_image::ToExtents;
+ use bevy_render::{
+@@ -110,8 +111,11 @@ impl ViewNode for MainTransmissivePass3dNode {
+                 let mut render_pass =
+                     render_context.begin_tracked_render_pass(render_pass_descriptor);
+ 
+-                if let Some(viewport) = camera.viewport.as_ref() {
+-                    render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++                if let Some(viewport) = Viewport::from_viewport_and_override(
++                    camera.viewport.as_ref(),
++                    resolution_override,
++                ) {
++                    render_pass.set_camera_viewport(&viewport);
+                 }
+ 
+                 if let Err(err) = transmissive_phase.render(&mut render_pass, world, view_entity) {
+diff --git a/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs b/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs
+index 0c70ec23a0863..bbe14578b0903 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs
+@@ -1,4 +1,5 @@
+ use crate::core_3d::Transparent3d;
++use bevy_camera::Viewport;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_render::{
+     camera::{ExtractedCamera, MainPassResolutionOverride},
+@@ -69,8 +70,10 @@ impl ViewNode for MainTransparentPass3dNode {
+ 
+             let pass_span = diagnostics.pass_span(&mut render_pass, "main_transparent_pass_3d");
+ 
+-            if let Some(viewport) = camera.viewport.as_ref() {
+-                render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++            if let Some(viewport) =
++                Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++            {
++                render_pass.set_camera_viewport(&viewport);
+             }
+ 
+             if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity) {
+diff --git a/crates/bevy_core_pipeline/src/deferred/node.rs b/crates/bevy_core_pipeline/src/deferred/node.rs
+index a8e1b7ab8ed2a..ffd51763ca88b 100644
+--- a/crates/bevy_core_pipeline/src/deferred/node.rs
++++ b/crates/bevy_core_pipeline/src/deferred/node.rs
+@@ -1,3 +1,4 @@
++use bevy_camera::Viewport;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_render::camera::MainPassResolutionOverride;
+ use bevy_render::experimental::occlusion_culling::OcclusionCulling;
+@@ -222,8 +223,10 @@ fn run_deferred_prepass<'w>(
+             occlusion_query_set: None,
+         });
+         let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
+-        if let Some(viewport) = camera.viewport.as_ref() {
+-            render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++        if let Some(viewport) =
++            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++        {
++            render_pass.set_camera_viewport(&viewport);
+         }
+ 
+         // Opaque draws
+diff --git a/crates/bevy_core_pipeline/src/oit/resolve/node.rs b/crates/bevy_core_pipeline/src/oit/resolve/node.rs
+index 77352e5ecb42b..83b8c604f442a 100644
+--- a/crates/bevy_core_pipeline/src/oit/resolve/node.rs
++++ b/crates/bevy_core_pipeline/src/oit/resolve/node.rs
+@@ -1,3 +1,4 @@
++use bevy_camera::Viewport;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_render::{
+     camera::{ExtractedCamera, MainPassResolutionOverride},
+@@ -63,8 +64,10 @@ impl ViewNode for OitResolveNode {
+                 occlusion_query_set: None,
+             });
+ 
+-            if let Some(viewport) = camera.viewport.as_ref() {
+-                render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++            if let Some(viewport) =
++                Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++            {
++                render_pass.set_camera_viewport(&viewport);
+             }
+ 
+             render_pass.set_render_pipeline(pipeline);
+diff --git a/crates/bevy_core_pipeline/src/prepass/node.rs b/crates/bevy_core_pipeline/src/prepass/node.rs
+index c4cc7b1d55da5..1b54ee8c5d393 100644
+--- a/crates/bevy_core_pipeline/src/prepass/node.rs
++++ b/crates/bevy_core_pipeline/src/prepass/node.rs
+@@ -1,3 +1,4 @@
++use bevy_camera::Viewport;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_render::{
+     camera::{ExtractedCamera, MainPassResolutionOverride},
+@@ -186,8 +187,10 @@ fn run_prepass<'w>(
+         let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
+         let pass_span = diagnostics.pass_span(&mut render_pass, label);
+ 
+-        if let Some(viewport) = camera.viewport.as_ref() {
+-            render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++        if let Some(viewport) =
++            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++        {
++            render_pass.set_camera_viewport(&viewport);
+         }
+ 
+         // Opaque draws
+diff --git a/crates/bevy_pbr/src/meshlet/material_shade_nodes.rs b/crates/bevy_pbr/src/meshlet/material_shade_nodes.rs
+index 39dcb0c1690fa..b0e34d5e1a79a 100644
+--- a/crates/bevy_pbr/src/meshlet/material_shade_nodes.rs
++++ b/crates/bevy_pbr/src/meshlet/material_shade_nodes.rs
+@@ -10,6 +10,7 @@ use crate::{
+     MeshViewBindGroup, PrepassViewBindGroup, ViewEnvironmentMapUniformOffset, ViewFogUniformOffset,
+     ViewLightProbesUniformOffset, ViewLightsUniformOffset, ViewScreenSpaceReflectionsUniformOffset,
+ };
++use bevy_camera::Viewport;
+ use bevy_core_pipeline::prepass::{
+     MotionVectorPrepass, PreviousViewUniformOffset, ViewPrepassTextures,
+ };
+@@ -102,8 +103,10 @@ impl ViewNode for MeshletMainOpaquePass3dNode {
+             timestamp_writes: None,
+             occlusion_query_set: None,
+         });
+-        if let Some(viewport) = camera.viewport.as_ref() {
+-            render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++        if let Some(viewport) =
++            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++        {
++            render_pass.set_camera_viewport(&viewport);
+         }
+ 
+         render_pass.set_bind_group(
+@@ -223,8 +226,10 @@ impl ViewNode for MeshletPrepassNode {
+             timestamp_writes: None,
+             occlusion_query_set: None,
+         });
+-        if let Some(viewport) = camera.viewport.as_ref() {
+-            render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++        if let Some(viewport) =
++            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++        {
++            render_pass.set_camera_viewport(&viewport);
+         }
+ 
+         if view_has_motion_vector_prepass {
+@@ -354,8 +359,10 @@ impl ViewNode for MeshletDeferredGBufferPrepassNode {
+             timestamp_writes: None,
+             occlusion_query_set: None,
+         });
+-        if let Some(viewport) = camera.viewport.as_ref() {
+-            render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++        if let Some(viewport) =
++            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++        {
++            render_pass.set_camera_viewport(&viewport);
+         }
+ 
+         if view_has_motion_vector_prepass {
+diff --git a/crates/bevy_render/src/view/mod.rs b/crates/bevy_render/src/view/mod.rs
+index cdda04cf2de10..6688a00f5e124 100644
+--- a/crates/bevy_render/src/view/mod.rs
++++ b/crates/bevy_render/src/view/mod.rs
+@@ -3,6 +3,7 @@ pub mod window;
+ 
+ use bevy_camera::{
+     primitives::Frustum, CameraMainTextureUsages, ClearColor, ClearColorConfig, Exposure,
++    MainPassResolutionOverride,
+ };
+ use bevy_diagnostic::FrameCount;
+ pub use visibility::*;
+@@ -568,6 +569,7 @@ pub struct ViewUniform {
+     pub exposure: f32,
+     // viewport(x_origin, y_origin, width, height)
+     pub viewport: Vec4,
++    pub main_pass_viewport: Vec4,
+     /// 6 world-space half spaces (normal: vec3, distance: f32) ordered left, right, top, bottom, near, far.
+     /// The normal vectors point towards the interior of the frustum.
+     /// A half space contains `p` if `normal.dot(p) + distance > 0.`
+@@ -901,6 +903,7 @@ pub fn prepare_view_uniforms(
+         Option<&Frustum>,
+         Option<&TemporalJitter>,
+         Option<&MipBias>,
++        Option<&MainPassResolutionOverride>,
+     )>,
+     frame_count: Res<FrameCount>,
+ ) {
+@@ -913,13 +916,28 @@ pub fn prepare_view_uniforms(
+     else {
+         return;
+     };
+-    for (entity, extracted_camera, extracted_view, frustum, temporal_jitter, mip_bias) in &views {
++    for (
++        entity,
++        extracted_camera,
++        extracted_view,
++        frustum,
++        temporal_jitter,
++        mip_bias,
++        resolution_override,
++    ) in &views
++    {
+         let viewport = extracted_view.viewport.as_vec4();
++        let mut main_pass_viewport = viewport;
++        if let Some(resolution_override) = resolution_override {
++            main_pass_viewport.z = resolution_override.0.x as f32;
++            main_pass_viewport.w = resolution_override.0.y as f32;
++        }
++
+         let unjittered_projection = extracted_view.clip_from_view;
+         let mut clip_from_view = unjittered_projection;
+ 
+         if let Some(temporal_jitter) = temporal_jitter {
+-            temporal_jitter.jitter_projection(&mut clip_from_view, viewport.zw());
++            temporal_jitter.jitter_projection(&mut clip_from_view, main_pass_viewport.zw());
+         }
+ 
+         let view_from_clip = clip_from_view.inverse();
+@@ -953,6 +971,7 @@ pub fn prepare_view_uniforms(
+                     .map(|c| c.exposure)
+                     .unwrap_or_else(|| Exposure::default().exposure()),
+                 viewport,
++                main_pass_viewport,
+                 frustum,
+                 color_grading: extracted_view.color_grading.clone().into(),
+                 mip_bias: mip_bias.unwrap_or(&MipBias(0.0)).0,
+diff --git a/crates/bevy_render/src/view/view.wgsl b/crates/bevy_render/src/view/view.wgsl
+index 375b9349f5036..0d0efb75b556e 100644
+--- a/crates/bevy_render/src/view/view.wgsl
++++ b/crates/bevy_render/src/view/view.wgsl
+@@ -48,7 +48,7 @@ struct View {
+     // `clip_from_view[3][3] == 1.0` is the standard way to check if a projection is orthographic
+     //
+     // Wgsl matrices are column major, so for example getting the near plane of a perspective projection is `clip_from_view[3][2]`
+-    // 
++    //
+     // Custom projections are also possible however.
+     clip_from_view: mat4x4<f32>,
+     view_from_clip: mat4x4<f32>,
+@@ -56,6 +56,7 @@ struct View {
+     exposure: f32,
+     // viewport(x_origin, y_origin, width, height)
+     viewport: vec4<f32>,
++    main_pass_viewport: vec4<f32>,
+     // 6 world-space half spaces (normal: vec3, distance: f32) ordered left, right, top, bottom, near, far.
+     // The normal vectors point towards the interior of the frustum.
+     // A half space contains `p` if `normal.dot(p) + distance > 0.`
+@@ -78,7 +79,7 @@ struct View {
+ /// https://www.w3.org/TR/webgpu/#coordinate-systems
+ /// (-1.0, -1.0) in NDC is located at the bottom-left corner of NDC
+ /// (1.0, 1.0) in NDC is located at the top-right corner of NDC
+-/// Z is depth where: 
++/// Z is depth where:
+ ///    1.0 is near clipping plane
+ ///    Perspective projection: 0.0 is inf far away
+ ///    Orthographic projection: 0.0 is far clipping plane
+@@ -209,7 +210,7 @@ fn perspective_camera_near(clip_from_view: mat4x4<f32>) -> f32 {
+     return clip_from_view[3][2];
+ }
+ 
+-/// Convert ndc depth to linear view z. 
++/// Convert ndc depth to linear view z.
+ /// Note: Depth values in front of the camera will be negative as -z is forward
+ fn depth_ndc_to_view_z(ndc_depth: f32, clip_from_view: mat4x4<f32>, view_from_clip: mat4x4<f32>) -> f32 {
+ #ifdef VIEW_PROJECTION_PERSPECTIVE
+@@ -222,7 +223,7 @@ fn depth_ndc_to_view_z(ndc_depth: f32, clip_from_view: mat4x4<f32>, view_from_cl
+ #endif
+ }
+ 
+-/// Convert linear view z to ndc depth. 
++/// Convert linear view z to ndc depth.
+ /// Note: View z input should be negative for values in front of the camera as -z is forward
+ fn view_z_to_depth_ndc(view_z: f32, clip_from_view: mat4x4<f32>) -> f32 {
+ #ifdef VIEW_PROJECTION_PERSPECTIVE
+diff --git a/crates/bevy_solari/src/realtime/node.rs b/crates/bevy_solari/src/realtime/node.rs
+index b873d7bee567f..552058f09651a 100644
+--- a/crates/bevy_solari/src/realtime/node.rs
++++ b/crates/bevy_solari/src/realtime/node.rs
+@@ -14,7 +14,6 @@ use bevy_ecs::{
+ };
+ use bevy_image::ToExtents;
+ use bevy_render::{
+-    camera::ExtractedCamera,
+     diagnostic::RecordDiagnostics,
+     render_graph::{NodeRunError, RenderGraphContext, ViewNode},
+     render_resource::{
+@@ -50,7 +49,6 @@ impl ViewNode for SolariLightingNode {
+     type ViewQuery = (
+         &'static SolariLighting,
+         &'static SolariLightingResources,
+-        &'static ExtractedCamera,
+         &'static ViewTarget,
+         &'static ViewPrepassTextures,
+         &'static ViewUniformOffset,
+@@ -64,7 +62,6 @@ impl ViewNode for SolariLightingNode {
+         (
+             solari_lighting,
+             solari_lighting_resources,
+-            camera,
+             view_target,
+             view_prepass_textures,
+             view_uniform_offset,
+@@ -84,7 +81,6 @@ impl ViewNode for SolariLightingNode {
+             Some(gi_initial_and_temporal_pipeline),
+             Some(gi_spatial_and_shade_pipeline),
+             Some(scene_bindings),
+-            Some(viewport),
+             Some(gbuffer),
+             Some(depth_buffer),
+             Some(motion_vectors),
+@@ -97,7 +93,6 @@ impl ViewNode for SolariLightingNode {
+             pipeline_cache.get_compute_pipeline(self.gi_initial_and_temporal_pipeline),
+             pipeline_cache.get_compute_pipeline(self.gi_spatial_and_shade_pipeline),
+             &scene_bindings.bind_group,
+-            camera.physical_viewport_size,
+             view_prepass_textures.deferred_view(),
+             view_prepass_textures.depth_view(),
+             view_prepass_textures.motion_vectors_view(),
+@@ -153,6 +148,9 @@ impl ViewNode for SolariLightingNode {
+         });
+         let pass_span = diagnostics.pass_span(&mut pass, "solari_lighting");
+ 
++        let dx = solari_lighting_resources.view_size.x.div_ceil(8);
++        let dy = solari_lighting_resources.view_size.y.div_ceil(8);
++
+         pass.set_bind_group(0, scene_bindings, &[]);
+         pass.set_bind_group(
+             1,
+@@ -171,16 +169,16 @@ impl ViewNode for SolariLightingNode {
+         pass.dispatch_workgroups(LIGHT_TILE_BLOCKS as u32, 1, 1);
+ 
+         pass.set_pipeline(di_initial_and_temporal_pipeline);
+-        pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
++        pass.dispatch_workgroups(dx, dy, 1);
+ 
+         pass.set_pipeline(di_spatial_and_shade_pipeline);
+-        pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
++        pass.dispatch_workgroups(dx, dy, 1);
+ 
+         pass.set_pipeline(gi_initial_and_temporal_pipeline);
+-        pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
++        pass.dispatch_workgroups(dx, dy, 1);
+ 
+         pass.set_pipeline(gi_spatial_and_shade_pipeline);
+-        pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
++        pass.dispatch_workgroups(dx, dy, 1);
+ 
+         pass_span.end(&mut pass);
+         drop(pass);
+@@ -195,7 +193,7 @@ impl ViewNode for SolariLightingNode {
+                 .texture
+                 .as_image_copy(),
+             solari_lighting_resources.previous_gbuffer.0.as_image_copy(),
+-            viewport.to_extents(),
++            solari_lighting_resources.view_size.to_extents(),
+         );
+         command_encoder.copy_texture_to_texture(
+             view_prepass_textures
+@@ -206,7 +204,7 @@ impl ViewNode for SolariLightingNode {
+                 .texture
+                 .as_image_copy(),
+             solari_lighting_resources.previous_depth.0.as_image_copy(),
+-            viewport.to_extents(),
++            solari_lighting_resources.view_size.to_extents(),
+         );
+ 
+         Ok(())
+diff --git a/crates/bevy_solari/src/realtime/prepare.rs b/crates/bevy_solari/src/realtime/prepare.rs
+index ea5ce3cf8fbf4..3bb6553214e8b 100644
+--- a/crates/bevy_solari/src/realtime/prepare.rs
++++ b/crates/bevy_solari/src/realtime/prepare.rs
+@@ -9,7 +9,7 @@ use bevy_ecs::{
+ use bevy_image::ToExtents;
+ use bevy_math::UVec2;
+ use bevy_render::{
+-    camera::ExtractedCamera,
++    camera::{ExtractedCamera, MainPassResolutionOverride},
+     render_resource::{
+         Buffer, BufferDescriptor, BufferUsages, Texture, TextureDescriptor, TextureDimension,
+         TextureUsages, TextureView, TextureViewDescriptor,
+@@ -48,16 +48,24 @@ pub struct SolariLightingResources {
+ 
+ pub fn prepare_solari_lighting_resources(
+     query: Query<
+-        (Entity, &ExtractedCamera, Option<&SolariLightingResources>),
++        (
++            Entity,
++            &ExtractedCamera,
++            Option<&SolariLightingResources>,
++            Option<&MainPassResolutionOverride>,
++        ),
+         With<SolariLighting>,
+     >,
+     render_device: Res<RenderDevice>,
+     mut commands: Commands,
+ ) {
+-    for (entity, camera, solari_lighting_resources) in &query {
+-        let Some(view_size) = camera.physical_viewport_size else {
++    for (entity, camera, solari_lighting_resources, resolution_override) in &query {
++        let Some(mut view_size) = camera.physical_viewport_size else {
+             continue;
+         };
++        if let Some(MainPassResolutionOverride(resolution_override)) = resolution_override {
++            view_size = *resolution_override;
++        }
+ 
+         if solari_lighting_resources.map(|r| r.view_size) == Some(view_size) {
+             continue;
+diff --git a/crates/bevy_solari/src/realtime/restir_di.wgsl b/crates/bevy_solari/src/realtime/restir_di.wgsl
+index e3077e525e55c..e6527cc514d05 100644
+--- a/crates/bevy_solari/src/realtime/restir_di.wgsl
++++ b/crates/bevy_solari/src/realtime/restir_di.wgsl
+@@ -35,9 +35,9 @@ const NULL_RESERVOIR_SAMPLE = 0xFFFFFFFFu;
+ 
+ @compute @workgroup_size(8, 8, 1)
+ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_invocation_id) global_id: vec3<u32>) {
+-    if any(global_id.xy >= vec2u(view.viewport.zw)) { return; }
++    if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) { return; }
+ 
+-    let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
++    let pixel_index = global_id.x + global_id.y * u32(view.main_pass_viewport.z);
+     var rng = pixel_index + constants.frame_index;
+ 
+     let depth = textureLoad(depth_buffer, global_id.xy, 0);
+@@ -60,9 +60,9 @@ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin
+ 
+ @compute @workgroup_size(8, 8, 1)
+ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
+-    if any(global_id.xy >= vec2u(view.viewport.zw)) { return; }
++    if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) { return; }
+ 
+-    let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
++    let pixel_index = global_id.x + global_id.y * u32(view.main_pass_viewport.z);
+     var rng = pixel_index + constants.frame_index;
+ 
+     let depth = textureLoad(depth_buffer, global_id.xy, 0);
+@@ -137,12 +137,12 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
+ 
+ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<f32>, world_normal: vec3<f32>) -> Reservoir {
+     let motion_vector = textureLoad(motion_vectors, pixel_id, 0).xy;
+-    let temporal_pixel_id_float = round(vec2<f32>(pixel_id) - (motion_vector * view.viewport.zw));
++    let temporal_pixel_id_float = round(vec2<f32>(pixel_id) - (motion_vector * view.main_pass_viewport.zw));
+     let temporal_pixel_id = vec2<u32>(temporal_pixel_id_float);
+ 
+     // Check if the current pixel was off screen during the previous frame (current pixel is newly visible),
+     // or if all temporal history should assumed to be invalid
+-    if any(temporal_pixel_id_float < vec2(0.0)) || any(temporal_pixel_id_float >= view.viewport.zw) || bool(constants.reset) {
++    if any(temporal_pixel_id_float < vec2(0.0)) || any(temporal_pixel_id_float >= view.main_pass_viewport.zw) || bool(constants.reset) {
+         return empty_reservoir();
+     }
+ 
+@@ -155,7 +155,7 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
+         return empty_reservoir();
+     }
+ 
+-    let temporal_pixel_index = temporal_pixel_id.x + temporal_pixel_id.y * u32(view.viewport.z);
++    let temporal_pixel_index = temporal_pixel_id.x + temporal_pixel_id.y * u32(view.main_pass_viewport.z);
+     var temporal_reservoir = di_reservoirs_a[temporal_pixel_index];
+ 
+     // Check if the light selected in the previous frame no longer exists in the current frame (e.g. entity despawned)
+@@ -183,7 +183,7 @@ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<
+         return empty_reservoir();
+     }
+ 
+-    let spatial_pixel_index = spatial_pixel_id.x + spatial_pixel_id.y * u32(view.viewport.z);
++    let spatial_pixel_index = spatial_pixel_id.x + spatial_pixel_id.y * u32(view.main_pass_viewport.z);
+     var spatial_reservoir = di_reservoirs_b[spatial_pixel_index];
+ 
+     if reservoir_valid(spatial_reservoir) {
+@@ -196,19 +196,19 @@ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<
+ 
+ fn get_neighbor_pixel_id(center_pixel_id: vec2<u32>, rng: ptr<function, u32>) -> vec2<u32> {
+     var spatial_id = vec2<f32>(center_pixel_id) + sample_disk(SPATIAL_REUSE_RADIUS_PIXELS, rng);
+-    spatial_id = clamp(spatial_id, vec2(0.0), view.viewport.zw - 1.0);
++    spatial_id = clamp(spatial_id, vec2(0.0), view.main_pass_viewport.zw - 1.0);
+     return vec2<u32>(spatial_id);
+ }
+ 
+ fn reconstruct_world_position(pixel_id: vec2<u32>, depth: f32) -> vec3<f32> {
+-    let uv = (vec2<f32>(pixel_id) + 0.5) / view.viewport.zw;
++    let uv = (vec2<f32>(pixel_id) + 0.5) / view.main_pass_viewport.zw;
+     let xy_ndc = (uv - vec2(0.5)) * vec2(2.0, -2.0);
+     let world_pos = view.world_from_clip * vec4(xy_ndc, depth, 1.0);
+     return world_pos.xyz / world_pos.w;
+ }
+ 
+ fn reconstruct_previous_world_position(pixel_id: vec2<u32>, depth: f32) -> vec3<f32> {
+-    let uv = (vec2<f32>(pixel_id) + 0.5) / view.viewport.zw;
++    let uv = (vec2<f32>(pixel_id) + 0.5) / view.main_pass_viewport.zw;
+     let xy_ndc = (uv - vec2(0.5)) * vec2(2.0, -2.0);
+     let world_pos = previous_view.world_from_clip * vec4(xy_ndc, depth, 1.0);
+     return world_pos.xyz / world_pos.w;
+diff --git a/crates/bevy_solari/src/realtime/restir_gi.wgsl b/crates/bevy_solari/src/realtime/restir_gi.wgsl
+index 3a74411d12a96..44545aa330671 100644
+--- a/crates/bevy_solari/src/realtime/restir_gi.wgsl
++++ b/crates/bevy_solari/src/realtime/restir_gi.wgsl
+@@ -28,9 +28,9 @@ const CONFIDENCE_WEIGHT_CAP = 30.0;
+ 
+ @compute @workgroup_size(8, 8, 1)
+ fn initial_and_temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
+-    if any(global_id.xy >= vec2u(view.viewport.zw)) { return; }
++    if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) { return; }
+ 
+-    let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
++    let pixel_index = global_id.x + global_id.y * u32(view.main_pass_viewport.z);
+     var rng = pixel_index + constants.frame_index;
+ 
+     let depth = textureLoad(depth_buffer, global_id.xy, 0);
+@@ -51,9 +51,9 @@ fn initial_and_temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
+ 
+ @compute @workgroup_size(8, 8, 1)
+ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
+-    if any(global_id.xy >= vec2u(view.viewport.zw)) { return; }
++    if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) { return; }
+ 
+-    let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
++    let pixel_index = global_id.x + global_id.y * u32(view.main_pass_viewport.z);
+     var rng = pixel_index + constants.frame_index;
+ 
+     let depth = textureLoad(depth_buffer, global_id.xy, 0);
+@@ -112,12 +112,12 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
+ 
+ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<f32>, world_normal: vec3<f32>) -> Reservoir {
+     let motion_vector = textureLoad(motion_vectors, pixel_id, 0).xy;
+-    let temporal_pixel_id_float = round(vec2<f32>(pixel_id) - (motion_vector * view.viewport.zw));
++    let temporal_pixel_id_float = round(vec2<f32>(pixel_id) - (motion_vector * view.main_pass_viewport.zw));
+     let temporal_pixel_id = vec2<u32>(temporal_pixel_id_float);
+ 
+     // Check if the current pixel was off screen during the previous frame (current pixel is newly visible),
+     // or if all temporal history should assumed to be invalid
+-    if any(temporal_pixel_id_float < vec2(0.0)) || any(temporal_pixel_id_float >= view.viewport.zw) || bool(constants.reset) {
++    if any(temporal_pixel_id_float < vec2(0.0)) || any(temporal_pixel_id_float >= view.main_pass_viewport.zw) || bool(constants.reset) {
+         return empty_reservoir();
+     }
+ 
+@@ -130,7 +130,7 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
+         return empty_reservoir();
+     }
+ 
+-    let temporal_pixel_index = temporal_pixel_id.x + temporal_pixel_id.y * u32(view.viewport.z);
++    let temporal_pixel_index = temporal_pixel_id.x + temporal_pixel_id.y * u32(view.main_pass_viewport.z);
+     var temporal_reservoir = gi_reservoirs_a[temporal_pixel_index];
+ 
+     temporal_reservoir.confidence_weight = min(temporal_reservoir.confidence_weight, CONFIDENCE_WEIGHT_CAP);
+@@ -158,7 +158,7 @@ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<
+         return SpatialInfo(empty_reservoir(), spatial_world_position, spatial_world_normal, spatial_diffuse_brdf);
+     }
+ 
+-    let spatial_pixel_index = spatial_pixel_id.x + spatial_pixel_id.y * u32(view.viewport.z);
++    let spatial_pixel_index = spatial_pixel_id.x + spatial_pixel_id.y * u32(view.main_pass_viewport.z);
+     let spatial_reservoir = gi_reservoirs_b[spatial_pixel_index];
+ 
+     return SpatialInfo(spatial_reservoir, spatial_world_position, spatial_world_normal, spatial_diffuse_brdf);
+@@ -166,7 +166,7 @@ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<
+ 
+ fn get_neighbor_pixel_id(center_pixel_id: vec2<u32>, rng: ptr<function, u32>) -> vec2<u32> {
+     var spatial_id = vec2<f32>(center_pixel_id) + sample_disk(SPATIAL_REUSE_RADIUS_PIXELS, rng);
+-    spatial_id = clamp(spatial_id, vec2(0.0), view.viewport.zw - 1.0);
++    spatial_id = clamp(spatial_id, vec2(0.0), view.main_pass_viewport.zw - 1.0);
+     return vec2<u32>(spatial_id);
+ }
+ 
+@@ -195,14 +195,14 @@ fn isnan(x: f32) -> bool {
+ }
+ 
+ fn reconstruct_world_position(pixel_id: vec2<u32>, depth: f32) -> vec3<f32> {
+-    let uv = (vec2<f32>(pixel_id) + 0.5) / view.viewport.zw;
++    let uv = (vec2<f32>(pixel_id) + 0.5) / view.main_pass_viewport.zw;
+     let xy_ndc = (uv - vec2(0.5)) * vec2(2.0, -2.0);
+     let world_pos = view.world_from_clip * vec4(xy_ndc, depth, 1.0);
+     return world_pos.xyz / world_pos.w;
+ }
+ 
+ fn reconstruct_previous_world_position(pixel_id: vec2<u32>, depth: f32) -> vec3<f32> {
+-    let uv = (vec2<f32>(pixel_id) + 0.5) / view.viewport.zw;
++    let uv = (vec2<f32>(pixel_id) + 0.5) / view.main_pass_viewport.zw;
+     let xy_ndc = (uv - vec2(0.5)) * vec2(2.0, -2.0);
+     let world_pos = previous_view.world_from_clip * vec4(xy_ndc, depth, 1.0);
+     return world_pos.xyz / world_pos.w;
+diff --git a/examples/shader/custom_render_phase.rs b/examples/shader/custom_render_phase.rs
+index 9993de341cdde..ca0171c1b5859 100644
+--- a/examples/shader/custom_render_phase.rs
++++ b/examples/shader/custom_render_phase.rs
+@@ -12,6 +12,7 @@
+ 
+ use std::ops::Range;
+ 
++use bevy::camera::Viewport;
+ use bevy::pbr::SetMeshViewEmptyBindGroup;
+ use bevy::{
+     core_pipeline::core_3d::graph::{Core3d, Node3d},
+@@ -611,8 +612,10 @@ impl ViewNode for CustomDrawNode {
+             occlusion_query_set: None,
+         });
+ 
+-        if let Some(viewport) = camera.viewport.as_ref() {
+-            render_pass.set_camera_viewport(&viewport.with_override(resolution_override));
++        if let Some(viewport) =
++            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
++        {
++            render_pass.set_camera_viewport(&viewport);
+         }
+ 
+         // Render the phase
