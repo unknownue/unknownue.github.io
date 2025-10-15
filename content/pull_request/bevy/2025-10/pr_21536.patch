@@ -1,0 +1,2027 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index ad106d740ec7e..964542d937226 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -229,6 +229,7 @@ common_api = [
+   "bevy_core_pipeline",
+   "bevy_post_process",
+   "bevy_sprite_render",
++  "bevy_gizmos_render",
+ ]
+ 
+ # COLLECTION: Features used to build 3D Bevy apps (does not include a render backend). You generally don't need to worry about this unless you are using a custom renderer.
+@@ -249,6 +250,7 @@ common_api = [
+   "3d_api",
+   "bevy_render",
+   "bevy_core_pipeline",
++  "bevy_gizmos_render",
+   "bevy_anti_alias",
+   "bevy_gltf",
+   "bevy_pbr",
+@@ -369,9 +371,12 @@ bevy_light = ["bevy_internal/bevy_light"]
+ # Provides shaders usable through asset handles.
+ bevy_shader = ["bevy_internal/bevy_shader"]
+ 
+-# Adds support for rendering gizmos
++# Adds support for gizmos
+ bevy_gizmos = ["bevy_internal/bevy_gizmos"]
+ 
++# Adds support for rendering gizmos
++bevy_gizmos_render = ["bevy_internal/bevy_gizmos_render"]
++
+ # Provides a collection of developer tools
+ bevy_dev_tools = ["bevy_internal/bevy_dev_tools"]
+ 
+diff --git a/crates/bevy_gizmos/Cargo.toml b/crates/bevy_gizmos/Cargo.toml
+index 5e2e0301dbe2e..dc8059f927f5a 100644
+--- a/crates/bevy_gizmos/Cargo.toml
++++ b/crates/bevy_gizmos/Cargo.toml
+@@ -8,37 +8,21 @@ repository = "https://github.com/bevyengine/bevy"
+ license = "MIT OR Apache-2.0"
+ keywords = ["bevy"]
+ 
+-[features]
+-webgl = []
+-webgpu = []
+-bevy_render = ["dep:bevy_render", "bevy_core_pipeline"]
+-
+ [dependencies]
+ # Bevy
+-bevy_pbr = { path = "../bevy_pbr", version = "0.18.0-dev", optional = true }
+-bevy_sprite_render = { path = "../bevy_sprite_render", version = "0.18.0-dev", optional = true }
+ bevy_app = { path = "../bevy_app", version = "0.18.0-dev" }
+ bevy_camera = { path = "../bevy_camera", version = "0.18.0-dev" }
+-bevy_light = { path = "../bevy_light", version = "0.18.0-dev" }
++bevy_light = { path = "../bevy_light", version = "0.18.0-dev", optional = true }
+ bevy_color = { path = "../bevy_color", version = "0.18.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.18.0-dev" }
+-bevy_image = { path = "../bevy_image", version = "0.18.0-dev" }
+-bevy_mesh = { path = "../bevy_mesh", version = "0.18.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.18.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.18.0-dev" }
+-bevy_shader = { path = "../bevy_shader", version = "0.18.0-dev" }
+-bevy_render = { path = "../bevy_render", version = "0.18.0-dev", optional = true }
+ bevy_utils = { path = "../bevy_utils", version = "0.18.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.18.0-dev" }
+-bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.18.0-dev", optional = true }
+ bevy_transform = { path = "../bevy_transform", version = "0.18.0-dev" }
+ bevy_gizmos_macros = { path = "macros", version = "0.18.0-dev" }
+ bevy_time = { path = "../bevy_time", version = "0.18.0-dev" }
+ 
+-# other
+-bytemuck = "1.0"
+-tracing = { version = "0.1", default-features = false, features = ["std"] }
+-
+ [lints]
+ workspace = true
+ 
+diff --git a/crates/bevy_gizmos/src/config.rs b/crates/bevy_gizmos/src/config.rs
+index 256847691d68a..33344817a12fb 100644
+--- a/crates/bevy_gizmos/src/config.rs
++++ b/crates/bevy_gizmos/src/config.rs
+@@ -1,11 +1,8 @@
+ //! A module for the [`GizmoConfig<T>`] [`Resource`].
+ 
++use bevy_camera::visibility::RenderLayers;
+ pub use bevy_gizmos_macros::GizmoConfigGroup;
+ 
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render")
+-))]
+ use {crate::GizmoAsset, bevy_asset::Handle, bevy_ecs::component::Component};
+ 
+ use bevy_ecs::{reflect::ReflectResource, resource::Resource};
+@@ -195,8 +192,7 @@ pub struct GizmoConfig {
+     /// Describes which rendering layers gizmos will be rendered to.
+     ///
+     /// Gizmos will only be rendered to cameras with intersecting layers.
+-    #[cfg(feature = "bevy_render")]
+-    pub render_layers: bevy_camera::visibility::RenderLayers,
++    pub render_layers: RenderLayers,
+ }
+ 
+ impl Default for GizmoConfig {
+@@ -205,7 +201,6 @@ impl Default for GizmoConfig {
+             enabled: true,
+             line: Default::default(),
+             depth_bias: 0.,
+-            #[cfg(feature = "bevy_render")]
+             render_layers: Default::default(),
+         }
+     }
+@@ -244,15 +239,23 @@ impl Default for GizmoLineConfig {
+     }
+ }
+ 
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render")
+-))]
++/// Configuration for gizmo meshes.
+ #[derive(Component)]
+-pub(crate) struct GizmoMeshConfig {
++pub struct GizmoMeshConfig {
++    /// Apply perspective to gizmo lines.
++    ///
++    /// This setting only affects 3D, non-orthographic cameras.
++    ///
++    /// Defaults to `false`.
+     pub line_perspective: bool,
++    /// Determine the style of gizmo lines.
+     pub line_style: GizmoLineStyle,
++    /// Describe how lines should join.
+     pub line_joints: GizmoLineJoint,
+-    pub render_layers: bevy_camera::visibility::RenderLayers,
++    /// Describes which rendering layers gizmos will be rendered to.
++    ///
++    /// Gizmos will only be rendered to cameras with intersecting layers.
++    pub render_layers: RenderLayers,
++    /// Handle of the gizmo asset.
+     pub handle: Handle<GizmoAsset>,
+ }
+diff --git a/crates/bevy_gizmos/src/gizmos.rs b/crates/bevy_gizmos/src/gizmos.rs
+index abceb366f2da4..6a8b156aa4ad3 100644
+--- a/crates/bevy_gizmos/src/gizmos.rs
++++ b/crates/bevy_gizmos/src/gizmos.rs
+@@ -290,10 +290,14 @@ where
+     Clear: 'static + Send + Sync,
+ {
+     pub(crate) enabled: bool,
+-    pub(crate) list_positions: Vec<Vec3>,
+-    pub(crate) list_colors: Vec<LinearRgba>,
+-    pub(crate) strip_positions: Vec<Vec3>,
+-    pub(crate) strip_colors: Vec<LinearRgba>,
++    /// The positions of line segment endpoints.
++    pub list_positions: Vec<Vec3>,
++    /// The colors of line segment endpoints.
++    pub list_colors: Vec<LinearRgba>,
++    /// The positions of line strip vertices.
++    pub strip_positions: Vec<Vec3>,
++    /// The colors of line strip vertices.
++    pub strip_colors: Vec<LinearRgba>,
+     #[reflect(ignore, clone)]
+     pub(crate) marker: PhantomData<(Config, Clear)>,
+ }
+diff --git a/crates/bevy_gizmos/src/lib.rs b/crates/bevy_gizmos/src/lib.rs
+index ae72cbca7afed..8f68d0dc3bf89 100755
+--- a/crates/bevy_gizmos/src/lib.rs
++++ b/crates/bevy_gizmos/src/lib.rs
+@@ -22,22 +22,6 @@
+ // Required to make proc macros work in bevy itself.
+ extern crate self as bevy_gizmos;
+ 
+-/// System set label for the systems handling the rendering of gizmos.
+-#[derive(SystemSet, Clone, Debug, Hash, PartialEq, Eq)]
+-pub enum GizmoRenderSystems {
+-    /// Adds gizmos to the [`Transparent2d`](bevy_core_pipeline::core_2d::Transparent2d) render phase
+-    #[cfg(feature = "bevy_sprite_render")]
+-    QueueLineGizmos2d,
+-    /// Adds gizmos to the [`Transparent3d`](bevy_core_pipeline::core_3d::Transparent3d) render phase
+-    #[cfg(feature = "bevy_pbr")]
+-    QueueLineGizmos3d,
+-}
+-
+-/// Deprecated alias for [`GizmoRenderSystems`].
+-#[deprecated(since = "0.17.0", note = "Renamed to `GizmoRenderSystems`.")]
+-pub type GizmoRenderSystem = GizmoRenderSystems;
+-
+-#[cfg(feature = "bevy_render")]
+ pub mod aabb;
+ pub mod arcs;
+ pub mod arrows;
+@@ -51,19 +35,14 @@ pub mod primitives;
+ pub mod retained;
+ pub mod rounded_box;
+ 
+-#[cfg(all(feature = "bevy_pbr", feature = "bevy_render"))]
++#[cfg(feature = "bevy_light")]
+ pub mod light;
+ 
+-#[cfg(all(feature = "bevy_sprite_render", feature = "bevy_render"))]
+-mod pipeline_2d;
+-#[cfg(all(feature = "bevy_pbr", feature = "bevy_render"))]
+-mod pipeline_3d;
+-
+ /// The gizmos prelude.
+ ///
+ /// This includes the most common types in this crate, re-exported for your convenience.
+ pub mod prelude {
+-    #[cfg(feature = "bevy_render")]
++    #[doc(hidden)]
+     pub use crate::aabb::{AabbGizmoConfigGroup, ShowAabbGizmo};
+ 
+     #[doc(hidden)]
+@@ -78,7 +57,8 @@ pub mod prelude {
+         AppGizmoBuilder, GizmoAsset,
+     };
+ 
+-    #[cfg(all(feature = "bevy_pbr", feature = "bevy_render"))]
++    #[doc(hidden)]
++    #[cfg(feature = "bevy_light")]
+     pub use crate::light::{LightGizmoColor, LightGizmoConfigGroup, ShowLightGizmo};
+ }
+ 
+@@ -91,113 +71,31 @@ use bevy_ecs::{
+ };
+ use bevy_reflect::TypePath;
+ 
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render")
+-))]
+-use {crate::config::GizmoMeshConfig, bevy_mesh::VertexBufferLayout};
+-
+ use crate::{config::ErasedGizmoConfigGroup, gizmos::GizmoBuffer};
+ 
+-#[cfg(feature = "bevy_render")]
+-use {
+-    crate::retained::extract_linegizmos,
+-    bevy_asset::AssetId,
+-    bevy_ecs::{
+-        component::Component,
+-        entity::Entity,
+-        query::ROQueryItem,
+-        system::{
+-            lifetimeless::{Read, SRes},
+-            Commands, SystemParamItem,
+-        },
+-    },
+-    bevy_math::{Affine3, Affine3A, Vec4},
+-    bevy_render::{
+-        extract_component::{ComponentUniforms, DynamicUniformIndex, UniformComponentPlugin},
+-        render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
+-        render_phase::{PhaseItem, RenderCommand, RenderCommandResult, TrackedRenderPass},
+-        render_resource::{
+-            binding_types::uniform_buffer, BindGroup, BindGroupEntries, BindGroupLayout,
+-            BindGroupLayoutEntries, Buffer, BufferInitDescriptor, BufferUsages, ShaderStages,
+-            ShaderType, VertexFormat,
+-        },
+-        renderer::RenderDevice,
+-        sync_world::{MainEntity, TemporaryRenderEntity},
+-        Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+-    },
+-    bytemuck::cast_slice,
+-};
+-
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render"),
+-))]
+-use bevy_render::render_resource::{VertexAttribute, VertexStepMode};
+ use bevy_time::Fixed;
+ use bevy_utils::TypeIdMap;
+-#[cfg(feature = "bevy_render")]
+-use config::GizmoLineJoint;
+ use config::{DefaultGizmoConfigGroup, GizmoConfig, GizmoConfigGroup, GizmoConfigStore};
+ use core::{any::TypeId, marker::PhantomData, mem};
+ use gizmos::{GizmoStorage, Swap};
+-#[cfg(all(feature = "bevy_pbr", feature = "bevy_render"))]
++#[cfg(feature = "bevy_light")]
+ use light::LightGizmoPlugin;
+ 
+ /// A [`Plugin`] that provides an immediate mode drawing api for visual debugging.
+-///
+-/// Requires to be loaded after [`PbrPlugin`](bevy_pbr::PbrPlugin) or [`SpriteRenderPlugin`](bevy_sprite_render::SpriteRenderPlugin).
+ #[derive(Default)]
+ pub struct GizmoPlugin;
+ 
+ impl Plugin for GizmoPlugin {
+     fn build(&self, app: &mut App) {
+-        #[cfg(feature = "bevy_render")]
+-        {
+-            use bevy_asset::embedded_asset;
+-            embedded_asset!(app, "lines.wgsl");
+-            embedded_asset!(app, "line_joints.wgsl");
+-        }
+-
+         app.init_asset::<GizmoAsset>()
+             .init_resource::<GizmoHandles>()
+             // We insert the Resource GizmoConfigStore into the world implicitly here if it does not exist.
+             .init_gizmo_group::<DefaultGizmoConfigGroup>();
+ 
+-        #[cfg(feature = "bevy_render")]
+-        app.add_plugins(aabb::AabbGizmoPlugin)
+-            .add_plugins(UniformComponentPlugin::<LineGizmoUniform>::default())
+-            .add_plugins(RenderAssetPlugin::<GpuLineGizmo>::default());
++        app.add_plugins(aabb::AabbGizmoPlugin);
+ 
+-        #[cfg(all(feature = "bevy_pbr", feature = "bevy_render"))]
++        #[cfg(feature = "bevy_light")]
+         app.add_plugins(LightGizmoPlugin);
+-
+-        #[cfg(feature = "bevy_render")]
+-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            render_app.add_systems(RenderStartup, init_line_gizmo_uniform_bind_group_layout);
+-
+-            render_app.add_systems(
+-                Render,
+-                prepare_line_gizmo_bind_group.in_set(RenderSystems::PrepareBindGroups),
+-            );
+-
+-            render_app.add_systems(ExtractSchedule, (extract_gizmo_data, extract_linegizmos));
+-
+-            #[cfg(feature = "bevy_sprite_render")]
+-            if app.is_plugin_added::<bevy_sprite_render::SpriteRenderPlugin>() {
+-                app.add_plugins(pipeline_2d::LineGizmo2dPlugin);
+-            } else {
+-                tracing::warn!("bevy_sprite_render feature is enabled but bevy_sprite_render::SpriteRenderPlugin was not detected. Are you sure you loaded GizmoPlugin after SpriteRenderPlugin?");
+-            }
+-            #[cfg(feature = "bevy_pbr")]
+-            if app.is_plugin_added::<bevy_pbr::PbrPlugin>() {
+-                app.add_plugins(pipeline_3d::LineGizmo3dPlugin);
+-            } else {
+-                tracing::warn!("bevy_pbr feature is enabled but bevy_pbr::PbrPlugin was not detected. Are you sure you loaded GizmoPlugin after PbrPlugin?");
+-            }
+-        } else {
+-            tracing::warn!("bevy_render feature is enabled but RenderApp was not detected. Are you sure you loaded GizmoPlugin after RenderPlugin?");
+-        }
+     }
+ }
+ 
+@@ -282,10 +180,17 @@ impl AppGizmoBuilder for App {
+ // That way iteration order is stable across executions and depends on the order of configuration
+ // group creation.
+ #[derive(Resource, Default)]
+-struct GizmoHandles {
++pub struct GizmoHandles {
+     handles: TypeIdMap<Option<Handle<GizmoAsset>>>,
+ }
+ 
++impl GizmoHandles {
++    /// The handles to the gizmo assets of each gizmo configuration group.
++    pub fn handles(&self) -> &TypeIdMap<Option<Handle<GizmoAsset>>> {
++        &self.handles
++    }
++}
++
+ /// Start a new gizmo clearing context.
+ ///
+ /// Internally this pushes the parent default context into a swap buffer.
+@@ -395,112 +300,6 @@ fn update_gizmo_meshes<Config: GizmoConfigGroup>(
+     }
+ }
+ 
+-#[cfg(feature = "bevy_render")]
+-fn init_line_gizmo_uniform_bind_group_layout(
+-    mut commands: Commands,
+-    render_device: Res<RenderDevice>,
+-) {
+-    let line_layout = render_device.create_bind_group_layout(
+-        "LineGizmoUniform layout",
+-        &BindGroupLayoutEntries::single(
+-            ShaderStages::VERTEX,
+-            uniform_buffer::<LineGizmoUniform>(true),
+-        ),
+-    );
+-
+-    commands.insert_resource(LineGizmoUniformBindgroupLayout {
+-        layout: line_layout,
+-    });
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-fn extract_gizmo_data(
+-    mut commands: Commands,
+-    handles: Extract<Res<GizmoHandles>>,
+-    config: Extract<Res<GizmoConfigStore>>,
+-) {
+-    use bevy_utils::once;
+-    use config::GizmoLineStyle;
+-    use tracing::warn;
+-
+-    for (group_type_id, handle) in &handles.handles {
+-        let Some((config, _)) = config.get_config_dyn(group_type_id) else {
+-            continue;
+-        };
+-
+-        if !config.enabled {
+-            continue;
+-        }
+-
+-        let Some(handle) = handle else {
+-            continue;
+-        };
+-
+-        let joints_resolution = if let GizmoLineJoint::Round(resolution) = config.line.joints {
+-            resolution
+-        } else {
+-            0
+-        };
+-
+-        let (gap_scale, line_scale) = if let GizmoLineStyle::Dashed {
+-            gap_scale,
+-            line_scale,
+-        } = config.line.style
+-        {
+-            if gap_scale <= 0.0 {
+-                once!(warn!("When using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the gap scale should be greater than zero."));
+-            }
+-            if line_scale <= 0.0 {
+-                once!(warn!("When using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the line scale should be greater than zero."));
+-            }
+-            (gap_scale, line_scale)
+-        } else {
+-            (1.0, 1.0)
+-        };
+-
+-        commands.spawn((
+-            LineGizmoUniform {
+-                world_from_local: Affine3::from(&Affine3A::IDENTITY).to_transpose(),
+-                line_width: config.line.width,
+-                depth_bias: config.depth_bias,
+-                joints_resolution,
+-                gap_scale,
+-                line_scale,
+-                #[cfg(feature = "webgl")]
+-                _padding: Default::default(),
+-            },
+-            #[cfg(any(feature = "bevy_pbr", feature = "bevy_sprite_render"))]
+-            GizmoMeshConfig {
+-                line_perspective: config.line.perspective,
+-                line_style: config.line.style,
+-                line_joints: config.line.joints,
+-                render_layers: config.render_layers.clone(),
+-                handle: handle.clone(),
+-            },
+-            // The immediate mode API does not have a main world entity to refer to,
+-            // but we do need MainEntity on this render entity for the systems to find it.
+-            MainEntity::from(Entity::PLACEHOLDER),
+-            TemporaryRenderEntity,
+-        ));
+-    }
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-#[derive(Component, ShaderType, Clone, Copy)]
+-struct LineGizmoUniform {
+-    world_from_local: [Vec4; 3],
+-    line_width: f32,
+-    depth_bias: f32,
+-    // Only used by gizmo line t if the current configs `line_joints` is set to `GizmoLineJoint::Round(_)`
+-    joints_resolution: u32,
+-    // Only used if the current configs `line_style` is set to `GizmoLineStyle::Dashed{_}`
+-    gap_scale: f32,
+-    line_scale: f32,
+-    /// WebGL2 structs must be 16 byte aligned.
+-    #[cfg(feature = "webgl")]
+-    _padding: bevy_math::Vec3,
+-}
+-
+ /// A collection of gizmos.
+ ///
+ /// Has the same gizmo drawing API as [`Gizmos`](crate::gizmos::Gizmos).
+@@ -511,6 +310,13 @@ pub struct GizmoAsset {
+     config_ty: TypeId,
+ }
+ 
++impl GizmoAsset {
++    /// A reference to the gizmo's vertex buffer.
++    pub fn buffer(&self) -> &GizmoBuffer<ErasedGizmoConfigGroup, ()> {
++        &self.buffer
++    }
++}
++
+ impl GizmoAsset {
+     /// Create a new [`GizmoAsset`].
+     pub fn new() -> Self {
+@@ -531,354 +337,3 @@ impl Default for GizmoAsset {
+         GizmoAsset::new()
+     }
+ }
+-
+-#[cfg(feature = "bevy_render")]
+-#[derive(Debug, Clone)]
+-struct GpuLineGizmo {
+-    list_position_buffer: Buffer,
+-    list_color_buffer: Buffer,
+-    list_vertex_count: u32,
+-    strip_position_buffer: Buffer,
+-    strip_color_buffer: Buffer,
+-    strip_vertex_count: u32,
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-impl RenderAsset for GpuLineGizmo {
+-    type SourceAsset = GizmoAsset;
+-    type Param = SRes<RenderDevice>;
+-
+-    fn prepare_asset(
+-        gizmo: Self::SourceAsset,
+-        _: AssetId<Self::SourceAsset>,
+-        render_device: &mut SystemParamItem<Self::Param>,
+-        _: Option<&Self>,
+-    ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+-        let list_position_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+-            usage: BufferUsages::VERTEX,
+-            label: Some("LineGizmo Position Buffer"),
+-            contents: cast_slice(&gizmo.buffer.list_positions),
+-        });
+-
+-        let list_color_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+-            usage: BufferUsages::VERTEX,
+-            label: Some("LineGizmo Color Buffer"),
+-            contents: cast_slice(&gizmo.buffer.list_colors),
+-        });
+-
+-        let strip_position_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+-            usage: BufferUsages::VERTEX,
+-            label: Some("LineGizmo Strip Position Buffer"),
+-            contents: cast_slice(&gizmo.buffer.strip_positions),
+-        });
+-
+-        let strip_color_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+-            usage: BufferUsages::VERTEX,
+-            label: Some("LineGizmo Strip Color Buffer"),
+-            contents: cast_slice(&gizmo.buffer.strip_colors),
+-        });
+-
+-        Ok(GpuLineGizmo {
+-            list_position_buffer,
+-            list_color_buffer,
+-            list_vertex_count: gizmo.buffer.list_positions.len() as u32,
+-            strip_position_buffer,
+-            strip_color_buffer,
+-            strip_vertex_count: gizmo.buffer.strip_positions.len() as u32,
+-        })
+-    }
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-#[derive(Resource)]
+-struct LineGizmoUniformBindgroupLayout {
+-    layout: BindGroupLayout,
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-#[derive(Resource)]
+-struct LineGizmoUniformBindgroup {
+-    bindgroup: BindGroup,
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-fn prepare_line_gizmo_bind_group(
+-    mut commands: Commands,
+-    line_gizmo_uniform_layout: Res<LineGizmoUniformBindgroupLayout>,
+-    render_device: Res<RenderDevice>,
+-    line_gizmo_uniforms: Res<ComponentUniforms<LineGizmoUniform>>,
+-) {
+-    if let Some(binding) = line_gizmo_uniforms.uniforms().binding() {
+-        commands.insert_resource(LineGizmoUniformBindgroup {
+-            bindgroup: render_device.create_bind_group(
+-                "LineGizmoUniform bindgroup",
+-                &line_gizmo_uniform_layout.layout,
+-                &BindGroupEntries::single(binding),
+-            ),
+-        });
+-    }
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-struct SetLineGizmoBindGroup<const I: usize>;
+-#[cfg(feature = "bevy_render")]
+-impl<const I: usize, P: PhaseItem> RenderCommand<P> for SetLineGizmoBindGroup<I> {
+-    type Param = SRes<LineGizmoUniformBindgroup>;
+-    type ViewQuery = ();
+-    type ItemQuery = Read<DynamicUniformIndex<LineGizmoUniform>>;
+-
+-    #[inline]
+-    fn render<'w>(
+-        _item: &P,
+-        _view: ROQueryItem<'w, '_, Self::ViewQuery>,
+-        uniform_index: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
+-        bind_group: SystemParamItem<'w, '_, Self::Param>,
+-        pass: &mut TrackedRenderPass<'w>,
+-    ) -> RenderCommandResult {
+-        let Some(uniform_index) = uniform_index else {
+-            return RenderCommandResult::Skip;
+-        };
+-        pass.set_bind_group(
+-            I,
+-            &bind_group.into_inner().bindgroup,
+-            &[uniform_index.index()],
+-        );
+-        RenderCommandResult::Success
+-    }
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-struct DrawLineGizmo<const STRIP: bool>;
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render")
+-))]
+-impl<P: PhaseItem, const STRIP: bool> RenderCommand<P> for DrawLineGizmo<STRIP> {
+-    type Param = SRes<RenderAssets<GpuLineGizmo>>;
+-    type ViewQuery = ();
+-    type ItemQuery = Read<GizmoMeshConfig>;
+-
+-    #[inline]
+-    fn render<'w>(
+-        _item: &P,
+-        _view: ROQueryItem<'w, '_, Self::ViewQuery>,
+-        config: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
+-        line_gizmos: SystemParamItem<'w, '_, Self::Param>,
+-        pass: &mut TrackedRenderPass<'w>,
+-    ) -> RenderCommandResult {
+-        let Some(config) = config else {
+-            return RenderCommandResult::Skip;
+-        };
+-        let Some(line_gizmo) = line_gizmos.into_inner().get(&config.handle) else {
+-            return RenderCommandResult::Skip;
+-        };
+-
+-        let vertex_count = if STRIP {
+-            line_gizmo.strip_vertex_count
+-        } else {
+-            line_gizmo.list_vertex_count
+-        };
+-
+-        if vertex_count < 2 {
+-            return RenderCommandResult::Success;
+-        }
+-
+-        let instances = if STRIP {
+-            let item_size = VertexFormat::Float32x3.size();
+-            let buffer_size = line_gizmo.strip_position_buffer.size() - item_size;
+-
+-            pass.set_vertex_buffer(0, line_gizmo.strip_position_buffer.slice(..buffer_size));
+-            pass.set_vertex_buffer(1, line_gizmo.strip_position_buffer.slice(item_size..));
+-
+-            let item_size = VertexFormat::Float32x4.size();
+-            let buffer_size = line_gizmo.strip_color_buffer.size() - item_size;
+-
+-            pass.set_vertex_buffer(2, line_gizmo.strip_color_buffer.slice(..buffer_size));
+-            pass.set_vertex_buffer(3, line_gizmo.strip_color_buffer.slice(item_size..));
+-
+-            vertex_count - 1
+-        } else {
+-            pass.set_vertex_buffer(0, line_gizmo.list_position_buffer.slice(..));
+-            pass.set_vertex_buffer(1, line_gizmo.list_color_buffer.slice(..));
+-
+-            vertex_count / 2
+-        };
+-
+-        pass.draw(0..6, 0..instances);
+-
+-        RenderCommandResult::Success
+-    }
+-}
+-
+-#[cfg(feature = "bevy_render")]
+-struct DrawLineJointGizmo;
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render")
+-))]
+-impl<P: PhaseItem> RenderCommand<P> for DrawLineJointGizmo {
+-    type Param = SRes<RenderAssets<GpuLineGizmo>>;
+-    type ViewQuery = ();
+-    type ItemQuery = Read<GizmoMeshConfig>;
+-
+-    #[inline]
+-    fn render<'w>(
+-        _item: &P,
+-        _view: ROQueryItem<'w, '_, Self::ViewQuery>,
+-        config: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
+-        line_gizmos: SystemParamItem<'w, '_, Self::Param>,
+-        pass: &mut TrackedRenderPass<'w>,
+-    ) -> RenderCommandResult {
+-        let Some(config) = config else {
+-            return RenderCommandResult::Skip;
+-        };
+-        let Some(line_gizmo) = line_gizmos.into_inner().get(&config.handle) else {
+-            return RenderCommandResult::Skip;
+-        };
+-
+-        if line_gizmo.strip_vertex_count <= 2 {
+-            return RenderCommandResult::Success;
+-        };
+-
+-        if config.line_joints == GizmoLineJoint::None {
+-            return RenderCommandResult::Success;
+-        };
+-
+-        let instances = {
+-            let item_size = VertexFormat::Float32x3.size();
+-            // position_a
+-            let buffer_size_a = line_gizmo.strip_position_buffer.size() - item_size * 2;
+-            pass.set_vertex_buffer(0, line_gizmo.strip_position_buffer.slice(..buffer_size_a));
+-            // position_b
+-            let buffer_size_b = line_gizmo.strip_position_buffer.size() - item_size;
+-            pass.set_vertex_buffer(
+-                1,
+-                line_gizmo
+-                    .strip_position_buffer
+-                    .slice(item_size..buffer_size_b),
+-            );
+-            // position_c
+-            pass.set_vertex_buffer(2, line_gizmo.strip_position_buffer.slice(item_size * 2..));
+-
+-            // color
+-            let item_size = VertexFormat::Float32x4.size();
+-            let buffer_size = line_gizmo.strip_color_buffer.size() - item_size;
+-            // This corresponds to the color of position_b, hence starts from `item_size`
+-            pass.set_vertex_buffer(
+-                3,
+-                line_gizmo.strip_color_buffer.slice(item_size..buffer_size),
+-            );
+-
+-            line_gizmo.strip_vertex_count - 2
+-        };
+-
+-        let vertices = match config.line_joints {
+-            GizmoLineJoint::None => unreachable!(),
+-            GizmoLineJoint::Miter => 6,
+-            GizmoLineJoint::Round(resolution) => resolution * 3,
+-            GizmoLineJoint::Bevel => 3,
+-        };
+-
+-        pass.draw(0..vertices, 0..instances);
+-
+-        RenderCommandResult::Success
+-    }
+-}
+-
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render")
+-))]
+-fn line_gizmo_vertex_buffer_layouts(strip: bool) -> Vec<VertexBufferLayout> {
+-    use VertexFormat::*;
+-    let mut position_layout = VertexBufferLayout {
+-        array_stride: Float32x3.size(),
+-        step_mode: VertexStepMode::Instance,
+-        attributes: vec![VertexAttribute {
+-            format: Float32x3,
+-            offset: 0,
+-            shader_location: 0,
+-        }],
+-    };
+-
+-    let mut color_layout = VertexBufferLayout {
+-        array_stride: Float32x4.size(),
+-        step_mode: VertexStepMode::Instance,
+-        attributes: vec![VertexAttribute {
+-            format: Float32x4,
+-            offset: 0,
+-            shader_location: 2,
+-        }],
+-    };
+-
+-    if strip {
+-        vec![
+-            position_layout.clone(),
+-            {
+-                position_layout.attributes[0].shader_location = 1;
+-                position_layout
+-            },
+-            color_layout.clone(),
+-            {
+-                color_layout.attributes[0].shader_location = 3;
+-                color_layout
+-            },
+-        ]
+-    } else {
+-        position_layout.array_stride *= 2;
+-        position_layout.attributes.push(VertexAttribute {
+-            format: Float32x3,
+-            offset: Float32x3.size(),
+-            shader_location: 1,
+-        });
+-
+-        color_layout.array_stride *= 2;
+-        color_layout.attributes.push(VertexAttribute {
+-            format: Float32x4,
+-            offset: Float32x4.size(),
+-            shader_location: 3,
+-        });
+-
+-        vec![position_layout, color_layout]
+-    }
+-}
+-
+-#[cfg(all(
+-    feature = "bevy_render",
+-    any(feature = "bevy_pbr", feature = "bevy_sprite_render")
+-))]
+-fn line_joint_gizmo_vertex_buffer_layouts() -> Vec<VertexBufferLayout> {
+-    use VertexFormat::*;
+-    let mut position_layout = VertexBufferLayout {
+-        array_stride: Float32x3.size(),
+-        step_mode: VertexStepMode::Instance,
+-        attributes: vec![VertexAttribute {
+-            format: Float32x3,
+-            offset: 0,
+-            shader_location: 0,
+-        }],
+-    };
+-
+-    let color_layout = VertexBufferLayout {
+-        array_stride: Float32x4.size(),
+-        step_mode: VertexStepMode::Instance,
+-        attributes: vec![VertexAttribute {
+-            format: Float32x4,
+-            offset: 0,
+-            shader_location: 3,
+-        }],
+-    };
+-
+-    vec![
+-        position_layout.clone(),
+-        {
+-            position_layout.attributes[0].shader_location = 1;
+-            position_layout.clone()
+-        },
+-        {
+-            position_layout.attributes[0].shader_location = 2;
+-            position_layout
+-        },
+-        color_layout.clone(),
+-    ]
+-}
+diff --git a/crates/bevy_gizmos/src/retained.rs b/crates/bevy_gizmos/src/retained.rs
+index 16b60db7d3a61..5b3cb818a339a 100644
+--- a/crates/bevy_gizmos/src/retained.rs
++++ b/crates/bevy_gizmos/src/retained.rs
+@@ -3,23 +3,10 @@
+ use core::ops::{Deref, DerefMut};
+ 
+ use bevy_asset::Handle;
+-#[cfg(feature = "bevy_render")]
+-use bevy_camera::visibility::RenderLayers;
+ use bevy_ecs::{component::Component, reflect::ReflectComponent};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_transform::components::Transform;
+ 
+-#[cfg(feature = "bevy_render")]
+-use {
+-    crate::{config::GizmoLineJoint, LineGizmoUniform},
+-    bevy_ecs::{
+-        entity::Entity,
+-        system::{Commands, Local, Query},
+-    },
+-    bevy_render::Extract,
+-    bevy_transform::components::GlobalTransform,
+-};
+-
+ use crate::{
+     config::{ErasedGizmoConfigGroup, GizmoLineConfig},
+     gizmos::GizmoBuffer,
+@@ -96,67 +83,3 @@ pub struct Gizmo {
+     /// You would set this value to a negative number close to 0.
+     pub depth_bias: f32,
+ }
+-
+-#[cfg(feature = "bevy_render")]
+-pub(crate) fn extract_linegizmos(
+-    mut commands: Commands,
+-    mut previous_len: Local<usize>,
+-    query: Extract<Query<(Entity, &Gizmo, &GlobalTransform, Option<&RenderLayers>)>>,
+-) {
+-    use bevy_math::Affine3;
+-    use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
+-    use bevy_utils::once;
+-    use tracing::warn;
+-
+-    use crate::config::GizmoLineStyle;
+-
+-    let mut values = Vec::with_capacity(*previous_len);
+-    for (entity, gizmo, transform, render_layers) in &query {
+-        let joints_resolution = if let GizmoLineJoint::Round(resolution) = gizmo.line_config.joints
+-        {
+-            resolution
+-        } else {
+-            0
+-        };
+-        let (gap_scale, line_scale) = if let GizmoLineStyle::Dashed {
+-            gap_scale,
+-            line_scale,
+-        } = gizmo.line_config.style
+-        {
+-            if gap_scale <= 0.0 {
+-                once!(warn!("when using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the gap scale should be greater than zero"));
+-            }
+-            if line_scale <= 0.0 {
+-                once!(warn!("when using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the line scale should be greater than zero"));
+-            }
+-            (gap_scale, line_scale)
+-        } else {
+-            (1.0, 1.0)
+-        };
+-
+-        values.push((
+-            LineGizmoUniform {
+-                world_from_local: Affine3::from(&transform.affine()).to_transpose(),
+-                line_width: gizmo.line_config.width,
+-                depth_bias: gizmo.depth_bias,
+-                joints_resolution,
+-                gap_scale,
+-                line_scale,
+-                #[cfg(feature = "webgl")]
+-                _padding: Default::default(),
+-            },
+-            #[cfg(any(feature = "bevy_pbr", feature = "bevy_sprite_render"))]
+-            crate::config::GizmoMeshConfig {
+-                line_perspective: gizmo.line_config.perspective,
+-                line_style: gizmo.line_config.style,
+-                line_joints: gizmo.line_config.joints,
+-                render_layers: render_layers.cloned().unwrap_or_default(),
+-                handle: gizmo.handle.clone(),
+-            },
+-            MainEntity::from(entity),
+-            TemporaryRenderEntity,
+-        ));
+-    }
+-    *previous_len = values.len();
+-    commands.spawn_batch(values);
+-}
+diff --git a/crates/bevy_gizmos_render/Cargo.toml b/crates/bevy_gizmos_render/Cargo.toml
+new file mode 100644
+index 0000000000000..dc5f86ca5dfcc
+--- /dev/null
++++ b/crates/bevy_gizmos_render/Cargo.toml
+@@ -0,0 +1,42 @@
++[package]
++name = "bevy_gizmos_render"
++version = "0.18.0-dev"
++edition = "2024"
++description = "Provides gizmos rendering for Bevy Engine"
++homepage = "https://bevy.org"
++repository = "https://github.com/bevyengine/bevy"
++license = "MIT OR Apache-2.0"
++keywords = ["bevy"]
++
++[features]
++webgl = []
++webgpu = []
++
++[dependencies]
++# Bevy
++bevy_pbr = { path = "../bevy_pbr", version = "0.18.0-dev", optional = true }
++bevy_sprite_render = { path = "../bevy_sprite_render", version = "0.18.0-dev", optional = true }
++bevy_app = { path = "../bevy_app", version = "0.18.0-dev" }
++bevy_gizmos = { path = "../bevy_gizmos", version = "0.18.0-dev" }
++bevy_camera = { path = "../bevy_camera", version = "0.18.0-dev" }
++bevy_ecs = { path = "../bevy_ecs", version = "0.18.0-dev" }
++bevy_image = { path = "../bevy_image", version = "0.18.0-dev" }
++bevy_mesh = { path = "../bevy_mesh", version = "0.18.0-dev" }
++bevy_math = { path = "../bevy_math", version = "0.18.0-dev" }
++bevy_asset = { path = "../bevy_asset", version = "0.18.0-dev" }
++bevy_shader = { path = "../bevy_shader", version = "0.18.0-dev" }
++bevy_render = { path = "../bevy_render", version = "0.18.0-dev" }
++bevy_utils = { path = "../bevy_utils", version = "0.18.0-dev" }
++bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.18.0-dev" }
++bevy_transform = { path = "../bevy_transform", version = "0.18.0-dev" }
++
++# other
++bytemuck = "1.0"
++tracing = { version = "0.1", default-features = false, features = ["std"] }
++
++[lints]
++workspace = true
++
++[package.metadata.docs.rs]
++rustdoc-args = ["-Zunstable-options", "--generate-link-to-definition"]
++all-features = true
+diff --git a/crates/bevy_gizmos_render/LICENSE-APACHE b/crates/bevy_gizmos_render/LICENSE-APACHE
+new file mode 100644
+index 0000000000000..d9a10c0d8e868
+--- /dev/null
++++ b/crates/bevy_gizmos_render/LICENSE-APACHE
+@@ -0,0 +1,176 @@
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
+diff --git a/crates/bevy_gizmos_render/LICENSE-MIT b/crates/bevy_gizmos_render/LICENSE-MIT
+new file mode 100644
+index 0000000000000..9cf106272ac3b
+--- /dev/null
++++ b/crates/bevy_gizmos_render/LICENSE-MIT
+@@ -0,0 +1,19 @@
++MIT License
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/crates/bevy_gizmos_render/README.md b/crates/bevy_gizmos_render/README.md
+new file mode 100644
+index 0000000000000..7c5be1b4647f7
+--- /dev/null
++++ b/crates/bevy_gizmos_render/README.md
+@@ -0,0 +1,7 @@
++# Bevy Gizmos Render
++
++[![License](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/bevyengine/bevy#license)
++[![Crates.io](https://img.shields.io/crates/v/bevy_gizmos_render.svg)](https://crates.io/crates/bevy_gizmos_render)
++[![Downloads](https://img.shields.io/crates/d/bevy_gizmos_render.svg)](https://crates.io/crates/bevy_gizmos_render)
++[![Docs](https://docs.rs/bevy_gizmos_render/badge.svg)](https://docs.rs/bevy_gizmos/latest/bevy_gizmos_render/)
++[![Discord](https://img.shields.io/discord/691052431525675048.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/bevy)
+diff --git a/crates/bevy_gizmos_render/src/lib.rs b/crates/bevy_gizmos_render/src/lib.rs
+new file mode 100755
+index 0000000000000..c9bc536f44b33
+--- /dev/null
++++ b/crates/bevy_gizmos_render/src/lib.rs
+@@ -0,0 +1,547 @@
++#![cfg_attr(docsrs, feature(doc_cfg))]
++#![doc(
++    html_logo_url = "https://bevy.org/assets/icon.png",
++    html_favicon_url = "https://bevy.org/assets/icon.png"
++)]
++
++//! This crate renders `bevy_gizmos` with `bevy_render`.
++
++/// System set label for the systems handling the rendering of gizmos.
++#[derive(SystemSet, Clone, Debug, Hash, PartialEq, Eq)]
++pub enum GizmoRenderSystems {
++    /// Adds gizmos to the [`Transparent2d`](bevy_core_pipeline::core_2d::Transparent2d) render phase
++    #[cfg(feature = "bevy_sprite_render")]
++    QueueLineGizmos2d,
++    /// Adds gizmos to the [`Transparent3d`](bevy_core_pipeline::core_3d::Transparent3d) render phase
++    #[cfg(feature = "bevy_pbr")]
++    QueueLineGizmos3d,
++}
++
++pub mod retained;
++
++#[cfg(feature = "bevy_sprite_render")]
++mod pipeline_2d;
++#[cfg(feature = "bevy_pbr")]
++mod pipeline_3d;
++
++use bevy_app::{App, Plugin};
++use bevy_ecs::{
++    resource::Resource,
++    schedule::{IntoScheduleConfigs, SystemSet},
++    system::Res,
++};
++
++use {bevy_gizmos::config::GizmoMeshConfig, bevy_mesh::VertexBufferLayout};
++
++use {
++    crate::retained::extract_linegizmos,
++    bevy_asset::AssetId,
++    bevy_ecs::{
++        component::Component,
++        entity::Entity,
++        query::ROQueryItem,
++        system::{
++            lifetimeless::{Read, SRes},
++            Commands, SystemParamItem,
++        },
++    },
++    bevy_math::{Affine3, Affine3A, Vec4},
++    bevy_render::{
++        extract_component::{ComponentUniforms, DynamicUniformIndex, UniformComponentPlugin},
++        render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
++        render_phase::{PhaseItem, RenderCommand, RenderCommandResult, TrackedRenderPass},
++        render_resource::{
++            binding_types::uniform_buffer, BindGroup, BindGroupEntries, BindGroupLayout,
++            BindGroupLayoutEntries, Buffer, BufferInitDescriptor, BufferUsages, ShaderStages,
++            ShaderType, VertexFormat,
++        },
++        renderer::RenderDevice,
++        sync_world::{MainEntity, TemporaryRenderEntity},
++        Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
++    },
++    bytemuck::cast_slice,
++};
++
++use bevy_render::render_resource::{VertexAttribute, VertexStepMode};
++
++use bevy_gizmos::{
++    config::{GizmoConfigStore, GizmoLineJoint},
++    GizmoAsset, GizmoHandles,
++};
++
++/// A [`Plugin`] that provides an immediate mode drawing api for visual debugging.
++///
++/// Requires to be loaded after [`PbrPlugin`](bevy_pbr::PbrPlugin) or [`SpriteRenderPlugin`](bevy_sprite_render::SpriteRenderPlugin).
++#[derive(Default)]
++pub struct GizmoRenderPlugin;
++
++impl Plugin for GizmoRenderPlugin {
++    fn build(&self, app: &mut App) {
++        {
++            use bevy_asset::embedded_asset;
++            embedded_asset!(app, "lines.wgsl");
++            embedded_asset!(app, "line_joints.wgsl");
++        }
++
++        app.add_plugins(UniformComponentPlugin::<LineGizmoUniform>::default())
++            .add_plugins(RenderAssetPlugin::<GpuLineGizmo>::default());
++
++        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
++            render_app.add_systems(RenderStartup, init_line_gizmo_uniform_bind_group_layout);
++
++            render_app.add_systems(
++                Render,
++                prepare_line_gizmo_bind_group.in_set(RenderSystems::PrepareBindGroups),
++            );
++
++            render_app.add_systems(ExtractSchedule, (extract_gizmo_data, extract_linegizmos));
++
++            #[cfg(feature = "bevy_sprite_render")]
++            if app.is_plugin_added::<bevy_sprite_render::SpriteRenderPlugin>() {
++                app.add_plugins(pipeline_2d::LineGizmo2dPlugin);
++            } else {
++                tracing::warn!("bevy_sprite_render feature is enabled but bevy_sprite_render::SpriteRenderPlugin was not detected. Are you sure you loaded GizmoPlugin after SpriteRenderPlugin?");
++            }
++            #[cfg(feature = "bevy_pbr")]
++            if app.is_plugin_added::<bevy_pbr::PbrPlugin>() {
++                app.add_plugins(pipeline_3d::LineGizmo3dPlugin);
++            } else {
++                tracing::warn!("bevy_pbr feature is enabled but bevy_pbr::PbrPlugin was not detected. Are you sure you loaded GizmoPlugin after PbrPlugin?");
++            }
++        } else {
++            tracing::warn!("bevy_render feature is enabled but RenderApp was not detected. Are you sure you loaded GizmoPlugin after RenderPlugin?");
++        }
++    }
++}
++
++fn init_line_gizmo_uniform_bind_group_layout(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++) {
++    let line_layout = render_device.create_bind_group_layout(
++        "LineGizmoUniform layout",
++        &BindGroupLayoutEntries::single(
++            ShaderStages::VERTEX,
++            uniform_buffer::<LineGizmoUniform>(true),
++        ),
++    );
++
++    commands.insert_resource(LineGizmoUniformBindgroupLayout {
++        layout: line_layout,
++    });
++}
++
++fn extract_gizmo_data(
++    mut commands: Commands,
++    handles: Extract<Res<GizmoHandles>>,
++    config: Extract<Res<GizmoConfigStore>>,
++) {
++    use bevy_gizmos::config::GizmoLineStyle;
++    use bevy_utils::once;
++    use tracing::warn;
++
++    for (group_type_id, handle) in handles.handles() {
++        let Some((config, _)) = config.get_config_dyn(group_type_id) else {
++            continue;
++        };
++
++        if !config.enabled {
++            continue;
++        }
++
++        let Some(handle) = handle else {
++            continue;
++        };
++
++        let joints_resolution = if let GizmoLineJoint::Round(resolution) = config.line.joints {
++            resolution
++        } else {
++            0
++        };
++
++        let (gap_scale, line_scale) = if let GizmoLineStyle::Dashed {
++            gap_scale,
++            line_scale,
++        } = config.line.style
++        {
++            if gap_scale <= 0.0 {
++                once!(warn!("When using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the gap scale should be greater than zero."));
++            }
++            if line_scale <= 0.0 {
++                once!(warn!("When using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the line scale should be greater than zero."));
++            }
++            (gap_scale, line_scale)
++        } else {
++            (1.0, 1.0)
++        };
++
++        commands.spawn((
++            LineGizmoUniform {
++                world_from_local: Affine3::from(&Affine3A::IDENTITY).to_transpose(),
++                line_width: config.line.width,
++                depth_bias: config.depth_bias,
++                joints_resolution,
++                gap_scale,
++                line_scale,
++                #[cfg(feature = "webgl")]
++                _padding: Default::default(),
++            },
++            #[cfg(any(feature = "bevy_pbr", feature = "bevy_sprite_render"))]
++            GizmoMeshConfig {
++                line_perspective: config.line.perspective,
++                line_style: config.line.style,
++                line_joints: config.line.joints,
++                render_layers: config.render_layers.clone(),
++                handle: handle.clone(),
++            },
++            // The immediate mode API does not have a main world entity to refer to,
++            // but we do need MainEntity on this render entity for the systems to find it.
++            MainEntity::from(Entity::PLACEHOLDER),
++            TemporaryRenderEntity,
++        ));
++    }
++}
++
++#[derive(Component, ShaderType, Clone, Copy)]
++struct LineGizmoUniform {
++    world_from_local: [Vec4; 3],
++    line_width: f32,
++    depth_bias: f32,
++    // Only used by gizmo line t if the current configs `line_joints` is set to `GizmoLineJoint::Round(_)`
++    joints_resolution: u32,
++    // Only used if the current configs `line_style` is set to `GizmoLineStyle::Dashed{_}`
++    gap_scale: f32,
++    line_scale: f32,
++    /// WebGL2 structs must be 16 byte aligned.
++    #[cfg(feature = "webgl")]
++    _padding: bevy_math::Vec3,
++}
++
++#[derive(Debug, Clone)]
++struct GpuLineGizmo {
++    list_position_buffer: Buffer,
++    list_color_buffer: Buffer,
++    list_vertex_count: u32,
++    strip_position_buffer: Buffer,
++    strip_color_buffer: Buffer,
++    strip_vertex_count: u32,
++}
++
++impl RenderAsset for GpuLineGizmo {
++    type SourceAsset = GizmoAsset;
++    type Param = SRes<RenderDevice>;
++
++    fn prepare_asset(
++        gizmo: Self::SourceAsset,
++        _: AssetId<Self::SourceAsset>,
++        render_device: &mut SystemParamItem<Self::Param>,
++        _: Option<&Self>,
++    ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
++        let list_position_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
++            usage: BufferUsages::VERTEX,
++            label: Some("LineGizmo Position Buffer"),
++            contents: cast_slice(&gizmo.buffer().list_positions),
++        });
++
++        let list_color_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
++            usage: BufferUsages::VERTEX,
++            label: Some("LineGizmo Color Buffer"),
++            contents: cast_slice(&gizmo.buffer().list_colors),
++        });
++
++        let strip_position_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
++            usage: BufferUsages::VERTEX,
++            label: Some("LineGizmo Strip Position Buffer"),
++            contents: cast_slice(&gizmo.buffer().strip_positions),
++        });
++
++        let strip_color_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
++            usage: BufferUsages::VERTEX,
++            label: Some("LineGizmo Strip Color Buffer"),
++            contents: cast_slice(&gizmo.buffer().strip_colors),
++        });
++
++        Ok(GpuLineGizmo {
++            list_position_buffer,
++            list_color_buffer,
++            list_vertex_count: gizmo.buffer().list_positions.len() as u32,
++            strip_position_buffer,
++            strip_color_buffer,
++            strip_vertex_count: gizmo.buffer().strip_positions.len() as u32,
++        })
++    }
++}
++
++#[derive(Resource)]
++struct LineGizmoUniformBindgroupLayout {
++    layout: BindGroupLayout,
++}
++
++#[derive(Resource)]
++struct LineGizmoUniformBindgroup {
++    bindgroup: BindGroup,
++}
++
++fn prepare_line_gizmo_bind_group(
++    mut commands: Commands,
++    line_gizmo_uniform_layout: Res<LineGizmoUniformBindgroupLayout>,
++    render_device: Res<RenderDevice>,
++    line_gizmo_uniforms: Res<ComponentUniforms<LineGizmoUniform>>,
++) {
++    if let Some(binding) = line_gizmo_uniforms.uniforms().binding() {
++        commands.insert_resource(LineGizmoUniformBindgroup {
++            bindgroup: render_device.create_bind_group(
++                "LineGizmoUniform bindgroup",
++                &line_gizmo_uniform_layout.layout,
++                &BindGroupEntries::single(binding),
++            ),
++        });
++    }
++}
++
++struct SetLineGizmoBindGroup<const I: usize>;
++
++impl<const I: usize, P: PhaseItem> RenderCommand<P> for SetLineGizmoBindGroup<I> {
++    type Param = SRes<LineGizmoUniformBindgroup>;
++    type ViewQuery = ();
++    type ItemQuery = Read<DynamicUniformIndex<LineGizmoUniform>>;
++
++    #[inline]
++    fn render<'w>(
++        _item: &P,
++        _view: ROQueryItem<'w, '_, Self::ViewQuery>,
++        uniform_index: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
++        bind_group: SystemParamItem<'w, '_, Self::Param>,
++        pass: &mut TrackedRenderPass<'w>,
++    ) -> RenderCommandResult {
++        let Some(uniform_index) = uniform_index else {
++            return RenderCommandResult::Skip;
++        };
++        pass.set_bind_group(
++            I,
++            &bind_group.into_inner().bindgroup,
++            &[uniform_index.index()],
++        );
++        RenderCommandResult::Success
++    }
++}
++
++struct DrawLineGizmo<const STRIP: bool>;
++
++impl<P: PhaseItem, const STRIP: bool> RenderCommand<P> for DrawLineGizmo<STRIP> {
++    type Param = SRes<RenderAssets<GpuLineGizmo>>;
++    type ViewQuery = ();
++    type ItemQuery = Read<GizmoMeshConfig>;
++
++    #[inline]
++    fn render<'w>(
++        _item: &P,
++        _view: ROQueryItem<'w, '_, Self::ViewQuery>,
++        config: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
++        line_gizmos: SystemParamItem<'w, '_, Self::Param>,
++        pass: &mut TrackedRenderPass<'w>,
++    ) -> RenderCommandResult {
++        let Some(config) = config else {
++            return RenderCommandResult::Skip;
++        };
++        let Some(line_gizmo) = line_gizmos.into_inner().get(&config.handle) else {
++            return RenderCommandResult::Skip;
++        };
++
++        let vertex_count = if STRIP {
++            line_gizmo.strip_vertex_count
++        } else {
++            line_gizmo.list_vertex_count
++        };
++
++        if vertex_count < 2 {
++            return RenderCommandResult::Success;
++        }
++
++        let instances = if STRIP {
++            let item_size = VertexFormat::Float32x3.size();
++            let buffer_size = line_gizmo.strip_position_buffer.size() - item_size;
++
++            pass.set_vertex_buffer(0, line_gizmo.strip_position_buffer.slice(..buffer_size));
++            pass.set_vertex_buffer(1, line_gizmo.strip_position_buffer.slice(item_size..));
++
++            let item_size = VertexFormat::Float32x4.size();
++            let buffer_size = line_gizmo.strip_color_buffer.size() - item_size;
++
++            pass.set_vertex_buffer(2, line_gizmo.strip_color_buffer.slice(..buffer_size));
++            pass.set_vertex_buffer(3, line_gizmo.strip_color_buffer.slice(item_size..));
++
++            vertex_count - 1
++        } else {
++            pass.set_vertex_buffer(0, line_gizmo.list_position_buffer.slice(..));
++            pass.set_vertex_buffer(1, line_gizmo.list_color_buffer.slice(..));
++
++            vertex_count / 2
++        };
++
++        pass.draw(0..6, 0..instances);
++
++        RenderCommandResult::Success
++    }
++}
++
++struct DrawLineJointGizmo;
++
++impl<P: PhaseItem> RenderCommand<P> for DrawLineJointGizmo {
++    type Param = SRes<RenderAssets<GpuLineGizmo>>;
++    type ViewQuery = ();
++    type ItemQuery = Read<GizmoMeshConfig>;
++
++    #[inline]
++    fn render<'w>(
++        _item: &P,
++        _view: ROQueryItem<'w, '_, Self::ViewQuery>,
++        config: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
++        line_gizmos: SystemParamItem<'w, '_, Self::Param>,
++        pass: &mut TrackedRenderPass<'w>,
++    ) -> RenderCommandResult {
++        let Some(config) = config else {
++            return RenderCommandResult::Skip;
++        };
++        let Some(line_gizmo) = line_gizmos.into_inner().get(&config.handle) else {
++            return RenderCommandResult::Skip;
++        };
++
++        if line_gizmo.strip_vertex_count <= 2 {
++            return RenderCommandResult::Success;
++        };
++
++        if config.line_joints == GizmoLineJoint::None {
++            return RenderCommandResult::Success;
++        };
++
++        let instances = {
++            let item_size = VertexFormat::Float32x3.size();
++            // position_a
++            let buffer_size_a = line_gizmo.strip_position_buffer.size() - item_size * 2;
++            pass.set_vertex_buffer(0, line_gizmo.strip_position_buffer.slice(..buffer_size_a));
++            // position_b
++            let buffer_size_b = line_gizmo.strip_position_buffer.size() - item_size;
++            pass.set_vertex_buffer(
++                1,
++                line_gizmo
++                    .strip_position_buffer
++                    .slice(item_size..buffer_size_b),
++            );
++            // position_c
++            pass.set_vertex_buffer(2, line_gizmo.strip_position_buffer.slice(item_size * 2..));
++
++            // color
++            let item_size = VertexFormat::Float32x4.size();
++            let buffer_size = line_gizmo.strip_color_buffer.size() - item_size;
++            // This corresponds to the color of position_b, hence starts from `item_size`
++            pass.set_vertex_buffer(
++                3,
++                line_gizmo.strip_color_buffer.slice(item_size..buffer_size),
++            );
++
++            line_gizmo.strip_vertex_count - 2
++        };
++
++        let vertices = match config.line_joints {
++            GizmoLineJoint::None => unreachable!(),
++            GizmoLineJoint::Miter => 6,
++            GizmoLineJoint::Round(resolution) => resolution * 3,
++            GizmoLineJoint::Bevel => 3,
++        };
++
++        pass.draw(0..vertices, 0..instances);
++
++        RenderCommandResult::Success
++    }
++}
++
++fn line_gizmo_vertex_buffer_layouts(strip: bool) -> Vec<VertexBufferLayout> {
++    use VertexFormat::*;
++    let mut position_layout = VertexBufferLayout {
++        array_stride: Float32x3.size(),
++        step_mode: VertexStepMode::Instance,
++        attributes: vec![VertexAttribute {
++            format: Float32x3,
++            offset: 0,
++            shader_location: 0,
++        }],
++    };
++
++    let mut color_layout = VertexBufferLayout {
++        array_stride: Float32x4.size(),
++        step_mode: VertexStepMode::Instance,
++        attributes: vec![VertexAttribute {
++            format: Float32x4,
++            offset: 0,
++            shader_location: 2,
++        }],
++    };
++
++    if strip {
++        vec![
++            position_layout.clone(),
++            {
++                position_layout.attributes[0].shader_location = 1;
++                position_layout
++            },
++            color_layout.clone(),
++            {
++                color_layout.attributes[0].shader_location = 3;
++                color_layout
++            },
++        ]
++    } else {
++        position_layout.array_stride *= 2;
++        position_layout.attributes.push(VertexAttribute {
++            format: Float32x3,
++            offset: Float32x3.size(),
++            shader_location: 1,
++        });
++
++        color_layout.array_stride *= 2;
++        color_layout.attributes.push(VertexAttribute {
++            format: Float32x4,
++            offset: Float32x4.size(),
++            shader_location: 3,
++        });
++
++        vec![position_layout, color_layout]
++    }
++}
++
++fn line_joint_gizmo_vertex_buffer_layouts() -> Vec<VertexBufferLayout> {
++    use VertexFormat::*;
++    let mut position_layout = VertexBufferLayout {
++        array_stride: Float32x3.size(),
++        step_mode: VertexStepMode::Instance,
++        attributes: vec![VertexAttribute {
++            format: Float32x3,
++            offset: 0,
++            shader_location: 0,
++        }],
++    };
++
++    let color_layout = VertexBufferLayout {
++        array_stride: Float32x4.size(),
++        step_mode: VertexStepMode::Instance,
++        attributes: vec![VertexAttribute {
++            format: Float32x4,
++            offset: 0,
++            shader_location: 3,
++        }],
++    };
++
++    vec![
++        position_layout.clone(),
++        {
++            position_layout.attributes[0].shader_location = 1;
++            position_layout.clone()
++        },
++        {
++            position_layout.attributes[0].shader_location = 2;
++            position_layout
++        },
++        color_layout.clone(),
++    ]
++}
+diff --git a/crates/bevy_gizmos/src/line_joints.wgsl b/crates/bevy_gizmos_render/src/line_joints.wgsl
+similarity index 100%
+rename from crates/bevy_gizmos/src/line_joints.wgsl
+rename to crates/bevy_gizmos_render/src/line_joints.wgsl
+diff --git a/crates/bevy_gizmos/src/lines.wgsl b/crates/bevy_gizmos_render/src/lines.wgsl
+similarity index 100%
+rename from crates/bevy_gizmos/src/lines.wgsl
+rename to crates/bevy_gizmos_render/src/lines.wgsl
+diff --git a/crates/bevy_gizmos/src/pipeline_2d.rs b/crates/bevy_gizmos_render/src/pipeline_2d.rs
+similarity index 99%
+rename from crates/bevy_gizmos/src/pipeline_2d.rs
+rename to crates/bevy_gizmos_render/src/pipeline_2d.rs
+index 48cd53c4e1420..50a0293d3d2d1 100644
+--- a/crates/bevy_gizmos/src/pipeline_2d.rs
++++ b/crates/bevy_gizmos_render/src/pipeline_2d.rs
+@@ -1,5 +1,4 @@
+ use crate::{
+-    config::{GizmoLineJoint, GizmoLineStyle, GizmoMeshConfig},
+     init_line_gizmo_uniform_bind_group_layout, line_gizmo_vertex_buffer_layouts,
+     line_joint_gizmo_vertex_buffer_layouts, DrawLineGizmo, DrawLineJointGizmo, GizmoRenderSystems,
+     GpuLineGizmo, LineGizmoUniformBindgroupLayout, SetLineGizmoBindGroup,
+@@ -8,6 +7,7 @@ use bevy_app::{App, Plugin};
+ use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+ use bevy_camera::visibility::RenderLayers;
+ use bevy_core_pipeline::core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT};
++use bevy_gizmos::config::{GizmoLineJoint, GizmoLineStyle, GizmoMeshConfig};
+ 
+ use bevy_ecs::{
+     prelude::Entity,
+@@ -131,6 +131,7 @@ impl SpecializedRenderPipeline for LineGizmoPipeline {
+             GizmoLineStyle::Solid => "fragment_solid",
+             GizmoLineStyle::Dotted => "fragment_dotted",
+             GizmoLineStyle::Dashed { .. } => "fragment_dashed",
++            _ => unimplemented!(),
+         };
+ 
+         RenderPipelineDescriptor {
+diff --git a/crates/bevy_gizmos/src/pipeline_3d.rs b/crates/bevy_gizmos_render/src/pipeline_3d.rs
+similarity index 99%
+rename from crates/bevy_gizmos/src/pipeline_3d.rs
+rename to crates/bevy_gizmos_render/src/pipeline_3d.rs
+index ded286949ac5e..d0d5d60b2940b 100644
+--- a/crates/bevy_gizmos/src/pipeline_3d.rs
++++ b/crates/bevy_gizmos_render/src/pipeline_3d.rs
+@@ -1,5 +1,4 @@
+ use crate::{
+-    config::{GizmoLineJoint, GizmoLineStyle, GizmoMeshConfig},
+     init_line_gizmo_uniform_bind_group_layout, line_gizmo_vertex_buffer_layouts,
+     line_joint_gizmo_vertex_buffer_layouts, DrawLineGizmo, DrawLineJointGizmo, GizmoRenderSystems,
+     GpuLineGizmo, LineGizmoUniformBindgroupLayout, SetLineGizmoBindGroup,
+@@ -12,6 +11,7 @@ use bevy_core_pipeline::{
+     oit::OrderIndependentTransparencySettings,
+     prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass},
+ };
++use bevy_gizmos::config::{GizmoLineJoint, GizmoLineStyle, GizmoMeshConfig};
+ 
+ use bevy_ecs::{
+     prelude::Entity,
+@@ -129,6 +129,7 @@ impl SpecializedRenderPipeline for LineGizmoPipeline {
+             GizmoLineStyle::Solid => "fragment_solid",
+             GizmoLineStyle::Dotted => "fragment_dotted",
+             GizmoLineStyle::Dashed { .. } => "fragment_dashed",
++            _ => unimplemented!(),
+         };
+ 
+         RenderPipelineDescriptor {
+diff --git a/crates/bevy_gizmos_render/src/retained.rs b/crates/bevy_gizmos_render/src/retained.rs
+new file mode 100644
+index 0000000000000..d31746a931860
+--- /dev/null
++++ b/crates/bevy_gizmos_render/src/retained.rs
+@@ -0,0 +1,76 @@
++//! This module is for 'retained' alternatives to the 'immediate mode' [`Gizmos`](bevy_gizmos::gizmos::Gizmos) system parameter.
++
++use crate::LineGizmoUniform;
++use bevy_camera::visibility::RenderLayers;
++use bevy_gizmos::retained::Gizmo;
++use bevy_math::Affine3;
++use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
++use bevy_utils::once;
++use tracing::warn;
++use {
++    bevy_ecs::{
++        entity::Entity,
++        system::{Commands, Local, Query},
++    },
++    bevy_gizmos::config::GizmoLineJoint,
++    bevy_render::Extract,
++    bevy_transform::components::GlobalTransform,
++};
++
++use bevy_gizmos::config::GizmoLineStyle;
++
++pub(crate) fn extract_linegizmos(
++    mut commands: Commands,
++    mut previous_len: Local<usize>,
++    query: Extract<Query<(Entity, &Gizmo, &GlobalTransform, Option<&RenderLayers>)>>,
++) {
++    let mut values = Vec::with_capacity(*previous_len);
++    for (entity, gizmo, transform, render_layers) in &query {
++        let joints_resolution = if let GizmoLineJoint::Round(resolution) = gizmo.line_config.joints
++        {
++            resolution
++        } else {
++            0
++        };
++        let (gap_scale, line_scale) = if let GizmoLineStyle::Dashed {
++            gap_scale,
++            line_scale,
++        } = gizmo.line_config.style
++        {
++            if gap_scale <= 0.0 {
++                once!(warn!("when using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the gap scale should be greater than zero"));
++            }
++            if line_scale <= 0.0 {
++                once!(warn!("when using gizmos with the line style `GizmoLineStyle::Dashed{{..}}` the line scale should be greater than zero"));
++            }
++            (gap_scale, line_scale)
++        } else {
++            (1.0, 1.0)
++        };
++
++        values.push((
++            LineGizmoUniform {
++                world_from_local: Affine3::from(&transform.affine()).to_transpose(),
++                line_width: gizmo.line_config.width,
++                depth_bias: gizmo.depth_bias,
++                joints_resolution,
++                gap_scale,
++                line_scale,
++                #[cfg(feature = "webgl")]
++                _padding: Default::default(),
++            },
++            #[cfg(any(feature = "bevy_pbr", feature = "bevy_sprite_render"))]
++            bevy_gizmos::config::GizmoMeshConfig {
++                line_perspective: gizmo.line_config.perspective,
++                line_style: gizmo.line_config.style,
++                line_joints: gizmo.line_config.joints,
++                render_layers: render_layers.cloned().unwrap_or_default(),
++                handle: gizmo.handle.clone(),
++            },
++            MainEntity::from(entity),
++            TemporaryRenderEntity,
++        ));
++    }
++    *previous_len = values.len();
++    commands.spawn_batch(values);
++}
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 3077662631c51..fb84919a92f2f 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -185,7 +185,7 @@ webgl = [
+   "bevy_anti_alias?/webgl",
+   "bevy_pbr?/webgl",
+   "bevy_render?/webgl",
+-  "bevy_gizmos?/webgl",
++  "bevy_gizmos_render?/webgl",
+   "bevy_sprite_render?/webgl",
+ ]
+ 
+@@ -194,7 +194,7 @@ webgpu = [
+   "bevy_anti_alias?/webgpu",
+   "bevy_pbr?/webgpu",
+   "bevy_render?/webgpu",
+-  "bevy_gizmos?/webgpu",
++  "bevy_gizmos_render?/webgpu",
+   "bevy_sprite_render?/webgpu",
+ ]
+ 
+@@ -227,14 +227,13 @@ bevy_window = ["dep:bevy_window", "dep:bevy_a11y", "bevy_image"]
+ bevy_winit = ["dep:bevy_winit", "bevy_window"]
+ bevy_camera = ["dep:bevy_camera", "bevy_mesh", "bevy_window"]
+ bevy_scene = ["dep:bevy_scene", "bevy_asset"]
+-bevy_light = ["dep:bevy_light", "bevy_camera"]
++bevy_light = ["dep:bevy_light", "bevy_camera", "bevy_gizmos?/bevy_light"]
+ bevy_render = [
+   "dep:bevy_render",
+   "bevy_camera",
+   "bevy_shader",
+   "bevy_color/wgpu-types",
+   "bevy_color/encase",
+-  "bevy_gizmos?/bevy_render",
+ ]
+ bevy_core_pipeline = ["dep:bevy_core_pipeline", "bevy_render"]
+ bevy_anti_alias = ["dep:bevy_anti_alias", "bevy_core_pipeline"]
+@@ -243,17 +242,18 @@ bevy_pbr = [
+   "dep:bevy_pbr",
+   "bevy_light",
+   "bevy_core_pipeline",
+-  "bevy_gizmos?/bevy_pbr",
++  "bevy_gizmos_render?/bevy_pbr",
+ ]
+ bevy_sprite_render = [
+   "dep:bevy_sprite_render",
+   "bevy_sprite",
+   "bevy_core_pipeline",
+-  "bevy_gizmos?/bevy_sprite_render",
++  "bevy_gizmos_render?/bevy_sprite_render",
+ ]
+ bevy_ui_render = ["dep:bevy_ui_render", "bevy_sprite_render", "bevy_ui"]
+ bevy_solari = ["dep:bevy_solari", "bevy_pbr"]
+ bevy_gizmos = ["dep:bevy_gizmos", "bevy_camera"]
++bevy_gizmos_render = ["dep:bevy_gizmos_render", "bevy_gizmos"]
+ bevy_gltf = ["dep:bevy_gltf", "bevy_scene", "bevy_pbr"]
+ 
+ # Used to disable code that is unsupported when Bevy is dynamically linked
+@@ -483,6 +483,7 @@ bevy_anti_alias = { path = "../bevy_anti_alias", optional = true, version = "0.1
+ bevy_dev_tools = { path = "../bevy_dev_tools", optional = true, version = "0.18.0-dev" }
+ bevy_gilrs = { path = "../bevy_gilrs", optional = true, version = "0.18.0-dev" }
+ bevy_gizmos = { path = "../bevy_gizmos", optional = true, version = "0.18.0-dev", default-features = false }
++bevy_gizmos_render = { path = "../bevy_gizmos_render", optional = true, version = "0.18.0-dev", default-features = false }
+ bevy_gltf = { path = "../bevy_gltf", optional = true, version = "0.18.0-dev" }
+ bevy_feathers = { path = "../bevy_feathers", optional = true, version = "0.18.0-dev" }
+ bevy_image = { path = "../bevy_image", optional = true, version = "0.18.0-dev" }
+diff --git a/crates/bevy_internal/src/default_plugins.rs b/crates/bevy_internal/src/default_plugins.rs
+index a1c41b0645f2a..75b47cf5c57e7 100644
+--- a/crates/bevy_internal/src/default_plugins.rs
++++ b/crates/bevy_internal/src/default_plugins.rs
+@@ -78,6 +78,8 @@ plugin_group! {
+         bevy_animation:::AnimationPlugin,
+         #[cfg(feature = "bevy_gizmos")]
+         bevy_gizmos:::GizmoPlugin,
++        #[cfg(feature = "bevy_gizmos_render")]
++        bevy_gizmos_render:::GizmoRenderPlugin,
+         #[cfg(feature = "bevy_state")]
+         bevy_state::app:::StatesPlugin,
+         #[cfg(feature = "bevy_ci_testing")]
+diff --git a/crates/bevy_internal/src/lib.rs b/crates/bevy_internal/src/lib.rs
+index bc21c32d3467d..e034b1688df7c 100644
+--- a/crates/bevy_internal/src/lib.rs
++++ b/crates/bevy_internal/src/lib.rs
+@@ -45,6 +45,8 @@ pub use bevy_feathers as feathers;
+ pub use bevy_gilrs as gilrs;
+ #[cfg(feature = "bevy_gizmos")]
+ pub use bevy_gizmos as gizmos;
++#[cfg(feature = "bevy_gizmos")]
++pub use bevy_gizmos_render as gizmos_render;
+ #[cfg(feature = "bevy_gltf")]
+ pub use bevy_gltf as gltf;
+ #[cfg(feature = "bevy_image")]
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index fb36c8f225000..a9d0d56b9f10e 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -77,7 +77,8 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
+ |bevy_debug_stepping|Enable stepping-based debugging of Bevy systems|
+ |bevy_dev_tools|Provides a collection of developer tools|
+ |bevy_gilrs|Adds gamepad support|
+-|bevy_gizmos|Adds support for rendering gizmos|
++|bevy_gizmos|Adds support for gizmos|
++|bevy_gizmos_render|Adds support for rendering gizmos|
+ |bevy_gltf|[glTF](https://www.khronos.org/gltf/) support|
+ |bevy_image|Load and access image data. Usually added by an image format|
+ |bevy_input_focus|Enable input focus subsystem|
+diff --git a/release-content/migration-guides/gizmos-render.md b/release-content/migration-guides/gizmos-render.md
+new file mode 100644
+index 0000000000000..7e8d8773f5034
+--- /dev/null
++++ b/release-content/migration-guides/gizmos-render.md
+@@ -0,0 +1,7 @@
++---
++title: "`bevy_gizmos` rendering split"
++pull_requests: [21536]
++---
++
++The rendering backend of `bevy_gizmos` has been split off into `bevy_gizmos_render`.
++If you were using `default-features = false` and `bevy_gizmos` and `bevy_render`, you may want to enable the `bevy_gizmos_render` feature now.
