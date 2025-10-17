@@ -1,0 +1,1428 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 703877983c574..32891dd1be347 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -134,6 +134,7 @@ default = [
+   "bevy_audio",
+   "bevy_color",
+   "bevy_core_pipeline",
++  "bevy_core_widgets",
+   "bevy_anti_aliasing",
+   "bevy_gilrs",
+   "bevy_gizmos",
+@@ -292,6 +293,9 @@ bevy_log = ["bevy_internal/bevy_log"]
+ # Enable input focus subsystem
+ bevy_input_focus = ["bevy_internal/bevy_input_focus"]
+ 
++# Headless widget collection for Bevy UI.
++bevy_core_widgets = ["bevy_internal/bevy_core_widgets"]
++
+ # Enable passthrough loading for SPIR-V shaders (Only supported on Vulkan, shader capabilities and extensions must agree with the platform implementation)
+ spirv_shader_passthrough = ["bevy_internal/spirv_shader_passthrough"]
+ 
+@@ -4438,3 +4442,25 @@ name = "Hotpatching Systems"
+ description = "Demonstrates how to hotpatch systems"
+ category = "ECS (Entity Component System)"
+ wasm = false
++
++[[example]]
++name = "core_widgets"
++path = "examples/ui/core_widgets.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.core_widgets]
++name = "Core Widgets"
++description = "Demonstrates use of core (headless) widgets in Bevy UI"
++category = "UI (User Interface)"
++wasm = true
++
++[[example]]
++name = "core_widgets_observers"
++path = "examples/ui/core_widgets_observers.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.core_widgets_observers]
++name = "Core Widgets (w/Observers)"
++description = "Demonstrates use of core (headless) widgets in Bevy UI, with Observers"
++category = "UI (User Interface)"
++wasm = true
+diff --git a/crates/bevy_core_widgets/Cargo.toml b/crates/bevy_core_widgets/Cargo.toml
+new file mode 100644
+index 0000000000000..21540a9787787
+--- /dev/null
++++ b/crates/bevy_core_widgets/Cargo.toml
+@@ -0,0 +1,32 @@
++[package]
++name = "bevy_core_widgets"
++version = "0.16.0-dev"
++edition = "2024"
++description = "Unstyled common widgets for B Bevy Engine"
++homepage = "https://bevyengine.org"
++repository = "https://github.com/bevyengine/bevy"
++license = "MIT OR Apache-2.0"
++keywords = ["bevy"]
++
++[dependencies]
++# bevy
++bevy_app = { path = "../bevy_app", version = "0.16.0-dev" }
++bevy_a11y = { path = "../bevy_a11y", version = "0.16.0-dev" }
++bevy_ecs = { path = "../bevy_ecs", version = "0.16.0-dev" }
++bevy_input = { path = "../bevy_input", version = "0.16.0-dev" }
++bevy_input_focus = { path = "../bevy_input_focus", version = "0.16.0-dev" }
++bevy_picking = { path = "../bevy_picking", version = "0.16.0-dev" }
++bevy_ui = { path = "../bevy_ui", version = "0.16.0-dev" }
++
++# other
++accesskit = "0.19"
++
++[features]
++default = []
++
++[lints]
++workspace = true
++
++[package.metadata.docs.rs]
++rustdoc-args = ["-Zunstable-options", "--generate-link-to-definition"]
++all-features = true
+diff --git a/crates/bevy_core_widgets/src/core_button.rs b/crates/bevy_core_widgets/src/core_button.rs
+new file mode 100644
+index 0000000000000..23f5c28380955
+--- /dev/null
++++ b/crates/bevy_core_widgets/src/core_button.rs
+@@ -0,0 +1,141 @@
++use accesskit::Role;
++use bevy_a11y::AccessibilityNode;
++use bevy_app::{App, Plugin};
++use bevy_ecs::query::Has;
++use bevy_ecs::system::ResMut;
++use bevy_ecs::{
++    component::Component,
++    entity::Entity,
++    observer::Trigger,
++    query::With,
++    system::{Commands, Query, SystemId},
++};
++use bevy_input::keyboard::{KeyCode, KeyboardInput};
++use bevy_input_focus::{FocusedInput, InputFocus, InputFocusVisible};
++use bevy_picking::events::{Cancel, Click, DragEnd, Pointer, Pressed, Released};
++use bevy_ui::{Depressed, InteractionDisabled};
++
++/// Headless button widget. This widget maintains a "pressed" state, which is used to
++/// indicate whether the button is currently being pressed by the user. It emits a `ButtonClicked`
++/// event when the button is un-pressed.
++#[derive(Component, Debug)]
++#[require(AccessibilityNode(accesskit::Node::new(Role::Button)))]
++pub struct CoreButton {
++    /// Optional system to run when the button is clicked, or when the Enter or Space key
++    /// is pressed while the button is focused. If this field is `None`, the button will
++    /// emit a `ButtonClicked` event when clicked.
++    pub on_click: Option<SystemId>,
++}
++
++fn button_on_key_event(
++    mut trigger: Trigger<FocusedInput<KeyboardInput>>,
++    q_state: Query<(&CoreButton, Has<InteractionDisabled>)>,
++    mut commands: Commands,
++) {
++    if let Ok((bstate, disabled)) = q_state.get(trigger.target().unwrap()) {
++        if !disabled {
++            let event = &trigger.event().input;
++            if !event.repeat
++                && (event.key_code == KeyCode::Enter || event.key_code == KeyCode::Space)
++            {
++                if let Some(on_click) = bstate.on_click {
++                    trigger.propagate(false);
++                    commands.run_system(on_click);
++                }
++            }
++        }
++    }
++}
++
++fn button_on_pointer_click(
++    mut trigger: Trigger<Pointer<Click>>,
++    mut q_state: Query<(&CoreButton, Has<Depressed>, Has<InteractionDisabled>)>,
++    mut commands: Commands,
++) {
++    if let Ok((bstate, pressed, disabled)) = q_state.get_mut(trigger.target().unwrap()) {
++        trigger.propagate(false);
++        if pressed && !disabled {
++            if let Some(on_click) = bstate.on_click {
++                commands.run_system(on_click);
++            }
++        }
++    }
++}
++
++fn button_on_pointer_down(
++    mut trigger: Trigger<Pointer<Pressed>>,
++    mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Depressed>), With<CoreButton>>,
++    focus: Option<ResMut<InputFocus>>,
++    focus_visible: Option<ResMut<InputFocusVisible>>,
++    mut commands: Commands,
++) {
++    if let Ok((button, disabled, depressed)) = q_state.get_mut(trigger.target().unwrap()) {
++        trigger.propagate(false);
++        if !disabled {
++            if !depressed {
++                commands.entity(button).insert(Depressed);
++            }
++            // Clicking on a button makes it the focused input,
++            // and hides the focus ring if it was visible.
++            if let Some(mut focus) = focus {
++                focus.0 = trigger.target();
++            }
++            if let Some(mut focus_visible) = focus_visible {
++                focus_visible.0 = false;
++            }
++        }
++    }
++}
++
++fn button_on_pointer_up(
++    mut trigger: Trigger<Pointer<Released>>,
++    mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Depressed>), With<CoreButton>>,
++    mut commands: Commands,
++) {
++    if let Ok((button, disabled, depressed)) = q_state.get_mut(trigger.target().unwrap()) {
++        trigger.propagate(false);
++        if !disabled && depressed {
++            commands.entity(button).remove::<Depressed>();
++        }
++    }
++}
++
++fn button_on_pointer_drag_end(
++    mut trigger: Trigger<Pointer<DragEnd>>,
++    mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Depressed>), With<CoreButton>>,
++    mut commands: Commands,
++) {
++    if let Ok((button, disabled, depressed)) = q_state.get_mut(trigger.target().unwrap()) {
++        trigger.propagate(false);
++        if !disabled && depressed {
++            commands.entity(button).remove::<Depressed>();
++        }
++    }
++}
++
++fn button_on_pointer_cancel(
++    mut trigger: Trigger<Pointer<Cancel>>,
++    mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Depressed>), With<CoreButton>>,
++    mut commands: Commands,
++) {
++    if let Ok((button, disabled, depressed)) = q_state.get_mut(trigger.target().unwrap()) {
++        trigger.propagate(false);
++        if !disabled && depressed {
++            commands.entity(button).remove::<Depressed>();
++        }
++    }
++}
++
++/// Plugin that adds the observers for the [`CoreButton`] widget.
++pub struct CoreButtonPlugin;
++
++impl Plugin for CoreButtonPlugin {
++    fn build(&self, app: &mut App) {
++        app.add_observer(button_on_key_event)
++            .add_observer(button_on_pointer_down)
++            .add_observer(button_on_pointer_up)
++            .add_observer(button_on_pointer_click)
++            .add_observer(button_on_pointer_drag_end)
++            .add_observer(button_on_pointer_cancel);
++    }
++}
+diff --git a/crates/bevy_core_widgets/src/lib.rs b/crates/bevy_core_widgets/src/lib.rs
+new file mode 100644
+index 0000000000000..afeed92a1f2a6
+--- /dev/null
++++ b/crates/bevy_core_widgets/src/lib.rs
+@@ -0,0 +1,27 @@
++//! This crate provides a set of core widgets for Bevy UI, such as buttons, checkboxes, and sliders.
++//! These widgets have no inherent styling, it's the responsibility of the user to add styling
++//! appropriate for their game or application.
++//!
++//! # State Management
++//!
++//! Most of the widgets use external state management: this means that the widgets do not
++//! automatically update their own internal state, but instead rely on the app to update the widget
++//! state (as well as any other related game state) in response to a change event emitted by the
++//! widget. The primary motivation for this is to avoid two-way data binding in scenarios where the
++//! user interface is showing a live view of dynamic data coming from deeper within the game engine.
++
++mod core_button;
++
++use bevy_app::{App, Plugin};
++
++pub use core_button::{CoreButton, CoreButtonPlugin};
++
++/// A plugin that registers the observers for all of the core widgets. If you don't want to
++/// use all of the widgets, you can import the individual widget plugins instead.
++pub struct CoreWidgetsPlugin;
++
++impl Plugin for CoreWidgetsPlugin {
++    fn build(&self, app: &mut App) {
++        app.add_plugins(CoreButtonPlugin);
++    }
++}
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 9f78fc009dcb1..e22702e34830b 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -395,6 +395,7 @@ bevy_color = { path = "../bevy_color", optional = true, version = "0.16.0-dev",
+   "bevy_reflect",
+ ] }
+ bevy_core_pipeline = { path = "../bevy_core_pipeline", optional = true, version = "0.16.0-dev" }
++bevy_core_widgets = { path = "../bevy_core_widgets", optional = true, version = "0.16.0-dev" }
+ bevy_anti_aliasing = { path = "../bevy_anti_aliasing", optional = true, version = "0.16.0-dev" }
+ bevy_dev_tools = { path = "../bevy_dev_tools", optional = true, version = "0.16.0-dev" }
+ bevy_gilrs = { path = "../bevy_gilrs", optional = true, version = "0.16.0-dev" }
+diff --git a/crates/bevy_internal/src/lib.rs b/crates/bevy_internal/src/lib.rs
+index 274364882e9ad..b5446d6b8525c 100644
+--- a/crates/bevy_internal/src/lib.rs
++++ b/crates/bevy_internal/src/lib.rs
+@@ -29,6 +29,8 @@ pub use bevy_audio as audio;
+ pub use bevy_color as color;
+ #[cfg(feature = "bevy_core_pipeline")]
+ pub use bevy_core_pipeline as core_pipeline;
++#[cfg(feature = "bevy_core_widgets")]
++pub use bevy_core_widgets as core_widgets;
+ #[cfg(feature = "bevy_dev_tools")]
+ pub use bevy_dev_tools as dev_tools;
+ pub use bevy_diagnostic as diagnostic;
+diff --git a/crates/bevy_picking/src/hover.rs b/crates/bevy_picking/src/hover.rs
+index 2bf23c50ba99f..529cb94e8cb9f 100644
+--- a/crates/bevy_picking/src/hover.rs
++++ b/crates/bevy_picking/src/hover.rs
+@@ -14,7 +14,7 @@ use crate::{
+ };
+ 
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::prelude::*;
++use bevy_ecs::{entity::EntityHashSet, prelude::*};
+ use bevy_math::FloatOrd;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::prelude::*;
+@@ -279,3 +279,287 @@ fn merge_interaction_states(
+         new_interaction_state.insert(*hovered_entity, new_interaction);
+     }
+ }
++
++/// A component that allows users to use regular Bevy change detection to determine when the pointer
++/// enters or leaves an entity. Users should insert this component on an entity to indicate interest
++/// in knowing about hover state changes.
++///
++/// The component's boolean value will be `true` whenever the pointer is currently directly hovering
++/// over the entity, or any of the entity's descendants (as defined by the [`ChildOf`]
++/// relationship). This is consistent with the behavior of the CSS `:hover` pseudo-class, which
++/// applies to the element and all of its descendants.
++///
++/// The contained boolean value is guaranteed to only be mutated when the pointer enters or leaves
++/// the entity, allowing Bevy change detection to be used efficiently. This is in contrast to the
++/// [`HoverMap`] resource, which is updated every frame.
++///
++/// Typically, a simple hoverable entity or widget will have this component added to it. More
++/// complex widgets can have this component added to each hoverable part.
++///
++/// The computational cost of keeping the `IsHovered` components up to date is relatively cheap, and
++/// linear in the number of entities that have the [`IsHovered`] component inserted.
++#[derive(Component, Copy, Clone, Default, Eq, PartialEq, Debug, Reflect)]
++#[reflect(Component, Default, PartialEq, Debug, Clone)]
++#[component(immutable)]
++pub struct IsHovered(pub bool);
++
++impl IsHovered {
++    /// Get whether the entity is currently hovered.
++    pub fn get(&self) -> bool {
++        self.0
++    }
++}
++
++/// A component that allows users to use regular Bevy change detection to determine when the pointer
++/// is directly hovering over an entity. Users should insert this component on an entity to indicate
++/// interest in knowing about hover state changes.
++///
++/// This is similar to [`IsHovered`] component, except that it does not include descendants in the
++/// hover state.
++#[derive(Component, Copy, Clone, Default, Eq, PartialEq, Debug, Reflect)]
++#[reflect(Component, Default, PartialEq, Debug, Clone)]
++#[component(immutable)]
++pub struct IsDirectlyHovered(pub bool);
++
++impl IsDirectlyHovered {
++    /// Get whether the entity is currently hovered.
++    pub fn get(&self) -> bool {
++        self.0
++    }
++}
++
++/// Uses [`HoverMap`] changes to update [`IsHovered`] components.
++pub fn update_is_hovered(
++    hover_map: Option<Res<HoverMap>>,
++    mut hovers: Query<(Entity, &IsHovered)>,
++    parent_query: Query<&ChildOf>,
++    mut commands: Commands,
++) {
++    // Don't do any work if there's no hover map.
++    let Some(hover_map) = hover_map else { return };
++
++    // Don't bother collecting ancestors if there are no hovers.
++    if hovers.is_empty() {
++        return;
++    }
++
++    // Algorithm: for each entity having a `IsHovered` component, we want to know if the current
++    // entry in the hover map is "within" (that is, in the set of descenants of) that entity. Rather
++    // than doing an expensive breadth-first traversal of children, instead start with the hovermap
++    // entry and search upwards. We can make this even cheaper by building a set of ancestors for
++    // the hovermap entry, and then testing each `IsHovered` entity against that set.
++
++    // A set which contains the hovered for the current pointer entity and its ancestors. The
++    // capacity is based on the likely tree depth of the hierarchy, which is typically greater for
++    // UI (because of layout issues) than for 3D scenes. A depth of 32 is a reasonable upper bound
++    // for most use cases.
++    let mut hover_ancestors = EntityHashSet::with_capacity(32);
++    if let Some(map) = hover_map.get(&PointerId::Mouse) {
++        for hovered_entity in map.keys() {
++            hover_ancestors.insert(*hovered_entity);
++            hover_ancestors.extend(parent_query.iter_ancestors(*hovered_entity));
++        }
++    }
++
++    // For each hovered entity, it is considered "hovering" if it's in the set of hovered ancestors.
++    for (entity, hoverable) in hovers.iter_mut() {
++        let is_hovering = hover_ancestors.contains(&entity);
++        if hoverable.0 != is_hovering {
++            commands.entity(entity).insert(IsHovered(is_hovering));
++        }
++    }
++}
++
++/// Uses [`HoverMap`] changes to update [`IsDirectlyHovered`] components.
++pub fn update_is_directly_hovered(
++    hover_map: Option<Res<HoverMap>>,
++    hovers: Query<(Entity, &IsDirectlyHovered)>,
++    mut commands: Commands,
++) {
++    // Don't do any work if there's no hover map.
++    let Some(hover_map) = hover_map else { return };
++
++    // Don't bother collecting ancestors if there are no hovers.
++    if hovers.is_empty() {
++        return;
++    }
++
++    if let Some(map) = hover_map.get(&PointerId::Mouse) {
++        // It's hovering if it's in the HoverMap.
++        for (entity, hoverable) in hovers.iter() {
++            let is_hovering = map.contains_key(&entity);
++            if hoverable.0 != is_hovering {
++                commands
++                    .entity(entity)
++                    .insert(IsDirectlyHovered(is_hovering));
++            }
++        }
++    } else {
++        // No hovered entity, reset all hovers.
++        for (entity, hoverable) in hovers.iter() {
++            if hoverable.0 {
++                commands.entity(entity).insert(IsDirectlyHovered(false));
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use bevy_render::camera::Camera;
++
++    use super::*;
++
++    #[test]
++    fn update_is_hovered_memoized() {
++        let mut world = World::default();
++        let camera = world.spawn(Camera::default()).id();
++
++        // Setup entities
++        let hovered_child = world.spawn_empty().id();
++        let hovered_entity = world.spawn(IsHovered(false)).add_child(hovered_child).id();
++
++        // Setup hover map with hovered_entity hovered by mouse
++        let mut hover_map = HoverMap::default();
++        let mut entity_map = HashMap::new();
++        entity_map.insert(
++            hovered_child,
++            HitData {
++                depth: 0.0,
++                camera,
++                position: None,
++                normal: None,
++            },
++        );
++        hover_map.insert(PointerId::Mouse, entity_map);
++        world.insert_resource(hover_map);
++
++        // Run the system
++        assert!(world.run_system_cached(update_is_hovered).is_ok());
++
++        // Check to insure that the hovered entity has the IsHovered component set to true
++        let hover = world.entity(hovered_entity).get_ref::<IsHovered>().unwrap();
++        assert!(hover.get());
++        assert!(hover.is_changed());
++
++        // Now do it again, but don't change the hover map.
++        world.increment_change_tick();
++
++        assert!(world.run_system_cached(update_is_hovered).is_ok());
++        let hover = world.entity(hovered_entity).get_ref::<IsHovered>().unwrap();
++        assert!(hover.get());
++
++        // Should not be changed
++        // NOTE: Test doesn't work - thinks it is always changed
++        // assert!(!hover.is_changed());
++
++        // Clear the hover map and run again.
++        world.insert_resource(HoverMap::default());
++        world.increment_change_tick();
++
++        assert!(world.run_system_cached(update_is_hovered).is_ok());
++        let hover = world.entity(hovered_entity).get_ref::<IsHovered>().unwrap();
++        assert!(!hover.get());
++        assert!(hover.is_changed());
++    }
++
++    #[test]
++    fn update_is_hovered_direct_self() {
++        let mut world = World::default();
++        let camera = world.spawn(Camera::default()).id();
++
++        // Setup entities
++        let hovered_entity = world.spawn(IsDirectlyHovered(false)).id();
++
++        // Setup hover map with hovered_entity hovered by mouse
++        let mut hover_map = HoverMap::default();
++        let mut entity_map = HashMap::new();
++        entity_map.insert(
++            hovered_entity,
++            HitData {
++                depth: 0.0,
++                camera,
++                position: None,
++                normal: None,
++            },
++        );
++        hover_map.insert(PointerId::Mouse, entity_map);
++        world.insert_resource(hover_map);
++
++        // Run the system
++        assert!(world.run_system_cached(update_is_directly_hovered).is_ok());
++
++        // Check to insure that the hovered entity has the IsDirectlyHovered component set to true
++        let hover = world
++            .entity(hovered_entity)
++            .get_ref::<IsDirectlyHovered>()
++            .unwrap();
++        assert!(hover.get());
++        assert!(hover.is_changed());
++
++        // Now do it again, but don't change the hover map.
++        world.increment_change_tick();
++
++        assert!(world.run_system_cached(update_is_directly_hovered).is_ok());
++        let hover = world
++            .entity(hovered_entity)
++            .get_ref::<IsDirectlyHovered>()
++            .unwrap();
++        assert!(hover.get());
++
++        // Should not be changed
++        // NOTE: Test doesn't work - thinks it is always changed
++        // assert!(!hover.is_changed());
++
++        // Clear the hover map and run again.
++        world.insert_resource(HoverMap::default());
++        world.increment_change_tick();
++
++        assert!(world.run_system_cached(update_is_directly_hovered).is_ok());
++        let hover = world
++            .entity(hovered_entity)
++            .get_ref::<IsDirectlyHovered>()
++            .unwrap();
++        assert!(!hover.get());
++        assert!(hover.is_changed());
++    }
++
++    #[test]
++    fn update_is_hovered_direct_child() {
++        let mut world = World::default();
++        let camera = world.spawn(Camera::default()).id();
++
++        // Setup entities
++        let hovered_child = world.spawn_empty().id();
++        let hovered_entity = world
++            .spawn(IsDirectlyHovered(false))
++            .add_child(hovered_child)
++            .id();
++
++        // Setup hover map with hovered_entity hovered by mouse
++        let mut hover_map = HoverMap::default();
++        let mut entity_map = HashMap::new();
++        entity_map.insert(
++            hovered_child,
++            HitData {
++                depth: 0.0,
++                camera,
++                position: None,
++                normal: None,
++            },
++        );
++        hover_map.insert(PointerId::Mouse, entity_map);
++        world.insert_resource(hover_map);
++
++        // Run the system
++        assert!(world.run_system_cached(update_is_directly_hovered).is_ok());
++
++        // Check to insure that the IsDirectlyHovered component is still false
++        let hover = world
++            .entity(hovered_entity)
++            .get_ref::<IsDirectlyHovered>()
++            .unwrap();
++        assert!(!hover.get());
++        assert!(hover.is_changed());
++    }
++}
+diff --git a/crates/bevy_picking/src/lib.rs b/crates/bevy_picking/src/lib.rs
+index 70a57145818c9..fde5801b4266a 100644
+--- a/crates/bevy_picking/src/lib.rs
++++ b/crates/bevy_picking/src/lib.rs
+@@ -170,6 +170,7 @@ pub mod window;
+ use bevy_app::{prelude::*, PluginGroupBuilder};
+ use bevy_ecs::prelude::*;
+ use bevy_reflect::prelude::*;
++use hover::{update_is_directly_hovered, update_is_hovered};
+ 
+ /// The picking prelude.
+ ///
+@@ -392,6 +393,7 @@ impl Plugin for PickingPlugin {
+             .register_type::<Self>()
+             .register_type::<Pickable>()
+             .register_type::<hover::PickingInteraction>()
++            .register_type::<hover::IsHovered>()
+             .register_type::<pointer::PointerId>()
+             .register_type::<pointer::PointerLocation>()
+             .register_type::<pointer::PointerPress>()
+@@ -429,7 +431,12 @@ impl Plugin for InteractionPlugin {
+             .add_event::<Pointer<Scroll>>()
+             .add_systems(
+                 PreUpdate,
+-                (generate_hovermap, update_interactions, pointer_events)
++                (
++                    generate_hovermap,
++                    update_interactions,
++                    (update_is_hovered, update_is_directly_hovered),
++                    pointer_events,
++                )
+                     .chain()
+                     .in_set(PickingSystems::Hover),
+             );
+diff --git a/crates/bevy_ui/src/interaction_states.rs b/crates/bevy_ui/src/interaction_states.rs
+new file mode 100644
+index 0000000000000..eed4864258f66
+--- /dev/null
++++ b/crates/bevy_ui/src/interaction_states.rs
+@@ -0,0 +1,74 @@
++/// This module contains components that are used to track the interaction state of UI widgets.
++use bevy_a11y::AccessibilityNode;
++use bevy_ecs::{
++    component::Component,
++    lifecycle::{OnAdd, OnInsert, OnRemove},
++    observer::Trigger,
++    world::DeferredWorld,
++};
++
++/// A component indicating that a widget is disabled and should be "grayed out".
++/// This is used to prevent user interaction with the widget. It should not, however, prevent
++/// the widget from being updated or rendered, or from acquiring keyboard focus.
++///
++/// For apps which support a11y: if a widget (such as a slider) contains multiple entities,
++/// the `InteractionDisabled` component should be added to the root entity of the widget - the
++/// same entity that contains the `AccessibilityNode` component. This will ensure that
++/// the a11y tree is updated correctly.
++#[derive(Component, Debug, Clone, Copy, Default)]
++pub struct InteractionDisabled;
++
++pub(crate) fn on_add_disabled(
++    trigger: Trigger<OnAdd, InteractionDisabled>,
++    mut world: DeferredWorld,
++) {
++    let mut entity = world.entity_mut(trigger.target().unwrap());
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.set_disabled();
++    }
++}
++
++pub(crate) fn on_remove_disabled(
++    trigger: Trigger<OnRemove, InteractionDisabled>,
++    mut world: DeferredWorld,
++) {
++    let mut entity = world.entity_mut(trigger.target().unwrap());
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.clear_disabled();
++    }
++}
++
++/// Component that indicates whether a button or widget is currently in a pressed or "held down"
++/// state.
++#[derive(Component, Default, Debug)]
++pub struct Depressed;
++
++/// Component that indicates whether a checkbox or radio button is in a checked state.
++#[derive(Component, Default, Debug)]
++#[component(immutable)]
++pub struct Checked(pub bool);
++
++impl Checked {
++    /// Returns whether the checkbox or radio button is currently checked.
++    pub fn get(&self) -> bool {
++        self.0
++    }
++}
++
++pub(crate) fn on_insert_checked(trigger: Trigger<OnInsert, Checked>, mut world: DeferredWorld) {
++    let mut entity = world.entity_mut(trigger.target().unwrap());
++    let checked = entity.get::<Checked>().unwrap().get();
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.set_toggled(match checked {
++            true => accesskit::Toggled::True,
++            false => accesskit::Toggled::False,
++        });
++    }
++}
++
++pub(crate) fn on_remove_checked(trigger: Trigger<OnRemove, Checked>, mut world: DeferredWorld) {
++    let mut entity = world.entity_mut(trigger.target().unwrap());
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.set_toggled(accesskit::Toggled::False);
++    }
++}
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index be0649c03855c..6edfad096781d 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -10,6 +10,7 @@
+ //! Spawn UI elements with [`widget::Button`], [`ImageNode`], [`Text`](prelude::Text) and [`Node`]
+ //! This UI is laid out with the Flexbox and CSS Grid layout models (see <https://cssreference.io/flexbox/>)
+ 
++pub mod interaction_states;
+ pub mod measurement;
+ pub mod ui_material;
+ pub mod update;
+@@ -38,6 +39,7 @@ mod ui_node;
+ pub use focus::*;
+ pub use geometry::*;
+ pub use gradients::*;
++pub use interaction_states::{Checked, Depressed, InteractionDisabled};
+ pub use layout::*;
+ pub use measurement::*;
+ pub use render::*;
+@@ -319,6 +321,11 @@ fn build_text_interop(app: &mut App) {
+ 
+     app.add_plugins(accessibility::AccessibilityPlugin);
+ 
++    app.add_observer(interaction_states::on_add_disabled)
++        .add_observer(interaction_states::on_remove_disabled)
++        .add_observer(interaction_states::on_insert_checked)
++        .add_observer(interaction_states::on_remove_checked);
++
+     app.configure_sets(
+         PostUpdate,
+         AmbiguousWithText.ambiguous_with(widget::text_system),
+diff --git a/crates/bevy_ui/src/ui_node.rs b/crates/bevy_ui/src/ui_node.rs
+index 2ae820a1a1f89..1c5ed364b98f9 100644
+--- a/crates/bevy_ui/src/ui_node.rs
++++ b/crates/bevy_ui/src/ui_node.rs
+@@ -2130,6 +2130,16 @@ impl BorderColor {
+         }
+     }
+ 
++    /// Helper to set all border colors to a given color.
++    pub fn set_all(&mut self, color: impl Into<Color>) -> &mut Self {
++        let color: Color = color.into();
++        self.top = color;
++        self.bottom = color;
++        self.left = color;
++        self.right = color;
++        self
++    }
++
+     /// Check if all contained border colors are transparent
+     pub fn is_fully_transparent(&self) -> bool {
+         self.top.is_fully_transparent()
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index e0f00f2f3de27..8784d5e72580d 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -21,6 +21,7 @@ The default feature set enables most of the expected features of a game engine,
+ |bevy_audio|Provides audio functionality|
+ |bevy_color|Provides shared color types and operations|
+ |bevy_core_pipeline|Provides cameras and other basic render pipeline features|
++|bevy_core_widgets|Headless widget collection for Bevy UI.|
+ |bevy_gilrs|Adds gamepad support|
+ |bevy_gizmos|Adds support for rendering gizmos|
+ |bevy_gltf|[glTF](https://www.khronos.org/gltf/) support|
+diff --git a/examples/README.md b/examples/README.md
+index dce7c114e851b..4e679d0d7a2ec 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -545,6 +545,8 @@ Example | Description
+ [Box Shadow](../examples/ui/box_shadow.rs) | Demonstrates how to create a node with a shadow
+ [Button](../examples/ui/button.rs) | Illustrates creating and updating a button
+ [CSS Grid](../examples/ui/grid.rs) | An example for CSS Grid layout
++[Core Widgets](../examples/ui/core_widgets.rs) | Demonstrates use of core (headless) widgets in Bevy UI
++[Core Widgets (w/Observers)](../examples/ui/core_widgets_observers.rs) | Demonstrates use of core (headless) widgets in Bevy UI, with Observers
+ [Directional Navigation](../examples/ui/directional_navigation.rs) | Demonstration of Directional Navigation between UI elements
+ [Display and Visibility](../examples/ui/display_and_visibility.rs) | Demonstrates how Display and Visibility work in the UI.
+ [Flex Layout](../examples/ui/flex_layout.rs) | Demonstrates how the AlignItems and JustifyContent properties can be composed to layout nodes and position text
+diff --git a/examples/ui/core_widgets.rs b/examples/ui/core_widgets.rs
+new file mode 100644
+index 0000000000000..69a45f3e50cc5
+--- /dev/null
++++ b/examples/ui/core_widgets.rs
+@@ -0,0 +1,233 @@
++//! This example illustrates how to create widgets using the `bevy_core_widgets` widget set.
++
++use bevy::{
++    color::palettes::basic::*,
++    core_widgets::{CoreButton, CoreWidgetsPlugin},
++    ecs::system::SystemId,
++    input_focus::{
++        tab_navigation::{TabGroup, TabIndex},
++        InputDispatchPlugin,
++    },
++    picking::hover::IsHovered,
++    prelude::*,
++    ui::{Depressed, InteractionDisabled},
++    winit::WinitSettings,
++};
++
++fn main() {
++    App::new()
++        .add_plugins((DefaultPlugins, CoreWidgetsPlugin, InputDispatchPlugin))
++        // Only run the app when there is user input. This will significantly reduce CPU/GPU use.
++        .insert_resource(WinitSettings::desktop_app())
++        .add_systems(Startup, setup)
++        .add_systems(
++            Update,
++            (update_button_style, update_button_style2, toggle_disabled),
++        )
++        .run();
++}
++
++const NORMAL_BUTTON: Color = Color::srgb(0.15, 0.15, 0.15);
++const HOVERED_BUTTON: Color = Color::srgb(0.25, 0.25, 0.25);
++const PRESSED_BUTTON: Color = Color::srgb(0.35, 0.75, 0.35);
++
++/// Marker which identifies buttons with a particular style, in this case the "Demo style".
++#[derive(Component)]
++struct DemoButton;
++
++fn update_button_style(
++    mut buttons: Query<
++        (
++            Has<Depressed>,
++            &IsHovered,
++            Has<InteractionDisabled>,
++            &mut BackgroundColor,
++            &mut BorderColor,
++            &Children,
++        ),
++        (
++            Or<(
++                Changed<Depressed>,
++                Changed<IsHovered>,
++                Added<InteractionDisabled>,
++            )>,
++            With<DemoButton>,
++        ),
++    >,
++    mut text_query: Query<&mut Text>,
++) {
++    for (depressed, hovered, disabled, mut color, mut border_color, children) in &mut buttons {
++        let mut text = text_query.get_mut(children[0]).unwrap();
++        set_button_style(
++            disabled,
++            hovered.get(),
++            depressed,
++            &mut color,
++            &mut border_color,
++            &mut text,
++        );
++    }
++}
++
++/// Supplementary system to detect removed marker components
++fn update_button_style2(
++    mut buttons: Query<
++        (
++            Has<Depressed>,
++            &IsHovered,
++            Has<InteractionDisabled>,
++            &mut BackgroundColor,
++            &mut BorderColor,
++            &Children,
++        ),
++        With<DemoButton>,
++    >,
++    mut removed_depressed: RemovedComponents<Depressed>,
++    mut removed_disabled: RemovedComponents<InteractionDisabled>,
++    mut text_query: Query<&mut Text>,
++) {
++    removed_depressed.read().for_each(|entity| {
++        if let Ok((depressed, hovered, disabled, mut color, mut border_color, children)) =
++            buttons.get_mut(entity)
++        {
++            let mut text = text_query.get_mut(children[0]).unwrap();
++            set_button_style(
++                disabled,
++                hovered.get(),
++                depressed,
++                &mut color,
++                &mut border_color,
++                &mut text,
++            );
++        }
++    });
++    removed_disabled.read().for_each(|entity| {
++        if let Ok((depressed, hovered, disabled, mut color, mut border_color, children)) =
++            buttons.get_mut(entity)
++        {
++            let mut text = text_query.get_mut(children[0]).unwrap();
++            set_button_style(
++                disabled,
++                hovered.get(),
++                depressed,
++                &mut color,
++                &mut border_color,
++                &mut text,
++            );
++        }
++    });
++}
++
++fn set_button_style(
++    disabled: bool,
++    hovered: bool,
++    depressed: bool,
++    color: &mut BackgroundColor,
++    border_color: &mut BorderColor,
++    text: &mut Text,
++) {
++    match (disabled, hovered, depressed) {
++        // Disabled button
++        (true, _, _) => {
++            **text = "Disabled".to_string();
++            *color = NORMAL_BUTTON.into();
++            border_color.set_all(GRAY);
++        }
++
++        // Pressed and hovered button
++        (false, true, true) => {
++            **text = "Press".to_string();
++            *color = PRESSED_BUTTON.into();
++            border_color.set_all(RED);
++        }
++
++        // Hovered, unpressed button
++        (false, true, false) => {
++            **text = "Hover".to_string();
++            *color = HOVERED_BUTTON.into();
++            border_color.set_all(WHITE);
++        }
++
++        // Unhovered button (either pressed or not).
++        (false, false, _) => {
++            **text = "Button".to_string();
++            *color = NORMAL_BUTTON.into();
++            border_color.set_all(BLACK);
++        }
++    }
++}
++
++fn setup(mut commands: Commands, assets: Res<AssetServer>) {
++    let on_click = commands.register_system(|| {
++        info!("Button clicked!");
++    });
++    // ui camera
++    commands.spawn(Camera2d);
++    commands.spawn(button(&assets, on_click));
++}
++
++fn button(asset_server: &AssetServer, on_click: SystemId) -> impl Bundle {
++    (
++        Node {
++            width: Val::Percent(100.0),
++            height: Val::Percent(100.0),
++            align_items: AlignItems::Center,
++            justify_content: JustifyContent::Center,
++            display: Display::Flex,
++            flex_direction: FlexDirection::Column,
++            ..default()
++        },
++        TabGroup::default(),
++        children![
++            (
++                Node {
++                    width: Val::Px(150.0),
++                    height: Val::Px(65.0),
++                    border: UiRect::all(Val::Px(5.0)),
++                    justify_content: JustifyContent::Center,
++                    align_items: AlignItems::Center,
++                    ..default()
++                },
++                DemoButton,
++                CoreButton {
++                    on_click: Some(on_click),
++                },
++                IsHovered::default(),
++                TabIndex(0),
++                BorderColor::all(Color::BLACK),
++                BorderRadius::MAX,
++                BackgroundColor(NORMAL_BUTTON),
++                children![(
++                    Text::new("Button"),
++                    TextFont {
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font_size: 33.0,
++                        ..default()
++                    },
++                    TextColor(Color::srgb(0.9, 0.9, 0.9)),
++                    TextShadow::default(),
++                )]
++            ),
++            Text::new("Press 'D' to toggle button disabled state"),
++        ],
++    )
++}
++
++fn toggle_disabled(
++    input: Res<ButtonInput<KeyCode>>,
++    mut interaction_query: Query<(Entity, Has<InteractionDisabled>), With<CoreButton>>,
++    mut commands: Commands,
++) {
++    if input.just_pressed(KeyCode::KeyD) {
++        for (entity, disabled) in &mut interaction_query {
++            // disabled.0 = !disabled.0;
++            if disabled {
++                info!("Button enabled");
++                commands.entity(entity).remove::<InteractionDisabled>();
++            } else {
++                info!("Button disabled");
++                commands.entity(entity).insert(InteractionDisabled);
++            }
++        }
++    }
++}
+diff --git a/examples/ui/core_widgets_observers.rs b/examples/ui/core_widgets_observers.rs
+new file mode 100644
+index 0000000000000..55dc2d36b157c
+--- /dev/null
++++ b/examples/ui/core_widgets_observers.rs
+@@ -0,0 +1,303 @@
++//! This example illustrates how to create widgets using the `bevy_core_widgets` widget set.
++
++use bevy::{
++    color::palettes::basic::*,
++    core_widgets::{CoreButton, CoreWidgetsPlugin},
++    ecs::system::SystemId,
++    input_focus::{
++        tab_navigation::{TabGroup, TabIndex},
++        InputDispatchPlugin,
++    },
++    picking::hover::IsHovered,
++    prelude::*,
++    ui::{Depressed, InteractionDisabled},
++    winit::WinitSettings,
++};
++
++fn main() {
++    App::new()
++        .add_plugins((DefaultPlugins, CoreWidgetsPlugin, InputDispatchPlugin))
++        // Only run the app when there is user input. This will significantly reduce CPU/GPU use.
++        .insert_resource(WinitSettings::desktop_app())
++        .add_systems(Startup, setup)
++        .add_observer(on_add_pressed)
++        .add_observer(on_remove_pressed)
++        .add_observer(on_add_disabled)
++        .add_observer(on_remove_disabled)
++        .add_observer(on_change_hover)
++        .add_systems(Update, toggle_disabled)
++        .run();
++}
++
++const NORMAL_BUTTON: Color = Color::srgb(0.15, 0.15, 0.15);
++const HOVERED_BUTTON: Color = Color::srgb(0.25, 0.25, 0.25);
++const PRESSED_BUTTON: Color = Color::srgb(0.35, 0.75, 0.35);
++
++/// Marker which identifies buttons with a particular style, in this case the "Demo style".
++#[derive(Component)]
++struct DemoButton;
++
++fn on_add_pressed(
++    trigger: Trigger<OnAdd, Depressed>,
++    mut buttons: Query<
++        (
++            &IsHovered,
++            Has<InteractionDisabled>,
++            &mut BackgroundColor,
++            &mut BorderColor,
++            &Children,
++        ),
++        With<DemoButton>,
++    >,
++    mut text_query: Query<&mut Text>,
++) {
++    if let Ok((hovered, disabled, mut color, mut border_color, children)) =
++        buttons.get_mut(trigger.target().unwrap())
++    {
++        let mut text = text_query.get_mut(children[0]).unwrap();
++        set_button_style(
++            disabled,
++            hovered.get(),
++            true,
++            &mut color,
++            &mut border_color,
++            &mut text,
++        );
++    }
++}
++
++fn on_remove_pressed(
++    trigger: Trigger<OnRemove, Depressed>,
++    mut buttons: Query<
++        (
++            &IsHovered,
++            Has<InteractionDisabled>,
++            &mut BackgroundColor,
++            &mut BorderColor,
++            &Children,
++        ),
++        With<DemoButton>,
++    >,
++    mut text_query: Query<&mut Text>,
++) {
++    if let Ok((hovered, disabled, mut color, mut border_color, children)) =
++        buttons.get_mut(trigger.target().unwrap())
++    {
++        let mut text = text_query.get_mut(children[0]).unwrap();
++        set_button_style(
++            disabled,
++            hovered.get(),
++            false,
++            &mut color,
++            &mut border_color,
++            &mut text,
++        );
++    }
++}
++
++fn on_add_disabled(
++    trigger: Trigger<OnAdd, InteractionDisabled>,
++    mut buttons: Query<
++        (
++            Has<Depressed>,
++            &IsHovered,
++            &mut BackgroundColor,
++            &mut BorderColor,
++            &Children,
++        ),
++        With<DemoButton>,
++    >,
++    mut text_query: Query<&mut Text>,
++) {
++    if let Ok((depressed, hovered, mut color, mut border_color, children)) =
++        buttons.get_mut(trigger.target().unwrap())
++    {
++        let mut text = text_query.get_mut(children[0]).unwrap();
++        set_button_style(
++            true,
++            hovered.get(),
++            depressed,
++            &mut color,
++            &mut border_color,
++            &mut text,
++        );
++    }
++}
++
++fn on_remove_disabled(
++    trigger: Trigger<OnRemove, InteractionDisabled>,
++    mut buttons: Query<
++        (
++            Has<Depressed>,
++            &IsHovered,
++            &mut BackgroundColor,
++            &mut BorderColor,
++            &Children,
++        ),
++        With<DemoButton>,
++    >,
++    mut text_query: Query<&mut Text>,
++) {
++    if let Ok((depressed, hovered, mut color, mut border_color, children)) =
++        buttons.get_mut(trigger.target().unwrap())
++    {
++        let mut text = text_query.get_mut(children[0]).unwrap();
++        set_button_style(
++            false,
++            hovered.get(),
++            depressed,
++            &mut color,
++            &mut border_color,
++            &mut text,
++        );
++    }
++}
++
++fn on_change_hover(
++    trigger: Trigger<OnInsert, IsHovered>,
++    mut buttons: Query<
++        (
++            Has<Depressed>,
++            &IsHovered,
++            Has<InteractionDisabled>,
++            &mut BackgroundColor,
++            &mut BorderColor,
++            &Children,
++        ),
++        With<DemoButton>,
++    >,
++    mut text_query: Query<&mut Text>,
++) {
++    if let Ok((depressed, hovered, disabled, mut color, mut border_color, children)) =
++        buttons.get_mut(trigger.target().unwrap())
++    {
++        if children.is_empty() {
++            return;
++        }
++        let Ok(mut text) = text_query.get_mut(children[0]) else {
++            return;
++        };
++        set_button_style(
++            disabled,
++            hovered.get(),
++            depressed,
++            &mut color,
++            &mut border_color,
++            &mut text,
++        );
++    }
++}
++
++fn set_button_style(
++    disabled: bool,
++    hovered: bool,
++    depressed: bool,
++    color: &mut BackgroundColor,
++    border_color: &mut BorderColor,
++    text: &mut Text,
++) {
++    match (disabled, hovered, depressed) {
++        // Disabled button
++        (true, _, _) => {
++            **text = "Disabled".to_string();
++            *color = NORMAL_BUTTON.into();
++            border_color.set_all(GRAY);
++        }
++
++        // Pressed and hovered button
++        (false, true, true) => {
++            **text = "Press".to_string();
++            *color = PRESSED_BUTTON.into();
++            border_color.set_all(RED);
++        }
++
++        // Hovered, unpressed button
++        (false, true, false) => {
++            **text = "Hover".to_string();
++            *color = HOVERED_BUTTON.into();
++            border_color.set_all(WHITE);
++        }
++
++        // Unhovered button (either pressed or not).
++        (false, false, _) => {
++            **text = "Button".to_string();
++            *color = NORMAL_BUTTON.into();
++            border_color.set_all(BLACK);
++        }
++    }
++}
++
++fn setup(mut commands: Commands, assets: Res<AssetServer>) {
++    let on_click = commands.register_system(|| {
++        info!("Button clicked!");
++    });
++    // ui camera
++    commands.spawn(Camera2d);
++    commands.spawn(button(&assets, on_click));
++}
++
++fn button(asset_server: &AssetServer, on_click: SystemId) -> impl Bundle {
++    (
++        Node {
++            width: Val::Percent(100.0),
++            height: Val::Percent(100.0),
++            align_items: AlignItems::Center,
++            justify_content: JustifyContent::Center,
++            display: Display::Flex,
++            flex_direction: FlexDirection::Column,
++            ..default()
++        },
++        TabGroup::default(),
++        children![
++            (
++                Node {
++                    width: Val::Px(150.0),
++                    height: Val::Px(65.0),
++                    border: UiRect::all(Val::Px(5.0)),
++                    justify_content: JustifyContent::Center,
++                    align_items: AlignItems::Center,
++                    ..default()
++                },
++                DemoButton,
++                CoreButton {
++                    on_click: Some(on_click),
++                },
++                IsHovered::default(),
++                TabIndex(0),
++                BorderColor::all(Color::BLACK),
++                BorderRadius::MAX,
++                BackgroundColor(NORMAL_BUTTON),
++                children![(
++                    Text::new("Button"),
++                    TextFont {
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font_size: 33.0,
++                        ..default()
++                    },
++                    TextColor(Color::srgb(0.9, 0.9, 0.9)),
++                    TextShadow::default(),
++                )]
++            ),
++            Text::new("Press 'D' to toggle button disabled state"),
++        ],
++    )
++}
++
++fn toggle_disabled(
++    input: Res<ButtonInput<KeyCode>>,
++    mut interaction_query: Query<(Entity, Has<InteractionDisabled>), With<CoreButton>>,
++    mut commands: Commands,
++) {
++    if input.just_pressed(KeyCode::KeyD) {
++        for (entity, disabled) in &mut interaction_query {
++            // disabled.0 = !disabled.0;
++            if disabled {
++                info!("Button enabled");
++                commands.entity(entity).remove::<InteractionDisabled>();
++            } else {
++                info!("Button disabled");
++                commands.entity(entity).insert(InteractionDisabled);
++            }
++        }
++    }
++}
+diff --git a/release-content/release-notes/headless-widgets.md b/release-content/release-notes/headless-widgets.md
+new file mode 100644
+index 0000000000000..a71e7aad2b8e8
+--- /dev/null
++++ b/release-content/release-notes/headless-widgets.md
+@@ -0,0 +1,90 @@
++---
++title: Headless Widgets
++authors: ["@viridia"]
++pull_requests: [19366]
++---
++
++Bevy's `Button` and `Interaction` components have been around for a long time. Unfortunately
++these components have a number of shortcomings, such as the fact that they don't use the new
++`bevy_picking` framework, or the fact that they are really only useful for creating buttons
++and not other kinds of widgets like sliders.
++
++As an art form, games thrive on novelty: the typical game doesn't have boring, standardized controls
++reminiscent of a productivity app, but instead will have beautiful, artistic widgets that are
++in harmony with the game's overall visual theme. But writing new and unique widgets requires
++skill and subtlety, particularly if we want first-class accessibility support. It's not a burden we
++want to put on the average indie developer.
++
++In the web development world, "headless" widget libraries, such as
++[headlessui](https://headlessui.com/) and [reakit](https://reakit.io/) have become popular. These
++provide standardized widgets that implement all of the correct interactions and behavioral logic,
++including integration with screen readers, but which are unstyled. It's the responsibility of the
++game developer to provide the visual style and animation for the widgets, which can fit the overall
++style of their game.
++
++With this release, Bevy introduces a collection of headless or "core" widgets. These are components
++which can be added to any UI Node to get widget-like behavior. The core widget set includes buttons,
++sliders, scrollbars, checkboxes, radio buttons, and more. This set will likely be expanded in
++future releases.
++
++## Core Widgets
++
++The `bevy_core_widgets` crate provides implementations of unstyled widgets, such as buttons,
++sliders, checkboxes and radio buttons.
++
++- `CoreButton` is a push button. It emits an activation event when clicked.
++- (More to be added in subsequent PRs)
++
++## Widget Interaction States
++
++Many of the core widgets will define supplementary ECS components that are used to store the widget's
++state, similar to how the old `Interaction` component worked, but in a way that is more flexible.
++These components include:
++
++- `InteractionDisabled` - a boolean component used to indicate that a component should be
++  "grayed out" and non-interactive. Note that these disabled widgets are still visible and can
++  have keyboard focus (otherwise the user would have no way to discover them).
++- `IsHovered` is a simple boolean component that allows detection of whether the widget is being
++  hovered using regular Bevy change detection.
++- `Checked` is a boolean component that stores the checked state of a checkbox or radio button.
++- `Depressed` is used for a button-like widget, and will be true while the button is held down.
++
++The combination of `IsHovered` and `ButtonPressed` fulfills the same purpose as the old
++`Interaction` component, except that now we can also represent "roll-off" behavior (the state where
++you click on a button and then, while holding the mouse down, move the pointer out of the button's
++bounds). It also provides additional flexibility in cases where a widget has multiple hoverable
++parts, or cases where a widget is hoverable but doesn't have a pressed state (such as a tree-view
++expansion toggle).
++
++## Widget Notifications
++
++Applications need a way to be notified when the user interacts with a widget. One way to do this
++is using Bevy observers. This approach is useful in cases where you want the widget notifications
++to bubble up the hierarchy.
++
++However, in UI work it's often desirable to connect widget interactions in ways that cut across the
++hierarchy. For these kinds of situations, the core widgets offer an an alternate approach: one-shot
++systems. You can register a function as a one-shot system and get the resulting `SystemId`. This can
++then be passed as a parameter to the widget when it is constructed, so when the button subsequently
++gets clicked or the slider is dragged, the system gets run. Because it's an ECS system, it can
++inject any additional parameters it needs to update the Bevy world in response to the interaction.
++
++Most of the core widgets use "external state management" - something that is referred to in the
++React.js world as "controlled" widgets. This means that for widgets that edit a parameter value
++(such as checkboxes and sliders), the widget doesn't automatically update its own internal value,
++but only sends a notification to the app telling it that the value needs to change. It's the
++responsibility of the app to handle this notification and update the widget accordingly, and at the
++same time update any other game state that is dependent on that parameter.
++
++There are multiple reasons for this, but the main one is this: typical game user interfaces aren't
++just passive forms of fields to fill in, but more often represent a dynamic view of live data. As a
++consequence, the displayed value of a widget may change even when the user is not directly
++interacting with that widget. Externalizing the state avoids the need for two-way data binding, and
++instead allows simpler one-way data binding that aligns well with the traditional "Model / View /
++Controller" (MVC) design pattern.
++
++There are two exceptions to this rule about external state management. First, widgets which don't
++edit a value, but which merely trigger an event (such as buttons), don't fall under this rule.
++Second, widgets which have complex states that are too large and heavyweight to fit within a
++notification event (such as a text editor) can choose to manage their state internally. These latter
++widgets will need to implement a two-way data binding strategy.

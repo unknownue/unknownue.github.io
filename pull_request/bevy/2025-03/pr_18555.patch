@@ -1,0 +1,397 @@
+diff --git a/crates/bevy_core_pipeline/src/core_2d/camera_2d.rs b/crates/bevy_core_pipeline/src/core_2d/camera_2d.rs
+index 67e5e7f1d80a2..d46174192be9f 100644
+--- a/crates/bevy_core_pipeline/src/core_2d/camera_2d.rs
++++ b/crates/bevy_core_pipeline/src/core_2d/camera_2d.rs
+@@ -18,9 +18,9 @@ use bevy_transform::prelude::{GlobalTransform, Transform};
+ #[require(
+     Camera,
+     DebandDither,
+-    CameraRenderGraph(|| CameraRenderGraph::new(Core2d)),
+-    Projection(|| Projection::Orthographic(OrthographicProjection::default_2d())),
+-    Frustum(|| OrthographicProjection::default_2d().compute_frustum(&GlobalTransform::from(Transform::default()))),
+-    Tonemapping(|| Tonemapping::None),
++    CameraRenderGraph::new(Core2d),
++    Projection::Orthographic(OrthographicProjection::default_2d()),
++    Frustum = OrthographicProjection::default_2d().compute_frustum(&GlobalTransform::from(Transform::default())),
++    Tonemapping::None,
+ )]
+ pub struct Camera2d;
+diff --git a/crates/bevy_core_pipeline/src/core_3d/camera_3d.rs b/crates/bevy_core_pipeline/src/core_3d/camera_3d.rs
+index 4afe1d4621eeb..9bcb2b4f80919 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/camera_3d.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/camera_3d.rs
+@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
+ #[reflect(Component, Default, Clone)]
+ #[require(
+     Camera,
+-    DebandDither(|| DebandDither::Enabled),
+-    CameraRenderGraph(|| CameraRenderGraph::new(Core3d)),
++    DebandDither::Enabled,
++    CameraRenderGraph::new(Core3d),
+     Projection,
+     Tonemapping,
+     ColorGrading,
+diff --git a/crates/bevy_ecs/macros/src/component.rs b/crates/bevy_ecs/macros/src/component.rs
+index 5b0d9ad6e09e4..ebfc2f5d3a650 100644
+--- a/crates/bevy_ecs/macros/src/component.rs
++++ b/crates/bevy_ecs/macros/src/component.rs
+@@ -3,13 +3,13 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
+ use quote::{format_ident, quote, ToTokens};
+ use std::collections::HashSet;
+ use syn::{
+-    parenthesized,
++    braced, parenthesized,
+     parse::Parse,
+     parse_macro_input, parse_quote,
+     punctuated::Punctuated,
+     spanned::Spanned,
+-    token::{Comma, Paren},
+-    Data, DataEnum, DataStruct, DeriveInput, Expr, ExprCall, ExprClosure, ExprPath, Field, Fields,
++    token::{Brace, Comma, Paren},
++    Data, DataEnum, DataStruct, DeriveInput, Expr, ExprCall, ExprPath, Field, FieldValue, Fields,
+     Ident, LitStr, Member, Path, Result, Token, Type, Visibility,
+ };
+ 
+@@ -207,17 +207,7 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
+                 );
+             });
+             match &require.func {
+-                Some(RequireFunc::Path(func)) => {
+-                    register_required.push(quote! {
+-                        components.register_required_components_manual::<Self, #ident>(
+-                            required_components,
+-                            || { let x: #ident = #func().into(); x },
+-                            inheritance_depth,
+-                            recursion_check_stack
+-                        );
+-                    });
+-                }
+-                Some(RequireFunc::Closure(func)) => {
++                Some(func) => {
+                     register_required.push(quote! {
+                         components.register_required_components_manual::<Self, #ident>(
+                             required_components,
+@@ -478,12 +468,7 @@ enum StorageTy {
+ 
+ struct Require {
+     path: Path,
+-    func: Option<RequireFunc>,
+-}
+-
+-enum RequireFunc {
+-    Path(Path),
+-    Closure(ExprClosure),
++    func: Option<TokenStream2>,
+ }
+ 
+ struct Relationship {
+@@ -580,25 +565,71 @@ fn parse_component_attr(ast: &DeriveInput) -> Result<Attrs> {
+ 
+ impl Parse for Require {
+     fn parse(input: syn::parse::ParseStream) -> Result<Self> {
+-        let path = input.parse::<Path>()?;
+-        let func = if input.peek(Paren) {
+-            let content;
+-            parenthesized!(content in input);
+-            if let Ok(func) = content.parse::<ExprClosure>() {
+-                Some(RequireFunc::Closure(func))
++        let mut path = input.parse::<Path>()?;
++        let mut last_segment_is_lower = false;
++        let mut is_constructor_call = false;
++        // Use the case of the type name to check if it's an enum
++        // This doesn't match everything that can be an enum according to the rust spec
++        // but it matches what clippy is OK with
++        let is_enum = {
++            let mut first_chars = path
++                .segments
++                .iter()
++                .rev()
++                .filter_map(|s| s.ident.to_string().chars().next());
++            if let Some(last) = first_chars.next() {
++                if last.is_uppercase() {
++                    if let Some(last) = first_chars.next() {
++                        last.is_uppercase()
++                    } else {
++                        false
++                    }
++                } else {
++                    last_segment_is_lower = true;
++                    false
++                }
+             } else {
+-                let func = content.parse::<Path>()?;
+-                Some(RequireFunc::Path(func))
++                false
+             }
+-        } else if input.peek(Token![=]) {
++        };
++
++        let func = if input.peek(Token![=]) {
++            // If there is an '=', then this is a "function style" require
+             let _t: syn::Token![=] = input.parse()?;
+-            let label: Ident = input.parse()?;
+-            let tokens: TokenStream = quote::quote! (|| #path::#label).into();
+-            let func = syn::parse(tokens).unwrap();
+-            Some(RequireFunc::Closure(func))
++            let expr: Expr = input.parse()?;
++            let tokens: TokenStream = quote::quote! (|| #expr).into();
++            Some(TokenStream2::from(tokens))
++        } else if input.peek(Brace) {
++            // This is a "value style" named-struct-like require
++            let content;
++            braced!(content in input);
++            let fields = Punctuated::<FieldValue, Token![,]>::parse_terminated(&content)?;
++            let tokens: TokenStream = quote::quote! (|| #path { #fields }).into();
++            Some(TokenStream2::from(tokens))
++        } else if input.peek(Paren) {
++            // This is a "value style" tuple-struct-like require
++            let content;
++            parenthesized!(content in input);
++            is_constructor_call = last_segment_is_lower;
++            let fields = Punctuated::<Expr, Token![,]>::parse_terminated(&content)?;
++            let tokens: TokenStream = quote::quote! (|| #path (#fields)).into();
++            Some(TokenStream2::from(tokens))
++        } else if is_enum {
++            // if this is an enum, then it is an inline enum component declaration
++            let tokens: TokenStream = quote::quote! (|| #path).into();
++            Some(TokenStream2::from(tokens))
+         } else {
++            // if this isn't any of the above, then it is a component ident, which will use Default
+             None
+         };
++
++        if is_enum || is_constructor_call {
++            let path_len = path.segments.len();
++            path = Path {
++                leading_colon: path.leading_colon,
++                segments: Punctuated::from_iter(path.segments.into_iter().take(path_len - 1)),
++            };
++        }
+         Ok(Require { path, func })
+     }
+ }
+diff --git a/crates/bevy_ecs/src/component.rs b/crates/bevy_ecs/src/component.rs
+index c40b15ebd008e..bebac8f67b4b8 100644
+--- a/crates/bevy_ecs/src/component.rs
++++ b/crates/bevy_ecs/src/component.rs
+@@ -160,62 +160,87 @@ use thiserror::Error;
+ /// assert_eq!(&C(0), world.entity(id).get::<C>().unwrap());
+ /// ```
+ ///
+-/// You can also define a custom constructor function or closure:
+-///
++/// You can define inline component values that take the following forms:
+ /// ```
+ /// # use bevy_ecs::prelude::*;
+ /// #[derive(Component)]
+-/// #[require(C(init_c))]
++/// #[require(
++///     B(1), // tuple structs
++///     C { value: 1 }, // named-field structs
++///     D::One, // enum variants
++///     E::ONE, // associated consts
++///     F::new(1) // constructors
++/// )]
+ /// struct A;
+ ///
+ /// #[derive(Component, PartialEq, Eq, Debug)]
+-/// #[require(C(|| C(20)))]
+-/// struct B;
++/// struct B(u8);
+ ///
+ /// #[derive(Component, PartialEq, Eq, Debug)]
+-/// struct C(usize);
++/// struct C {
++///     value: u8
++/// }
+ ///
+-/// fn init_c() -> C {
+-///     C(10)
++/// #[derive(Component, PartialEq, Eq, Debug)]
++/// enum D {
++///    Zero,
++///    One,
++/// }
++///
++/// #[derive(Component, PartialEq, Eq, Debug)]
++/// struct E(u8);
++///
++/// impl E {
++///     pub const ONE: Self = Self(1);
++/// }
++///
++/// #[derive(Component, PartialEq, Eq, Debug)]
++/// struct F(u8);
++///
++/// impl F {
++///     fn new(value: u8) -> Self {
++///         Self(value)
++///     }
+ /// }
+ ///
+ /// # let mut world = World::default();
+-/// // This will implicitly also insert C with the init_c() constructor
+ /// let id = world.spawn(A).id();
+-/// assert_eq!(&C(10), world.entity(id).get::<C>().unwrap());
++/// assert_eq!(&B(1), world.entity(id).get::<B>().unwrap());
++/// assert_eq!(&C { value: 1 }, world.entity(id).get::<C>().unwrap());
++/// assert_eq!(&D::One, world.entity(id).get::<D>().unwrap());
++/// assert_eq!(&E(1), world.entity(id).get::<E>().unwrap());
++/// assert_eq!(&F(1), world.entity(id).get::<F>().unwrap());
++/// ````
+ ///
+-/// // This will implicitly also insert C with the `|| C(20)` constructor closure
+-/// let id = world.spawn(B).id();
+-/// assert_eq!(&C(20), world.entity(id).get::<C>().unwrap());
+-/// ```
+ ///
+-/// For convenience sake, you can abbreviate enum labels or constant values, with the type inferred to match that of the component you are requiring:
++/// You can also define arbitrary expressions by using `=`
+ ///
+ /// ```
+ /// # use bevy_ecs::prelude::*;
+ /// #[derive(Component)]
+-/// #[require(B = One, C = ONE)]
++/// #[require(C = init_c())]
+ /// struct A;
+ ///
+ /// #[derive(Component, PartialEq, Eq, Debug)]
+-/// enum B {
+-///    Zero,
+-///    One,
+-///    Two
+-/// }
++/// #[require(C = C(20))]
++/// struct B;
+ ///
+ /// #[derive(Component, PartialEq, Eq, Debug)]
+-/// struct C(u8);
++/// struct C(usize);
+ ///
+-/// impl C {
+-///     pub const ONE: Self = Self(1);
++/// fn init_c() -> C {
++///     C(10)
+ /// }
+ ///
+ /// # let mut world = World::default();
++/// // This will implicitly also insert C with the init_c() constructor
+ /// let id = world.spawn(A).id();
+-/// assert_eq!(&B::One, world.entity(id).get::<B>().unwrap());
+-/// assert_eq!(&C(1), world.entity(id).get::<C>().unwrap());
+-/// ````
++/// assert_eq!(&C(10), world.entity(id).get::<C>().unwrap());
++///
++/// // This will implicitly also insert C with the `|| C(20)` constructor closure
++/// let id = world.spawn(B).id();
++/// assert_eq!(&C(20), world.entity(id).get::<C>().unwrap());
++/// ```
+ ///
+ /// Required components are _recursive_. This means, if a Required Component has required components,
+ /// those components will _also_ be inserted if they are missing:
+@@ -252,13 +277,13 @@ use thiserror::Error;
+ /// struct X(usize);
+ ///
+ /// #[derive(Component, Default)]
+-/// #[require(X(|| X(1)))]
++/// #[require(X(1))]
+ /// struct Y;
+ ///
+ /// #[derive(Component)]
+ /// #[require(
+ ///     Y,
+-///     X(|| X(2)),
++///     X(2),
+ /// )]
+ /// struct Z;
+ ///
+diff --git a/crates/bevy_ecs/src/entity/clone_entities.rs b/crates/bevy_ecs/src/entity/clone_entities.rs
+index e2f11b0857f8e..ff3d0a10f475a 100644
+--- a/crates/bevy_ecs/src/entity/clone_entities.rs
++++ b/crates/bevy_ecs/src/entity/clone_entities.rs
+@@ -1229,7 +1229,7 @@ mod tests {
+         struct A;
+ 
+         #[derive(Component, Clone, PartialEq, Debug, Default)]
+-        #[require(C(|| C(5)))]
++        #[require(C(5))]
+         struct B;
+ 
+         #[derive(Component, Clone, PartialEq, Debug)]
+@@ -1257,7 +1257,7 @@ mod tests {
+         struct A;
+ 
+         #[derive(Component, Clone, PartialEq, Debug, Default)]
+-        #[require(C(|| C(5)))]
++        #[require(C(5))]
+         struct B;
+ 
+         #[derive(Component, Clone, PartialEq, Debug)]
+diff --git a/crates/bevy_ecs/src/lib.rs b/crates/bevy_ecs/src/lib.rs
+index 5e126b430b0b2..612e32b492b54 100644
+--- a/crates/bevy_ecs/src/lib.rs
++++ b/crates/bevy_ecs/src/lib.rs
+@@ -1926,7 +1926,7 @@ mod tests {
+         struct X;
+ 
+         #[derive(Component)]
+-        #[require(Z(new_z))]
++        #[require(Z = new_z())]
+         struct Y {
+             value: String,
+         }
+@@ -2651,7 +2651,7 @@ mod tests {
+         struct MyRequired(bool);
+ 
+         #[derive(Component, Default)]
+-        #[require(MyRequired(|| MyRequired(false)))]
++        #[require(MyRequired(false))]
+         struct MiddleMan;
+ 
+         #[derive(Component, Default)]
+@@ -2659,7 +2659,7 @@ mod tests {
+         struct ConflictingRequire;
+ 
+         #[derive(Component, Default)]
+-        #[require(MyRequired(|| MyRequired(true)))]
++        #[require(MyRequired(true))]
+         struct MyComponent;
+ 
+         let mut world = World::new();
+diff --git a/crates/bevy_ecs/src/world/entity_ref.rs b/crates/bevy_ecs/src/world/entity_ref.rs
+index 3813d34745f32..01917b9d80c66 100644
+--- a/crates/bevy_ecs/src/world/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_ref.rs
+@@ -5836,7 +5836,7 @@ mod tests {
+         struct A;
+ 
+         #[derive(Component, Clone, PartialEq, Debug, Default)]
+-        #[require(C(|| C(3)))]
++        #[require(C(3))]
+         struct B;
+ 
+         #[derive(Component, Clone, PartialEq, Debug, Default)]
+diff --git a/crates/bevy_pbr/src/decal/forward.rs b/crates/bevy_pbr/src/decal/forward.rs
+index 8490017fbbae6..862d4b6019d08 100644
+--- a/crates/bevy_pbr/src/decal/forward.rs
++++ b/crates/bevy_pbr/src/decal/forward.rs
+@@ -67,7 +67,7 @@ impl Plugin for ForwardDecalPlugin {
+ /// * Looking at forward decals at a steep angle can cause distortion. This can be mitigated by padding your decal's
+ ///   texture with extra transparent pixels on the edges.
+ #[derive(Component, Reflect)]
+-#[require(Mesh3d(|| Mesh3d(FORWARD_DECAL_MESH_HANDLE)))]
++#[require(Mesh3d(FORWARD_DECAL_MESH_HANDLE))]
+ pub struct ForwardDecal;
+ 
+ /// Type alias for an extended material with a [`ForwardDecalMaterialExt`] extension.
+diff --git a/crates/bevy_ui/src/widget/button.rs b/crates/bevy_ui/src/widget/button.rs
+index e793c968b5d74..abb788f21bf6b 100644
+--- a/crates/bevy_ui/src/widget/button.rs
++++ b/crates/bevy_ui/src/widget/button.rs
+@@ -5,5 +5,5 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ /// Marker struct for buttons
+ #[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq, Reflect)]
+ #[reflect(Component, Default, Debug, PartialEq, Clone)]
+-#[require(Node, FocusPolicy(|| FocusPolicy::Block), Interaction)]
++#[require(Node, FocusPolicy::Block, Interaction)]
+ pub struct Button;

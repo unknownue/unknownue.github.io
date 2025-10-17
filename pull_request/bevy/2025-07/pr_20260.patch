@@ -1,0 +1,191 @@
+diff --git a/benches/benches/bevy_ecs/world/despawn.rs b/benches/benches/bevy_ecs/world/despawn.rs
+index 7b79ed95d9af5..892b791314d4f 100644
+--- a/benches/benches/bevy_ecs/world/despawn.rs
++++ b/benches/benches/bevy_ecs/world/despawn.rs
+@@ -17,14 +17,15 @@ pub fn world_despawn(criterion: &mut Criterion) {
+             bencher.iter_batched_ref(
+                 || {
+                     let mut world = World::default();
+-                    for _ in 0..entity_count {
+-                        world.spawn((A(Mat4::default()), B(Vec4::default())));
+-                    }
+-                    let ents = world.iter_entities().map(|e| e.id()).collect::<Vec<_>>();
+-                    (world, ents)
++                    let entities: Vec<Entity> = world
++                        .spawn_batch(
++                            (0..entity_count).map(|_| (A(Mat4::default()), B(Vec4::default()))),
++                        )
++                        .collect();
++                    (world, entities)
+                 },
+-                |(world, ents)| {
+-                    ents.iter().for_each(|e| {
++                |(world, entities)| {
++                    entities.iter().for_each(|e| {
+                         world.despawn(*e);
+                     });
+                 },
+diff --git a/crates/bevy_ecs/src/entity_disabling.rs b/crates/bevy_ecs/src/entity_disabling.rs
+index a27eb54c8f8ea..d87373f48149c 100644
+--- a/crates/bevy_ecs/src/entity_disabling.rs
++++ b/crates/bevy_ecs/src/entity_disabling.rs
+@@ -36,7 +36,7 @@
+ //!
+ //! ## Default query filters
+ //!
+-//! In Bevy, entity disabling is implemented through the construction of a global "default query filter".
++//! In Bevy, entity disabling is implemented through the construction of a global "default query filter" resource.
+ //! Queries which do not explicitly mention the disabled component will not include entities with that component.
+ //! If an entity has multiple disabling components, it will only be included in queries that mention all of them.
+ //!
+@@ -50,6 +50,32 @@
+ //! Entities with disabling components are still present in the [`World`] and can be accessed directly,
+ //! using methods on [`World`] or [`Commands`](crate::prelude::Commands).
+ //!
++//! As default query filters are implemented through a resource,
++//! it's possible to temporarily ignore any default filters by using [`World::resource_scope`](crate::prelude::World).
++//!
++//! ```
++//! use bevy_ecs::prelude::*;
++//! use bevy_ecs::entity_disabling::{DefaultQueryFilters, Disabled};
++//!
++//! let mut world = World::default();
++//!
++//! #[derive(Component)]
++//! struct CustomDisabled;
++//!
++//! world.register_disabling_component::<CustomDisabled>();
++//!
++//! world.spawn(Disabled);
++//! world.spawn(CustomDisabled);
++//!
++//! // resource_scope removes DefaultQueryFilters temporarily before re-inserting into the world.
++//! world.resource_scope(|world: &mut World, _: Mut<DefaultQueryFilters>| {
++//!     // within this scope, we can query like no components are disabled.
++//!     assert_eq!(world.query::<&Disabled>().query(&world).count(), 1);
++//!     assert_eq!(world.query::<&CustomDisabled>().query(&world).count(), 1);
++//!     assert_eq!(world.query::<()>().query(&world).count(), world.entities().len() as usize);
++//! })
++//! ```
++//!
+ //! ### Warnings
+ //!
+ //! Currently, only queries for which the cache is built after enabling a default query filter will have entities
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index f6e3a197efc82..44ef11aa4567b 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -977,6 +977,7 @@ impl World {
+     /// Returns an [`Entity`] iterator of current entities.
+     ///
+     /// This is useful in contexts where you only have read-only access to the [`World`].
++    #[deprecated(since = "0.17.0", note = "use world.query::<EntityRef>()` instead")]
+     #[inline]
+     pub fn iter_entities(&self) -> impl Iterator<Item = EntityRef<'_>> + '_ {
+         self.archetypes.iter().flat_map(|archetype| {
+@@ -998,6 +999,7 @@ impl World {
+     }
+ 
+     /// Returns a mutable iterator over all entities in the `World`.
++    #[deprecated(since = "0.17.0", note = "use world.query::<EntityMut>()` instead")]
+     pub fn iter_entities_mut(&mut self) -> impl Iterator<Item = EntityMut<'_>> + '_ {
+         let last_change_tick = self.last_change_tick;
+         let change_tick = self.change_tick();
+@@ -4107,6 +4109,7 @@ mod tests {
+ 
+         let iterate_and_count_entities = |world: &World, entity_counters: &mut HashMap<_, _>| {
+             entity_counters.clear();
++            #[expect(deprecated, reason = "remove this test in in 0.17.0")]
+             for entity in world.iter_entities() {
+                 let counter = entity_counters.entry(entity.id()).or_insert(0);
+                 *counter += 1;
+@@ -4184,6 +4187,7 @@ mod tests {
+         let b1 = world.spawn(B(1)).id();
+         let b2 = world.spawn(B(2)).id();
+ 
++        #[expect(deprecated, reason = "remove this test in 0.17.0")]
+         for mut entity in world.iter_entities_mut() {
+             if let Some(mut a) = entity.get_mut::<A>() {
+                 a.0 -= 1;
+@@ -4194,6 +4198,7 @@ mod tests {
+         assert_eq!(world.entity(b1).get(), Some(&B(1)));
+         assert_eq!(world.entity(b2).get(), Some(&B(2)));
+ 
++        #[expect(deprecated, reason = "remove this test in in 0.17.0")]
+         for mut entity in world.iter_entities_mut() {
+             if let Some(mut b) = entity.get_mut::<B>() {
+                 b.0 *= 2;
+@@ -4204,6 +4209,7 @@ mod tests {
+         assert_eq!(world.entity(b1).get(), Some(&B(2)));
+         assert_eq!(world.entity(b2).get(), Some(&B(4)));
+ 
++        #[expect(deprecated, reason = "remove this test in in 0.17.0")]
+         let mut entities = world.iter_entities_mut().collect::<Vec<_>>();
+         entities.sort_by_key(|e| e.get::<A>().map(|a| a.0).or(e.get::<B>().map(|b| b.0)));
+         let (a, b) = entities.split_at_mut(2);
+diff --git a/crates/bevy_scene/src/dynamic_scene.rs b/crates/bevy_scene/src/dynamic_scene.rs
+index f0cf3960d60ea..fc3b223ce2b60 100644
+--- a/crates/bevy_scene/src/dynamic_scene.rs
++++ b/crates/bevy_scene/src/dynamic_scene.rs
+@@ -54,7 +54,15 @@ impl DynamicScene {
+     /// Create a new dynamic scene from a given world.
+     pub fn from_world(world: &World) -> Self {
+         DynamicSceneBuilder::from_world(world)
+-            .extract_entities(world.iter_entities().map(|entity| entity.id()))
++            .extract_entities(
++                // we do this instead of a query, in order to completely sidestep default query filters.
++                // while we could use `Allows<_>`, this wouldn't account for custom disabled components
++                world
++                    .archetypes()
++                    .iter()
++                    .flat_map(bevy_ecs::archetype::Archetype::entities)
++                    .map(bevy_ecs::archetype::ArchetypeEntity::id),
++            )
+             .extract_resources()
+             .build()
+     }
+diff --git a/crates/bevy_scene/src/lib.rs b/crates/bevy_scene/src/lib.rs
+index 9e6fe16d1a0a6..b088fb9871055 100644
+--- a/crates/bevy_scene/src/lib.rs
++++ b/crates/bevy_scene/src/lib.rs
+@@ -121,7 +121,10 @@ mod tests {
+     use bevy_asset::{AssetPlugin, Assets};
+     use bevy_ecs::{
+         component::Component,
++        entity::Entity,
++        entity_disabling::Internal,
+         hierarchy::{ChildOf, Children},
++        query::Allows,
+         reflect::{AppTypeRegistry, ReflectComponent},
+         world::World,
+     };
+@@ -302,8 +305,13 @@ mod tests {
+             scene
+                 .world
+                 .insert_resource(world.resource::<AppTypeRegistry>().clone());
++            let entities: Vec<Entity> = scene
++                .world
++                .query_filtered::<Entity, Allows<Internal>>()
++                .iter(&scene.world)
++                .collect();
+             DynamicSceneBuilder::from_world(&scene.world)
+-                .extract_entities(scene.world.iter_entities().map(|entity| entity.id()))
++                .extract_entities(entities.into_iter())
+                 .build()
+         };
+ 
+diff --git a/release-content/migration-guides/deprecate_iter_entities.md b/release-content/migration-guides/deprecate_iter_entities.md
+new file mode 100644
+index 0000000000000..0b4a167a65c38
+--- /dev/null
++++ b/release-content/migration-guides/deprecate_iter_entities.md
+@@ -0,0 +1,9 @@
++---
++title: Deprecate `iter_entities` and `iter_entities_mut`.
++pull_requests: [20260]
++---
++
++In Bevy 0.17.0 we deprecate `world.iter_entities()` and `world.iter_entities_mut()`.
++Use `world.query::<EntityMut>().iter(&world)` and `world.query::<EntityRef>().iter(&mut world)` instead.
++
++This may not return every single entity, because of [default filter queries](https://docs.rs/bevy/latest/bevy/ecs/entity_disabling/index.html). If you really intend to query disabled entities too, consider removing the `DefaultQueryFilters` resource from the world before querying the elements. You can also add an `Allows<Component>` filter to allow a specific disabled `Component`, to show up in the query.
