@@ -1,0 +1,945 @@
+diff --git a/crates/bevy_asset/src/asset_changed.rs b/crates/bevy_asset/src/asset_changed.rs
+index 272dca46f3ae2..69af860e83722 100644
+--- a/crates/bevy_asset/src/asset_changed.rs
++++ b/crates/bevy_asset/src/asset_changed.rs
+@@ -7,7 +7,8 @@ use crate::{AsAssetId, Asset, AssetId};
+ use bevy_ecs::component::Components;
+ use bevy_ecs::{
+     archetype::Archetype,
+-    component::{ComponentId, Tick},
++    change_detection::Tick,
++    component::ComponentId,
+     prelude::{Entity, Resource, World},
+     query::{FilteredAccess, QueryData, QueryFilter, ReadFetch, WorldQuery},
+     storage::{Table, TableRow},
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index c712223be9dfb..52381717be176 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -506,7 +506,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+                     state: &'s mut Self::State,
+                     system_meta: &#path::system::SystemMeta,
+                     world: #path::world::unsafe_world_cell::UnsafeWorldCell<'w>,
+-                    change_tick: #path::component::Tick,
++                    change_tick: #path::change_detection::Tick,
+                 ) -> Self::Item<'w, 's> {
+                     let (#(#tuple_patterns,)*) = <
+                         (#(#tuple_types,)*) as #path::system::SystemParam
+diff --git a/crates/bevy_ecs/macros/src/world_query.rs b/crates/bevy_ecs/macros/src/world_query.rs
+index ccd01c425ecab..1cc8eaf501953 100644
+--- a/crates/bevy_ecs/macros/src/world_query.rs
++++ b/crates/bevy_ecs/macros/src/world_query.rs
+@@ -113,8 +113,8 @@ pub(crate) fn world_query_impl(
+             unsafe fn init_fetch<'__w, '__s>(
+                 _world: #path::world::unsafe_world_cell::UnsafeWorldCell<'__w>,
+                 state: &'__s Self::State,
+-                _last_run: #path::component::Tick,
+-                _this_run: #path::component::Tick,
++                _last_run: #path::change_detection::Tick,
++                _this_run: #path::change_detection::Tick,
+             ) -> <Self as #path::query::WorldQuery>::Fetch<'__w> {
+                 #fetch_struct_name {
+                     #(#named_field_idents:
+diff --git a/crates/bevy_ecs/src/bundle/info.rs b/crates/bevy_ecs/src/bundle/info.rs
+index 589ec0b7c65e6..5d0dbeddf63c8 100644
+--- a/crates/bevy_ecs/src/bundle/info.rs
++++ b/crates/bevy_ecs/src/bundle/info.rs
+@@ -11,10 +11,9 @@ use indexmap::{IndexMap, IndexSet};
+ use crate::{
+     archetype::{Archetype, BundleComponentStatus, ComponentStatus},
+     bundle::{Bundle, DynamicBundle},
+-    change_detection::MaybeLocation,
++    change_detection::{MaybeLocation, Tick},
+     component::{
+         ComponentId, Components, ComponentsRegistrator, RequiredComponentConstructor, StorageType,
+-        Tick,
+     },
+     entity::Entity,
+     query::DebugCheckedUnwrap as _,
+diff --git a/crates/bevy_ecs/src/bundle/insert.rs b/crates/bevy_ecs/src/bundle/insert.rs
+index 69c669d6406f3..4dffb138c3fe6 100644
+--- a/crates/bevy_ecs/src/bundle/insert.rs
++++ b/crates/bevy_ecs/src/bundle/insert.rs
+@@ -8,8 +8,8 @@ use crate::{
+         ComponentStatus,
+     },
+     bundle::{ArchetypeMoveType, Bundle, BundleId, BundleInfo, DynamicBundle, InsertMode},
+-    change_detection::MaybeLocation,
+-    component::{Components, StorageType, Tick},
++    change_detection::{MaybeLocation, Tick},
++    component::{Components, StorageType},
+     entity::{Entities, Entity, EntityLocation},
+     event::EntityComponentsTrigger,
+     lifecycle::{Add, Insert, Replace, ADD, INSERT, REPLACE},
+diff --git a/crates/bevy_ecs/src/bundle/spawner.rs b/crates/bevy_ecs/src/bundle/spawner.rs
+index b4f32147aecdf..571fe8c39e58d 100644
+--- a/crates/bevy_ecs/src/bundle/spawner.rs
++++ b/crates/bevy_ecs/src/bundle/spawner.rs
+@@ -6,7 +6,7 @@ use crate::{
+     archetype::{Archetype, ArchetypeCreated, ArchetypeId, SpawnBundleStatus},
+     bundle::{Bundle, BundleId, BundleInfo, DynamicBundle, InsertMode},
+     change_detection::MaybeLocation,
+-    component::Tick,
++    change_detection::Tick,
+     entity::{Entities, Entity, EntityLocation},
+     event::EntityComponentsTrigger,
+     lifecycle::{Add, Insert, ADD, INSERT},
+diff --git a/crates/bevy_ecs/src/change_detection/mod.rs b/crates/bevy_ecs/src/change_detection/mod.rs
+index 3fc54166d18f9..0b8ce3a8f33ee 100644
+--- a/crates/bevy_ecs/src/change_detection/mod.rs
++++ b/crates/bevy_ecs/src/change_detection/mod.rs
+@@ -2,10 +2,12 @@
+ 
+ mod maybe_location;
+ mod params;
++mod tick;
+ mod traits;
+ 
+ pub use maybe_location::MaybeLocation;
+ pub use params::*;
++pub use tick::*;
+ pub use traits::{DetectChanges, DetectChangesMut};
+ 
+ /// The (arbitrarily chosen) minimum number of world tick increments between `check_tick` scans.
+@@ -32,10 +34,10 @@ mod tests {
+ 
+     use crate::{
+         change_detection::{
+-            ComponentTicksMut, MaybeLocation, Mut, NonSendMut, Ref, ResMut, CHECK_TICK_THRESHOLD,
+-            MAX_CHANGE_AGE,
++            ComponentTicks, ComponentTicksMut, MaybeLocation, Mut, NonSendMut, Ref, ResMut, Tick,
++            CHECK_TICK_THRESHOLD, MAX_CHANGE_AGE,
+         },
+-        component::{Component, ComponentTicks, Tick},
++        component::Component,
+         system::{IntoSystem, Single, System},
+         world::World,
+     };
+diff --git a/crates/bevy_ecs/src/change_detection/params.rs b/crates/bevy_ecs/src/change_detection/params.rs
+index 0c331d09632d9..e66d62864a604 100644
+--- a/crates/bevy_ecs/src/change_detection/params.rs
++++ b/crates/bevy_ecs/src/change_detection/params.rs
+@@ -1,6 +1,5 @@
+ use crate::{
+-    change_detection::{traits::*, MaybeLocation},
+-    component::{ComponentTickCells, Tick},
++    change_detection::{traits::*, ComponentTickCells, MaybeLocation, Tick},
+     ptr::PtrMut,
+     resource::Resource,
+ };
+diff --git a/crates/bevy_ecs/src/component/tick.rs b/crates/bevy_ecs/src/change_detection/tick.rs
+similarity index 98%
+rename from crates/bevy_ecs/src/component/tick.rs
+rename to crates/bevy_ecs/src/change_detection/tick.rs
+index ae1186d37e4fa..8361d9f5c0c85 100644
+--- a/crates/bevy_ecs/src/component/tick.rs
++++ b/crates/bevy_ecs/src/change_detection/tick.rs
+@@ -100,7 +100,7 @@ impl Tick {
+ ///
+ /// ```
+ /// use bevy_ecs::prelude::*;
+-/// use bevy_ecs::component::CheckChangeTicks;
++/// use bevy_ecs::change_detection::CheckChangeTicks;
+ ///
+ /// #[derive(Resource)]
+ /// struct CustomSchedule(Schedule);
+@@ -173,7 +173,7 @@ impl ComponentTicks {
+     ///
+     /// # Example
+     /// ```no_run
+-    /// # use bevy_ecs::{world::World, component::ComponentTicks};
++    /// # use bevy_ecs::{world::World, change_detection::ComponentTicks};
+     /// let world: World = unimplemented!();
+     /// let component_ticks: ComponentTicks = unimplemented!();
+     ///
+diff --git a/crates/bevy_ecs/src/change_detection/traits.rs b/crates/bevy_ecs/src/change_detection/traits.rs
+index c893d15cab315..1d632c12e121b 100644
+--- a/crates/bevy_ecs/src/change_detection/traits.rs
++++ b/crates/bevy_ecs/src/change_detection/traits.rs
+@@ -1,4 +1,4 @@
+-use crate::{change_detection::MaybeLocation, component::Tick};
++use crate::{change_detection::MaybeLocation, change_detection::Tick};
+ use alloc::borrow::ToOwned;
+ use core::mem;
+ 
+diff --git a/crates/bevy_ecs/src/component/mod.rs b/crates/bevy_ecs/src/component/mod.rs
+index 1d808f0e1d1ee..22381fa61dbdd 100644
+--- a/crates/bevy_ecs/src/component/mod.rs
++++ b/crates/bevy_ecs/src/component/mod.rs
+@@ -4,13 +4,11 @@ mod clone;
+ mod info;
+ mod register;
+ mod required;
+-mod tick;
+ 
+ pub use clone::*;
+ pub use info::*;
+ pub use register::*;
+ pub use required::*;
+-pub use tick::*;
+ 
+ use crate::{
+     entity::EntityMapper,
+diff --git a/crates/bevy_ecs/src/component/required.rs b/crates/bevy_ecs/src/component/required.rs
+index a873e2eb85421..9974763623a2e 100644
+--- a/crates/bevy_ecs/src/component/required.rs
++++ b/crates/bevy_ecs/src/component/required.rs
+@@ -7,8 +7,8 @@ use thiserror::Error;
+ 
+ use crate::{
+     bundle::BundleInfo,
+-    change_detection::MaybeLocation,
+-    component::{Component, ComponentId, Components, ComponentsRegistrator, Tick},
++    change_detection::{MaybeLocation, Tick},
++    component::{Component, ComponentId, Components, ComponentsRegistrator},
+     entity::Entity,
+     query::DebugCheckedUnwrap as _,
+     storage::{SparseSets, Table, TableRow},
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index 7611a8dd6b8a5..dd1b1b24f7c78 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -75,8 +75,7 @@ pub use unique_vec::{UniqueEntityEquivalentVec, UniqueEntityVec};
+ 
+ use crate::{
+     archetype::{ArchetypeId, ArchetypeRow},
+-    change_detection::MaybeLocation,
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, MaybeLocation, Tick},
+     storage::{SparseSetIndex, TableId, TableRow},
+ };
+ use alloc::vec::Vec;
+diff --git a/crates/bevy_ecs/src/error/handler.rs b/crates/bevy_ecs/src/error/handler.rs
+index f5a4f9f9b9886..beec6faad5352 100644
+--- a/crates/bevy_ecs/src/error/handler.rs
++++ b/crates/bevy_ecs/src/error/handler.rs
+@@ -1,6 +1,6 @@
+ use core::fmt::Display;
+ 
+-use crate::{component::Tick, error::BevyError, prelude::Resource};
++use crate::{change_detection::Tick, error::BevyError, prelude::Resource};
+ use bevy_utils::prelude::DebugName;
+ use derive_more::derive::{Deref, DerefMut};
+ 
+diff --git a/crates/bevy_ecs/src/lifecycle.rs b/crates/bevy_ecs/src/lifecycle.rs
+index f50060eb37654..a5da8c8a78d8c 100644
+--- a/crates/bevy_ecs/src/lifecycle.rs
++++ b/crates/bevy_ecs/src/lifecycle.rs
+@@ -50,8 +50,8 @@
+ //! For example, [`Add`] corresponds to [`ADD`].
+ //! This is used to skip [`TypeId`](core::any::TypeId) lookups in hot paths.
+ use crate::{
+-    change_detection::MaybeLocation,
+-    component::{Component, ComponentId, ComponentIdFor, Tick},
++    change_detection::{MaybeLocation, Tick},
++    component::{Component, ComponentId, ComponentIdFor},
+     entity::Entity,
+     event::{EntityComponentsTrigger, EntityEvent, EventKey},
+     message::{
+diff --git a/crates/bevy_ecs/src/message/message_registry.rs b/crates/bevy_ecs/src/message/message_registry.rs
+index 481ab19389fbf..be950d5c29f84 100644
+--- a/crates/bevy_ecs/src/message/message_registry.rs
++++ b/crates/bevy_ecs/src/message/message_registry.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+-    change_detection::{DetectChangesMut, MutUntyped},
+-    component::{ComponentId, Tick},
++    change_detection::{DetectChangesMut, MutUntyped, Tick},
++    component::ComponentId,
+     message::{Message, Messages},
+     resource::Resource,
+     world::World,
+diff --git a/crates/bevy_ecs/src/message/update.rs b/crates/bevy_ecs/src/message/update.rs
+index 60175999fd2ed..58c5710623bb9 100644
+--- a/crates/bevy_ecs/src/message/update.rs
++++ b/crates/bevy_ecs/src/message/update.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     change_detection::Mut,
+-    component::Tick,
++    change_detection::Tick,
+     message::{MessageRegistry, ShouldUpdateMessages},
+     system::{Local, Res, ResMut},
+     world::World,
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 2afa8631d86b6..4e987bbc62feb 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -1,8 +1,8 @@
+ use crate::{
+     archetype::{Archetype, Archetypes},
+     bundle::Bundle,
+-    change_detection::{ComponentTicksMut, ComponentTicksRef, MaybeLocation},
+-    component::{Component, ComponentId, Components, Mutable, StorageType, Tick},
++    change_detection::{ComponentTicksMut, ComponentTicksRef, MaybeLocation, Tick},
++    component::{Component, ComponentId, Components, Mutable, StorageType},
+     entity::{Entities, Entity, EntityLocation},
+     query::{Access, DebugCheckedUnwrap, FilteredAccess, WorldQuery},
+     storage::{ComponentSparseSet, Table, TableRow},
+diff --git a/crates/bevy_ecs/src/query/filter.rs b/crates/bevy_ecs/src/query/filter.rs
+index 4ebc38098503a..b1d78295fa52e 100644
+--- a/crates/bevy_ecs/src/query/filter.rs
++++ b/crates/bevy_ecs/src/query/filter.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+     archetype::Archetype,
+-    component::{Component, ComponentId, Components, StorageType, Tick},
++    change_detection::Tick,
++    component::{Component, ComponentId, Components, StorageType},
+     entity::{Entities, Entity},
+     query::{DebugCheckedUnwrap, FilteredAccess, StorageSwitch, WorldQuery},
+     storage::{ComponentSparseSet, Table, TableRow},
+diff --git a/crates/bevy_ecs/src/query/iter.rs b/crates/bevy_ecs/src/query/iter.rs
+index cab2ee9c9391d..13e69ce3cb969 100644
+--- a/crates/bevy_ecs/src/query/iter.rs
++++ b/crates/bevy_ecs/src/query/iter.rs
+@@ -2,7 +2,7 @@ use super::{QueryData, QueryFilter, ReadOnlyQueryData};
+ use crate::{
+     archetype::{Archetype, ArchetypeEntity, Archetypes},
+     bundle::Bundle,
+-    component::Tick,
++    change_detection::Tick,
+     entity::{ContainsEntity, Entities, Entity, EntityEquivalent, EntitySet, EntitySetIterator},
+     query::{ArchetypeFilter, DebugCheckedUnwrap, QueryState, StorageId},
+     storage::{Table, TableRow, Tables},
+diff --git a/crates/bevy_ecs/src/query/mod.rs b/crates/bevy_ecs/src/query/mod.rs
+index 81f1c4ba49308..fb8899fd5de87 100644
+--- a/crates/bevy_ecs/src/query/mod.rs
++++ b/crates/bevy_ecs/src/query/mod.rs
+@@ -107,7 +107,8 @@ impl<T> DebugCheckedUnwrap for Option<T> {
+ mod tests {
+     use crate::{
+         archetype::Archetype,
+-        component::{Component, ComponentId, Components, Tick},
++        change_detection::Tick,
++        component::{Component, ComponentId, Components},
+         prelude::{AnyOf, Changed, Entity, Or, QueryState, Resource, With, Without},
+         query::{
+             ArchetypeFilter, FilteredAccess, Has, QueryCombinationIter, QueryData,
+diff --git a/crates/bevy_ecs/src/query/par_iter.rs b/crates/bevy_ecs/src/query/par_iter.rs
+index b8d8618fa5bf1..6242f8e39b8be 100644
+--- a/crates/bevy_ecs/src/query/par_iter.rs
++++ b/crates/bevy_ecs/src/query/par_iter.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     batching::BatchingStrategy,
+-    component::Tick,
++    change_detection::Tick,
+     entity::{EntityEquivalent, UniqueEntityEquivalentVec},
+     world::unsafe_world_cell::UnsafeWorldCell,
+ };
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index 09821a718c668..91a979fa2e5e7 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+     archetype::{Archetype, ArchetypeGeneration, ArchetypeId},
+-    component::{ComponentId, Tick},
++    change_detection::Tick,
++    component::ComponentId,
+     entity::{Entity, EntityEquivalent, EntitySet, UniqueEntityArray},
+     entity_disabling::DefaultQueryFilters,
+     prelude::FromWorld,
+diff --git a/crates/bevy_ecs/src/query/world_query.rs b/crates/bevy_ecs/src/query/world_query.rs
+index ec669a589a10f..fef5b0257f167 100644
+--- a/crates/bevy_ecs/src/query/world_query.rs
++++ b/crates/bevy_ecs/src/query/world_query.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+     archetype::Archetype,
+-    component::{ComponentId, Components, Tick},
++    change_detection::Tick,
++    component::{ComponentId, Components},
+     query::FilteredAccess,
+     storage::Table,
+     world::{unsafe_world_cell::UnsafeWorldCell, World},
+diff --git a/crates/bevy_ecs/src/schedule/executor/mod.rs b/crates/bevy_ecs/src/schedule/executor/mod.rs
+index 7d595aeec1a8d..197ba52be51c5 100644
+--- a/crates/bevy_ecs/src/schedule/executor/mod.rs
++++ b/crates/bevy_ecs/src/schedule/executor/mod.rs
+@@ -14,7 +14,7 @@ pub use self::multi_threaded::{MainThreadExecutor, MultiThreadedExecutor};
+ use fixedbitset::FixedBitSet;
+ 
+ use crate::{
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, Tick},
+     error::{BevyError, ErrorContext, Result},
+     prelude::{IntoSystemSet, SystemSet},
+     query::FilteredAccessSet,
+diff --git a/crates/bevy_ecs/src/schedule/node.rs b/crates/bevy_ecs/src/schedule/node.rs
+index 6f07c321e07a7..25ce6f55ac757 100644
+--- a/crates/bevy_ecs/src/schedule/node.rs
++++ b/crates/bevy_ecs/src/schedule/node.rs
+@@ -10,7 +10,7 @@ use bevy_platform::collections::HashMap;
+ use slotmap::{new_key_type, Key, KeyData, SecondaryMap, SlotMap};
+ 
+ use crate::{
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, Tick},
+     prelude::{SystemIn, SystemSet},
+     query::FilteredAccessSet,
+     schedule::{
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index e3daedae58631..52d47fd691d70 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -23,7 +23,7 @@ use thiserror::Error;
+ #[cfg(feature = "trace")]
+ use tracing::info_span;
+ 
+-use crate::{component::CheckChangeTicks, system::System};
++use crate::{change_detection::CheckChangeTicks, system::System};
+ use crate::{
+     component::{ComponentId, Components},
+     prelude::Component,
+diff --git a/crates/bevy_ecs/src/storage/resource.rs b/crates/bevy_ecs/src/storage/resource.rs
+index 18c7bb7666e65..d60bc16921cb3 100644
+--- a/crates/bevy_ecs/src/storage/resource.rs
++++ b/crates/bevy_ecs/src/storage/resource.rs
+@@ -1,8 +1,9 @@
+ use crate::{
+-    change_detection::{ComponentTicksMut, MaybeLocation, MutUntyped},
+-    component::{
+-        CheckChangeTicks, ComponentId, ComponentTickCells, ComponentTicks, Components, Tick,
++    change_detection::{
++        CheckChangeTicks, ComponentTickCells, ComponentTicks, ComponentTicksMut, MaybeLocation,
++        MutUntyped, Tick,
+     },
++    component::{ComponentId, Components},
+     storage::{blob_array::BlobArray, SparseSet},
+ };
+ use bevy_ptr::{OwningPtr, Ptr, UnsafeCellDeref};
+diff --git a/crates/bevy_ecs/src/storage/sparse_set.rs b/crates/bevy_ecs/src/storage/sparse_set.rs
+index f273af1eec0b9..5bc08399d71bd 100644
+--- a/crates/bevy_ecs/src/storage/sparse_set.rs
++++ b/crates/bevy_ecs/src/storage/sparse_set.rs
+@@ -1,8 +1,6 @@
+ use crate::{
+-    change_detection::MaybeLocation,
+-    component::{
+-        CheckChangeTicks, ComponentId, ComponentInfo, ComponentTickCells, ComponentTicks, Tick,
+-    },
++    change_detection::{CheckChangeTicks, ComponentTickCells, ComponentTicks, MaybeLocation, Tick},
++    component::{ComponentId, ComponentInfo},
+     entity::{Entity, EntityRow},
+     query::DebugCheckedUnwrap,
+     storage::{AbortOnPanic, Column, TableRow, VecExtensions},
+diff --git a/crates/bevy_ecs/src/storage/table/mod.rs b/crates/bevy_ecs/src/storage/table/mod.rs
+index 974583f1f04a0..592449975d16b 100644
+--- a/crates/bevy_ecs/src/storage/table/mod.rs
++++ b/crates/bevy_ecs/src/storage/table/mod.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+-    change_detection::MaybeLocation,
+-    component::{CheckChangeTicks, ComponentId, ComponentInfo, ComponentTicks, Components, Tick},
++    change_detection::{CheckChangeTicks, ComponentTicks, MaybeLocation, Tick},
++    component::{ComponentId, ComponentInfo, Components},
+     entity::Entity,
+     query::DebugCheckedUnwrap,
+     storage::{AbortOnPanic, ImmutableSparseSet, SparseSet},
+@@ -869,8 +869,8 @@ impl Drop for Table {
+ #[cfg(test)]
+ mod tests {
+     use crate::{
+-        change_detection::MaybeLocation,
+-        component::{Component, ComponentIds, Components, ComponentsRegistrator, Tick},
++        change_detection::{MaybeLocation, Tick},
++        component::{Component, ComponentIds, Components, ComponentsRegistrator},
+         entity::{Entity, EntityRow},
+         ptr::OwningPtr,
+         storage::{TableBuilder, TableId, TableRow, Tables},
+diff --git a/crates/bevy_ecs/src/system/adapter_system.rs b/crates/bevy_ecs/src/system/adapter_system.rs
+index 3bae1615e8122..8d3d35e04c8c2 100644
+--- a/crates/bevy_ecs/src/system/adapter_system.rs
++++ b/crates/bevy_ecs/src/system/adapter_system.rs
+@@ -175,7 +175,7 @@ where
+         self.system.initialize(world)
+     }
+ 
+-    fn check_change_tick(&mut self, check: crate::component::CheckChangeTicks) {
++    fn check_change_tick(&mut self, check: crate::change_detection::CheckChangeTicks) {
+         self.system.check_change_tick(check);
+     }
+ 
+@@ -183,11 +183,11 @@ where
+         self.system.default_system_sets()
+     }
+ 
+-    fn get_last_run(&self) -> crate::component::Tick {
++    fn get_last_run(&self) -> crate::change_detection::Tick {
+         self.system.get_last_run()
+     }
+ 
+-    fn set_last_run(&mut self, last_run: crate::component::Tick) {
++    fn set_last_run(&mut self, last_run: crate::change_detection::Tick) {
+         self.system.set_last_run(last_run);
+     }
+ }
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index 1e6d9ee30a4dd..a12b3469a4651 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -3,7 +3,7 @@ use bevy_utils::prelude::DebugName;
+ use core::marker::PhantomData;
+ 
+ use crate::{
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, Tick},
+     prelude::World,
+     query::FilteredAccessSet,
+     schedule::InternedSystemSet,
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index 1385061bc2f7e..6da22b1328b5e 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -186,7 +186,7 @@ const _: () = {
+             state: &'s mut Self::State,
+             system_meta: &bevy_ecs::system::SystemMeta,
+             world: UnsafeWorldCell<'w>,
+-            change_tick: bevy_ecs::component::Tick,
++            change_tick: bevy_ecs::change_detection::Tick,
+         ) -> Self::Item<'w, 's> {
+             let(f0, f1) =  <(Deferred<'s, CommandQueue>, &'w Entities) as bevy_ecs::system::SystemParam>::get_param(&mut state.state, system_meta, world, change_tick);
+             Commands {
+diff --git a/crates/bevy_ecs/src/system/exclusive_function_system.rs b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+index a9cb1104a5630..01f71d4585119 100644
+--- a/crates/bevy_ecs/src/system/exclusive_function_system.rs
++++ b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, Tick},
+     error::Result,
+     query::FilteredAccessSet,
+     schedule::{InternedSystemSet, SystemSet},
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index 81665745e91c7..62b3597f89897 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, Tick},
+     error::{BevyError, Result},
+     never::Never,
+     prelude::FromWorld,
+diff --git a/crates/bevy_ecs/src/system/query.rs b/crates/bevy_ecs/src/system/query.rs
+index fb89216075afa..36a1ca3dc7d69 100644
+--- a/crates/bevy_ecs/src/system/query.rs
++++ b/crates/bevy_ecs/src/system/query.rs
+@@ -2,7 +2,7 @@ use bevy_utils::prelude::DebugName;
+ 
+ use crate::{
+     batching::BatchingStrategy,
+-    component::Tick,
++    change_detection::Tick,
+     entity::{Entity, EntityDoesNotExistError, EntityEquivalent, EntitySet, UniqueEntityArray},
+     query::{
+         DebugCheckedUnwrap, NopWorldQuery, QueryCombinationIter, QueryData, QueryEntityError,
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index 150b748e88679..2481bb5f25f4f 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -1,7 +1,7 @@
+ use bevy_utils::prelude::DebugName;
+ 
+ use crate::{
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, Tick},
+     error::Result,
+     query::FilteredAccessSet,
+     system::{input::SystemIn, BoxedSystem, RunSystemError, System, SystemInput},
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index 456e9522bdcad..a7b5a5dc1a011 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -8,7 +8,7 @@ use core::fmt::{Debug, Display};
+ use log::warn;
+ 
+ use crate::{
+-    component::{CheckChangeTicks, Tick},
++    change_detection::{CheckChangeTicks, Tick},
+     error::BevyError,
+     query::FilteredAccessSet,
+     schedule::InternedSystemSet,
+diff --git a/crates/bevy_ecs/src/system/system_name.rs b/crates/bevy_ecs/src/system/system_name.rs
+index edfeefdd56e57..af4fc91f3c9a2 100644
+--- a/crates/bevy_ecs/src/system/system_name.rs
++++ b/crates/bevy_ecs/src/system/system_name.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    component::Tick,
++    change_detection::Tick,
+     prelude::World,
+     query::FilteredAccessSet,
+     system::{ExclusiveSystemParam, ReadOnlySystemParam, SystemMeta, SystemParam},
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index 07be989a82d6e..909e434c19242 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -2,8 +2,8 @@ pub use crate::change_detection::{NonSend, NonSendMut, Res, ResMut};
+ use crate::{
+     archetype::Archetypes,
+     bundle::Bundles,
+-    change_detection::{ComponentTicksMut, ComponentTicksRef},
+-    component::{ComponentId, Components, Tick},
++    change_detection::{ComponentTicksMut, ComponentTicksRef, Tick},
++    component::{ComponentId, Components},
+     entity::Entities,
+     query::{
+         Access, FilteredAccess, FilteredAccessSet, QueryData, QueryFilter, QuerySingleError,
+diff --git a/crates/bevy_ecs/src/world/entity_access/entity_mut.rs b/crates/bevy_ecs/src/world/entity_access/entity_mut.rs
+index 612cc6fe998db..c7ecdb4adb62f 100644
+--- a/crates/bevy_ecs/src/world/entity_access/entity_mut.rs
++++ b/crates/bevy_ecs/src/world/entity_access/entity_mut.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     archetype::Archetype,
+-    change_detection::MaybeLocation,
+-    component::{Component, ComponentId, ComponentTicks, Mutable, Tick},
++    change_detection::{ComponentTicks, MaybeLocation, Tick},
++    component::{Component, ComponentId, Mutable},
+     entity::{ContainsEntity, Entity, EntityEquivalent, EntityLocation},
+     query::{Access, ReadOnlyQueryData, ReleaseStateQueryData},
+     world::{
+diff --git a/crates/bevy_ecs/src/world/entity_access/entity_ref.rs b/crates/bevy_ecs/src/world/entity_access/entity_ref.rs
+index 59fee2d09909c..9978c775bc4b7 100644
+--- a/crates/bevy_ecs/src/world/entity_access/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_access/entity_ref.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     archetype::Archetype,
+-    change_detection::MaybeLocation,
+-    component::{Component, ComponentId, ComponentTicks, Tick},
++    change_detection::{ComponentTicks, MaybeLocation, Tick},
++    component::{Component, ComponentId},
+     entity::{ContainsEntity, Entity, EntityEquivalent, EntityLocation},
+     query::{Access, ReadOnlyQueryData, ReleaseStateQueryData},
+     world::{
+diff --git a/crates/bevy_ecs/src/world/entity_access/except.rs b/crates/bevy_ecs/src/world/entity_access/except.rs
+index 639b12c5b4c67..24ff59e354f61 100644
+--- a/crates/bevy_ecs/src/world/entity_access/except.rs
++++ b/crates/bevy_ecs/src/world/entity_access/except.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     bundle::Bundle,
+-    change_detection::{MaybeLocation, MutUntyped},
+-    component::{Component, ComponentId, ComponentTicks, Components, Mutable, Tick},
++    change_detection::{ComponentTicks, MaybeLocation, MutUntyped, Tick},
++    component::{Component, ComponentId, Components, Mutable},
+     entity::{ContainsEntity, Entity, EntityEquivalent},
+     query::Access,
+     world::{
+diff --git a/crates/bevy_ecs/src/world/entity_access/filtered.rs b/crates/bevy_ecs/src/world/entity_access/filtered.rs
+index d87f83314269a..4459fc262e517 100644
+--- a/crates/bevy_ecs/src/world/entity_access/filtered.rs
++++ b/crates/bevy_ecs/src/world/entity_access/filtered.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     archetype::Archetype,
+-    change_detection::{MaybeLocation, MutUntyped},
+-    component::{Component, ComponentId, ComponentTicks, Mutable, Tick},
++    change_detection::{ComponentTicks, MaybeLocation, MutUntyped, Tick},
++    component::{Component, ComponentId, Mutable},
+     entity::{ContainsEntity, Entity, EntityEquivalent, EntityLocation},
+     query::Access,
+     world::{unsafe_world_cell::UnsafeEntityCell, EntityMut, EntityRef, Mut, Ref},
+diff --git a/crates/bevy_ecs/src/world/entity_access/mod.rs b/crates/bevy_ecs/src/world/entity_access/mod.rs
+index 2a64f24ac9de9..aa852d0106260 100644
+--- a/crates/bevy_ecs/src/world/entity_access/mod.rs
++++ b/crates/bevy_ecs/src/world/entity_access/mod.rs
+@@ -21,7 +21,7 @@ mod tests {
+     use core::panic::AssertUnwindSafe;
+     use std::sync::OnceLock;
+ 
+-    use crate::component::Tick;
++    use crate::change_detection::Tick;
+     use crate::lifecycle::HookContext;
+     use crate::{
+         change_detection::{MaybeLocation, MutUntyped},
+diff --git a/crates/bevy_ecs/src/world/entity_access/world_mut.rs b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+index 28d92fa978a5c..f11ff26e16d23 100644
+--- a/crates/bevy_ecs/src/world/entity_access/world_mut.rs
++++ b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+@@ -3,8 +3,8 @@ use crate::{
+     bundle::{
+         Bundle, BundleFromComponents, BundleInserter, BundleRemover, DynamicBundle, InsertMode,
+     },
+-    change_detection::{MaybeLocation, MutUntyped},
+-    component::{Component, ComponentId, ComponentTicks, Components, Mutable, StorageType, Tick},
++    change_detection::{ComponentTicks, MaybeLocation, MutUntyped, Tick},
++    component::{Component, ComponentId, Components, Mutable, StorageType},
+     entity::{
+         Entity, EntityCloner, EntityClonerBuilder, EntityIdLocation, EntityLocation, OptIn, OptOut,
+     },
+diff --git a/crates/bevy_ecs/src/world/filtered_resource.rs b/crates/bevy_ecs/src/world/filtered_resource.rs
+index 698955ce9067a..703d240964c96 100644
+--- a/crates/bevy_ecs/src/world/filtered_resource.rs
++++ b/crates/bevy_ecs/src/world/filtered_resource.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+-    change_detection::{ComponentTicksMut, ComponentTicksRef, Mut, MutUntyped, Ref},
+-    component::{ComponentId, Tick},
++    change_detection::{ComponentTicksMut, ComponentTicksRef, Mut, MutUntyped, Ref, Tick},
++    component::ComponentId,
+     query::Access,
+     resource::Resource,
+     world::{unsafe_world_cell::UnsafeWorldCell, World},
+diff --git a/crates/bevy_ecs/src/world/identifier.rs b/crates/bevy_ecs/src/world/identifier.rs
+index 37e71110e55d6..ea4a2b20bc74b 100644
+--- a/crates/bevy_ecs/src/world/identifier.rs
++++ b/crates/bevy_ecs/src/world/identifier.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    component::Tick,
++    change_detection::Tick,
+     query::FilteredAccessSet,
+     storage::SparseSetIndex,
+     system::{ExclusiveSystemParam, ReadOnlySystemParam, SystemMeta, SystemParam},
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index cd6882fe67fd8..31f0bebdcf909 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -35,11 +35,13 @@ use crate::{
+         Bundle, BundleId, BundleInfo, BundleInserter, BundleSpawner, Bundles, InsertMode,
+         NoBundleEffect,
+     },
+-    change_detection::{ComponentTicksMut, MaybeLocation, MutUntyped},
++    change_detection::{
++        CheckChangeTicks, ComponentTicks, ComponentTicksMut, MaybeLocation, MutUntyped, Tick,
++    },
+     component::{
+-        CheckChangeTicks, Component, ComponentDescriptor, ComponentId, ComponentIds, ComponentInfo,
+-        ComponentTicks, Components, ComponentsQueuedRegistrator, ComponentsRegistrator, Mutable,
+-        RequiredComponents, RequiredComponentsError, Tick,
++        Component, ComponentDescriptor, ComponentId, ComponentIds, ComponentInfo, Components,
++        ComponentsQueuedRegistrator, ComponentsRegistrator, Mutable, RequiredComponents,
++        RequiredComponentsError,
+     },
+     entity::{Entities, Entity, EntityDoesNotExistError},
+     entity_disabling::DefaultQueryFilters,
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index 2b70ce587992c..b3d807d36fb35 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -4,10 +4,11 @@ use super::{Mut, Ref, World, WorldId};
+ use crate::{
+     archetype::{Archetype, Archetypes},
+     bundle::Bundles,
+-    change_detection::{ComponentTicksMut, ComponentTicksRef, MaybeLocation, MutUntyped},
+-    component::{
+-        ComponentId, ComponentTickCells, ComponentTicks, Components, Mutable, StorageType, Tick,
++    change_detection::{
++        ComponentTickCells, ComponentTicks, ComponentTicksMut, ComponentTicksRef, MaybeLocation,
++        MutUntyped, Tick,
+     },
++    component::{ComponentId, Components, Mutable, StorageType},
+     entity::{ContainsEntity, Entities, Entity, EntityDoesNotExistError, EntityLocation},
+     error::{DefaultErrorHandler, ErrorHandler},
+     lifecycle::RemovedComponentMessages,
+diff --git a/crates/bevy_gizmos/src/gizmos.rs b/crates/bevy_gizmos/src/gizmos.rs
+index 6a8b156aa4ad3..88039631dd413 100644
+--- a/crates/bevy_gizmos/src/gizmos.rs
++++ b/crates/bevy_gizmos/src/gizmos.rs
+@@ -9,7 +9,7 @@ use core::{
+ 
+ use bevy_color::{Color, LinearRgba};
+ use bevy_ecs::{
+-    component::Tick,
++    change_detection::Tick,
+     query::FilteredAccessSet,
+     resource::Resource,
+     system::{
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 306b867a01acd..2d091c21b522d 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -17,7 +17,7 @@ use bevy_core_pipeline::{
+     tonemapping::Tonemapping,
+ };
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::component::Tick;
++use bevy_ecs::change_detection::Tick;
+ use bevy_ecs::system::SystemChangeTick;
+ use bevy_ecs::{
+     prelude::*,
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 28a9718d180cb..1576b4228f5ea 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -52,7 +52,7 @@ use crate::meshlet::{
+ 
+ use alloc::sync::Arc;
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::{component::Tick, system::SystemChangeTick};
++use bevy_ecs::{change_detection::Tick, system::SystemChangeTick};
+ use bevy_platform::collections::HashMap;
+ use bevy_render::{
+     erased_render_asset::ErasedRenderAssets,
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 904be3164ec60..4ceac5888b5fb 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -12,7 +12,7 @@ use bevy_camera::Camera3d;
+ use bevy_color::ColorToComponents;
+ use bevy_core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT;
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::component::Tick;
++use bevy_ecs::change_detection::Tick;
+ use bevy_ecs::system::SystemChangeTick;
+ use bevy_ecs::{
+     entity::{EntityHashMap, EntityHashSet},
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 3bebf27276402..000613efd1c31 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -76,7 +76,7 @@ use crate::{
+ use bevy_core_pipeline::oit::OrderIndependentTransparencySettings;
+ use bevy_core_pipeline::prepass::{DeferredPrepass, DepthPrepass, NormalPrepass};
+ use bevy_core_pipeline::tonemapping::{DebandDither, Tonemapping};
+-use bevy_ecs::component::Tick;
++use bevy_ecs::change_detection::Tick;
+ use bevy_ecs::system::SystemChangeTick;
+ use bevy_render::camera::TemporalJitter;
+ use bevy_render::prelude::Msaa;
+diff --git a/crates/bevy_pbr/src/wireframe.rs b/crates/bevy_pbr/src/wireframe.rs
+index ff732d7887548..0468b7c0681ad 100644
+--- a/crates/bevy_pbr/src/wireframe.rs
++++ b/crates/bevy_pbr/src/wireframe.rs
+@@ -13,7 +13,7 @@ use bevy_color::{Color, ColorToComponents};
+ use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+-    component::Tick,
++    change_detection::Tick,
+     prelude::*,
+     query::QueryItem,
+     system::{lifetimeless::SRes, SystemChangeTick, SystemParamItem},
+diff --git a/crates/bevy_render/src/extract_param.rs b/crates/bevy_render/src/extract_param.rs
+index e7701843fb2df..4d81fb9eb1903 100644
+--- a/crates/bevy_render/src/extract_param.rs
++++ b/crates/bevy_render/src/extract_param.rs
+@@ -1,6 +1,6 @@
+ use crate::MainWorld;
+ use bevy_ecs::{
+-    component::Tick,
++    change_detection::Tick,
+     prelude::*,
+     query::FilteredAccessSet,
+     system::{
+diff --git a/crates/bevy_render/src/render_phase/mod.rs b/crates/bevy_render/src/render_phase/mod.rs
+index 253d06f48521e..ea9deb540284a 100644
+--- a/crates/bevy_render/src/render_phase/mod.rs
++++ b/crates/bevy_render/src/render_phase/mod.rs
+@@ -30,7 +30,7 @@ mod rangefinder;
+ 
+ use bevy_app::{App, Plugin};
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::component::Tick;
++use bevy_ecs::change_detection::Tick;
+ use bevy_ecs::entity::EntityHash;
+ use bevy_platform::collections::{hash_map::Entry, HashMap};
+ use bevy_utils::default;
+diff --git a/crates/bevy_render/src/sync_world.rs b/crates/bevy_render/src/sync_world.rs
+index ba3d6d860f60d..862b24130ac64 100644
+--- a/crates/bevy_render/src/sync_world.rs
++++ b/crates/bevy_render/src/sync_world.rs
+@@ -278,7 +278,8 @@ mod render_entities_world_query_impls {
+ 
+     use bevy_ecs::{
+         archetype::Archetype,
+-        component::{ComponentId, Components, Tick},
++        change_detection::Tick,
++        component::{ComponentId, Components},
+         entity::Entity,
+         query::{FilteredAccess, QueryData, ReadOnlyQueryData, ReleaseStateQueryData, WorldQuery},
+         storage::{Table, TableRow},
+diff --git a/crates/bevy_sprite_render/src/mesh2d/material.rs b/crates/bevy_sprite_render/src/mesh2d/material.rs
+index afed1c0e75145..d4f64fa87acc0 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/material.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/material.rs
+@@ -14,7 +14,7 @@ use bevy_core_pipeline::{
+     tonemapping::Tonemapping,
+ };
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::component::Tick;
++use bevy_ecs::change_detection::Tick;
+ use bevy_ecs::system::SystemChangeTick;
+ use bevy_ecs::{
+     prelude::*,
+diff --git a/crates/bevy_sprite_render/src/mesh2d/mesh.rs b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+index 8b07c535ba6d5..a1f03b85acfa1 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+@@ -13,7 +13,7 @@ use bevy_core_pipeline::{
+     },
+ };
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::component::Tick;
++use bevy_ecs::change_detection::Tick;
+ use bevy_ecs::system::SystemChangeTick;
+ use bevy_ecs::{
+     prelude::*,
+diff --git a/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs b/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs
+index 98ab9c73f3fae..5f9a0a0e6e54d 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs
+@@ -12,7 +12,7 @@ use bevy_color::{Color, ColorToComponents};
+ use bevy_core_pipeline::core_2d::graph::{Core2d, Node2d};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+-    component::Tick,
++    change_detection::Tick,
+     prelude::*,
+     query::QueryItem,
+     system::{lifetimeless::SRes, SystemChangeTick, SystemParamItem},
+diff --git a/examples/shader_advanced/custom_phase_item.rs b/examples/shader_advanced/custom_phase_item.rs
+index b7bde3192d57f..32ad10146dd18 100644
+--- a/examples/shader_advanced/custom_phase_item.rs
++++ b/examples/shader_advanced/custom_phase_item.rs
+@@ -14,7 +14,7 @@ use bevy::{
+     },
+     core_pipeline::core_3d::{Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, CORE_3D_DEPTH_FORMAT},
+     ecs::{
+-        component::Tick,
++        change_detection::Tick,
+         query::ROQueryItem,
+         system::{lifetimeless::SRes, SystemParamItem},
+     },
+diff --git a/examples/shader_advanced/specialized_mesh_pipeline.rs b/examples/shader_advanced/specialized_mesh_pipeline.rs
+index 40602a8429274..ee5abdb54d647 100644
+--- a/examples/shader_advanced/specialized_mesh_pipeline.rs
++++ b/examples/shader_advanced/specialized_mesh_pipeline.rs
+@@ -10,7 +10,7 @@ use bevy::{
+     asset::RenderAssetUsages,
+     camera::visibility::{self, VisibilityClass},
+     core_pipeline::core_3d::{Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, CORE_3D_DEPTH_FORMAT},
+-    ecs::component::Tick,
++    ecs::change_detection::Tick,
+     math::{vec3, vec4},
+     mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology},
+     pbr::{
+diff --git a/release-content/migration-guides/change_detection_refactors.md b/release-content/migration-guides/change_detection_refactors.md
+index baa6e60f304ab..16f0929eefb32 100644
+--- a/release-content/migration-guides/change_detection_refactors.md
++++ b/release-content/migration-guides/change_detection_refactors.md
+@@ -1,7 +1,15 @@
+ ---
+ title: "Tick-related refactors"
+-pull_requests: [21562]
++pull_requests: [21562, 21613]
+ ---
+ 
+-- `TickCells` is now `ComponentTickCells`.
+-- `ComponentSparseSet::get_with_ticks` now returns `Option<(Ptr, ComponentTickCells)>` instead of `Option<(Ptr, TickCells, MaybeLocation)>`.
++`TickCells` is now `ComponentTickCells`.
++
++`ComponentSparseSet::get_with_ticks` now returns `Option<(Ptr, ComponentTickCells)>` instead of `Option<(Ptr, TickCells, MaybeLocation)>`.
++
++The following types have been moved from the `component` module to the `change_detection` module:
++
++- `Tick`
++- `ComponentTicks`
++- `ComponentTickCells`
++- `CheckChangeTicks`
