@@ -1,0 +1,671 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 265ad19415ba2..40989da9fd7d2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3549,6 +3549,17 @@ description = "Demonstrates how the to use the size constraints to control the s
+ category = "UI (User Interface)"
+ wasm = true
+ 
++[[example]]
++name = "strikethrough"
++path = "examples/ui/strikethrough.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.strikethrough]
++name = "Strikethrough"
++description = "Demonstrates how to display text with strikethrough."
++category = "UI (User Interface)"
++wasm = true
++
+ [[example]]
+ name = "text"
+ path = "examples/ui/text.rs"
+diff --git a/crates/bevy_sprite_render/src/text2d/mod.rs b/crates/bevy_sprite_render/src/text2d/mod.rs
+index 5dbd603ed21df..b839edeba8058 100644
+--- a/crates/bevy_sprite_render/src/text2d/mod.rs
++++ b/crates/bevy_sprite_render/src/text2d/mod.rs
+@@ -6,6 +6,7 @@ use bevy_camera::visibility::ViewVisibility;
+ use bevy_color::LinearRgba;
+ use bevy_ecs::{
+     entity::Entity,
++    query::With,
+     system::{Commands, Query, Res, ResMut},
+ };
+ use bevy_image::prelude::*;
+@@ -14,7 +15,8 @@ use bevy_render::sync_world::TemporaryRenderEntity;
+ use bevy_render::Extract;
+ use bevy_sprite::{Anchor, Text2dShadow};
+ use bevy_text::{
+-    ComputedTextBlock, PositionedGlyph, TextBackgroundColor, TextBounds, TextColor, TextLayoutInfo,
++    ComputedTextBlock, PositionedGlyph, Strikethrough, TextBackgroundColor, TextBounds, TextColor,
++    TextLayoutInfo,
+ };
+ use bevy_transform::prelude::GlobalTransform;
+ 
+@@ -39,6 +41,7 @@ pub fn extract_text2d_sprite(
+     >,
+     text_colors: Extract<Query<&TextColor>>,
+     text_background_colors_query: Extract<Query<&TextBackgroundColor>>,
++    strikethrough_query: Extract<Query<&TextColor, With<Strikethrough>>>,
+ ) {
+     let mut start = extracted_slices.slices.len();
+     let mut end = start + 1;
+@@ -68,7 +71,8 @@ pub fn extract_text2d_sprite(
+ 
+         let top_left = (Anchor::TOP_LEFT.0 - anchor.as_vec()) * size;
+ 
+-        for &(section_entity, rect) in text_layout_info.section_rects.iter() {
++        for &(section_index, rect, _, _) in text_layout_info.section_geometry.iter() {
++            let section_entity = computed_block.entities()[section_index].entity;
+             let Ok(text_background_color) = text_background_colors_query.get(section_entity) else {
+                 continue;
+             };
+@@ -144,6 +148,34 @@ pub fn extract_text2d_sprite(
+ 
+                 end += 1;
+             }
++
++            for &(section_index, rect, strikethrough_y, stroke) in
++                text_layout_info.section_geometry.iter()
++            {
++                let section_entity = computed_block.entities()[section_index].entity;
++                let Ok(_) = strikethrough_query.get(section_entity) else {
++                    continue;
++                };
++                let render_entity = commands.spawn(TemporaryRenderEntity).id();
++                let offset = Vec2::new(rect.center().x, -strikethrough_y - 0.5 * stroke);
++                let transform =
++                    shadow_transform * GlobalTransform::from_translation(offset.extend(0.));
++                extracted_sprites.sprites.push(ExtractedSprite {
++                    main_entity,
++                    render_entity,
++                    transform,
++                    color,
++                    image_handle_id: AssetId::default(),
++                    flip_x: false,
++                    flip_y: false,
++                    kind: ExtractedSpriteKind::Single {
++                        anchor: Vec2::ZERO,
++                        rect: None,
++                        scaling_mode: None,
++                        custom_size: Some(Vec2::new(rect.size().x, stroke)),
++                    },
++                });
++            }
+         }
+ 
+         let transform =
+@@ -206,5 +238,35 @@ pub fn extract_text2d_sprite(
+ 
+             end += 1;
+         }
++
++        for &(section_index, rect, strikethrough_y, stroke) in
++            text_layout_info.section_geometry.iter()
++        {
++            let section_entity = computed_block.entities()[section_index].entity;
++            let Ok(text_color) = strikethrough_query.get(section_entity) else {
++                continue;
++            };
++            let render_entity = commands.spawn(TemporaryRenderEntity).id();
++            let offset = Vec2::new(rect.center().x, -strikethrough_y - 0.5 * stroke);
++            let transform = *global_transform
++                * GlobalTransform::from_translation(top_left.extend(0.))
++                * scaling
++                * GlobalTransform::from_translation(offset.extend(0.));
++            extracted_sprites.sprites.push(ExtractedSprite {
++                main_entity,
++                render_entity,
++                transform,
++                color: text_color.0.into(),
++                image_handle_id: AssetId::default(),
++                flip_x: false,
++                flip_y: false,
++                kind: ExtractedSpriteKind::Single {
++                    anchor: Vec2::ZERO,
++                    rect: None,
++                    scaling_mode: None,
++                    custom_size: Some(Vec2::new(rect.size().x, stroke)),
++                },
++            });
++        }
+     }
+ }
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index acd43f92edd82..1c6756e28db95 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -59,7 +59,8 @@ pub use text_access::*;
+ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+-        Font, Justify, LineBreak, TextColor, TextError, TextFont, TextLayout, TextSpan,
++        Font, Justify, LineBreak, Strikethrough, TextColor, TextError, TextFont, TextLayout,
++        TextSpan,
+     };
+ }
+ 
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index 35c97ad26c75d..ae67c1a27063f 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -77,7 +77,7 @@ pub struct TextPipeline {
+     /// See [this dark magic](https://users.rust-lang.org/t/how-to-cache-a-vectors-capacity/94478/10).
+     spans_buffer: Vec<(usize, &'static str, &'static TextFont, FontFaceInfo)>,
+     /// Buffered vec for collecting info for glyph assembly.
+-    glyph_info: Vec<(AssetId<Font>, FontSmoothing)>,
++    glyph_info: Vec<(AssetId<Font>, FontSmoothing, f32, f32, f32)>,
+ }
+ 
+ impl TextPipeline {
+@@ -238,7 +238,7 @@ impl TextPipeline {
+         swash_cache: &mut SwashCache,
+     ) -> Result<(), TextError> {
+         layout_info.glyphs.clear();
+-        layout_info.section_rects.clear();
++        layout_info.section_geometry.clear();
+         layout_info.size = Default::default();
+ 
+         // Clear this here at the focal point of text rendering to ensure the field's lifecycle has strong boundaries.
+@@ -248,7 +248,13 @@ impl TextPipeline {
+         let mut glyph_info = core::mem::take(&mut self.glyph_info);
+         glyph_info.clear();
+         let text_spans = text_spans.inspect(|(_, _, _, text_font, _)| {
+-            glyph_info.push((text_font.font.id(), text_font.font_smoothing));
++            glyph_info.push((
++                text_font.font.id(),
++                text_font.font_smoothing,
++                text_font.font_size,
++                0.,
++                0.,
++            ));
+         });
+ 
+         let update_result = self.update_buffer(
+@@ -266,6 +272,20 @@ impl TextPipeline {
+ 
+         update_result?;
+ 
++        for (font, _, size, strike_offset, stroke) in self.glyph_info.iter_mut() {
++            let Some((id, _)) = self.map_handle_to_font_id.get(font) else {
++                continue;
++            };
++            if let Some(font) = font_system.get_font(*id) {
++                let swash = font.as_swash();
++                let metrics = swash.metrics(&[]);
++                let upem = metrics.units_per_em as f32;
++                let scalar = *size * scale_factor as f32 / upem;
++                *strike_offset = (metrics.strikeout_offset * scalar).round();
++                *stroke = (metrics.stroke_size * scalar).round().max(1.);
++            }
++        }
++
+         let buffer = &mut computed.buffer;
+         let box_size = buffer_dimensions(buffer);
+ 
+@@ -281,14 +301,16 @@ impl TextPipeline {
+                     match current_section {
+                         Some(section) => {
+                             if section != layout_glyph.metadata {
+-                                layout_info.section_rects.push((
+-                                    computed.entities[section].entity,
++                                layout_info.section_geometry.push((
++                                    section,
+                                     Rect::new(
+                                         start,
+                                         run.line_top,
+                                         end,
+                                         run.line_top + run.line_height,
+                                     ),
++                                    (run.line_y - self.glyph_info[section].3).round(),
++                                    self.glyph_info[section].4,
+                                 ));
+                                 start = end.max(layout_glyph.x);
+                                 current_section = Some(layout_glyph.metadata);
+@@ -374,9 +396,11 @@ impl TextPipeline {
+                     Ok(())
+                 });
+             if let Some(section) = current_section {
+-                layout_info.section_rects.push((
+-                    computed.entities[section].entity,
++                layout_info.section_geometry.push((
++                    section,
+                     Rect::new(start, run.line_top, end, run.line_top + run.line_height),
++                    (run.line_y - self.glyph_info[section].3).round(),
++                    self.glyph_info[section].4,
+                 ));
+             }
+ 
+@@ -457,9 +481,9 @@ pub struct TextLayoutInfo {
+     pub scale_factor: f32,
+     /// Scaled and positioned glyphs in screenspace
+     pub glyphs: Vec<PositionedGlyph>,
+-    /// Rects bounding the text block's text sections.
+-    /// A text section spanning more than one line will have multiple bounding rects.
+-    pub section_rects: Vec<(Entity, Rect)>,
++    /// Geometry of each text segment: (section index, bounding rect, strikeout offset, strikeout stroke thickness)
++    /// A text section spanning more than one line will have multiple segments.
++    pub section_geometry: Vec<(usize, Rect, f32, f32)>,
+     /// The glyphs resulting size
+     pub size: Vec2,
+ }
+@@ -516,10 +540,11 @@ pub fn load_font_to_fontdb(
+             // TODO: it is assumed this is the right font face
+             let face_id = *ids.last().unwrap();
+             let face = font_system.db().face(face_id).unwrap();
+-            let family_name = Arc::from(face.families[0].0.as_str());
+ 
++            let family_name = Arc::from(face.families[0].0.as_str());
+             (face_id, family_name)
+         });
++
+     let face = font_system.db().face(*face_id).unwrap();
+ 
+     FontFaceInfo {
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index e4da3288d43c0..83c0cb00bf4db 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -425,6 +425,11 @@ pub enum LineBreak {
+     NoWrap,
+ }
+ 
++/// A text entity with this component is drawn with strikethrough.
++#[derive(Component, Copy, Clone, Debug, Reflect, Default, Serialize, Deserialize)]
++#[reflect(Serialize, Deserialize, Clone, Default)]
++pub struct Strikethrough;
++
+ /// Determines which antialiasing method to use when rendering text. By default, text is
+ /// rendered with grayscale antialiasing, but this can be changed to achieve a pixelated look.
+ ///
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index 3cb4678ea97ef..e794c69a0e346 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -60,7 +60,8 @@ use gradient::GradientPlugin;
+ 
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_text::{
+-    ComputedTextBlock, PositionedGlyph, TextBackgroundColor, TextColor, TextLayoutInfo,
++    ComputedTextBlock, PositionedGlyph, Strikethrough, TextBackgroundColor, TextColor,
++    TextLayoutInfo,
+ };
+ use bevy_transform::components::GlobalTransform;
+ use box_shadow::BoxShadowPlugin;
+@@ -117,6 +118,7 @@ pub mod stack_z_offsets {
+     pub const IMAGE: f32 = 0.04;
+     pub const MATERIAL: f32 = 0.05;
+     pub const TEXT: f32 = 0.06;
++    pub const TEXT_STRIKETHROUGH: f32 = 0.07;
+ }
+ 
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+@@ -244,7 +246,7 @@ impl Plugin for UiRenderPlugin {
+                     extract_uinode_images.in_set(RenderUiSystems::ExtractImages),
+                     extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
+                     extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
+-                    extract_text_background_colors.in_set(RenderUiSystems::ExtractTextBackgrounds),
++                    extract_text_decorations.in_set(RenderUiSystems::ExtractTextBackgrounds),
+                     extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
+                     extract_text_sections.in_set(RenderUiSystems::ExtractText),
+                     #[cfg(feature = "bevy_ui_debug")]
+@@ -1016,16 +1018,27 @@ pub fn extract_text_shadows(
+             Option<&CalculatedClip>,
+             &TextLayoutInfo,
+             &TextShadow,
++            &ComputedTextBlock,
+         )>,
+     >,
++    text_decoration_query: Extract<Query<&Strikethrough>>,
+     camera_map: Extract<UiCameraMap>,
+ ) {
+     let mut start = extracted_uinodes.glyphs.len();
+     let mut end = start + 1;
+ 
+     let mut camera_mapper = camera_map.get_mapper();
+-    for (entity, uinode, transform, target, inherited_visibility, clip, text_layout_info, shadow) in
+-        &uinode_query
++    for (
++        entity,
++        uinode,
++        transform,
++        target,
++        inherited_visibility,
++        clip,
++        text_layout_info,
++        shadow,
++        computed_block,
++    ) in &uinode_query
+     {
+         // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
+         if !inherited_visibility.get() || uinode.is_empty() {
+@@ -1080,16 +1093,53 @@ pub fn extract_text_shadows(
+ 
+             end += 1;
+         }
++
++        for &(section_index, rect, strikethrough_y, stroke) in
++            text_layout_info.section_geometry.iter()
++        {
++            let section_entity = computed_block.entities()[section_index].entity;
++            if !text_decoration_query.contains(section_entity) {
++                continue;
++            }
++
++            extracted_uinodes.uinodes.push(ExtractedUiNode {
++                z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
++                render_entity: commands.spawn(TemporaryRenderEntity).id(),
++                clip: clip.map(|clip| clip.clip),
++                image: AssetId::default(),
++                extracted_camera_entity,
++                transform: node_transform
++                    * Affine2::from_translation(Vec2::new(
++                        rect.center().x,
++                        strikethrough_y + 0.5 * stroke,
++                    )),
++                item: ExtractedUiItem::Node {
++                    color: shadow.color.into(),
++                    rect: Rect {
++                        min: Vec2::ZERO,
++                        max: Vec2::new(rect.size().x, stroke),
++                    },
++                    atlas_scaling: None,
++                    flip_x: false,
++                    flip_y: false,
++                    border: BorderRect::ZERO,
++                    border_radius: ResolvedBorderRadius::ZERO,
++                    node_type: NodeType::Rect,
++                },
++                main_entity: entity.into(),
++            });
++        }
+     }
+ }
+ 
+-pub fn extract_text_background_colors(
++pub fn extract_text_decorations(
+     mut commands: Commands,
+     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
+     uinode_query: Extract<
+         Query<(
+             Entity,
+             &ComputedNode,
++            &ComputedTextBlock,
+             &UiGlobalTransform,
+             &InheritedVisibility,
+             Option<&CalculatedClip>,
+@@ -1097,12 +1147,22 @@ pub fn extract_text_background_colors(
+             &TextLayoutInfo,
+         )>,
+     >,
+-    text_background_colors_query: Extract<Query<&TextBackgroundColor>>,
++    text_background_colors_query: Extract<
++        Query<(AnyOf<(&TextBackgroundColor, &Strikethrough)>, &TextColor)>,
++    >,
+     camera_map: Extract<UiCameraMap>,
+ ) {
+     let mut camera_mapper = camera_map.get_mapper();
+-    for (entity, uinode, global_transform, inherited_visibility, clip, camera, text_layout_info) in
+-        &uinode_query
++    for (
++        entity,
++        uinode,
++        computed_block,
++        global_transform,
++        inherited_visibility,
++        clip,
++        camera,
++        text_layout_info,
++    ) in &uinode_query
+     {
+         // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
+         if !inherited_visibility.get() || uinode.is_empty() {
+@@ -1116,33 +1176,69 @@ pub fn extract_text_background_colors(
+         let transform =
+             Affine2::from(global_transform) * Affine2::from_translation(-0.5 * uinode.size());
+ 
+-        for &(section_entity, rect) in text_layout_info.section_rects.iter() {
+-            let Ok(text_background_color) = text_background_colors_query.get(section_entity) else {
++        for &(section_index, rect, strikethrough_y, stroke) in
++            text_layout_info.section_geometry.iter()
++        {
++            let section_entity = computed_block.entities()[section_index].entity;
++            let Ok(((text_background_color, maybe_strikethrough), text_color)) =
++                text_background_colors_query.get(section_entity)
++            else {
+                 continue;
+             };
+ 
+-            extracted_uinodes.uinodes.push(ExtractedUiNode {
+-                z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
+-                render_entity: commands.spawn(TemporaryRenderEntity).id(),
+-                clip: clip.map(|clip| clip.clip),
+-                image: AssetId::default(),
+-                extracted_camera_entity,
+-                transform: transform * Affine2::from_translation(rect.center()),
+-                item: ExtractedUiItem::Node {
+-                    color: text_background_color.0.to_linear(),
+-                    rect: Rect {
+-                        min: Vec2::ZERO,
+-                        max: rect.size(),
++            if let Some(text_background_color) = text_background_color {
++                extracted_uinodes.uinodes.push(ExtractedUiNode {
++                    z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
++                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
++                    clip: clip.map(|clip| clip.clip),
++                    image: AssetId::default(),
++                    extracted_camera_entity,
++                    transform: transform * Affine2::from_translation(rect.center()),
++                    item: ExtractedUiItem::Node {
++                        color: text_background_color.0.to_linear(),
++                        rect: Rect {
++                            min: Vec2::ZERO,
++                            max: rect.size(),
++                        },
++                        atlas_scaling: None,
++                        flip_x: false,
++                        flip_y: false,
++                        border: uinode.border(),
++                        border_radius: uinode.border_radius(),
++                        node_type: NodeType::Rect,
+                     },
+-                    atlas_scaling: None,
+-                    flip_x: false,
+-                    flip_y: false,
+-                    border: uinode.border(),
+-                    border_radius: uinode.border_radius(),
+-                    node_type: NodeType::Rect,
+-                },
+-                main_entity: entity.into(),
+-            });
++                    main_entity: entity.into(),
++                });
++            }
++
++            if maybe_strikethrough.is_some() {
++                extracted_uinodes.uinodes.push(ExtractedUiNode {
++                    z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
++                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
++                    clip: clip.map(|clip| clip.clip),
++                    image: AssetId::default(),
++                    extracted_camera_entity,
++                    transform: transform
++                        * Affine2::from_translation(Vec2::new(
++                            rect.center().x,
++                            strikethrough_y + 0.5 * stroke,
++                        )),
++                    item: ExtractedUiItem::Node {
++                        color: text_color.0.to_linear(),
++                        rect: Rect {
++                            min: Vec2::ZERO,
++                            max: Vec2::new(rect.size().x, stroke),
++                        },
++                        atlas_scaling: None,
++                        flip_x: false,
++                        flip_y: false,
++                        border: BorderRect::ZERO,
++                        border_radius: ResolvedBorderRadius::ZERO,
++                        node_type: NodeType::Rect,
++                    },
++                    main_entity: entity.into(),
++                });
++            }
+         }
+     }
+ }
+diff --git a/examples/README.md b/examples/README.md
+index a04524e21cd7d..ea585f2b43bd1 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -569,6 +569,7 @@ Example | Description
+ [Stacked Gradients](../examples/ui/stacked_gradients.rs) | An example demonstrating stacked gradients
+ [Standard Widgets](../examples/ui/standard_widgets.rs) | Demonstrates use of core (headless) widgets in Bevy UI
+ [Standard Widgets (w/Observers)](../examples/ui/standard_widgets_observers.rs) | Demonstrates use of core (headless) widgets in Bevy UI, with Observers
++[Strikethrough](../examples/ui/strikethrough.rs) | Demonstrates how to display text with strikethrough.
+ [Tab Navigation](../examples/ui/tab_navigation.rs) | Demonstration of Tab Navigation between UI elements
+ [Text](../examples/ui/text.rs) | Illustrates creating and updating text
+ [Text Background Colors](../examples/ui/text_background_colors.rs) | Demonstrates text background colors
+diff --git a/examples/ui/strikethrough.rs b/examples/ui/strikethrough.rs
+new file mode 100644
+index 0000000000000..2dfeb81630c12
+--- /dev/null
++++ b/examples/ui/strikethrough.rs
+@@ -0,0 +1,125 @@
++//! This example illustrates UI text with strikethrough
++
++use bevy::{
++    color::palettes::css::{GREEN, NAVY, RED},
++    prelude::*,
++};
++
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins)
++        .add_systems(Startup, setup)
++        .run();
++}
++
++fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
++    commands.spawn(Camera2d);
++    commands.spawn((
++        Text::new("struck\nstruck"),
++        // Just add the `Strikethrough` component to any `Text`, `Text2d` or `TextSpan` and it's text will be struck through.
++        Strikethrough,
++        TextFont {
++            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++            font_size: 67.0,
++            ..default()
++        },
++        TextLayout::new_with_justify(Justify::Center),
++        Node {
++            position_type: PositionType::Absolute,
++            bottom: px(5),
++            right: px(5),
++            ..default()
++        },
++        TextBackgroundColor::BLACK,
++    ));
++
++    commands.spawn((
++        Node {
++            flex_direction: FlexDirection::Column,
++            width: Val::Percent(100.),
++            height: Val::Percent(100.),
++            justify_content: JustifyContent::Center,
++            align_items: AlignItems::Center,
++            ..Default::default()
++        },
++        children![
++            (
++                Text::new("struck\nstruckstruck\nstruckstuckstruck"),
++                Strikethrough,
++                TextBackgroundColor(GREEN.into()),
++            ),
++            Text::new("normal"),
++            (
++                Text::new("struck"),
++                Strikethrough,
++                TextBackgroundColor(GREEN.into()),
++                children![
++                    TextSpan::new("normal"),
++                    (TextSpan::new("struck"), Strikethrough,)
++                ],
++            ),
++            (
++                Text::new("struck struck"),
++                Strikethrough,
++                TextFont {
++                    font_size: 67.0,
++                    ..default()
++                },
++            ),
++            (
++                Text::new("2struck\nstruck"),
++                Strikethrough,
++                TextFont {
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font_size: 67.0,
++                    ..default()
++                },
++                BackgroundColor(NAVY.into())
++            ),
++            (
++                Text::new(""),
++                children![
++                    (
++                        TextSpan::new("struck"),
++                        Strikethrough,
++                        TextFont {
++                            font_size: 15.,
++                            ..default()
++                        },
++                        TextColor(RED.into()),
++                        TextBackgroundColor(Color::BLACK)
++                    ),
++                    (
++                        TextSpan::new("\nnormal"),
++                        TextFont {
++                            font_size: 30.,
++                            ..default()
++                        },
++                        TextColor(RED.into()),
++                        TextBackgroundColor(GREEN.into())
++                    ),
++                    (
++                        TextSpan::new("\nstruck"),
++                        TextFont {
++                            font_size: 50.,
++                            ..default()
++                        },
++                        Strikethrough,
++                        TextColor(RED.into()),
++                        TextBackgroundColor(NAVY.into())
++                    ),
++                    (
++                        TextSpan::new("struck"),
++                        TextFont {
++                            font_size: 70.,
++                            ..default()
++                        },
++                        Strikethrough,
++                        TextColor(RED.into()),
++                        TextBackgroundColor(NAVY.into())
++                    )
++                ]
++            ),
++        ],
++    ));
++}
+diff --git a/release-content/release-notes/text_strikethrough.md b/release-content/release-notes/text_strikethrough.md
+new file mode 100644
+index 0000000000000..d322442200106
+--- /dev/null
++++ b/release-content/release-notes/text_strikethrough.md
+@@ -0,0 +1,7 @@
++---
++title: Text strikethrough support
++authors: ["@ickshonpe"]
++pull_requests: [21555]
++---
++
++`bevy_text` now supports strikethrough. To display text with strikethrough, just add the `Strikethrough` component to any `Text`, `Text2d`, or `TextSpan` entity.
