@@ -1,0 +1,1069 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7c22fd34b6b7c..7776f0da94e6c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,6 +28,8 @@ members = [
+   "examples/mobile",
+   # Examples of using Bevy on no_std platforms.
+   "examples/no_std/*",
++  # Examples of compiling Bevy with automatic reflect type registration for platforms without `inventory` support.
++  "examples/reflection/auto_register_static",
+   # Benchmarks
+   "benches",
+   # Internal tools that are not published.
+@@ -159,6 +161,7 @@ default = [
+   "hdr",
+   "multi_threaded",
+   "png",
++  "reflect_auto_register",
+   "smaa_luts",
+   "sysinfo_plugin",
+   "tonemapping_luts",
+@@ -548,6 +551,12 @@ reflect_functions = ["bevy_internal/reflect_functions"]
+ # Enable documentation reflection
+ reflect_documentation = ["bevy_internal/reflect_documentation"]
+ 
++# Enable automatic reflect registration
++reflect_auto_register = ["bevy_internal/reflect_auto_register"]
++
++# Enable automatic reflect registration without inventory. See `reflect::load_type_registrations` for more info.
++reflect_auto_register_static = ["bevy_internal/reflect_auto_register_static"]
++
+ # Enable winit custom cursor support
+ custom_cursor = ["bevy_internal/custom_cursor"]
+ 
+@@ -2781,6 +2790,17 @@ description = "Demonstrates how to create and use type data"
+ category = "Reflection"
+ wasm = false
+ 
++[[example]]
++name = "auto_register_static"
++path = "examples/reflection/auto_register_static/src/lib.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.auto_register_static]
++name = "Automatic types registration"
++description = "Demonstrates how to set up automatic reflect types registration for platforms without `inventory` support"
++category = "Reflection"
++wasm = false
++
+ # Scene
+ [[example]]
+ name = "scene"
+diff --git a/crates/bevy_app/Cargo.toml b/crates/bevy_app/Cargo.toml
+index ee3e8bf72a803..61c1e8f37983f 100644
+--- a/crates/bevy_app/Cargo.toml
++++ b/crates/bevy_app/Cargo.toml
+@@ -22,6 +22,11 @@ reflect_functions = [
+   "bevy_reflect/functions",
+   "bevy_ecs/reflect_functions",
+ ]
++reflect_auto_register = [
++  "bevy_reflect",
++  "bevy_reflect/auto_register",
++  "bevy_ecs/reflect_auto_register",
++]
+ 
+ # Debugging Features
+ 
+diff --git a/crates/bevy_app/src/app.rs b/crates/bevy_app/src/app.rs
+index e2755078c6535..9ff4792960679 100644
+--- a/crates/bevy_app/src/app.rs
++++ b/crates/bevy_app/src/app.rs
+@@ -108,7 +108,12 @@ impl Default for App {
+         {
+             use bevy_ecs::observer::ObservedBy;
+ 
++            #[cfg(not(feature = "reflect_auto_register"))]
+             app.init_resource::<AppTypeRegistry>();
++
++            #[cfg(feature = "reflect_auto_register")]
++            app.insert_resource(AppTypeRegistry::new_with_derived_types());
++
+             app.register_type::<Name>();
+             app.register_type::<ChildOf>();
+             app.register_type::<Children>();
+diff --git a/crates/bevy_app/src/hotpatch.rs b/crates/bevy_app/src/hotpatch.rs
+index 90642a67ddaea..c5765a2874cac 100644
+--- a/crates/bevy_app/src/hotpatch.rs
++++ b/crates/bevy_app/src/hotpatch.rs
+@@ -3,6 +3,8 @@ extern crate alloc;
+ 
+ use alloc::sync::Arc;
+ 
++#[cfg(feature = "reflect_auto_register")]
++use bevy_ecs::schedule::IntoScheduleConfigs;
+ use bevy_ecs::{
+     change_detection::DetectChangesMut, event::EventWriter, system::ResMut, HotPatchChanges,
+     HotPatched,
+@@ -44,5 +46,14 @@ impl Plugin for HotPatchPlugin {
+                     }
+                 },
+             );
++
++        #[cfg(feature = "reflect_auto_register")]
++        app.add_systems(
++            crate::First,
++            (move |registry: bevy_ecs::system::Res<bevy_ecs::reflect::AppTypeRegistry>| {
++                registry.write().register_derived_types();
++            })
++            .run_if(bevy_ecs::schedule::common_conditions::on_event::<HotPatched>),
++        );
+     }
+ }
+diff --git a/crates/bevy_ecs/Cargo.toml b/crates/bevy_ecs/Cargo.toml
+index 064863fb20220..68e9eab110799 100644
+--- a/crates/bevy_ecs/Cargo.toml
++++ b/crates/bevy_ecs/Cargo.toml
+@@ -27,6 +27,7 @@ bevy_reflect = ["dep:bevy_reflect"]
+ 
+ ## Extends reflection support to functions.
+ reflect_functions = ["bevy_reflect", "bevy_reflect/functions"]
++reflect_auto_register = ["bevy_reflect", "bevy_reflect/auto_register"]
+ 
+ ## Enables automatic backtrace capturing in BevyError
+ backtrace = ["std"]
+diff --git a/crates/bevy_ecs/src/reflect/mod.rs b/crates/bevy_ecs/src/reflect/mod.rs
+index 24e1449e61a8d..dce6237f1b857 100644
+--- a/crates/bevy_ecs/src/reflect/mod.rs
++++ b/crates/bevy_ecs/src/reflect/mod.rs
+@@ -47,6 +47,18 @@ impl DerefMut for AppTypeRegistry {
+     }
+ }
+ 
++impl AppTypeRegistry {
++    /// Creates [`AppTypeRegistry`] and automatically registers all types deriving [`Reflect`].
++    ///
++    /// See [`TypeRegistry::register_derived_types`] for more details.
++    #[cfg(feature = "reflect_auto_register")]
++    pub fn new_with_derived_types() -> Self {
++        let app_registry = AppTypeRegistry::default();
++        app_registry.write().register_derived_types();
++        app_registry
++    }
++}
++
+ /// A [`Resource`] storing [`FunctionRegistry`] for
+ /// function registrations relevant to a whole app.
+ ///
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index b75dc368c4ef4..c662a4858dad8 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -300,6 +300,20 @@ reflect_functions = [
+   "bevy_ecs/reflect_functions",
+ ]
+ 
++# Enable automatic reflect registration using inventory.
++reflect_auto_register = [
++  "bevy_reflect/auto_register_inventory",
++  "bevy_app/reflect_auto_register",
++  "bevy_ecs/reflect_auto_register",
++]
++
++# Enable automatic reflect registration without inventory. See `reflect::load_type_registrations` for more info.
++reflect_auto_register_static = [
++  "bevy_reflect/auto_register_static",
++  "bevy_app/reflect_auto_register",
++  "bevy_ecs/reflect_auto_register",
++]
++
+ # Enable documentation reflection
+ reflect_documentation = ["bevy_reflect/documentation"]
+ 
+diff --git a/crates/bevy_reflect/Cargo.toml b/crates/bevy_reflect/Cargo.toml
+index e2fa168b0785c..8412609be4aa9 100644
+--- a/crates/bevy_reflect/Cargo.toml
++++ b/crates/bevy_reflect/Cargo.toml
+@@ -10,7 +10,7 @@ keywords = ["bevy"]
+ rust-version = "1.85.0"
+ 
+ [features]
+-default = ["std", "smallvec", "debug"]
++default = ["std", "smallvec", "debug", "auto_register_inventory"]
+ 
+ # Features
+ 
+@@ -68,6 +68,22 @@ std = [
+ ## on all platforms, including `no_std`.
+ critical-section = ["bevy_platform/critical-section"]
+ 
++# Enables automatic reflect registration. Does nothing by itself, 
++# must select `auto_register_inventory` or `auto_register_static` to make it work.
++auto_register = []
++## Enables automatic reflect registration using inventory. Not supported on all platforms.
++auto_register_inventory = [
++  "auto_register",
++  "bevy_reflect_derive/auto_register_inventory",
++  "dep:inventory",
++]
++## Enable automatic reflect registration without inventory. This feature has precedence over `auto_register_inventory`.
++## See `load_type_registrations` for more info.
++auto_register_static = [
++  "auto_register",
++  "bevy_reflect_derive/auto_register_static",
++]
++
+ ## Enables use of browser APIs.
+ ## Note this is currently only applicable on `wasm32` architectures.
+ web = ["bevy_platform/web", "uuid?/js"]
+@@ -113,6 +129,9 @@ wgpu-types = { version = "26", features = [
+   "serde",
+ ], optional = true, default-features = false }
+ 
++# deps for automatic type registration
++inventory = { version = "0.3", optional = true }
++
+ [dev-dependencies]
+ ron = "0.10"
+ rmp-serde = "1.1"
+diff --git a/crates/bevy_reflect/derive/Cargo.toml b/crates/bevy_reflect/derive/Cargo.toml
+index 19875633edbad..7b56184881a4f 100644
+--- a/crates/bevy_reflect/derive/Cargo.toml
++++ b/crates/bevy_reflect/derive/Cargo.toml
+@@ -17,6 +17,13 @@ default = []
+ documentation = []
+ # Enables macro logic related to function reflection
+ functions = []
++# Enables automatic reflect registration. Does nothing by itself, 
++# must select `auto_register_inventory` or `auto_register_static` to make it work.
++auto_register = []
++# Enables automatic reflection using inventory. Not supported on all platforms.
++auto_register_inventory = ["auto_register"]
++# Enables automatic reflection on platforms not supported by inventory. See `load_type_registrations` for more info.
++auto_register_static = ["auto_register", "dep:uuid"]
+ 
+ [dependencies]
+ bevy_macro_utils = { path = "../../bevy_macro_utils", version = "0.17.0-dev" }
+@@ -24,6 +31,9 @@ indexmap = "2.0"
+ proc-macro2 = "1.0"
+ quote = "1.0"
+ syn = { version = "2.0", features = ["full", "extra-traits"] }
++uuid = { version = "1.13.1", default-features = false, features = [
++  "v4",
++], optional = true }
+ 
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ # TODO: Assuming all wasm builds are for the browser. Require `no_std` support to break assumption.
+diff --git a/crates/bevy_reflect/derive/src/container_attributes.rs b/crates/bevy_reflect/derive/src/container_attributes.rs
+index 8b2ae0351f53a..d6ff66218f121 100644
+--- a/crates/bevy_reflect/derive/src/container_attributes.rs
++++ b/crates/bevy_reflect/derive/src/container_attributes.rs
+@@ -25,6 +25,7 @@ mod kw {
+     syn::custom_keyword!(Hash);
+     syn::custom_keyword!(Clone);
+     syn::custom_keyword!(no_field_bounds);
++    syn::custom_keyword!(no_auto_register);
+     syn::custom_keyword!(opaque);
+ }
+ 
+@@ -184,6 +185,7 @@ pub(crate) struct ContainerAttributes {
+     type_path_attrs: TypePathAttrs,
+     custom_where: Option<WhereClause>,
+     no_field_bounds: bool,
++    no_auto_register: bool,
+     custom_attributes: CustomAttributes,
+     is_opaque: bool,
+     idents: Vec<Ident>,
+@@ -240,6 +242,8 @@ impl ContainerAttributes {
+             self.parse_no_field_bounds(input)
+         } else if lookahead.peek(kw::Clone) {
+             self.parse_clone(input)
++        } else if lookahead.peek(kw::no_auto_register) {
++            self.parse_no_auto_register(input)
+         } else if lookahead.peek(kw::Debug) {
+             self.parse_debug(input)
+         } else if lookahead.peek(kw::Hash) {
+@@ -378,6 +382,16 @@ impl ContainerAttributes {
+         Ok(())
+     }
+ 
++    /// Parse `no_auto_register` attribute.
++    ///
++    /// Examples:
++    /// - `#[reflect(no_auto_register)]`
++    fn parse_no_auto_register(&mut self, input: ParseStream) -> syn::Result<()> {
++        input.parse::<kw::no_auto_register>()?;
++        self.no_auto_register = true;
++        Ok(())
++    }
++
+     /// Parse `where` attribute.
+     ///
+     /// Examples:
+@@ -583,6 +597,12 @@ impl ContainerAttributes {
+         self.no_field_bounds
+     }
+ 
++    /// Returns true if the `no_auto_register` attribute was found on this type.
++    #[cfg(feature = "auto_register")]
++    pub fn no_auto_register(&self) -> bool {
++        self.no_auto_register
++    }
++
+     /// Returns true if the `opaque` attribute was found on this type.
+     pub fn is_opaque(&self) -> bool {
+         self.is_opaque
+diff --git a/crates/bevy_reflect/derive/src/impls/common.rs b/crates/bevy_reflect/derive/src/impls/common.rs
+index 87836e383dc6d..c6507c6917491 100644
+--- a/crates/bevy_reflect/derive/src/impls/common.rs
++++ b/crates/bevy_reflect/derive/src/impls/common.rs
+@@ -154,3 +154,88 @@ pub fn common_partial_reflect_methods(
+         #debug_fn
+     }
+ }
++
++#[cfg(feature = "auto_register")]
++pub fn reflect_auto_registration(meta: &ReflectMeta) -> Option<proc_macro2::TokenStream> {
++    if meta.attrs().no_auto_register() {
++        return None;
++    }
++
++    let bevy_reflect_path = meta.bevy_reflect_path();
++    let type_path = meta.type_path();
++
++    if type_path.impl_is_generic() {
++        return None;
++    };
++
++    #[cfg(feature = "auto_register_static")]
++    {
++        use std::{
++            env, fs,
++            io::Write,
++            path::PathBuf,
++            sync::{LazyLock, Mutex},
++        };
++
++        // Skip unless env var is set, otherwise this might slow down rust-analyzer
++        if env::var("BEVY_REFLECT_AUTO_REGISTER_STATIC").is_err() {
++            return None;
++        }
++
++        // Names of registrations functions will be stored in this file.
++        // To allow writing to this file from multiple threads during compilation it is protected by mutex.
++        // This static is valid for the duration of compilation of one crate and we have one file per crate,
++        // so it is enough to protect compilation threads from overwriting each other.
++        // This file is reset on every crate recompilation.
++        //
++        // It might make sense to replace the mutex with File::lock when file_lock feature becomes stable.
++        static REGISTRATION_FNS_EXPORT: LazyLock<Mutex<fs::File>> = LazyLock::new(|| {
++            let path = PathBuf::from("target").join("bevy_reflect_type_registrations");
++            fs::DirBuilder::new()
++                .recursive(true)
++                .create(&path)
++                .unwrap_or_else(|_| panic!("Failed to create {path:?}"));
++            let file_path = path.join(env::var("CARGO_CRATE_NAME").unwrap());
++            let file = fs::OpenOptions::new()
++                .create(true)
++                .write(true)
++                .truncate(true)
++                .open(&file_path)
++                .unwrap_or_else(|_| panic!("Failed to create {file_path:?}"));
++            Mutex::new(file)
++        });
++
++        let export_name = format!("_bevy_reflect_register_{}", uuid::Uuid::new_v4().as_u128());
++
++        {
++            let mut file = REGISTRATION_FNS_EXPORT.lock().unwrap();
++            writeln!(file, "{export_name}")
++                .unwrap_or_else(|_| panic!("Failed to write registration function {export_name}"));
++            // We must sync_data to ensure all content is written before releasing the lock.
++            file.sync_data().unwrap();
++        };
++
++        Some(quote! {
++            /// # Safety
++            /// This function must only be used by the `load_type_registrations` macro.
++            #[unsafe(export_name=#export_name)]
++            pub unsafe extern "Rust" fn bevy_register_type(registry: &mut #bevy_reflect_path::TypeRegistry) {
++                <#type_path as #bevy_reflect_path::__macro_exports::RegisterForReflection>::__register(registry);
++            }
++        })
++    }
++
++    #[cfg(all(
++        feature = "auto_register_inventory",
++        not(feature = "auto_register_static")
++    ))]
++    {
++        Some(quote! {
++            #bevy_reflect_path::__macro_exports::auto_register::inventory::submit!{
++                #bevy_reflect_path::__macro_exports::auto_register::AutomaticReflectRegistrations(
++                    <#type_path as #bevy_reflect_path::__macro_exports::auto_register::RegisterForReflection>::__register
++                )
++            }
++        })
++    }
++}
+diff --git a/crates/bevy_reflect/derive/src/impls/enums.rs b/crates/bevy_reflect/derive/src/impls/enums.rs
+index f2272c7c816e7..68f98e2617d26 100644
+--- a/crates/bevy_reflect/derive/src/impls/enums.rs
++++ b/crates/bevy_reflect/derive/src/impls/enums.rs
+@@ -77,6 +77,11 @@ pub(crate) fn impl_enum(reflect_enum: &ReflectEnum) -> proc_macro2::TokenStream
+     let (impl_generics, ty_generics, where_clause) =
+         reflect_enum.meta().type_path().generics().split_for_impl();
+ 
++    #[cfg(not(feature = "auto_register"))]
++    let auto_register = None::<proc_macro2::TokenStream>;
++    #[cfg(feature = "auto_register")]
++    let auto_register = crate::impls::reflect_auto_registration(reflect_enum.meta());
++
+     let where_reflect_clause = where_clause_options.extend_where_clause(where_clause);
+ 
+     quote! {
+@@ -90,6 +95,8 @@ pub(crate) fn impl_enum(reflect_enum: &ReflectEnum) -> proc_macro2::TokenStream
+ 
+         #function_impls
+ 
++        #auto_register
++
+         impl #impl_generics #bevy_reflect_path::Enum for #enum_path #ty_generics #where_reflect_clause {
+             fn field(&self, #ref_name: &str) -> #FQOption<&dyn #bevy_reflect_path::PartialReflect> {
+                  match #match_this {
+diff --git a/crates/bevy_reflect/derive/src/impls/mod.rs b/crates/bevy_reflect/derive/src/impls/mod.rs
+index 6477c4041e3a3..48c8c84621d46 100644
+--- a/crates/bevy_reflect/derive/src/impls/mod.rs
++++ b/crates/bevy_reflect/derive/src/impls/mod.rs
+@@ -9,6 +9,8 @@ mod tuple_structs;
+ mod typed;
+ 
+ pub(crate) use assertions::impl_assertions;
++#[cfg(feature = "auto_register")]
++pub(crate) use common::reflect_auto_registration;
+ pub(crate) use common::{common_partial_reflect_methods, impl_full_reflect};
+ pub(crate) use enums::impl_enum;
+ #[cfg(feature = "functions")]
+diff --git a/crates/bevy_reflect/derive/src/impls/opaque.rs b/crates/bevy_reflect/derive/src/impls/opaque.rs
+index a39b0b4849e6b..f3f80b632b672 100644
+--- a/crates/bevy_reflect/derive/src/impls/opaque.rs
++++ b/crates/bevy_reflect/derive/src/impls/opaque.rs
+@@ -55,6 +55,11 @@ pub(crate) fn impl_opaque(meta: &ReflectMeta) -> proc_macro2::TokenStream {
+     #[cfg(feature = "functions")]
+     let function_impls = crate::impls::impl_function_traits(&where_clause_options);
+ 
++    #[cfg(not(feature = "auto_register"))]
++    let auto_register = None::<proc_macro2::TokenStream>;
++    #[cfg(feature = "auto_register")]
++    let auto_register = crate::impls::reflect_auto_registration(meta);
++
+     let (impl_generics, ty_generics, where_clause) = type_path.generics().split_for_impl();
+     let where_reflect_clause = where_clause_options.extend_where_clause(where_clause);
+     let get_type_registration_impl = meta.get_type_registration(&where_clause_options);
+@@ -70,6 +75,8 @@ pub(crate) fn impl_opaque(meta: &ReflectMeta) -> proc_macro2::TokenStream {
+ 
+         #function_impls
+ 
++        #auto_register
++
+         impl #impl_generics #bevy_reflect_path::PartialReflect for #type_path #ty_generics #where_reflect_clause  {
+             #[inline]
+             fn get_represented_type_info(&self) -> #FQOption<&'static #bevy_reflect_path::TypeInfo> {
+diff --git a/crates/bevy_reflect/derive/src/impls/structs.rs b/crates/bevy_reflect/derive/src/impls/structs.rs
+index b78ce40a08091..730a9092a38a2 100644
+--- a/crates/bevy_reflect/derive/src/impls/structs.rs
++++ b/crates/bevy_reflect/derive/src/impls/structs.rs
+@@ -58,6 +58,11 @@ pub(crate) fn impl_struct(reflect_struct: &ReflectStruct) -> proc_macro2::TokenS
+         .generics()
+         .split_for_impl();
+ 
++    #[cfg(not(feature = "auto_register"))]
++    let auto_register = None::<proc_macro2::TokenStream>;
++    #[cfg(feature = "auto_register")]
++    let auto_register = crate::impls::reflect_auto_registration(reflect_struct.meta());
++
+     let where_reflect_clause = where_clause_options.extend_where_clause(where_clause);
+ 
+     quote! {
+@@ -71,6 +76,8 @@ pub(crate) fn impl_struct(reflect_struct: &ReflectStruct) -> proc_macro2::TokenS
+ 
+         #function_impls
+ 
++        #auto_register
++
+         impl #impl_generics #bevy_reflect_path::Struct for #struct_path #ty_generics #where_reflect_clause {
+             fn field(&self, name: &str) -> #FQOption<&dyn #bevy_reflect_path::PartialReflect> {
+                 match name {
+diff --git a/crates/bevy_reflect/derive/src/impls/tuple_structs.rs b/crates/bevy_reflect/derive/src/impls/tuple_structs.rs
+index 01b6a46b7bae7..e9fb9bd009508 100644
+--- a/crates/bevy_reflect/derive/src/impls/tuple_structs.rs
++++ b/crates/bevy_reflect/derive/src/impls/tuple_structs.rs
+@@ -46,6 +46,11 @@ pub(crate) fn impl_tuple_struct(reflect_struct: &ReflectStruct) -> proc_macro2::
+         .generics()
+         .split_for_impl();
+ 
++    #[cfg(not(feature = "auto_register"))]
++    let auto_register = None::<proc_macro2::TokenStream>;
++    #[cfg(feature = "auto_register")]
++    let auto_register = crate::impls::reflect_auto_registration(reflect_struct.meta());
++
+     let where_reflect_clause = where_clause_options.extend_where_clause(where_clause);
+ 
+     quote! {
+@@ -59,6 +64,8 @@ pub(crate) fn impl_tuple_struct(reflect_struct: &ReflectStruct) -> proc_macro2::
+ 
+         #function_impls
+ 
++        #auto_register
++
+         impl #impl_generics #bevy_reflect_path::TupleStruct for #struct_path #ty_generics #where_reflect_clause {
+             fn field(&self, index: usize) -> #FQOption<&dyn #bevy_reflect_path::PartialReflect> {
+                 match index {
+diff --git a/crates/bevy_reflect/derive/src/lib.rs b/crates/bevy_reflect/derive/src/lib.rs
+index 7ee7ad83e7605..c979c4db1f75d 100644
+--- a/crates/bevy_reflect/derive/src/lib.rs
++++ b/crates/bevy_reflect/derive/src/lib.rs
+@@ -40,6 +40,8 @@ mod trait_reflection;
+ mod type_path;
+ mod where_clause_options;
+ 
++use std::{fs, io::Read, path::PathBuf};
++
+ use crate::derive_data::{ReflectDerive, ReflectMeta, ReflectStruct};
+ use container_attributes::ContainerAttributes;
+ use derive_data::{ReflectImplSource, ReflectProvenance, ReflectTraitToImpl, ReflectTypePath};
+@@ -320,6 +322,12 @@ fn match_reflect_impls(ast: DeriveInput, source: ReflectImplSource) -> TokenStre
+ /// #[reflect(@Required, @EditorTooltip::new("An ID is required!"))]
+ /// struct Id(u8);
+ /// ```
++/// ## `#[reflect(no_auto_register)]`
++///
++/// This attribute will opt-out of the automatic reflect type registration.
++///
++/// All non-generic types annotated with `#[derive(Reflect)]` are usually automatically registered on app startup.
++/// If this behavior is not desired, this attribute may be used to disable it for the annotated type.
+ ///
+ /// # Field Attributes
+ ///
+@@ -843,3 +851,53 @@ pub fn impl_type_path(input: TokenStream) -> TokenStream {
+         };
+     })
+ }
++
++/// Collects and loads type registrations when using `auto_register_static` feature.
++///
++/// Correctly using this macro requires following:
++/// 1. This macro must be called **last** during compilation. This can be achieved by putting your main function
++///    in a separate crate or restructuring your project to be separated into `bin` and `lib`, and putting this macro in `bin`.
++///    Any automatic type registrations using `#[derive(Reflect)]` within the same crate as this macro are not guaranteed to run.
++/// 2. Your project must be compiled with `auto_register_static` feature **and** `BEVY_REFLECT_AUTO_REGISTER_STATIC=1` env variable.
++///    Enabling the feature generates registration functions while setting the variable enables export and
++///    caching of registration function names.
++/// 3. Must be called before creating `App` or using `TypeRegistry::register_derived_types`.
++///
++/// If you're experiencing linking issues try running `cargo clean` before rebuilding.
++#[proc_macro]
++pub fn load_type_registrations(_input: TokenStream) -> TokenStream {
++    if !cfg!(feature = "auto_register_static") {
++        return TokenStream::new();
++    }
++
++    let Ok(dir) = fs::read_dir(PathBuf::from("target").join("bevy_reflect_type_registrations"))
++    else {
++        return TokenStream::new();
++    };
++    let mut str_buf = String::new();
++    let mut registration_fns = Vec::new();
++    for file_path in dir {
++        let mut file = fs::OpenOptions::new()
++            .read(true)
++            .open(file_path.unwrap().path())
++            .unwrap();
++        file.read_to_string(&mut str_buf).unwrap();
++        registration_fns.extend(str_buf.lines().filter(|s| !s.is_empty()).map(|s| {
++            s.parse::<proc_macro2::TokenStream>()
++                .expect("Unexpected function name")
++        }));
++        str_buf.clear();
++    }
++    let bevy_reflect_path = meta::get_bevy_reflect_path();
++    TokenStream::from(quote! {
++        {
++            fn _register_types(){
++                unsafe extern "Rust" {
++                    #( safe fn #registration_fns(registry_ptr: &mut #bevy_reflect_path::TypeRegistry); )*
++                };
++                #( #bevy_reflect_path::__macro_exports::auto_register::push_registration_fn(#registration_fns); )*
++            }
++            _register_types();
++        }
++    })
++}
+diff --git a/crates/bevy_reflect/src/lib.rs b/crates/bevy_reflect/src/lib.rs
+index 99a0a1f7b5606..401faa297c1fe 100644
+--- a/crates/bevy_reflect/src/lib.rs
++++ b/crates/bevy_reflect/src/lib.rs
+@@ -463,13 +463,6 @@
+ //! typically require manual monomorphization (i.e. manually specifying the types the generic method can
+ //! take).
+ //!
+-//! ## Manual Registration
+-//!
+-//! Since Rust doesn't provide built-in support for running initialization code before `main`,
+-//! there is no way for `bevy_reflect` to automatically register types into the [type registry].
+-//! This means types must manually be registered, including their desired monomorphized
+-//! representations if generic.
+-//!
+ //! # Features
+ //!
+ //! ## `bevy`
+@@ -519,6 +512,24 @@
+ //! which enables capturing the type stack when serializing or deserializing a type
+ //! and displaying it in error messages.
+ //!
++//! ## `auto_register_inventory`/`auto_register_static`
++//!
++//! | Default | Dependencies                      |
++//! | :-----: | :-------------------------------: |
++//! | ✅      | [`bevy_reflect_derive/auto_register_inventory`] |
++//! | ❌      | [`bevy_reflect_derive/auto_register_static`] |
++//!
++//! These features enable automatic registration of types that derive [`Reflect`].
++//!
++//! - `auto_register_inventory` uses `inventory` to collect types on supported platforms (Linux, macOS, iOS, FreeBSD, Android, Windows, WebAssembly).
++//! - `auto_register_static` uses platform-independent way to collect types, but requires additional setup and might
++//!   slow down compilation, so it should only be used on platforms not supported by `inventory`.
++//!   See documentation for [`load_type_registrations`] macro for more info
++//!
++//! When this feature is enabled `bevy_reflect` will automatically collects all types that derive [`Reflect`] on app startup,
++//! and [`TypeRegistry::register_derived_types`] can be used to register these types at any point in the program.
++//! However, this does not apply to types with generics: their desired monomorphized representations must be registered manually.
++//!
+ //! [Reflection]: https://en.wikipedia.org/wiki/Reflective_programming
+ //! [Bevy]: https://bevy.org/
+ //! [limitations]: #limitations
+@@ -723,6 +734,91 @@ pub mod __macro_exports {
+     impl RegisterForReflection for DynamicArray {}
+ 
+     impl RegisterForReflection for DynamicTuple {}
++
++    /// Automatic reflect registration implementation
++    #[cfg(feature = "auto_register")]
++    pub mod auto_register {
++        pub use super::*;
++
++        /// inventory impl
++        #[cfg(all(
++            not(feature = "auto_register_static"),
++            feature = "auto_register_inventory"
++        ))]
++        mod __automatic_type_registration_impl {
++            use super::*;
++
++            pub use inventory;
++
++            /// Stores type registration functions
++            pub struct AutomaticReflectRegistrations(pub fn(&mut TypeRegistry));
++
++            /// Registers all collected types.
++            pub fn register_types(registry: &mut TypeRegistry) {
++                #[cfg(target_family = "wasm")]
++                wasm_support::init();
++                for registration_fn in inventory::iter::<AutomaticReflectRegistrations> {
++                    registration_fn.0(registry);
++                }
++            }
++
++            inventory::collect!(AutomaticReflectRegistrations);
++
++            #[cfg(target_family = "wasm")]
++            mod wasm_support {
++                use bevy_platform::sync::atomic::{AtomicBool, Ordering};
++
++                static INIT_DONE: AtomicBool = AtomicBool::new(false);
++
++                #[expect(unsafe_code, reason = "This function is generated by linker.")]
++                unsafe extern "C" {
++                    fn __wasm_call_ctors();
++                }
++
++                /// This function must be called before using [`inventory::iter`] on [`AutomaticReflectRegistrations`] to run constructors on all platforms.
++                pub fn init() {
++                    if INIT_DONE.swap(true, Ordering::Relaxed) {
++                        return;
++                    };
++                    // SAFETY:
++                    // This will call constructors on wasm platforms at most once (as long as `init` is the only function that calls `__wasm_call_ctors`).
++                    //
++                    // For more information see: https://docs.rs/inventory/latest/inventory/#webassembly-and-constructors
++                    #[expect(
++                        unsafe_code,
++                        reason = "This function must be called to use inventory on wasm."
++                    )]
++                    unsafe {
++                        __wasm_call_ctors();
++                    }
++                }
++            }
++        }
++
++        /// static impl
++        #[cfg(feature = "auto_register_static")]
++        mod __automatic_type_registration_impl {
++            use super::*;
++            use alloc::vec::Vec;
++            use bevy_platform::sync::Mutex;
++
++            static REGISTRATION_FNS: Mutex<Vec<fn(&mut TypeRegistry)>> = Mutex::new(Vec::new());
++
++            /// Adds adds a new registration function for [`TypeRegistry`]
++            pub fn push_registration_fn(registration_fn: fn(&mut TypeRegistry)) {
++                REGISTRATION_FNS.lock().unwrap().push(registration_fn);
++            }
++
++            /// Registers all collected types.
++            pub fn register_types(registry: &mut TypeRegistry) {
++                for func in REGISTRATION_FNS.lock().unwrap().iter() {
++                    (func)(registry);
++                }
++            }
++        }
++
++        pub use __automatic_type_registration_impl::*;
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -3369,6 +3465,76 @@ bevy_reflect::tests::Test {
+         );
+     }
+ 
++    #[cfg(feature = "auto_register")]
++    mod auto_register_reflect {
++        use super::*;
++
++        #[test]
++        fn should_ignore_auto_reflect_registration() {
++            #[derive(Reflect)]
++            #[reflect(no_auto_register)]
++            struct NoAutomaticStruct {
++                a: usize,
++            }
++
++            let mut registry = TypeRegistry::default();
++            registry.register_derived_types();
++
++            assert!(!registry.contains(TypeId::of::<NoAutomaticStruct>()));
++        }
++
++        #[test]
++        fn should_auto_register_reflect_for_all_supported_types() {
++            // Struct
++            #[derive(Reflect)]
++            struct StructReflect {
++                a: usize,
++            }
++
++            // ZST struct
++            #[derive(Reflect)]
++            struct ZSTStructReflect;
++
++            // Tuple struct
++            #[derive(Reflect)]
++            struct TupleStructReflect(pub u32);
++
++            // Enum
++            #[derive(Reflect)]
++            enum EnumReflect {
++                A,
++                B,
++            }
++
++            // ZST enum
++            #[derive(Reflect)]
++            enum ZSTEnumReflect {}
++
++            // Opaque struct
++            #[derive(Reflect, Clone)]
++            #[reflect(opaque)]
++            struct OpaqueStructReflect {
++                _a: usize,
++            }
++
++            // ZST opaque struct
++            #[derive(Reflect, Clone)]
++            #[reflect(opaque)]
++            struct ZSTOpaqueStructReflect;
++
++            let mut registry = TypeRegistry::default();
++            registry.register_derived_types();
++
++            assert!(registry.contains(TypeId::of::<StructReflect>()));
++            assert!(registry.contains(TypeId::of::<ZSTStructReflect>()));
++            assert!(registry.contains(TypeId::of::<TupleStructReflect>()));
++            assert!(registry.contains(TypeId::of::<EnumReflect>()));
++            assert!(registry.contains(TypeId::of::<ZSTEnumReflect>()));
++            assert!(registry.contains(TypeId::of::<OpaqueStructReflect>()));
++            assert!(registry.contains(TypeId::of::<ZSTOpaqueStructReflect>()));
++        }
++    }
++
+     #[cfg(feature = "glam")]
+     mod glam {
+         use super::*;
+diff --git a/crates/bevy_reflect/src/type_registry.rs b/crates/bevy_reflect/src/type_registry.rs
+index a20074b8274dd..d534cbff889b5 100644
+--- a/crates/bevy_reflect/src/type_registry.rs
++++ b/crates/bevy_reflect/src/type_registry.rs
+@@ -120,6 +120,44 @@ impl TypeRegistry {
+         registry
+     }
+ 
++    /// Register all non-generic types annotated with `#[derive(Reflect)]`.
++    ///
++    /// Calling this method is equivalent to calling [`register`](Self::register) on all types without generic parameters
++    /// that derived [`Reflect`] trait.
++    ///
++    /// This method is supported on Linux, macOS, Windows, iOS, Android, and Web via the `inventory` crate.
++    /// It does nothing on platforms not supported by either of those crates.
++    ///
++    /// # Example
++    ///
++    /// ```
++    /// # use std::any::TypeId;
++    /// # use bevy_reflect::{Reflect, TypeRegistry, std_traits::ReflectDefault};
++    /// #[derive(Reflect, Default)]
++    /// #[reflect(Default)]
++    /// struct Foo {
++    ///   name: Option<String>,
++    ///   value: i32
++    /// }
++    ///
++    /// let mut type_registry = TypeRegistry::empty();
++    /// type_registry.register_derived_types();
++    ///
++    /// // The main type
++    /// assert!(type_registry.contains(TypeId::of::<Foo>()));
++    ///
++    /// // Its type dependencies
++    /// assert!(type_registry.contains(TypeId::of::<Option<String>>()));
++    /// assert!(type_registry.contains(TypeId::of::<i32>()));
++    ///
++    /// // Its type data
++    /// assert!(type_registry.get_type_data::<ReflectDefault>(TypeId::of::<Foo>()).is_some());
++    /// ```
++    #[cfg(feature = "auto_register")]
++    pub fn register_derived_types(&mut self) {
++        crate::__macro_exports::auto_register::register_types(self);
++    }
++
+     /// Attempts to register the type `T` if it has not yet been registered already.
+     ///
+     /// This will also recursively register any type dependencies as specified by [`GetTypeRegistration::register_type_dependencies`].
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 6e409cf998bb7..d287b90868bb0 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -48,6 +48,7 @@ The default feature set enables most of the expected features of a game engine,
+ |ktx2|KTX2 compressed texture support|
+ |multi_threaded|Enables multithreaded parallelism in the engine. Disabling it forces all engine tasks to run on a single thread.|
+ |png|PNG image format support|
++|reflect_auto_register|Enable automatic reflect registration|
+ |smaa_luts|Include SMAA Look Up Tables KTX2 Files|
+ |std|Allows access to the `std` crate.|
+ |sysinfo_plugin|Enables system information diagnostic plugin|
+@@ -109,6 +110,7 @@ The default feature set enables most of the expected features of a game engine,
+ |pbr_transmission_textures|Enable support for transmission-related textures in the `StandardMaterial`, at the risk of blowing past the global, per-shader texture limit on older/lower-end GPUs|
+ |pnm|PNM image format support, includes pam, pbm, pgm and ppm|
+ |qoi|QOI image format support|
++|reflect_auto_register_static|Enable automatic reflect registration without inventory. See `reflect::load_type_registrations` for more info.|
+ |reflect_documentation|Enable documentation reflection|
+ |reflect_functions|Enable function reflection|
+ |serialize|Enable serialization support through serde|
+diff --git a/examples/README.md b/examples/README.md
+index ad1b1113b0ef2..51f59f0a9ebe3 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -424,6 +424,7 @@ Example | Description
+ 
+ Example | Description
+ --- | ---
++[Automatic types registration](../examples/reflection/auto_register_static/src/lib.rs) | Demonstrates how to set up automatic reflect types registration for platforms without `inventory` support
+ [Custom Attributes](../examples/reflection/custom_attributes.rs) | Registering and accessing custom attributes on reflected types
+ [Dynamic Types](../examples/reflection/dynamic_types.rs) | How dynamic types are used with reflection
+ [Function Reflection](../examples/reflection/function_reflection.rs) | Demonstrates how functions can be called dynamically using reflection
+diff --git a/examples/reflection/auto_register_static/Cargo.toml b/examples/reflection/auto_register_static/Cargo.toml
+new file mode 100644
+index 0000000000000..8d4c812831621
+--- /dev/null
++++ b/examples/reflection/auto_register_static/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "auto_register_static"
++version = "0.0.0"
++edition = "2024"
++publish = false
++license = "MIT OR Apache-2.0"
++
++[lib]
++# Our app must be a lib for static auto registration to work.
++crate-type = ["lib"]
++name = "auto_register_static"
++
++[dependencies]
++bevy = { path = "../../../", default-features = false, features = ["trace"] }
++
++[lints]
++workspace = true
+diff --git a/examples/reflection/auto_register_static/Makefile b/examples/reflection/auto_register_static/Makefile
+new file mode 100644
+index 0000000000000..7b47a20e1353d
+--- /dev/null
++++ b/examples/reflection/auto_register_static/Makefile
+@@ -0,0 +1,4 @@
++.PHONEY: run
++
++run:
++	BEVY_REFLECT_AUTO_REGISTER_STATIC=1 cargo run --features bevy/reflect_auto_register_static
+\ No newline at end of file
+diff --git a/examples/reflection/auto_register_static/README.md b/examples/reflection/auto_register_static/README.md
+new file mode 100644
+index 0000000000000..de60e00584bb1
+--- /dev/null
++++ b/examples/reflection/auto_register_static/README.md
+@@ -0,0 +1,19 @@
++# Automatic registration example for platforms without inventory support
++
++This example illustrates how to use automatic type registration of `bevy_reflect` on platforms that don't support `inventory`.
++
++To run the example, use the provided `Makefile` with `make run` or run manually by setting env var and enabling the required feature:
++
++```sh
++BEVY_REFLECT_AUTO_REGISTER_STATIC=1 cargo run --features bevy/reflect_auto_register_static
++```
++
++This approach should generally work on all platforms, however it is less convenient and slows down linking. It's recommended to use it only as a fallback.
++
++Here's a list of caveats of this approach:
++
++1. `load_type_registrations!` macro must be called before constructing `App` or using `TypeRegistry::register_derived_types`.
++2. All of the types to be automatically registered must be declared in a separate from `load_type_registrations!` crate. This is why this example uses separate `lib` and `bin` setup.
++3. Registration function names are cached in `target/type_registrations`. Due to incremental compilation the only way to rebuild this cache is to build with `bevy/reflect_auto_register_static` (or `auto_register_static` if just using `bevy_reflect`) feature disabled, then delete `target/type_registrations` and rebuild again with this feature enabled and `BEVY_REFLECT_AUTO_REGISTER_STATIC=1` environment variable set. Running `cargo clean` before recompiling is also an option, but it is even slower to do.
++
++If you're experiencing linking issues try running `cargo clean` before rebuilding.
+diff --git a/examples/reflection/auto_register_static/src/bin/main.rs b/examples/reflection/auto_register_static/src/bin/main.rs
+new file mode 100644
+index 0000000000000..b9359d11a0e30
+--- /dev/null
++++ b/examples/reflection/auto_register_static/src/bin/main.rs
+@@ -0,0 +1,10 @@
++//! Demonstrates how to set up automatic reflect types registration for platforms without `inventory` support
++use auto_register_static::main as lib_main;
++use bevy::reflect::load_type_registrations;
++
++fn main() {
++    // This must be called before our main to collect all type registration functions.
++    load_type_registrations!();
++    // After running load_type_registrations! we just forward to our main.
++    lib_main();
++}
+diff --git a/examples/reflection/auto_register_static/src/lib.rs b/examples/reflection/auto_register_static/src/lib.rs
+new file mode 100644
+index 0000000000000..3279bf77489b6
+--- /dev/null
++++ b/examples/reflection/auto_register_static/src/lib.rs
+@@ -0,0 +1,44 @@
++//! Demonstrates how to set up automatic reflect types registration for platforms without `inventory` support
++use bevy::prelude::*;
++
++// The type that should be automatically registered.
++// All types subject to automatic registration must not be defined in the same crate as `load_type_registrations!``.
++// Any `#[derive(Reflect)]` types within the `bin` crate are not guaranteed to be registered automatically.
++#[derive(Reflect)]
++struct Struct {
++    a: i32,
++}
++
++mod private {
++    mod very_private {
++        use bevy::prelude::*;
++
++        // Works with private types too!
++        #[derive(Reflect)]
++        struct PrivateStruct {
++            a: i32,
++        }
++    }
++}
++
++/// This is the main entrypoint, bin just forwards to it.
++pub fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins)
++        .add_systems(Startup, startup)
++        .run();
++}
++
++fn startup(reg: Res<AppTypeRegistry>) {
++    let registry = reg.read();
++    info!(
++        "Is `Struct` registered? {}",
++        registry.contains(core::any::TypeId::of::<Struct>())
++    );
++    info!(
++        "Type info of `PrivateStruct`: {:?}",
++        registry
++            .get_with_short_type_path("PrivateStruct")
++            .expect("Not registered")
++    );
++}
+diff --git a/release-content/release-notes/reflect_auto_registration.md b/release-content/release-notes/reflect_auto_registration.md
+new file mode 100644
+index 0000000000000..1f0f23be33fd0
+--- /dev/null
++++ b/release-content/release-notes/reflect_auto_registration.md
+@@ -0,0 +1,53 @@
++---
++title: Reflect auto registration
++authors: ["@eugineerd"]
++pull_requests: [15030]
++---
++
++## Automatic [`Reflect`] registration
++
++Deriving [`Reflect`] on types opts into **Bevy's** runtime reflection infrastructure, which is used to power systems like component runtime inspection and serialization. Before **Bevy 0.17**, any top-level
++types that derive [`Reflect`] (not used as a field in some other [`Reflect`]-ed type) had to be manually registered using [`register_type`] for the runtime reflection to work with them. With this release,
++all types that [`#[derive(Reflect)]`] are now automatically registered! This works for any types without generic type parameters and should reduce the boilerplate needed when adding functionality that depends on [`Reflect`].
++
++```rs
++fn main() {
++  // No need to manually call .register_type::<Foo>()
++  App::new()
++    .add_plugins(DefaultPlugins)
++    .add_systems(Startup, setup)
++    .run();
++}
++
++#[derive(Reflect)]
++pub struct Foo {
++  a: usize,
++}
++
++fn setup(type_registry: Res<AppTypeRegistry>) {
++  let type_registry = type_registry.read();
++  assert!(type_registry.contains(TypeId::of::<Foo>()));
++}
++```
++
++In cases where automatic registration is undesirable, it can be opted-out of by adding #[reflect(no_auto_register)] reflect attribute to a type:
++
++```rs
++#[derive(Reflect)]
++#[reflect(no_auto_register)]
++pub struct Foo {
++  a: usize,
++}
++```
++
++## Unsupported platforms
++
++This feature relies on the [`inventory`] crate to collect all type registrations at compile-time. However, some niche platforms are not supported by [`inventory`], and while it would be best for
++any unsupported platforms to be supported upstream, sometimes it might not be possible. For this reason, there is a different implementation of this feature that works on all platforms.
++It comes with some caveats with regards to project structure and might increase compile time, so it is better used as a backup solution. The detailed instructions on how to use this feature
++can be found in this [`example`]. Types can also still be manually registered using `app.register_type::<T>()`.
++
++[`Reflect`]: https://docs.rs/bevy/0.17.0/bevy/prelude/trait.Reflect.html
++[`inventory`]: https://github.com/dtolnay/inventory
++[`example`]: https://github.com/bevyengine/bevy/tree/release-0.17.0/examples/reflection/auto_register_static
++[`register_type`]: https://docs.rs/bevy/0.17.0/bevy/prelude/struct.App.html#method.register_type
