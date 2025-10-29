@@ -1,0 +1,295 @@
+diff --git a/crates/bevy_image/src/compressed_image_saver.rs b/crates/bevy_image/src/compressed_image_saver.rs
+index bcae2f238060d..0c8f730630ce5 100644
+--- a/crates/bevy_image/src/compressed_image_saver.rs
++++ b/crates/bevy_image/src/compressed_image_saver.rs
+@@ -70,6 +70,7 @@ impl AssetSaver for CompressedImageSaver {
+             sampler: image.sampler.clone(),
+             asset_usage: image.asset_usage,
+             texture_format: None,
++            array_layout: None,
+         })
+     }
+ }
+diff --git a/crates/bevy_image/src/image_loader.rs b/crates/bevy_image/src/image_loader.rs
+index 91d03cb9d1116..e5a945cf55e7b 100644
+--- a/crates/bevy_image/src/image_loader.rs
++++ b/crates/bevy_image/src/image_loader.rs
+@@ -1,4 +1,7 @@
+-use crate::image::{Image, ImageFormat, ImageType, TextureError};
++use crate::{
++    image::{Image, ImageFormat, ImageType, TextureError},
++    TextureReinterpretationError,
++};
+ use bevy_asset::{io::Reader, AssetLoader, LoadContext, RenderAssetUsages};
+ use thiserror::Error;
+ 
+@@ -96,6 +99,15 @@ pub enum ImageFormatSetting {
+     Guess,
+ }
+ 
++/// How to interpret the image as an array of textures.
++#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
++pub enum ImageArrayLayout {
++    /// Interpret the image as a vertical stack of *n* images.
++    RowCount { rows: u32 },
++    /// Interpret the image as a vertical stack of images, each *n* pixels tall.
++    RowHeight { pixels: u32 },
++}
++
+ /// Settings for loading an [`Image`] using an [`ImageLoader`].
+ #[derive(Serialize, Deserialize, Debug, Clone)]
+ pub struct ImageLoaderSettings {
+@@ -118,6 +130,11 @@ pub struct ImageLoaderSettings {
+     /// Where the asset will be used - see the docs on
+     /// [`RenderAssetUsages`] for details.
+     pub asset_usage: RenderAssetUsages,
++    /// Interpret the image as an array of images. This is
++    /// primarily for use with the `texture2DArray` shader
++    /// uniform type.
++    #[serde(default)]
++    pub array_layout: Option<ImageArrayLayout>,
+ }
+ 
+ impl Default for ImageLoaderSettings {
+@@ -128,6 +145,7 @@ impl Default for ImageLoaderSettings {
+             is_srgb: true,
+             sampler: ImageSampler::Default,
+             asset_usage: RenderAssetUsages::default(),
++            array_layout: None,
+         }
+     }
+ }
+@@ -142,6 +160,9 @@ pub enum ImageLoaderError {
+     /// An error occurred while trying to decode the image bytes.
+     #[error("Could not load texture file: {0}")]
+     FileTexture(#[from] FileTextureError),
++    /// An error occurred while trying to interpret the image bytes as an array texture.
++    #[error("Invalid array layout: {0}")]
++    ArrayLayout(#[from] TextureReinterpretationError),
+ }
+ 
+ impl AssetLoader for ImageLoader {
+@@ -176,7 +197,8 @@ impl AssetLoader for ImageLoader {
+                 )?)
+             }
+         };
+-        Ok(Image::from_buffer(
++
++        let mut image = Image::from_buffer(
+             &bytes,
+             image_type,
+             self.supported_compressed_formats,
+@@ -184,16 +206,25 @@ impl AssetLoader for ImageLoader {
+             settings.sampler.clone(),
+             settings.asset_usage,
+         )
+-        .map(|mut image| {
+-            if let Some(format) = settings.texture_format {
+-                image.texture_descriptor.format = format;
+-            }
+-            image
+-        })
+         .map_err(|err| FileTextureError {
+             error: err,
+             path: format!("{}", load_context.path().display()),
+-        })?)
++        })?;
++
++        if let Some(format) = settings.texture_format {
++            image.texture_descriptor.format = format;
++        }
++
++        if let Some(array_layout) = settings.array_layout {
++            let layers = match array_layout {
++                ImageArrayLayout::RowCount { rows } => rows,
++                ImageArrayLayout::RowHeight { pixels } => image.height() / pixels,
++            };
++
++            image.reinterpret_stacked_2d_as_array(layers)?;
++        }
++
++        Ok(image)
+     }
+ 
+     fn extensions(&self) -> &[&str] {
+diff --git a/examples/2d/tilemap_chunk.rs b/examples/2d/tilemap_chunk.rs
+index 62b547ad97ef8..4bc1855841c04 100644
+--- a/examples/2d/tilemap_chunk.rs
++++ b/examples/2d/tilemap_chunk.rs
+@@ -2,6 +2,7 @@
+ 
+ use bevy::{
+     color::palettes::tailwind::RED_400,
++    image::{ImageArrayLayout, ImageLoaderSettings},
+     prelude::*,
+     sprite_render::{TileData, TilemapChunk, TilemapChunkTileData},
+ };
+@@ -12,10 +13,7 @@ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
+         .add_systems(Startup, (setup, spawn_fake_player).chain())
+-        .add_systems(
+-            Update,
+-            (update_tileset_image, update_tilemap, move_player, log_tile),
+-        )
++        .add_systems(Update, (update_tilemap, move_player, log_tile))
+         .run();
+ }
+ 
+@@ -47,7 +45,14 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+         TilemapChunk {
+             chunk_size,
+             tile_display_size,
+-            tileset: assets.load("textures/array_texture.png"),
++            tileset: assets.load_with_settings(
++                "textures/array_texture.png",
++                |settings: &mut ImageLoaderSettings| {
++                    // The tileset texture is expected to be an array of tile textures, so we tell the
++                    // `ImageLoader` that our texture is composed of 4 stacked tile images.
++                    settings.array_layout = Some(ImageArrayLayout::RowCount { rows: 4 });
++                },
++            ),
+             ..default()
+         },
+         TilemapChunkTileData(tile_data),
+@@ -108,22 +113,6 @@ fn move_player(
+     player.translation.x = origin.lerp(destination, t);
+ }
+ 
+-fn update_tileset_image(
+-    chunk_query: Single<&TilemapChunk>,
+-    mut events: MessageReader<AssetEvent<Image>>,
+-    mut images: ResMut<Assets<Image>>,
+-) {
+-    let chunk = *chunk_query;
+-    for event in events.read() {
+-        if event.is_loaded_with_dependencies(chunk.tileset.id()) {
+-            let image = images.get_mut(&chunk.tileset).unwrap();
+-            image
+-                .reinterpret_stacked_2d_as_array(4)
+-                .expect("asset should be 2d texture with height evenly divisible by 4");
+-        }
+-    }
+-}
+-
+ fn update_tilemap(
+     time: Res<Time>,
+     mut query: Query<(&mut TilemapChunkTileData, &mut UpdateTimer)>,
+diff --git a/examples/shader/array_texture.rs b/examples/shader/array_texture.rs
+index 51703ae14837e..b91872725ab3a 100644
+--- a/examples/shader/array_texture.rs
++++ b/examples/shader/array_texture.rs
+@@ -2,7 +2,11 @@
+ //! uniform variable.
+ 
+ use bevy::{
+-    prelude::*, reflect::TypePath, render::render_resource::AsBindGroup, shader::ShaderRef,
++    image::{ImageArrayLayout, ImageLoaderSettings},
++    prelude::*,
++    reflect::TypePath,
++    render::render_resource::AsBindGroup,
++    shader::ShaderRef,
+ };
+ 
+ /// This example uses a shader source file from the assets subdirectory
+@@ -15,22 +19,22 @@ fn main() {
+             MaterialPlugin::<ArrayTextureMaterial>::default(),
+         ))
+         .add_systems(Startup, setup)
+-        .add_systems(Update, create_array_texture)
+         .run();
+ }
+ 
+-#[derive(Resource)]
+-struct LoadingTexture {
+-    is_loaded: bool,
+-    handle: Handle<Image>,
+-}
+-
+-fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+-    // Start loading the texture.
+-    commands.insert_resource(LoadingTexture {
+-        is_loaded: false,
+-        handle: asset_server.load("textures/array_texture.png"),
+-    });
++fn setup(
++    mut commands: Commands,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<ArrayTextureMaterial>>,
++    asset_server: Res<AssetServer>,
++) {
++    // Load the texture.
++    let array_texture = asset_server.load_with_settings(
++        "textures/array_texture.png",
++        |settings: &mut ImageLoaderSettings| {
++            settings.array_layout = Some(ImageArrayLayout::RowCount { rows: 4 });
++        },
++    );
+ 
+     // light
+     commands.spawn((
+@@ -43,37 +47,10 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+         Camera3d::default(),
+         Transform::from_xyz(5.0, 5.0, 5.0).looking_at(Vec3::new(1.5, 0.0, 0.0), Vec3::Y),
+     ));
+-}
+-
+-fn create_array_texture(
+-    mut commands: Commands,
+-    asset_server: Res<AssetServer>,
+-    mut loading_texture: ResMut<LoadingTexture>,
+-    mut images: ResMut<Assets<Image>>,
+-    mut meshes: ResMut<Assets<Mesh>>,
+-    mut materials: ResMut<Assets<ArrayTextureMaterial>>,
+-) {
+-    if loading_texture.is_loaded
+-        || !asset_server
+-            .load_state(loading_texture.handle.id())
+-            .is_loaded()
+-    {
+-        return;
+-    }
+-    loading_texture.is_loaded = true;
+-    let image = images.get_mut(&loading_texture.handle).unwrap();
+-
+-    // Create a new array texture asset from the loaded texture.
+-    let array_layers = 4;
+-    image
+-        .reinterpret_stacked_2d_as_array(array_layers)
+-        .expect("asset should be 2d texture with height evenly divisible by array_layers");
+ 
+     // Spawn some cubes using the array texture
+     let mesh_handle = meshes.add(Cuboid::default());
+-    let material_handle = materials.add(ArrayTextureMaterial {
+-        array_texture: loading_texture.handle.clone(),
+-    });
++    let material_handle = materials.add(ArrayTextureMaterial { array_texture });
+     for x in -5..=5 {
+         commands.spawn((
+             Mesh3d(mesh_handle.clone()),
+diff --git a/release-content/migration-guides/image_loader_array_layout.md b/release-content/migration-guides/image_loader_array_layout.md
+new file mode 100644
+index 0000000000000..bca9fcb18bc5a
+--- /dev/null
++++ b/release-content/migration-guides/image_loader_array_layout.md
+@@ -0,0 +1,20 @@
++---
++title: Image Loader Array Layout
++pull_requests: [21628]
++---
++
++`ImageLoader` now supports loading array textures using the new `ImageLoaderSettings::array_layout` setting.
++
++In previous versions, loading an array texture generally required a system that waited for the asset to load, then called `Image::reinterpret_stacked_2d_as_array`. Now the `ImageLoader` can do that for you automatically.
++
++```rs
++use bevy::image::{ImageLoaderSettings, ImageArrayLayout};
++
++let array_texture = asset_server.load_with_settings(
++    "textures/array_texture.png",
++    |settings: &mut ImageLoaderSettings| {
++        // Load the image as a stacked array of 4 textures.
++        settings.array_layout = Some(ImageArrayLayout::RowCount { rows: 4 });
++    },
++);
++```
