@@ -1,0 +1,1289 @@
+diff --git a/crates/bevy_asset/macros/src/lib.rs b/crates/bevy_asset/macros/src/lib.rs
+index a064477186f69..12268399ecf00 100644
+--- a/crates/bevy_asset/macros/src/lib.rs
++++ b/crates/bevy_asset/macros/src/lib.rs
+@@ -2,10 +2,10 @@
+ 
+ //! Macros for deriving asset traits.
+ 
+-use bevy_macro_utils::BevyManifest;
++use bevy_macro_utils::{as_member, BevyManifest};
+ use proc_macro::{Span, TokenStream};
+ use quote::{format_ident, quote};
+-use syn::{parse_macro_input, Data, DeriveInput, Path};
++use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Path};
+ 
+ pub(crate) fn bevy_asset_path() -> Path {
+     BevyManifest::shared(|manifest| manifest.get_path("bevy_asset"))
+@@ -55,17 +55,14 @@ fn derive_dependency_visitor_internal(
+     let field_has_dep = |f: &syn::Field| f.attrs.iter().any(is_dep_attribute);
+ 
+     let body = match &ast.data {
+-        Data::Struct(data_struct) => {
+-            let fields = data_struct.fields.iter();
+-            let field_visitors = fields.enumerate().filter(|(_, f)| field_has_dep(f));
+-            let field_visitors = field_visitors.map(|(i, field)| match &field.ident {
+-                Some(ident) => visit_dep(quote!(&self.#ident)),
+-                None => {
+-                    let index = syn::Index::from(i);
+-                    visit_dep(quote!(&self.#index))
+-                }
+-            });
+-            Some(quote!( #(#field_visitors)* ))
++        Data::Struct(DataStruct { fields, .. }) => {
++            let field_visitors = fields
++                .iter()
++                .enumerate()
++                .filter(|(_, f)| field_has_dep(f))
++                .map(|(i, field)| as_member(field.ident.as_ref(), i))
++                .map(|member| visit_dep(quote!(&self.#member)));
++            Some(quote!(#(#field_visitors)*))
+         }
+         Data::Enum(data_enum) => {
+             let variant_has_dep = |v: &syn::Variant| v.fields.iter().any(field_has_dep);
+@@ -73,29 +70,15 @@ fn derive_dependency_visitor_internal(
+             let cases = data_enum.variants.iter().filter(|v| variant_has_dep(v));
+             let cases = cases.map(|variant| {
+                 let ident = &variant.ident;
+-                let fields = &variant.fields;
+-
+-                let field_visitors = fields.iter().enumerate().filter(|(_, f)| field_has_dep(f));
+-
+-                let field_visitors = field_visitors.map(|(i, field)| match &field.ident {
+-                    Some(ident) => visit_dep(quote!(#ident)),
+-                    None => {
+-                        let ident = format_ident!("member{i}");
+-                        visit_dep(quote!(#ident))
+-                    }
+-                });
+-                let fields = match fields {
+-                    syn::Fields::Named(fields) => {
+-                        let named = fields.named.iter().map(|f| f.ident.as_ref());
+-                        quote!({ #(#named,)* .. })
+-                    }
+-                    syn::Fields::Unnamed(fields) => {
+-                        let named = (0..fields.unnamed.len()).map(|i| format_ident!("member{i}"));
+-                        quote!( ( #(#named,)* ) )
+-                    }
+-                    syn::Fields::Unit => unreachable!("Can't pass filter is_dep_attribute"),
+-                };
+-                quote!(Self::#ident #fields => {
++                let field_members = variant
++                    .fields
++                    .iter()
++                    .enumerate()
++                    .filter(|(_, f)| field_has_dep(f))
++                    .map(|(i, field)| as_member(field.ident.as_ref(), i));
++                let field_locals = field_members.clone().map(|m| format_ident!("__self_{}", m));
++                let field_visitors = field_locals.clone().map(|i| visit_dep(quote!(#i)));
++                quote!(Self::#ident {#(#field_members: #field_locals,)* ..} => {
+                     #(#field_visitors)*
+                 })
+             });
+diff --git a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs
+index 44e43430473f9..9c2c5832e5f26 100644
+--- a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs
++++ b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs
+@@ -17,20 +17,6 @@ struct MutableInvalidAttribute {
+     a: &'static mut Foo,
+ }
+ 
+-#[derive(QueryData)]
+-#[query_data(mutable(foo))]
+-//~^ ERROR: `mutable` does not take any arguments
+-struct MutableInvalidAttributeParameters {
+-    a: &'static mut Foo,
+-}
+-
+-#[derive(QueryData)]
+-#[query_data(derive)]
+-//~^ ERROR: `derive` requires at least one argument
+-struct MutableMissingAttributeParameters {
+-    a: &'static mut Foo,
+-}
+-
+ #[derive(QueryData)]
+ #[query_data(mutable)]
+ struct MutableMarked {
+diff --git a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr
+index 4460ce08a0471..ec71c112a6a05 100644
+--- a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr
++++ b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr
+@@ -4,18 +4,6 @@ error: invalid attribute, expected `mutable` or `derive`
+ 14 | #[query_data(mut)]
+    |              ^^^
+ 
+-error: `mutable` does not take any arguments
+-  --> tests/ui/world_query_derive.rs:21:14
+-   |
+-21 | #[query_data(mutable(foo))]
+-   |              ^^^^^^^
+-
+-error: `derive` requires at least one argument
+-  --> tests/ui/world_query_derive.rs:28:14
+-   |
+-28 | #[query_data(derive)]
+-   |              ^^^^^^
+-
+ error[E0277]: the trait bound `&'static mut Foo: ReadOnlyQueryData` is not satisfied
+   --> tests/ui/world_query_derive.rs:10:8
+    |
+diff --git a/crates/bevy_ecs/macros/Cargo.toml b/crates/bevy_ecs/macros/Cargo.toml
+index 4b1ff6fb7d698..c70c258e6d74f 100644
+--- a/crates/bevy_ecs/macros/Cargo.toml
++++ b/crates/bevy_ecs/macros/Cargo.toml
+@@ -11,7 +11,7 @@ proc-macro = true
+ [dependencies]
+ bevy_macro_utils = { path = "../../bevy_macro_utils", version = "0.18.0-dev" }
+ 
+-syn = { version = "2.0.99", features = ["full", "extra-traits"] }
++syn = { version = "2.0.108", features = ["full", "extra-traits"] }
+ quote = "1.0"
+ proc-macro2 = "1.0"
+ [lints]
+diff --git a/crates/bevy_ecs/macros/src/component.rs b/crates/bevy_ecs/macros/src/component.rs
+index 3ba48175d6f90..c26ed196aa502 100644
+--- a/crates/bevy_ecs/macros/src/component.rs
++++ b/crates/bevy_ecs/macros/src/component.rs
+@@ -350,7 +350,7 @@ pub(crate) fn map_entities(
+                 let ident = &variant.ident;
+                 let field_idents = field_members
+                     .iter()
+-                    .map(|member| format_ident!("__self_{}", member))
++                    .map(|member| format_ident!("__self{}", member))
+                     .collect::<Vec<_>>();
+ 
+                 map.push(
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index 52381717be176..f968d36e50ea5 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -20,8 +20,8 @@ use proc_macro::TokenStream;
+ use proc_macro2::{Ident, Span};
+ use quote::{format_ident, quote, ToTokens};
+ use syn::{
+-    parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned, token::Comma,
+-    ConstParam, Data, DataStruct, DeriveInput, GenericParam, Index, TypeParam,
++    parse_macro_input, parse_quote, punctuated::Punctuated, token::Comma, ConstParam, Data,
++    DeriveInput, GenericParam, TypeParam,
+ };
+ 
+ enum BundleFieldKind {
+@@ -52,8 +52,6 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+     let ast = parse_macro_input!(input as DeriveInput);
+     let ecs_path = bevy_ecs_path();
+ 
+-    let mut errors = vec![];
+-
+     let mut attributes = BundleAttributes::default();
+ 
+     for attr in &ast.attrs {
+@@ -67,20 +65,20 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+                 Err(meta.error(format!("Invalid bundle container attribute. Allowed attributes: `{BUNDLE_ATTRIBUTE_NO_FROM_COMPONENTS}`")))
+             });
+ 
+-            if let Err(error) = parsing {
+-                errors.push(error.into_compile_error());
++            if let Err(e) = parsing {
++                return e.into_compile_error().into();
+             }
+         }
+     }
+ 
+-    let named_fields = match get_struct_fields(&ast.data, "derive(Bundle)") {
++    let fields = match get_struct_fields(&ast.data, "derive(Bundle)") {
+         Ok(fields) => fields,
+         Err(e) => return e.into_compile_error().into(),
+     };
+ 
+-    let mut field_kind = Vec::with_capacity(named_fields.len());
++    let mut field_kinds = Vec::with_capacity(fields.len());
+ 
+-    for field in named_fields {
++    for field in fields {
+         let mut kind = BundleFieldKind::Component;
+ 
+         for attr in field
+@@ -102,42 +100,27 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+             }
+         }
+ 
+-        field_kind.push(kind);
++        field_kinds.push(kind);
+     }
+ 
+-    let field = named_fields
+-        .iter()
+-        .map(|field| field.ident.as_ref())
+-        .collect::<Vec<_>>();
+-
+-    let field_type = named_fields
+-        .iter()
+-        .map(|field| &field.ty)
+-        .collect::<Vec<_>>();
++    let field_types = fields.iter().map(|field| &field.ty).collect::<Vec<_>>();
+ 
+     let mut active_field_types = Vec::new();
+-    let mut active_field_tokens = Vec::new();
+-    let mut active_field_alias: Vec<proc_macro2::TokenStream> = Vec::new();
+-    let mut inactive_field_tokens = Vec::new();
+-    for (((i, field_type), field_kind), field) in field_type
+-        .iter()
+-        .enumerate()
+-        .zip(field_kind.iter())
+-        .zip(field.iter())
++    let mut active_field_members = Vec::new();
++    let mut active_field_locals = Vec::new();
++    let mut inactive_field_members = Vec::new();
++    for ((field_member, field_type), field_kind) in
++        fields.members().zip(field_types).zip(field_kinds)
+     {
+-        let field_alias = format_ident!("field_{}", i).to_token_stream();
+-        let field_tokens = match field {
+-            Some(field) => field.to_token_stream(),
+-            None => Index::from(i).to_token_stream(),
+-        };
++        let field_local = format_ident!("field_{}", field_member);
++
+         match field_kind {
+             BundleFieldKind::Component => {
+                 active_field_types.push(field_type);
+-                active_field_alias.push(field_alias);
+-                active_field_tokens.push(field_tokens);
++                active_field_locals.push(field_local);
++                active_field_members.push(field_member);
+             }
+-
+-            BundleFieldKind::Ignore => inactive_field_tokens.push(field_tokens),
++            BundleFieldKind::Ignore => inactive_field_members.push(field_member),
+         }
+     }
+     let generics = ast.generics;
+@@ -179,11 +162,11 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+                 use #ecs_path::__macro_exports::DebugCheckedUnwrap;
+ 
+                 #ecs_path::ptr::deconstruct_moving_ptr!({
+-                    let #struct_name { #(#active_field_tokens: #active_field_alias,)* #(#inactive_field_tokens: _,)* } = ptr;
++                    let #struct_name { #(#active_field_members: #active_field_locals,)* #(#inactive_field_members: _,)* } = ptr;
+                 });
+                 #(
+                     <#active_field_types as #ecs_path::bundle::DynamicBundle>::get_components(
+-                        #active_field_alias,
++                        #active_field_locals,
+                         func
+                     );
+                 )*
+@@ -210,17 +193,13 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+                 __F: FnMut(&mut __T) -> #ecs_path::ptr::OwningPtr<'_>
+             {
+                 Self {
+-                    #(#active_field_tokens: <#active_field_types as #ecs_path::bundle::BundleFromComponents>::from_components(ctx, &mut *func),)*
+-                    #(#inactive_field_tokens: ::core::default::Default::default(),)*
++                    #(#active_field_members: <#active_field_types as #ecs_path::bundle::BundleFromComponents>::from_components(ctx, &mut *func),)*
++                    #(#inactive_field_members: ::core::default::Default::default(),)*
+                 }
+             }
+         }
+     });
+-
+-    let attribute_errors = &errors;
+-
+     TokenStream::from(quote! {
+-        #(#attribute_errors)*
+         #bundle_impl
+         #from_components_impl
+         #dynamic_bundle_impl
+@@ -258,72 +237,61 @@ pub fn derive_map_entities(input: TokenStream) -> TokenStream {
+ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+     let token_stream = input.clone();
+     let ast = parse_macro_input!(input as DeriveInput);
+-    let Data::Struct(DataStruct {
+-        fields: field_definitions,
+-        ..
+-    }) = ast.data
+-    else {
+-        return syn::Error::new(
+-            ast.span(),
+-            "Invalid `SystemParam` type: expected a `struct`",
+-        )
+-        .into_compile_error()
+-        .into();
+-    };
++
++    match derive_system_param_impl(token_stream, ast) {
++        Ok(t) => t,
++        Err(e) => e.into_compile_error().into(),
++    }
++}
++fn derive_system_param_impl(
++    token_stream: TokenStream,
++    ast: DeriveInput,
++) -> syn::Result<TokenStream> {
++    let fields = get_struct_fields(&ast.data, "derive(SystemParam)")?;
+     let path = bevy_ecs_path();
+ 
+-    let mut field_locals = Vec::new();
+-    let mut field_names = Vec::new();
+-    let mut fields = Vec::new();
+-    let mut field_types = Vec::new();
+-    let mut field_messages = Vec::new();
+-    for (i, field) in field_definitions.iter().enumerate() {
+-        field_locals.push(format_ident!("f{i}"));
+-        let i = Index::from(i);
+-        let field_value = field
+-            .ident
+-            .as_ref()
+-            .map(|f| quote! { #f })
+-            .unwrap_or_else(|| quote! { #i });
+-        field_names.push(format!("::{field_value}"));
+-        fields.push(field_value);
+-        field_types.push(&field.ty);
+-        let mut field_message = None;
+-        for meta in field
+-            .attrs
+-            .iter()
+-            .filter(|a| a.path().is_ident("system_param"))
+-        {
+-            if let Err(e) = meta.parse_nested_meta(|nested| {
++    let field_locals = fields
++        .members()
++        .map(|m| format_ident!("field{}", m))
++        .collect::<Vec<_>>();
++    let field_members = fields.members().collect::<Vec<_>>();
++    let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
++
++    let field_validation_names = fields.members().map(|m| format!("::{}", quote! { #m }));
++    let mut field_validation_messages = Vec::with_capacity(fields.len());
++    for attr in fields
++        .iter()
++        .map(|f| f.attrs.iter().find(|a| a.path().is_ident("system_param")))
++    {
++        let mut field_validation_message = None;
++        if let Some(attr) = attr {
++            attr.parse_nested_meta(|nested| {
+                 if nested.path.is_ident("validation_message") {
+-                    field_message = Some(nested.value()?.parse()?);
++                    field_validation_message = Some(nested.value()?.parse()?);
+                     Ok(())
+                 } else {
+                     Err(nested.error("Unsupported attribute"))
+                 }
+-            }) {
+-                return e.into_compile_error().into();
+-            }
++            })?;
+         }
+-        field_messages.push(field_message.unwrap_or_else(|| quote! { err.message }));
++        field_validation_messages
++            .push(field_validation_message.unwrap_or_else(|| quote! { err.message }));
+     }
+ 
+     let generics = ast.generics;
+ 
+     // Emit an error if there's any unrecognized lifetime names.
++    let w = format_ident!("w");
++    let s = format_ident!("s");
+     for lt in generics.lifetimes() {
+         let ident = &lt.lifetime.ident;
+-        let w = format_ident!("w");
+-        let s = format_ident!("s");
+         if ident != &w && ident != &s {
+-            return syn::Error::new_spanned(
++            return Err(syn::Error::new_spanned(
+                 lt,
+                 r#"invalid lifetime name: expected `'w` or `'s`
+  'w -- refers to data stored in the World.
+  's -- refers to data stored in the SystemParam's state.'"#,
+-            )
+-            .into_compile_error()
+-            .into();
++            ));
+         }
+     }
+ 
+@@ -368,8 +336,8 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+         })
+         .collect();
+ 
+-    let mut tuple_types: Vec<_> = field_types.iter().map(|x| quote! { #x }).collect();
+-    let mut tuple_patterns: Vec<_> = field_locals.iter().map(|x| quote! { #x }).collect();
++    let mut tuple_types: Vec<_> = field_types.iter().map(ToTokens::to_token_stream).collect();
++    let mut tuple_patterns: Vec<_> = field_locals.iter().map(ToTokens::to_token_stream).collect();
+ 
+     // If the number of fields exceeds the 16-parameter limit,
+     // fold the fields into tuples of tuples until we are below the limit.
+@@ -381,7 +349,6 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+         let end = Vec::from_iter(tuple_patterns.drain(..LIMIT));
+         tuple_patterns.push(parse_quote!( (#(#end,)*) ));
+     }
+-
+     // Create a where clause for the `ReadOnlySystemParam` impl.
+     // Ensure that each field implements `ReadOnlySystemParam`.
+     let mut read_only_generics = generics.clone();
+@@ -405,25 +372,23 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+         .iter()
+         .filter(|a| a.path().is_ident("system_param"))
+     {
+-        if let Err(e) = meta.parse_nested_meta(|nested| {
++        meta.parse_nested_meta(|nested| {
+             if nested.path.is_ident("builder") {
+                 builder_name = Some(format_ident!("{struct_name}Builder"));
+                 Ok(())
+             } else {
+                 Err(nested.error("Unsupported attribute"))
+             }
+-        }) {
+-            return e.into_compile_error().into();
+-        }
++        })?;
+     }
+ 
+     let builder = builder_name.map(|builder_name| {
+-        let builder_type_parameters: Vec<_> = (0..fields.len()).map(|i| format_ident!("B{i}")).collect();
++        let builder_type_parameters: Vec<Ident> = field_members.iter().map(|m| format_ident!("B{}", m)).collect();
+         let builder_doc_comment = format!("A [`SystemParamBuilder`] for a [`{struct_name}`].");
+         let builder_struct = quote! {
+             #[doc = #builder_doc_comment]
+             struct #builder_name<#(#builder_type_parameters,)*> {
+-                #(#fields: #builder_type_parameters,)*
++                #(#field_members: #builder_type_parameters,)*
+             }
+         };
+         let lifetimes: Vec<_> = generics.lifetimes().collect();
+@@ -438,7 +403,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+                 #where_clause
+             {
+                 fn build(self, world: &mut #path::world::World) -> <#generic_struct as #path::system::SystemParam>::State {
+-                    let #builder_name { #(#fields: #field_locals,)* } = self;
++                    let #builder_name { #(#field_members: #field_locals,)* } = self;
+                     #state_struct_name {
+                         state: #path::system::SystemParamBuilder::build((#(#tuple_patterns,)*), world)
+                     }
+@@ -449,7 +414,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+     });
+     let (builder_struct, builder_impl) = builder.unzip();
+ 
+-    TokenStream::from(quote! {
++    Ok(TokenStream::from(quote! {
+         // We define the FetchState struct in an anonymous scope to avoid polluting the user namespace.
+         // The struct can still be accessed via SystemParam::State, e.g. MessageReaderState can be accessed via
+         // <MessageReader<'static, 'static, T> as SystemParam>::State
+@@ -496,7 +461,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+                     let #state_struct_name { state: (#(#tuple_patterns,)*) } = state;
+                     #(
+                         <#field_types as #path::system::SystemParam>::validate_param(#field_locals, _system_meta, _world)
+-                            .map_err(|err| #path::system::SystemParamValidationError::new::<Self>(err.skipped, #field_messages, #field_names))?;
++                            .map_err(|err| #path::system::SystemParamValidationError::new::<Self>(err.skipped, #field_validation_messages, #field_validation_names))?;
+                     )*
+                     Result::Ok(())
+                 }
+@@ -512,7 +477,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+                         (#(#tuple_types,)*) as #path::system::SystemParam
+                     >::get_param(&mut state.state, system_meta, world, change_tick);
+                     #struct_name {
+-                        #(#fields: #field_locals,)*
++                        #(#field_members: #field_locals,)*
+                     }
+                 }
+             }
+@@ -524,7 +489,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+         };
+ 
+         #builder_struct
+-    })
++    }))
+ }
+ 
+ /// Implement `QueryData` to use a struct as a data parameter in a query
+diff --git a/crates/bevy_ecs/macros/src/query_data.rs b/crates/bevy_ecs/macros/src/query_data.rs
+index 3459a171234ea..1e9dea94bbca3 100644
+--- a/crates/bevy_ecs/macros/src/query_data.rs
++++ b/crates/bevy_ecs/macros/src/query_data.rs
+@@ -1,10 +1,9 @@
+-use bevy_macro_utils::ensure_no_collision;
++use bevy_macro_utils::{ensure_no_collision, get_struct_fields};
+ use proc_macro::TokenStream;
+ use proc_macro2::{Ident, Span};
+ use quote::{format_ident, quote};
+ use syn::{
+-    parse_macro_input, parse_quote, punctuated::Punctuated, token, token::Comma, Attribute, Data,
+-    DataStruct, DeriveInput, Field, Index, Meta,
++    parse_macro_input, parse_quote, punctuated::Punctuated, token::Comma, DeriveInput, Meta,
+ };
+ 
+ use crate::{
+@@ -36,28 +35,18 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+ 
+     let mut attributes = QueryDataAttributes::default();
+     for attr in &ast.attrs {
+-        if attr
+-            .path()
+-            .get_ident()
+-            .is_none_or(|ident| ident != QUERY_DATA_ATTRIBUTE_NAME)
+-        {
++        if !attr.path().is_ident(QUERY_DATA_ATTRIBUTE_NAME) {
+             continue;
+         }
+ 
+         let result = attr.parse_nested_meta(|meta| {
+             if meta.path.is_ident(MUTABLE_ATTRIBUTE_NAME) {
+                 attributes.is_mutable = true;
+-                if meta.input.peek(token::Paren) {
+-                    Err(meta.error(format_args!("`{MUTABLE_ATTRIBUTE_NAME}` does not take any arguments")))
+-                } else {
+-                    Ok(())
+-                }
++                Ok(())
+             } else if meta.path.is_ident(DERIVE_ATTRIBUTE_NAME) {
+                 meta.parse_nested_meta(|meta| {
+                     attributes.derive_args.push(Meta::Path(meta.path));
+                     Ok(())
+-                }).map_err(|_| {
+-                    meta.error(format_args!("`{DERIVE_ATTRIBUTE_NAME}` requires at least one argument"))
+                 })
+             } else {
+                 Err(meta.error(format_args!("invalid attribute, expected `{MUTABLE_ATTRIBUTE_NAME}` or `{DERIVE_ATTRIBUTE_NAME}`")))
+@@ -123,45 +112,23 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+     let state_struct_name = Ident::new(&format!("{struct_name}State"), Span::call_site());
+     let state_struct_name = ensure_no_collision(state_struct_name, tokens);
+ 
+-    let Data::Struct(DataStruct { fields, .. }) = &ast.data else {
+-        return syn::Error::new(
+-            Span::call_site(),
+-            "#[derive(QueryData)]` only supports structs",
+-        )
+-        .into_compile_error()
+-        .into();
++    let fields = match get_struct_fields(&ast.data, "derive(QueryData)") {
++        Ok(fields) => fields,
++        Err(e) => return e.into_compile_error().into(),
+     };
+ 
+-    let mut field_attrs = Vec::new();
+-    let mut field_visibilities = Vec::new();
+-    let mut field_idents = Vec::new();
+-    let mut named_field_idents = Vec::new();
+-    let mut field_types = Vec::new();
+-    let mut read_only_field_types = Vec::new();
+-    for (i, field) in fields.iter().enumerate() {
+-        let attrs = match read_world_query_field_info(field) {
+-            Ok(QueryDataFieldInfo { attrs }) => attrs,
+-            Err(e) => return e.into_compile_error().into(),
+-        };
+-
+-        let named_field_ident = field
+-            .ident
+-            .as_ref()
+-            .cloned()
+-            .unwrap_or_else(|| format_ident!("f{i}"));
+-        let i = Index::from(i);
+-        let field_ident = field
+-            .ident
+-            .as_ref()
+-            .map_or(quote! { #i }, |i| quote! { #i });
+-        field_idents.push(field_ident);
+-        named_field_idents.push(named_field_ident);
+-        field_attrs.push(attrs);
+-        field_visibilities.push(field.vis.clone());
+-        let field_ty = field.ty.clone();
+-        field_types.push(quote!(#field_ty));
+-        read_only_field_types.push(quote!(<#field_ty as #path::query::QueryData>::ReadOnly));
+-    }
++    let field_attrs = fields.iter().map(|f| f.attrs.clone()).collect();
++    let field_visibilities = fields.iter().map(|f| f.vis.clone()).collect();
++    let field_members = fields.members().collect();
++    let field_aliases = fields
++        .members()
++        .map(|m| format_ident!("field{}", m))
++        .collect();
++    let field_types: Vec<syn::Type> = fields.iter().map(|f| f.ty.clone()).collect();
++    let read_only_field_types = field_types
++        .iter()
++        .map(|ty| parse_quote!(<#ty as #path::query::QueryData>::ReadOnly))
++        .collect();
+ 
+     let derive_args = &attributes.derive_args;
+     // `#[derive()]` is valid syntax
+@@ -178,7 +145,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+         &user_impl_generics_with_world_and_state,
+         &field_attrs,
+         &field_visibilities,
+-        &field_idents,
++        &field_members,
+         &user_ty_generics,
+         &user_ty_generics_with_world_and_state,
+         user_where_clauses_with_world_and_state,
+@@ -193,7 +160,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+         &user_impl_generics_with_world,
+         &user_ty_generics,
+         &user_ty_generics_with_world,
+-        &named_field_idents,
++        &field_aliases,
+         &marker_name,
+         &state_struct_name,
+         user_where_clauses,
+@@ -213,7 +180,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+             &user_impl_generics_with_world_and_state,
+             &field_attrs,
+             &field_visibilities,
+-            &field_idents,
++            &field_members,
+             &user_ty_generics,
+             &user_ty_generics_with_world_and_state,
+             user_where_clauses_with_world_and_state,
+@@ -228,7 +195,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+             &user_impl_generics_with_world,
+             &user_ty_generics,
+             &user_ty_generics_with_world,
+-            &named_field_idents,
++            &field_aliases,
+             &marker_name,
+             &state_struct_name,
+             user_where_clauses,
+@@ -248,7 +215,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                     #[doc = "Automatically generated read-only field for accessing `"]
+                     #[doc = stringify!(#field_types)]
+                     #[doc = "`."]
+-                    #field_visibilities #named_field_idents: #read_only_field_types,
++                    #field_visibilities #field_members: #read_only_field_types,
+                 )*
+             }
+ 
+@@ -275,7 +242,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                     ) -> Self::Item<'__wshort, '__s> {
+                         #read_only_item_struct_name {
+                             #(
+-                                #field_idents: <#read_only_field_types>::shrink(item.#field_idents),
++                                #field_members: <#read_only_field_types>::shrink(item.#field_members),
+                             )*
+                         }
+                     }
+@@ -285,7 +252,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                         access: &mut #path::query::Access,
+                         available_access: &#path::query::Access,
+                     ) {
+-                        #(<#field_types>::provide_extra_access(&mut state.#named_field_idents, access, available_access);)*
++                        #(<#field_types>::provide_extra_access(&mut state.#field_aliases, access, available_access);)*
+                     }
+ 
+                     /// SAFETY: we call `fetch` for each member that implements `Fetch`.
+@@ -297,7 +264,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                         _table_row: #path::storage::TableRow,
+                     ) -> Option<Self::Item<'__w, '__s>> {
+                         Some(Self::Item {
+-                            #(#field_idents: <#read_only_field_types>::fetch(&_state.#named_field_idents, &mut _fetch.#named_field_idents, _entity, _table_row)?,)*
++                            #(#field_members: <#read_only_field_types>::fetch(&_state.#field_aliases, &mut _fetch.#field_aliases, _entity, _table_row)?,)*
+                         })
+                     }
+                 }
+@@ -309,7 +276,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                 where #(for<'__a> #field_types: #path::query::QueryData<ReadOnly: #path::query::ReleaseStateQueryData>,)* {
+                     fn release_state<'__w>(_item: Self::Item<'__w, '_>) -> Self::Item<'__w, 'static> {
+                         Self::Item {
+-                            #(#field_idents: <#read_only_field_types>::release_state(_item.#field_idents),)*
++                            #(#field_members: <#read_only_field_types>::release_state(_item.#field_members),)*
+                         }
+                     }
+                 }
+@@ -340,7 +307,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                 ) -> Self::Item<'__wshort, '__s> {
+                     #item_struct_name {
+                         #(
+-                            #field_idents: <#field_types>::shrink(item.#field_idents),
++                            #field_members: <#field_types>::shrink(item.#field_members),
+                         )*
+                     }
+                 }
+@@ -350,7 +317,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                     access: &mut #path::query::Access,
+                     available_access: &#path::query::Access,
+                 ) {
+-                    #(<#field_types>::provide_extra_access(&mut state.#named_field_idents, access, available_access);)*
++                    #(<#field_types>::provide_extra_access(&mut state.#field_aliases, access, available_access);)*
+                 }
+ 
+                 /// SAFETY: we call `fetch` for each member that implements `Fetch`.
+@@ -362,7 +329,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                     _table_row: #path::storage::TableRow,
+                 ) -> Option<Self::Item<'__w, '__s>> {
+                     Some(Self::Item {
+-                        #(#field_idents: <#field_types>::fetch(&_state.#named_field_idents, &mut _fetch.#named_field_idents, _entity, _table_row)?,)*
++                        #(#field_members: <#field_types>::fetch(&_state.#field_aliases, &mut _fetch.#field_aliases, _entity, _table_row)?,)*
+                     })
+                 }
+             }
+@@ -374,7 +341,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+             where #(for<'__a> #field_types: #path::query::ReleaseStateQueryData,)* {
+                 fn release_state<'__w>(_item: Self::Item<'__w, '_>) -> Self::Item<'__w, 'static> {
+                     Self::Item {
+-                        #(#field_idents: <#field_types>::release_state(_item.#field_idents),)*
++                        #(#field_members: <#field_types>::release_state(_item.#field_members),)*
+                     }
+                 }
+             }
+@@ -435,7 +402,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+             )]
+             #[automatically_derived]
+             #visibility struct #state_struct_name #user_impl_generics #user_where_clauses {
+-                #(#named_field_idents: <#field_types as #path::query::WorldQuery>::State,)*
++                #(#field_aliases: <#field_types as #path::query::WorldQuery>::State,)*
+             }
+ 
+             #mutable_world_query_impl
+@@ -477,33 +444,9 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                 q: #struct_name #user_ty_generics,
+                 q2: #read_only_struct_name #user_ty_generics
+             ) #user_where_clauses {
+-                #(q.#field_idents;)*
+-                #(q2.#field_idents;)*
++                #(q.#field_members;)*
++                #(q2.#field_members;)*
+             }
+         };
+     })
+ }
+-
+-struct QueryDataFieldInfo {
+-    /// All field attributes except for `query_data` ones.
+-    attrs: Vec<Attribute>,
+-}
+-
+-fn read_world_query_field_info(field: &Field) -> syn::Result<QueryDataFieldInfo> {
+-    let mut attrs = Vec::new();
+-    for attr in &field.attrs {
+-        if attr
+-            .path()
+-            .get_ident()
+-            .is_some_and(|ident| ident == QUERY_DATA_ATTRIBUTE_NAME)
+-        {
+-            return Err(syn::Error::new_spanned(
+-                attr,
+-                "#[derive(QueryData)] does not support field attributes.",
+-            ));
+-        }
+-        attrs.push(attr.clone());
+-    }
+-
+-    Ok(QueryDataFieldInfo { attrs })
+-}
+diff --git a/crates/bevy_ecs/macros/src/query_filter.rs b/crates/bevy_ecs/macros/src/query_filter.rs
+index 712befb71007d..ed4f55c6af02f 100644
+--- a/crates/bevy_ecs/macros/src/query_filter.rs
++++ b/crates/bevy_ecs/macros/src/query_filter.rs
+@@ -1,8 +1,8 @@
+-use bevy_macro_utils::ensure_no_collision;
++use bevy_macro_utils::{ensure_no_collision, get_struct_fields};
+ use proc_macro::TokenStream;
+ use proc_macro2::{Ident, Span};
+ use quote::{format_ident, quote};
+-use syn::{parse_macro_input, parse_quote, Data, DataStruct, DeriveInput, Index};
++use syn::{parse_macro_input, parse_quote, DeriveInput};
+ 
+ use crate::{bevy_ecs_path, world_query::world_query_impl};
+ 
+@@ -41,40 +41,17 @@ pub fn derive_query_filter_impl(input: TokenStream) -> TokenStream {
+     let state_struct_name = Ident::new(&format!("{struct_name}State"), Span::call_site());
+     let state_struct_name = ensure_no_collision(state_struct_name, tokens);
+ 
+-    let Data::Struct(DataStruct { fields, .. }) = &ast.data else {
+-        return syn::Error::new(
+-            Span::call_site(),
+-            "#[derive(WorldQuery)]` only supports structs",
+-        )
+-        .into_compile_error()
+-        .into();
++    let fields = match get_struct_fields(&ast.data, "derive(WorldQuery)") {
++        Ok(fields) => fields,
++        Err(e) => return e.into_compile_error().into(),
+     };
+ 
+-    let mut field_attrs = Vec::new();
+-    let mut field_visibilities = Vec::new();
+-    let mut field_idents = Vec::new();
+-    let mut named_field_idents = Vec::new();
+-    let mut field_types = Vec::new();
+-    for (i, field) in fields.iter().enumerate() {
+-        let attrs = field.attrs.clone();
+-
+-        let named_field_ident = field
+-            .ident
+-            .as_ref()
+-            .cloned()
+-            .unwrap_or_else(|| format_ident!("f{i}"));
+-        let i = Index::from(i);
+-        let field_ident = field
+-            .ident
+-            .as_ref()
+-            .map_or(quote! { #i }, |i| quote! { #i });
+-        field_idents.push(field_ident);
+-        named_field_idents.push(named_field_ident);
+-        field_attrs.push(attrs);
+-        field_visibilities.push(field.vis.clone());
+-        let field_ty = field.ty.clone();
+-        field_types.push(quote!(#field_ty));
+-    }
++    let field_members: Vec<_> = fields.members().collect();
++    let field_aliases = fields
++        .members()
++        .map(|m| format_ident!("field{}", m))
++        .collect();
++    let field_types = fields.iter().map(|f| f.ty.clone()).collect();
+ 
+     let world_query_impl = world_query_impl(
+         &path,
+@@ -86,7 +63,7 @@ pub fn derive_query_filter_impl(input: TokenStream) -> TokenStream {
+         &user_impl_generics_with_world,
+         &user_ty_generics,
+         &user_ty_generics_with_world,
+-        &named_field_idents,
++        &field_aliases,
+         &marker_name,
+         &state_struct_name,
+         user_where_clauses,
+@@ -107,7 +84,7 @@ pub fn derive_query_filter_impl(input: TokenStream) -> TokenStream {
+                 _entity: #path::entity::Entity,
+                 _table_row: #path::storage::TableRow,
+             ) -> bool {
+-                true #(&& <#field_types>::filter_fetch(&_state.#named_field_idents, &mut _fetch.#named_field_idents, _entity, _table_row))*
++                true #(&& <#field_types>::filter_fetch(&_state.#field_aliases, &mut _fetch.#field_aliases, _entity, _table_row))*
+             }
+         }
+     };
+@@ -128,7 +105,7 @@ pub fn derive_query_filter_impl(input: TokenStream) -> TokenStream {
+             )]
+             #[automatically_derived]
+             #visibility struct #state_struct_name #user_impl_generics #user_where_clauses {
+-                #(#named_field_idents: <#field_types as #path::query::WorldQuery>::State,)*
++                #(#field_aliases: <#field_types as #path::query::WorldQuery>::State,)*
+             }
+ 
+             #world_query_impl
+@@ -160,8 +137,8 @@ pub fn derive_query_filter_impl(input: TokenStream) -> TokenStream {
+                 q: #struct_name #user_ty_generics,
+                 q2: #struct_name #user_ty_generics
+             ) #user_where_clauses {
+-                #(q.#field_idents;)*
+-                #(q2.#field_idents;)*
++                #(q.#field_members;)*
++                #(q2.#field_members;)*
+             }
+         };
+     })
+diff --git a/crates/bevy_ecs/macros/src/world_query.rs b/crates/bevy_ecs/macros/src/world_query.rs
+index 1cc8eaf501953..39feecf3798b8 100644
+--- a/crates/bevy_ecs/macros/src/world_query.rs
++++ b/crates/bevy_ecs/macros/src/world_query.rs
+@@ -1,6 +1,6 @@
+ use proc_macro2::Ident;
+ use quote::quote;
+-use syn::{Attribute, Fields, ImplGenerics, TypeGenerics, Visibility, WhereClause};
++use syn::{Attribute, Fields, ImplGenerics, Member, Type, TypeGenerics, Visibility, WhereClause};
+ 
+ pub(crate) fn item_struct(
+     path: &syn::Path,
+@@ -9,11 +9,11 @@ pub(crate) fn item_struct(
+     struct_name: &Ident,
+     visibility: &Visibility,
+     item_struct_name: &Ident,
+-    field_types: &Vec<proc_macro2::TokenStream>,
++    field_types: &Vec<Type>,
+     user_impl_generics_with_world_and_state: &ImplGenerics,
+     field_attrs: &Vec<Vec<Attribute>>,
+     field_visibilities: &Vec<Visibility>,
+-    field_idents: &Vec<proc_macro2::TokenStream>,
++    field_members: &Vec<Member>,
+     user_ty_generics: &TypeGenerics,
+     user_ty_generics_with_world_and_state: &TypeGenerics,
+     user_where_clauses_with_world_and_state: Option<&WhereClause>,
+@@ -34,7 +34,7 @@ pub(crate) fn item_struct(
+             #derive_macro_call
+             #item_attrs
+             #visibility struct #item_struct_name #user_impl_generics_with_world_and_state #user_where_clauses_with_world_and_state {
+-                #(#(#field_attrs)* #field_visibilities #field_idents: <#field_types as #path::query::QueryData>::Item<'__w, '__s>,)*
++                #(#(#field_attrs)* #field_visibilities #field_members: <#field_types as #path::query::QueryData>::Item<'__w, '__s>,)*
+             }
+         },
+         Fields::Unnamed(_) => quote! {
+@@ -56,12 +56,12 @@ pub(crate) fn world_query_impl(
+     struct_name: &Ident,
+     visibility: &Visibility,
+     fetch_struct_name: &Ident,
+-    field_types: &Vec<proc_macro2::TokenStream>,
++    field_types: &Vec<Type>,
+     user_impl_generics: &ImplGenerics,
+     user_impl_generics_with_world: &ImplGenerics,
+     user_ty_generics: &TypeGenerics,
+     user_ty_generics_with_world: &TypeGenerics,
+-    named_field_idents: &Vec<Ident>,
++    field_aliases: &Vec<Ident>,
+     marker_name: &Ident,
+     state_struct_name: &Ident,
+     user_where_clauses: Option<&WhereClause>,
+@@ -78,7 +78,7 @@ pub(crate) fn world_query_impl(
+         )]
+         #[automatically_derived]
+         #visibility struct #fetch_struct_name #user_impl_generics_with_world #user_where_clauses_with_world {
+-            #(#named_field_idents: <#field_types as #path::query::WorldQuery>::Fetch<'__w>,)*
++            #(#field_aliases: <#field_types as #path::query::WorldQuery>::Fetch<'__w>,)*
+             #marker_name: &'__w(),
+         }
+ 
+@@ -86,7 +86,7 @@ pub(crate) fn world_query_impl(
+             #user_where_clauses_with_world {
+                 fn clone(&self) -> Self {
+                     Self {
+-                        #(#named_field_idents: self.#named_field_idents.clone(),)*
++                        #(#field_aliases: self.#field_aliases.clone(),)*
+                         #marker_name: &(),
+                     }
+                 }
+@@ -104,7 +104,7 @@ pub(crate) fn world_query_impl(
+             ) -> <#struct_name #user_ty_generics as #path::query::WorldQuery>::Fetch<'__wshort> {
+                 #fetch_struct_name {
+                     #(
+-                        #named_field_idents: <#field_types>::shrink_fetch(fetch.#named_field_idents),
++                        #field_aliases: <#field_types>::shrink_fetch(fetch.#field_aliases),
+                     )*
+                     #marker_name: &(),
+                 }
+@@ -117,10 +117,10 @@ pub(crate) fn world_query_impl(
+                 _this_run: #path::change_detection::Tick,
+             ) -> <Self as #path::query::WorldQuery>::Fetch<'__w> {
+                 #fetch_struct_name {
+-                    #(#named_field_idents:
++                    #(#field_aliases:
+                         <#field_types>::init_fetch(
+                             _world,
+-                            &state.#named_field_idents,
++                            &state.#field_aliases,
+                             _last_run,
+                             _this_run,
+                         ),
+@@ -139,7 +139,7 @@ pub(crate) fn world_query_impl(
+                 _archetype: &'__w #path::archetype::Archetype,
+                 _table: &'__w #path::storage::Table
+             ) {
+-                #(<#field_types>::set_archetype(&mut _fetch.#named_field_idents, &_state.#named_field_idents, _archetype, _table);)*
++                #(<#field_types>::set_archetype(&mut _fetch.#field_aliases, &_state.#field_aliases, _archetype, _table);)*
+             }
+ 
+             /// SAFETY: we call `set_table` for each member that implements `Fetch`
+@@ -149,27 +149,27 @@ pub(crate) fn world_query_impl(
+                 _state: &'__s Self::State,
+                 _table: &'__w #path::storage::Table
+             ) {
+-                #(<#field_types>::set_table(&mut _fetch.#named_field_idents, &_state.#named_field_idents, _table);)*
++                #(<#field_types>::set_table(&mut _fetch.#field_aliases, &_state.#field_aliases, _table);)*
+             }
+ 
+             fn update_component_access(state: &Self::State, _access: &mut #path::query::FilteredAccess) {
+-                #( <#field_types>::update_component_access(&state.#named_field_idents, _access); )*
++                #( <#field_types>::update_component_access(&state.#field_aliases, _access); )*
+             }
+ 
+             fn init_state(world: &mut #path::world::World) -> #state_struct_name #user_ty_generics {
+                 #state_struct_name {
+-                    #(#named_field_idents: <#field_types>::init_state(world),)*
++                    #(#field_aliases: <#field_types>::init_state(world),)*
+                 }
+             }
+ 
+             fn get_state(components: &#path::component::Components) -> Option<#state_struct_name #user_ty_generics> {
+                 Some(#state_struct_name {
+-                    #(#named_field_idents: <#field_types>::get_state(components)?,)*
++                    #(#field_aliases: <#field_types>::get_state(components)?,)*
+                 })
+             }
+ 
+             fn matches_component_set(state: &Self::State, _set_contains_id: &impl Fn(#path::component::ComponentId) -> bool) -> bool {
+-                true #(&& <#field_types>::matches_component_set(&state.#named_field_idents, _set_contains_id))*
++                true #(&& <#field_types>::matches_component_set(&state.#field_aliases, _set_contains_id))*
+             }
+         }
+     }
+diff --git a/crates/bevy_macro_utils/src/lib.rs b/crates/bevy_macro_utils/src/lib.rs
+index 42b9b2f216222..cffed77dd443e 100644
+--- a/crates/bevy_macro_utils/src/lib.rs
++++ b/crates/bevy_macro_utils/src/lib.rs
+@@ -14,6 +14,7 @@ mod attrs;
+ mod bevy_manifest;
+ pub mod fq_std;
+ mod label;
++mod member;
+ mod parser;
+ mod result_sifter;
+ mod shape;
+@@ -22,6 +23,7 @@ mod symbol;
+ pub use attrs::*;
+ pub use bevy_manifest::*;
+ pub use label::*;
++pub use member::*;
+ pub use parser::*;
+ pub use result_sifter::*;
+ pub use shape::*;
+diff --git a/crates/bevy_macro_utils/src/member.rs b/crates/bevy_macro_utils/src/member.rs
+new file mode 100644
+index 0000000000000..5b16309106249
+--- /dev/null
++++ b/crates/bevy_macro_utils/src/member.rs
+@@ -0,0 +1,46 @@
++use syn::{Ident, Member};
++
++/// Converts an optional identifier or index into a [`syn::Member`] variant.
++///
++/// This is useful for when you want to access a field inside a `quote!` block regardless of whether it is an identifier or an index.
++/// There is also [`syn::Fields::members`], but this method doesn't work when you're dealing with single / filtered fields.
++///
++/// Rust struct syntax allows for `Struct { foo: "string" }` with explicitly
++/// named fields. It allows the `Struct { 0: "string" }` syntax when the struct
++/// is declared as a tuple struct.
++///
++/// # Example
++/// ```rust
++/// use syn::{Ident, parse_str, DeriveInput, Data, DataStruct};
++/// use quote::quote;
++/// use bevy_macro_utils::as_member;
++///
++/// let ast: DeriveInput = syn::parse_str(
++///     r#"
++///     struct Mystruct {
++///         field: usize,
++///         #[my_derive]
++///         other_field: usize
++///     }
++/// "#,
++/// )
++/// .unwrap();
++///
++/// let Data::Struct(DataStruct { fields, .. }) = &ast.data else { return };
++///
++/// let field_members = fields
++///     .iter()
++///     .enumerate()
++///     .filter(|(_, field)| field.attrs.iter().any(|attr| attr.path().is_ident("my_derive")))
++///     .map(|(i, field)| { as_member(field.ident.as_ref(), i) });
++///
++/// // it won't matter now if it's a named field or a unnamed field. e.g self.field or self.0
++/// quote!(
++///     #(self.#field_members.do_something();)*
++///     );
++///
++/// ```
++///
++pub fn as_member(ident: Option<&Ident>, index: usize) -> Member {
++    ident.map_or_else(|| Member::from(index), |ident| Member::Named(ident.clone()))
++}
+diff --git a/crates/bevy_macro_utils/src/shape.rs b/crates/bevy_macro_utils/src/shape.rs
+index 502738cb9b044..b109fcd6eaa6b 100644
+--- a/crates/bevy_macro_utils/src/shape.rs
++++ b/crates/bevy_macro_utils/src/shape.rs
+@@ -3,20 +3,13 @@ use syn::{
+     Field, Fields,
+ };
+ 
+-/// Get the fields of a data structure if that structure is a struct with named fields;
++/// Get the fields of a data structure if that structure is a struct;
+ /// otherwise, return a compile error that points to the site of the macro invocation.
+ ///
+ /// `meta` should be the name of the macro calling this function.
+-pub fn get_struct_fields<'a>(
+-    data: &'a Data,
+-    meta: &str,
+-) -> syn::Result<&'a Punctuated<Field, Comma>> {
++pub fn get_struct_fields<'a>(data: &'a Data, meta: &str) -> Result<&'a Fields, Error> {
+     match data {
+-        Data::Struct(data_struct) => match &data_struct.fields {
+-            Fields::Named(fields_named) => Ok(&fields_named.named),
+-            Fields::Unnamed(fields_unnamed) => Ok(&fields_unnamed.unnamed),
+-            Fields::Unit => Ok(const { &Punctuated::new() }),
+-        },
++        Data::Struct(data_struct) => Ok(&data_struct.fields),
+         Data::Enum(DataEnum { enum_token, .. }) => Err(Error::new(
+             enum_token.span(),
+             format!("#[{meta}] only supports structs, not enums"),
+@@ -27,3 +20,15 @@ pub fn get_struct_fields<'a>(
+         )),
+     }
+ }
++
++/// Return an error if `Fields` is not `Fields::Named`
++pub fn require_named<'a>(fields: &'a Fields) -> Result<&'a Punctuated<Field, Comma>, Error> {
++    if let Fields::Named(fields) = fields {
++        Ok(&fields.named)
++    } else {
++        Err(Error::new(
++            fields.span(),
++            "Unnamed fields are not supported here",
++        ))
++    }
++}
+diff --git a/crates/bevy_reflect/derive/src/enum_utility.rs b/crates/bevy_reflect/derive/src/enum_utility.rs
+index 2b32ce1e4d0f3..3410c6eae51b8 100644
+--- a/crates/bevy_reflect/derive/src/enum_utility.rs
++++ b/crates/bevy_reflect/derive/src/enum_utility.rs
+@@ -1,8 +1,8 @@
+ use crate::field_attributes::CloneBehavior;
+ use crate::{
+     derive_data::ReflectEnum, derive_data::StructField, field_attributes::DefaultBehavior,
+-    ident::ident_or_index,
+ };
++use bevy_macro_utils::as_member;
+ use bevy_macro_utils::fq_std::{FQClone, FQDefault, FQOption, FQResult};
+ use proc_macro2::{Ident, TokenStream};
+ use quote::{format_ident, quote, ToTokens};
+@@ -153,7 +153,7 @@ pub(crate) trait VariantBuilder: Sized {
+             let mut field_constructors = Vec::with_capacity(fields.len());
+ 
+             for field in fields {
+-                let member = ident_or_index(field.data.ident.as_ref(), field.declaration_index);
++                let member = as_member(field.data.ident.as_ref(), field.declaration_index);
+                 let alias = format_ident!("_{}", member);
+ 
+                 let variant_field = VariantField {
+diff --git a/crates/bevy_reflect/derive/src/from_reflect.rs b/crates/bevy_reflect/derive/src/from_reflect.rs
+index c2e5240995a8d..970782d5395ea 100644
+--- a/crates/bevy_reflect/derive/src/from_reflect.rs
++++ b/crates/bevy_reflect/derive/src/from_reflect.rs
+@@ -3,10 +3,10 @@ use crate::{
+     derive_data::ReflectEnum,
+     enum_utility::{EnumVariantOutputData, FromReflectVariantBuilder, VariantBuilder},
+     field_attributes::DefaultBehavior,
+-    ident::ident_or_index,
+     where_clause_options::WhereClauseOptions,
+     ReflectMeta, ReflectStruct,
+ };
++use bevy_macro_utils::as_member;
+ use bevy_macro_utils::fq_std::{FQClone, FQDefault, FQOption};
+ use proc_macro2::Span;
+ use quote::{quote, ToTokens};
+@@ -216,7 +216,7 @@ fn get_ignored_fields(reflect_struct: &ReflectStruct) -> MemberValuePair {
+         reflect_struct
+             .ignored_fields()
+             .map(|field| {
+-                let member = ident_or_index(field.data.ident.as_ref(), field.declaration_index);
++                let member = as_member(field.data.ident.as_ref(), field.declaration_index);
+ 
+                 let value = match &field.attrs.default {
+                     DefaultBehavior::Func(path) => quote! {#path()},
+@@ -245,7 +245,7 @@ fn get_active_fields(
+         reflect_struct
+             .active_fields()
+             .map(|field| {
+-                let member = ident_or_index(field.data.ident.as_ref(), field.declaration_index);
++                let member = as_member(field.data.ident.as_ref(), field.declaration_index);
+                 let accessor = get_field_accessor(
+                     field.data,
+                     field.reflection_index.expect("field should be active"),
+diff --git a/crates/bevy_reflect/derive/src/ident.rs b/crates/bevy_reflect/derive/src/ident.rs
+index f14c7ff98f68e..931b3e989a8c6 100644
+--- a/crates/bevy_reflect/derive/src/ident.rs
++++ b/crates/bevy_reflect/derive/src/ident.rs
+@@ -1,5 +1,4 @@
+ use proc_macro2::{Ident, Span};
+-use syn::Member;
+ 
+ /// Returns the "reflected" ident for a given string.
+ ///
+@@ -19,27 +18,3 @@ pub(crate) fn get_reflect_ident(name: &str) -> Ident {
+     let reflected = format!("Reflect{name}");
+     Ident::new(&reflected, Span::call_site())
+ }
+-
+-/// Returns a [`Member`] made of `ident` or `index` if `ident` is `None`.
+-///
+-/// Rust struct syntax allows for `Struct { foo: "string" }` with explicitly
+-/// named fields. It allows the `Struct { 0: "string" }` syntax when the struct
+-/// is declared as a tuple struct.
+-///
+-/// ```
+-/// struct Foo { field: &'static str }
+-/// struct Bar(&'static str);
+-/// let Foo { field } = Foo { field: "hi" };
+-/// let Bar { 0: field } = Bar { 0: "hello" };
+-/// let Bar(field) = Bar("hello"); // more common syntax
+-/// ```
+-///
+-/// This function helps field access in contexts where you are declaring either
+-/// a tuple struct or a struct with named fields. If you don't have a field name,
+-/// it means that you must access the field through an index.
+-pub(crate) fn ident_or_index(ident: Option<&Ident>, index: usize) -> Member {
+-    ident.map_or_else(
+-        || Member::Unnamed(index.into()),
+-        |ident| Member::Named(ident.clone()),
+-    )
+-}
+diff --git a/crates/bevy_reflect/derive/src/remote.rs b/crates/bevy_reflect/derive/src/remote.rs
+index 13cbe681ed4c7..60f4bb61593ee 100644
+--- a/crates/bevy_reflect/derive/src/remote.rs
++++ b/crates/bevy_reflect/derive/src/remote.rs
+@@ -1,11 +1,10 @@
+ use crate::{
+     derive_data::{ReflectImplSource, ReflectProvenance, ReflectTraitToImpl},
+-    from_reflect,
+-    ident::ident_or_index,
+-    impls,
++    from_reflect, impls,
+     impls::impl_assertions,
+     ReflectDerive, REFLECT_ATTRIBUTE_NAME,
+ };
++use bevy_macro_utils::as_member;
+ use bevy_macro_utils::fq_std::FQOption;
+ use proc_macro::TokenStream;
+ use proc_macro2::{Ident, Span};
+@@ -262,7 +261,7 @@ pub(crate) fn generate_remote_assertions(
+                 .remote
+                 .as_ref()
+                 .map(|remote_ty| RemoteAssertionData {
+-                    ident: ident_or_index(field.data.ident.as_ref(), field.declaration_index),
++                    ident: as_member(field.data.ident.as_ref(), field.declaration_index),
+                     variant: None,
+                     ty: &field.data.ty,
+                     generics: data.meta().type_path().generics(),
+@@ -276,7 +275,7 @@ pub(crate) fn generate_remote_assertions(
+                     .remote
+                     .as_ref()
+                     .map(|remote_ty| RemoteAssertionData {
+-                        ident: ident_or_index(field.data.ident.as_ref(), field.declaration_index),
++                        ident: as_member(field.data.ident.as_ref(), field.declaration_index),
+                         variant: Some(&variant.data.ident),
+                         ty: &field.data.ty,
+                         generics: data.meta().type_path().generics(),
+@@ -365,8 +364,7 @@ fn generate_remote_definition_assertions(derive_data: &ReflectDerive) -> proc_ma
+             let mut output = proc_macro2::TokenStream::new();
+ 
+             for field in data.fields() {
+-                let field_member =
+-                    ident_or_index(field.data.ident.as_ref(), field.declaration_index);
++                let field_member = as_member(field.data.ident.as_ref(), field.declaration_index);
+                 let field_ty = &field.data.ty;
+                 let span = create_assertion_span(field_ty.span());
+ 
+@@ -389,7 +387,7 @@ fn generate_remote_definition_assertions(derive_data: &ReflectDerive) -> proc_ma
+ 
+                 for field in variant.fields() {
+                     let field_member =
+-                        ident_or_index(field.data.ident.as_ref(), field.declaration_index);
++                        as_member(field.data.ident.as_ref(), field.declaration_index);
+                     let field_ident = format_ident!("field_{}", field_member);
+                     let field_ty = &field.data.ty;
+                     let span = create_assertion_span(field_ty.span());
+diff --git a/crates/bevy_render/macros/src/specializer.rs b/crates/bevy_render/macros/src/specializer.rs
+index d59d4966a0ac0..486f75d2eb021 100644
+--- a/crates/bevy_render/macros/src/specializer.rs
++++ b/crates/bevy_render/macros/src/specializer.rs
+@@ -1,6 +1,6 @@
+ use bevy_macro_utils::{
+     fq_std::{FQDefault, FQResult},
+-    get_struct_fields,
++    get_struct_fields, require_named,
+ };
+ use proc_macro::TokenStream;
+ use proc_macro2::Span;
+@@ -227,6 +227,7 @@ pub fn impl_specializer(input: TokenStream) -> TokenStream {
+     let ast = parse_macro_input!(input as DeriveInput);
+     let targets = guard!(get_specialize_targets(&ast, "Specializer"));
+     let fields = guard!(get_struct_fields(&ast.data, "Specializer"));
++    let fields = guard!(require_named(fields));
+     let field_info = guard!(get_field_info(fields, &targets));
+ 
+     let key_idents: Vec<Option<Ident>> = field_info
