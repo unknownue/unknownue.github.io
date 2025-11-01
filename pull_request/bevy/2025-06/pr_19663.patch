@@ -1,0 +1,487 @@
+diff --git a/crates/bevy_ecs/src/observer/mod.rs b/crates/bevy_ecs/src/observer/mod.rs
+index d34b686b95664..ef8b0b6042c0e 100644
+--- a/crates/bevy_ecs/src/observer/mod.rs
++++ b/crates/bevy_ecs/src/observer/mod.rs
+@@ -253,9 +253,21 @@ impl<'w, E, B: Bundle> On<'w, E, B> {
+ impl<'w, E: EntityEvent, B: Bundle> On<'w, E, B> {
+     /// Returns the [`Entity`] that was targeted by the `event` that triggered this observer.
+     ///
++    /// Note that if event propagation is enabled, this may not be the same as the original target of the event,
++    /// which can be accessed via [`On::original_target`].
++    ///
+     /// If the event was not targeted at a specific entity, this will return [`Entity::PLACEHOLDER`].
+     pub fn target(&self) -> Entity {
+-        self.trigger.target.unwrap_or(Entity::PLACEHOLDER)
++        self.trigger.current_target.unwrap_or(Entity::PLACEHOLDER)
++    }
++
++    /// Returns the original [`Entity`] that the `event` was targeted at when it was first triggered.
++    ///
++    /// If event propagation is not enabled, this will always return the same value as [`On::target`].
++    ///
++    /// If the event was not targeted at a specific entity, this will return [`Entity::PLACEHOLDER`].
++    pub fn original_target(&self) -> Entity {
++        self.trigger.original_target.unwrap_or(Entity::PLACEHOLDER)
+     }
+ 
+     /// Enables or disables event propagation, allowing the same event to trigger observers on a chain of different entities.
+@@ -483,8 +495,15 @@ pub struct ObserverTrigger {
+     pub event_type: ComponentId,
+     /// The [`ComponentId`]s the trigger targeted.
+     components: SmallVec<[ComponentId; 2]>,
+-    /// The entity the trigger targeted.
+-    pub target: Option<Entity>,
++    /// The entity that the entity-event targeted, if any.
++    ///
++    /// Note that if event propagation is enabled, this may not be the same as [`ObserverTrigger::original_target`].
++    pub current_target: Option<Entity>,
++    /// The entity that the entity-event was originally targeted at, if any.
++    ///
++    /// If event propagation is enabled, this will be the first entity that the event was targeted at,
++    /// even if the event was propagated to other entities.
++    pub original_target: Option<Entity>,
+     /// The location of the source code that triggered the observer.
+     pub caller: MaybeLocation,
+ }
+@@ -573,7 +592,8 @@ impl Observers {
+     pub(crate) fn invoke<T>(
+         mut world: DeferredWorld,
+         event_type: ComponentId,
+-        target: Option<Entity>,
++        current_target: Option<Entity>,
++        original_target: Option<Entity>,
+         components: impl Iterator<Item = ComponentId> + Clone,
+         data: &mut T,
+         propagate: &mut bool,
+@@ -601,7 +621,8 @@ impl Observers {
+                     observer,
+                     event_type,
+                     components: components.clone().collect(),
+-                    target,
++                    current_target,
++                    original_target,
+                     caller,
+                 },
+                 data.into(),
+@@ -612,7 +633,7 @@ impl Observers {
+         observers.map.iter().for_each(&mut trigger_observer);
+ 
+         // Trigger entity observers listening for this kind of trigger
+-        if let Some(target_entity) = target {
++        if let Some(target_entity) = current_target {
+             if let Some(map) = observers.entity_observers.get(&target_entity) {
+                 map.iter().for_each(&mut trigger_observer);
+             }
+@@ -626,7 +647,7 @@ impl Observers {
+                     .iter()
+                     .for_each(&mut trigger_observer);
+ 
+-                if let Some(target_entity) = target {
++                if let Some(target_entity) = current_target {
+                     if let Some(map) = component_observers.entity_map.get(&target_entity) {
+                         map.iter().for_each(&mut trigger_observer);
+                     }
+@@ -752,6 +773,7 @@ impl World {
+             world.trigger_observers_with_data::<_, ()>(
+                 event_id,
+                 None,
++                None,
+                 core::iter::empty::<ComponentId>(),
+                 event_data,
+                 false,
+@@ -863,6 +885,7 @@ impl World {
+                 world.trigger_observers_with_data::<_, E::Traversal>(
+                     event_id,
+                     None,
++                    None,
+                     targets.components(),
+                     event_data,
+                     false,
+@@ -876,6 +899,7 @@ impl World {
+                     world.trigger_observers_with_data::<_, E::Traversal>(
+                         event_id,
+                         Some(target_entity),
++                        Some(target_entity),
+                         targets.components(),
+                         event_data,
+                         E::AUTO_PROPAGATE,
+@@ -1543,21 +1567,27 @@ mod tests {
+         let mut world = World::new();
+         world.init_resource::<Order>();
+ 
+-        let parent = world
+-            .spawn_empty()
+-            .observe(|_: On<EventPropagating>, mut res: ResMut<Order>| {
++        let parent = world.spawn_empty().id();
++        let child = world.spawn(ChildOf(parent)).id();
++
++        world.entity_mut(parent).observe(
++            move |trigger: On<EventPropagating>, mut res: ResMut<Order>| {
+                 res.observed("parent");
+-            })
+-            .id();
+ 
+-        let child = world
+-            .spawn(ChildOf(parent))
+-            .observe(|_: On<EventPropagating>, mut res: ResMut<Order>| {
++                assert_eq!(trigger.target(), parent);
++                assert_eq!(trigger.original_target(), child);
++            },
++        );
++
++        world.entity_mut(child).observe(
++            move |trigger: On<EventPropagating>, mut res: ResMut<Order>| {
+                 res.observed("child");
+-            })
+-            .id();
++                assert_eq!(trigger.target(), child);
++                assert_eq!(trigger.original_target(), child);
++            },
++        );
+ 
+-        // TODO: ideally this flush is not necessary, but right now observe() returns WorldEntityMut
++        // TODO: ideally this flush is not necessary, but right now observe() returns EntityWorldMut
+         // and therefore does not automatically flush.
+         world.flush();
+         world.trigger_targets(EventPropagating, child);
+diff --git a/crates/bevy_ecs/src/world/deferred_world.rs b/crates/bevy_ecs/src/world/deferred_world.rs
+index 3e55dd8087135..2a8d1ac8e8386 100644
+--- a/crates/bevy_ecs/src/world/deferred_world.rs
++++ b/crates/bevy_ecs/src/world/deferred_world.rs
+@@ -747,6 +747,7 @@ impl<'w> DeferredWorld<'w> {
+             self.reborrow(),
+             event,
+             target,
++            target,
+             components,
+             &mut (),
+             &mut false,
+@@ -762,7 +763,8 @@ impl<'w> DeferredWorld<'w> {
+     pub(crate) unsafe fn trigger_observers_with_data<E, T>(
+         &mut self,
+         event: ComponentId,
+-        target: Option<Entity>,
++        current_target: Option<Entity>,
++        original_target: Option<Entity>,
+         components: impl Iterator<Item = ComponentId> + Clone,
+         data: &mut E,
+         mut propagate: bool,
+@@ -773,32 +775,36 @@ impl<'w> DeferredWorld<'w> {
+         Observers::invoke::<_>(
+             self.reborrow(),
+             event,
+-            target,
++            current_target,
++            original_target,
+             components.clone(),
+             data,
+             &mut propagate,
+             caller,
+         );
+-        let Some(mut target) = target else { return };
++        let Some(mut current_target) = current_target else {
++            return;
++        };
+ 
+         loop {
+             if !propagate {
+                 return;
+             }
+             if let Some(traverse_to) = self
+-                .get_entity(target)
++                .get_entity(current_target)
+                 .ok()
+                 .and_then(|entity| entity.get_components::<T>())
+                 .and_then(|item| T::traverse(item, data))
+             {
+-                target = traverse_to;
++                current_target = traverse_to;
+             } else {
+                 break;
+             }
+             Observers::invoke::<_>(
+                 self.reborrow(),
+                 event,
+-                Some(target),
++                Some(current_target),
++                original_target,
+                 components.clone(),
+                 data,
+                 &mut propagate,
+diff --git a/crates/bevy_picking/src/events.rs b/crates/bevy_picking/src/events.rs
+index 393e4a9edc46e..2116d986afee2 100644
+--- a/crates/bevy_picking/src/events.rs
++++ b/crates/bevy_picking/src/events.rs
+@@ -63,8 +63,6 @@ use crate::{
+ #[entity_event(traversal = PointerTraversal, auto_propagate)]
+ #[reflect(Component, Debug, Clone)]
+ pub struct Pointer<E: Debug + Clone + Reflect> {
+-    /// The original target of this picking event, before bubbling
+-    pub target: Entity,
+     /// The pointer that triggered this event
+     pub pointer_id: PointerId,
+     /// The location of the pointer during this event
+@@ -126,9 +124,8 @@ impl<E: Debug + Clone + Reflect> core::ops::Deref for Pointer<E> {
+ 
+ impl<E: Debug + Clone + Reflect> Pointer<E> {
+     /// Construct a new `Pointer<E>` event.
+-    pub fn new(id: PointerId, location: Location, target: Entity, event: E) -> Self {
++    pub fn new(id: PointerId, location: Location, event: E) -> Self {
+         Self {
+-            target,
+             pointer_id: id,
+             pointer_location: location,
+             event,
+@@ -497,12 +494,7 @@ pub fn pointer_events(
+             };
+ 
+             // Always send Out events
+-            let out_event = Pointer::new(
+-                pointer_id,
+-                location.clone(),
+-                hovered_entity,
+-                Out { hit: hit.clone() },
+-            );
++            let out_event = Pointer::new(pointer_id, location.clone(), Out { hit: hit.clone() });
+             commands.trigger_targets(out_event.clone(), hovered_entity);
+             event_writers.out_events.write(out_event);
+ 
+@@ -514,7 +506,6 @@ pub fn pointer_events(
+                     let drag_leave_event = Pointer::new(
+                         pointer_id,
+                         location.clone(),
+-                        hovered_entity,
+                         DragLeave {
+                             button,
+                             dragged: *drag_target,
+@@ -556,7 +547,6 @@ pub fn pointer_events(
+                     let drag_enter_event = Pointer::new(
+                         pointer_id,
+                         location.clone(),
+-                        hovered_entity,
+                         DragEnter {
+                             button,
+                             dragged: *drag_target,
+@@ -569,12 +559,7 @@ pub fn pointer_events(
+             }
+ 
+             // Always send Over events
+-            let over_event = Pointer::new(
+-                pointer_id,
+-                location.clone(),
+-                hovered_entity,
+-                Over { hit: hit.clone() },
+-            );
++            let over_event = Pointer::new(pointer_id, location.clone(), Over { hit: hit.clone() });
+             commands.trigger_targets(over_event.clone(), hovered_entity);
+             event_writers.over_events.write(over_event);
+         }
+@@ -600,7 +585,6 @@ pub fn pointer_events(
+                     let pressed_event = Pointer::new(
+                         pointer_id,
+                         location.clone(),
+-                        hovered_entity,
+                         Press {
+                             button,
+                             hit: hit.clone(),
+@@ -628,7 +612,6 @@ pub fn pointer_events(
+                         let click_event = Pointer::new(
+                             pointer_id,
+                             location.clone(),
+-                            hovered_entity,
+                             Click {
+                                 button,
+                                 hit: hit.clone(),
+@@ -642,7 +625,6 @@ pub fn pointer_events(
+                     let released_event = Pointer::new(
+                         pointer_id,
+                         location.clone(),
+-                        hovered_entity,
+                         Release {
+                             button,
+                             hit: hit.clone(),
+@@ -659,7 +641,6 @@ pub fn pointer_events(
+                         let drag_drop_event = Pointer::new(
+                             pointer_id,
+                             location.clone(),
+-                            *dragged_over,
+                             DragDrop {
+                                 button,
+                                 dropped: drag_target,
+@@ -673,7 +654,6 @@ pub fn pointer_events(
+                     let drag_end_event = Pointer::new(
+                         pointer_id,
+                         location.clone(),
+-                        drag_target,
+                         DragEnd {
+                             button,
+                             distance: drag.latest_pos - drag.start_pos,
+@@ -686,7 +666,6 @@ pub fn pointer_events(
+                         let drag_leave_event = Pointer::new(
+                             pointer_id,
+                             location.clone(),
+-                            *dragged_over,
+                             DragLeave {
+                                 button,
+                                 dragged: drag_target,
+@@ -727,7 +706,6 @@ pub fn pointer_events(
+                         let drag_start_event = Pointer::new(
+                             pointer_id,
+                             location.clone(),
+-                            *press_target,
+                             DragStart {
+                                 button,
+                                 hit: hit.clone(),
+@@ -746,7 +724,6 @@ pub fn pointer_events(
+                         let drag_event = Pointer::new(
+                             pointer_id,
+                             location.clone(),
+-                            *drag_target,
+                             Drag {
+                                 button,
+                                 distance: location.position - drag.start_pos,
+@@ -769,7 +746,6 @@ pub fn pointer_events(
+                             let drag_over_event = Pointer::new(
+                                 pointer_id,
+                                 location.clone(),
+-                                hovered_entity,
+                                 DragOver {
+                                     button,
+                                     dragged: *drag_target,
+@@ -791,7 +767,6 @@ pub fn pointer_events(
+                     let move_event = Pointer::new(
+                         pointer_id,
+                         location.clone(),
+-                        hovered_entity,
+                         Move {
+                             hit: hit.clone(),
+                             delta,
+@@ -811,7 +786,6 @@ pub fn pointer_events(
+                     let scroll_event = Pointer::new(
+                         pointer_id,
+                         location.clone(),
+-                        hovered_entity,
+                         Scroll {
+                             unit,
+                             x,
+@@ -831,8 +805,7 @@ pub fn pointer_events(
+                     .iter()
+                     .flat_map(|h| h.iter().map(|(entity, data)| (*entity, data.to_owned())))
+                 {
+-                    let cancel_event =
+-                        Pointer::new(pointer_id, location.clone(), hovered_entity, Cancel { hit });
++                    let cancel_event = Pointer::new(pointer_id, location.clone(), Cancel { hit });
+                     commands.trigger_targets(cancel_event.clone(), hovered_entity);
+                     event_writers.cancel_events.write(cancel_event);
+                 }
+diff --git a/examples/ecs/error_handling.rs b/examples/ecs/error_handling.rs
+index 0cbad732e4823..0f8fab27044a7 100644
+--- a/examples/ecs/error_handling.rs
++++ b/examples/ecs/error_handling.rs
+@@ -128,7 +128,7 @@ fn fallible_observer(
+     mut step: Local<f32>,
+ ) -> Result {
+     let mut transform = world
+-        .get_mut::<Transform>(trigger.target)
++        .get_mut::<Transform>(trigger.target())
+         .ok_or("No transform found.")?;
+ 
+     *step = if transform.translation.x > 3. {
+diff --git a/examples/ui/directional_navigation.rs b/examples/ui/directional_navigation.rs
+index f35af78c35033..28b0e123f6ef3 100644
+--- a/examples/ui/directional_navigation.rs
++++ b/examples/ui/directional_navigation.rs
+@@ -382,7 +382,6 @@ fn interact_with_focused_button(
+         if let Some(focused_entity) = input_focus.0 {
+             commands.trigger_targets(
+                 Pointer::<Click> {
+-                    target: focused_entity,
+                     // We're pretending that we're a mouse
+                     pointer_id: PointerId::Mouse,
+                     // This field isn't used, so we're just setting it to a placeholder value
+diff --git a/examples/usages/context_menu.rs b/examples/usages/context_menu.rs
+index 411ab323346b7..b4ade6063ba88 100644
+--- a/examples/usages/context_menu.rs
++++ b/examples/usages/context_menu.rs
+@@ -43,7 +43,7 @@ fn text_color_on_hover<T: Debug + Clone + Reflect>(
+     move |mut trigger: On<Pointer<T>>,
+           mut text_color: Query<&mut TextColor>,
+           children: Query<&Children>| {
+-        let Ok(children) = children.get(trigger.event().target) else {
++        let Ok(children) = children.get(trigger.original_target()) else {
+             return;
+         };
+         trigger.propagate(false);
+@@ -112,9 +112,7 @@ fn on_trigger_menu(trigger: On<OpenContextMenu>, mut commands: Commands) {
+              menu_items: Query<&ContextMenuItem>,
+              mut clear_col: ResMut<ClearColor>,
+              mut commands: Commands| {
+-                // Note that we want to know the target of the `Pointer<Press>` event (Button) here.
+-                // Not to be confused with the trigger `target`
+-                let target = trigger.event().target;
++                let target = trigger.original_target();
+ 
+                 if let Ok(item) = menu_items.get(target) {
+                     clear_col.0 = item.0.into();
+diff --git a/release-content/migration-guides/pointer_target.md b/release-content/migration-guides/pointer_target.md
+new file mode 100644
+index 0000000000000..2a5fc427baf17
+--- /dev/null
++++ b/release-content/migration-guides/pointer_target.md
+@@ -0,0 +1,30 @@
++---
++title: Original target of `Pointer` picking events is now stored on observers
++pull_requests: [19663]
++---
++
++The `Pointer.target` field, which tracks the original target of the pointer event before bubbling, has been removed.
++Instead, all observers now track this information, available via the `On::original_target()` method.
++
++If you were using this information via the buffered event API of picking, please migrate to observers.
++If you cannot for performance reasons, please open an issue explaining your exact use case!
++
++As a workaround, you can transform any entity-event into a buffered event that contains the targeted entity using
++an observer than emits events.
++
++```rust
++#[derive(Event, BufferedEvent)]
++struct TransformedEntityEvent<E: EntityEvent> {
++    entity: Entity,
++    event: E,
++}
++
++// A generic observer that handles this transformation
++fn transform_entity_event<E: EntityEvent>(trigger: On<E>, event_writer: EventWriter<TransformedEntityEvent<E>>){
++    if trigger.target() == trigger.original_target(){
++        event_writer.send(trigger.event())
++    }
++}
++```
++
++Additionally, the `ObserverTrigger::target` field has been renamed to `ObserverTrigger::current_target` and a new `ObserverTrigger::original_target` field has been added.
+diff --git a/release-content/release-notes/observer_overhaul.md b/release-content/release-notes/observer_overhaul.md
+index 057bad453bf7e..f51b138764954 100644
+--- a/release-content/release-notes/observer_overhaul.md
++++ b/release-content/release-notes/observer_overhaul.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Observer Overhaul
+-authors: ["@Jondolf"]
+-pull_requests: [19596]
++authors: ["@Jondolf", "@alice-i-cecile"]
++pull_requests: [19596, 19663]
+ ---
+ 
+ ## Rename `Trigger` to `On`
+@@ -32,3 +32,11 @@ where observers are very high-traffic APIs.
+ One concern that may come to mind is that `Add` can sometimes conflict with the `core::ops::Add` trait.
+ However, in practice these scenarios should be rare, and when you do get conflicts, it should be straightforward
+ to disambiguate by using `ops::Add`, for example.
++
++## Original targets
++
++`bevy_picking`'s `Pointer` events have always tracked the original target that an entity-event was targeting,
++allowing you to bubble events up your hierarchy to see if any of the parents care,
++then act on the entity that was actually picked in the first place.
++
++This was handy! We've enabled this functionality for all entity-events: simply call `On::original_target`.

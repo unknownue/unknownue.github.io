@@ -1,0 +1,113 @@
+diff --git a/crates/bevy_ecs/src/relationship/mod.rs b/crates/bevy_ecs/src/relationship/mod.rs
+index 943268ee17b12..67fd899a48763 100644
+--- a/crates/bevy_ecs/src/relationship/mod.rs
++++ b/crates/bevy_ecs/src/relationship/mod.rs
+@@ -128,6 +128,21 @@ pub trait Relationship: Component + Sized {
+             world.commands().entity(entity).remove::<Self>();
+             return;
+         }
++        // For one-to-one relationships, remove existing relationship before adding new one
++        let current_source_to_remove = world
++            .get_entity(target_entity)
++            .ok()
++            .and_then(|target_entity_ref| target_entity_ref.get::<Self::RelationshipTarget>())
++            .and_then(|relationship_target| {
++                relationship_target
++                    .collection()
++                    .source_to_remove_before_add()
++            });
++
++        if let Some(current_source) = current_source_to_remove {
++            world.commands().entity(current_source).try_remove::<Self>();
++        }
++
+         if let Ok(mut entity_commands) = world.commands().get_entity(target_entity) {
+             // Deferring is necessary for batch mode
+             entity_commands
+diff --git a/crates/bevy_ecs/src/relationship/relationship_source_collection.rs b/crates/bevy_ecs/src/relationship/relationship_source_collection.rs
+index 668118003bd78..48866ae9f7fd2 100644
+--- a/crates/bevy_ecs/src/relationship/relationship_source_collection.rs
++++ b/crates/bevy_ecs/src/relationship/relationship_source_collection.rs
+@@ -69,6 +69,12 @@ pub trait RelationshipSourceCollection {
+         self.len() == 0
+     }
+ 
++    /// For one-to-one relationships, returns the entity that should be removed before adding a new one.
++    /// Returns `None` for one-to-many relationships or when no entity needs to be removed.
++    fn source_to_remove_before_add(&self) -> Option<Entity> {
++        None
++    }
++
+     /// Add multiple entities to collection at once.
+     ///
+     /// May be faster than repeatedly calling [`Self::add`].
+@@ -345,14 +351,7 @@ impl RelationshipSourceCollection for Entity {
+     }
+ 
+     fn add(&mut self, entity: Entity) -> bool {
+-        assert_eq!(
+-            *self,
+-            Entity::PLACEHOLDER,
+-            "Entity {entity} attempted to target an entity with a one-to-one relationship, but it is already targeted by {}. You must remove the original relationship first.",
+-            *self
+-        );
+         *self = entity;
+-
+         true
+     }
+ 
+@@ -389,15 +388,17 @@ impl RelationshipSourceCollection for Entity {
+ 
+     fn extend_from_iter(&mut self, entities: impl IntoIterator<Item = Entity>) {
+         for entity in entities {
+-            assert_eq!(
+-                *self,
+-                Entity::PLACEHOLDER,
+-                "Entity {entity} attempted to target an entity with a one-to-one relationship, but it is already targeted by {}. You must remove the original relationship first.",
+-                *self
+-            );
+             *self = entity;
+         }
+     }
++
++    fn source_to_remove_before_add(&self) -> Option<Entity> {
++        if *self != Entity::PLACEHOLDER {
++            Some(*self)
++        } else {
++            None
++        }
++    }
+ }
+ 
+ impl<const N: usize> OrderedRelationshipSourceCollection for SmallVec<[Entity; N]> {
+@@ -724,7 +725,6 @@ mod tests {
+     }
+ 
+     #[test]
+-    #[should_panic]
+     fn one_to_one_relationship_shared_target() {
+         #[derive(Component)]
+         #[relationship(relationship_target = Below)]
+@@ -740,6 +740,22 @@ mod tests {
+ 
+         world.entity_mut(a).insert(Above(c));
+         world.entity_mut(b).insert(Above(c));
++
++        // The original relationship (a -> c) should be removed and the new relationship (b -> c) should be established
++        assert!(
++            world.get::<Above>(a).is_none(),
++            "Original relationship should be removed"
++        );
++        assert_eq!(
++            world.get::<Above>(b).unwrap().0,
++            c,
++            "New relationship should be established"
++        );
++        assert_eq!(
++            world.get::<Below>(c).unwrap().0,
++            b,
++            "Target should point to new source"
++        );
+     }
+ 
+     #[test]

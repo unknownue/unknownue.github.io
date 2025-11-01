@@ -1,0 +1,367 @@
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 12cc6614c550f..3bebf27276402 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -1764,8 +1764,6 @@ pub fn collect_meshes_for_gpu_building(
+ pub struct MeshPipeline {
+     /// A reference to all the mesh pipeline view layouts.
+     pub view_layouts: MeshPipelineViewLayouts,
+-    // This dummy white texture is to be used in place of optional StandardMaterial textures
+-    pub dummy_white_gpu_image: GpuImage,
+     pub clustered_forward_buffer_binding_type: BufferBindingType,
+     pub mesh_layouts: MeshLayouts,
+     /// The shader asset handle.
+@@ -1803,55 +1801,16 @@ impl FromWorld for MeshPipeline {
+         let mut system_state: SystemState<(
+             Res<RenderDevice>,
+             Res<RenderAdapter>,
+-            Res<DefaultImageSampler>,
+-            Res<RenderQueue>,
+             Res<MeshPipelineViewLayouts>,
+         )> = SystemState::new(world);
+-        let (render_device, render_adapter, default_sampler, render_queue, view_layouts) =
+-            system_state.get_mut(world);
++        let (render_device, render_adapter, view_layouts) = system_state.get_mut(world);
+ 
+         let clustered_forward_buffer_binding_type = render_device
+             .get_supported_read_only_binding_type(CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT);
+ 
+-        // A 1x1x1 'all 1.0' texture to use as a dummy texture to use in place of optional StandardMaterial textures
+-        let dummy_white_gpu_image = {
+-            let image = Image::default();
+-            let texture = render_device.create_texture(&image.texture_descriptor);
+-            let sampler = match image.sampler {
+-                ImageSampler::Default => (**default_sampler).clone(),
+-                ImageSampler::Descriptor(ref descriptor) => {
+-                    render_device.create_sampler(&descriptor.as_wgpu())
+-                }
+-            };
+-
+-            if let Ok(format_size) = image.texture_descriptor.format.pixel_size() {
+-                render_queue.write_texture(
+-                    texture.as_image_copy(),
+-                    image.data.as_ref().expect("Image was created without data"),
+-                    TexelCopyBufferLayout {
+-                        offset: 0,
+-                        bytes_per_row: Some(image.width() * format_size as u32),
+-                        rows_per_image: None,
+-                    },
+-                    image.texture_descriptor.size,
+-                );
+-            }
+-
+-            let texture_view = texture.create_view(&TextureViewDescriptor::default());
+-            GpuImage {
+-                texture,
+-                texture_view,
+-                texture_format: image.texture_descriptor.format,
+-                sampler,
+-                size: image.texture_descriptor.size,
+-                mip_level_count: image.texture_descriptor.mip_level_count,
+-            }
+-        };
+-
+         MeshPipeline {
+             view_layouts: view_layouts.clone(),
+             clustered_forward_buffer_binding_type,
+-            dummy_white_gpu_image,
+             mesh_layouts: MeshLayouts::new(&render_device, &render_adapter),
+             shader,
+             per_object_buffer_batch_size: GpuArrayBuffer::<MeshUniform>::batch_size(
+@@ -1868,22 +1827,6 @@ impl FromWorld for MeshPipeline {
+ }
+ 
+ impl MeshPipeline {
+-    pub fn get_image_texture<'a>(
+-        &'a self,
+-        gpu_images: &'a RenderAssets<GpuImage>,
+-        handle_option: &Option<Handle<Image>>,
+-    ) -> Option<(&'a TextureView, &'a Sampler)> {
+-        if let Some(handle) = handle_option {
+-            let gpu_image = gpu_images.get(handle)?;
+-            Some((&gpu_image.texture_view, &gpu_image.sampler))
+-        } else {
+-            Some((
+-                &self.dummy_white_gpu_image.texture_view,
+-                &self.dummy_white_gpu_image.sampler,
+-            ))
+-        }
+-    }
+-
+     pub fn get_view_layout(
+         &self,
+         layout_key: MeshPipelineViewLayoutKey,
+@@ -1892,6 +1835,61 @@ impl MeshPipeline {
+     }
+ }
+ 
++/// A 1x1x1 'all 1.0' texture to use as a dummy texture in place of optional [`crate::pbr_material::StandardMaterial`] textures
++pub fn build_dummy_white_gpu_image(
++    render_device: Res<RenderDevice>,
++    default_sampler: Res<DefaultImageSampler>,
++    render_queue: Res<RenderQueue>,
++) -> GpuImage {
++    let image = Image::default();
++    let texture = render_device.create_texture(&image.texture_descriptor);
++    let sampler = match image.sampler {
++        ImageSampler::Default => (**default_sampler).clone(),
++        ImageSampler::Descriptor(ref descriptor) => {
++            render_device.create_sampler(&descriptor.as_wgpu())
++        }
++    };
++
++    if let Ok(format_size) = image.texture_descriptor.format.pixel_size() {
++        render_queue.write_texture(
++            texture.as_image_copy(),
++            image.data.as_ref().expect("Image was created without data"),
++            TexelCopyBufferLayout {
++                offset: 0,
++                bytes_per_row: Some(image.width() * format_size as u32),
++                rows_per_image: None,
++            },
++            image.texture_descriptor.size,
++        );
++    }
++
++    let texture_view = texture.create_view(&TextureViewDescriptor::default());
++    GpuImage {
++        texture,
++        texture_view,
++        texture_format: image.texture_descriptor.format,
++        sampler,
++        size: image.texture_descriptor.size,
++        mip_level_count: image.texture_descriptor.mip_level_count,
++    }
++}
++
++pub fn get_image_texture<'a>(
++    dummy_white_gpu_image: &'a GpuImage,
++    gpu_images: &'a RenderAssets<GpuImage>,
++    handle_option: &Option<Handle<Image>>,
++) -> Option<(&'a TextureView, &'a Sampler)> {
++    if let Some(handle) = handle_option {
++        let gpu_image = gpu_images.get(handle)?;
++        Some((&gpu_image.texture_view, &gpu_image.sampler))
++    } else {
++        Some((
++            &dummy_white_gpu_image.texture_view,
++            &dummy_white_gpu_image.sampler,
++        ))
++    }
++}
++
+ impl GetBatchData for MeshPipeline {
+     type Param = (
+         SRes<RenderMeshInstances>,
+diff --git a/crates/bevy_sprite_render/src/mesh2d/mesh.rs b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+index 7f8b102786bb3..8b07c535ba6d5 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+@@ -20,7 +20,7 @@ use bevy_ecs::{
+     query::ROQueryItem,
+     system::{lifetimeless::*, SystemParamItem},
+ };
+-use bevy_image::{BevyDefault, Image, ImageSampler, TextureFormatPixelInfo};
++use bevy_image::BevyDefault;
+ use bevy_math::{Affine3, Vec4};
+ use bevy_mesh::{Mesh, Mesh2d, MeshTag, MeshVertexBufferLayoutRef};
+ use bevy_render::prelude::Msaa;
+@@ -42,9 +42,9 @@ use bevy_render::{
+         TrackedRenderPass,
+     },
+     render_resource::{binding_types::uniform_buffer, *},
+-    renderer::{RenderDevice, RenderQueue},
++    renderer::RenderDevice,
+     sync_world::{MainEntity, MainEntityHashMap},
+-    texture::{DefaultImageSampler, FallbackImage, GpuImage},
++    texture::{FallbackImage, GpuImage},
+     view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+@@ -286,16 +286,12 @@ pub struct Mesh2dPipeline {
+     pub view_layout: BindGroupLayoutDescriptor,
+     pub mesh_layout: BindGroupLayoutDescriptor,
+     pub shader: Handle<Shader>,
+-    // This dummy white texture is to be used in place of optional textures
+-    pub dummy_white_gpu_image: GpuImage,
+     pub per_object_buffer_batch_size: Option<u32>,
+ }
+ 
+ pub fn init_mesh_2d_pipeline(
+     mut commands: Commands,
+     render_device: Res<RenderDevice>,
+-    render_queue: Res<RenderQueue>,
+-    default_sampler: Res<DefaultImageSampler>,
+     asset_server: Res<AssetServer>,
+ ) {
+     let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
+@@ -319,44 +315,10 @@ pub fn init_mesh_2d_pipeline(
+             GpuArrayBuffer::<Mesh2dUniform>::binding_layout(&render_device.limits()),
+         ),
+     );
+-    // A 1x1x1 'all 1.0' texture to use as a dummy texture to use in place of optional StandardMaterial textures
+-    let dummy_white_gpu_image = {
+-        let image = Image::default();
+-        let texture = render_device.create_texture(&image.texture_descriptor);
+-        let sampler = match image.sampler {
+-            ImageSampler::Default => (**default_sampler).clone(),
+-            ImageSampler::Descriptor(ref descriptor) => {
+-                render_device.create_sampler(&descriptor.as_wgpu())
+-            }
+-        };
+-
+-        if let Ok(format_size) = image.texture_descriptor.format.pixel_size() {
+-            render_queue.write_texture(
+-                texture.as_image_copy(),
+-                image.data.as_ref().expect("Image has no data"),
+-                TexelCopyBufferLayout {
+-                    offset: 0,
+-                    bytes_per_row: Some(image.width() * format_size as u32),
+-                    rows_per_image: None,
+-                },
+-                image.texture_descriptor.size,
+-            );
+-        }
+ 
+-        let texture_view = texture.create_view(&TextureViewDescriptor::default());
+-        GpuImage {
+-            texture,
+-            texture_view,
+-            texture_format: image.texture_descriptor.format,
+-            sampler,
+-            size: image.texture_descriptor.size,
+-            mip_level_count: image.texture_descriptor.mip_level_count,
+-        }
+-    };
+     commands.insert_resource(Mesh2dPipeline {
+         view_layout,
+         mesh_layout,
+-        dummy_white_gpu_image,
+         per_object_buffer_batch_size: GpuArrayBuffer::<Mesh2dUniform>::batch_size(
+             &render_device.limits(),
+         ),
+@@ -364,24 +326,6 @@ pub fn init_mesh_2d_pipeline(
+     });
+ }
+ 
+-impl Mesh2dPipeline {
+-    pub fn get_image_texture<'a>(
+-        &'a self,
+-        gpu_images: &'a RenderAssets<GpuImage>,
+-        handle_option: &Option<Handle<Image>>,
+-    ) -> Option<(&'a TextureView, &'a Sampler)> {
+-        if let Some(handle) = handle_option {
+-            let gpu_image = gpu_images.get(handle)?;
+-            Some((&gpu_image.texture_view, &gpu_image.sampler))
+-        } else {
+-            Some((
+-                &self.dummy_white_gpu_image.texture_view,
+-                &self.dummy_white_gpu_image.sampler,
+-            ))
+-        }
+-    }
+-}
+-
+ impl GetBatchData for Mesh2dPipeline {
+     type Param = (
+         SRes<RenderMesh2dInstances>,
+diff --git a/crates/bevy_sprite_render/src/render/mod.rs b/crates/bevy_sprite_render/src/render/mod.rs
+index 1df2a06cc046d..b618f26ad5a40 100644
+--- a/crates/bevy_sprite_render/src/render/mod.rs
++++ b/crates/bevy_sprite_render/src/render/mod.rs
+@@ -17,7 +17,7 @@ use bevy_ecs::{
+     query::ROQueryItem,
+     system::{lifetimeless::*, SystemParamItem},
+ };
+-use bevy_image::{BevyDefault, Image, ImageSampler, TextureAtlasLayout, TextureFormatPixelInfo};
++use bevy_image::{BevyDefault, Image, TextureAtlasLayout};
+ use bevy_math::{Affine3A, FloatOrd, Quat, Rect, Vec2, Vec4};
+ use bevy_mesh::VertexBufferLayout;
+ use bevy_platform::collections::HashMap;
+@@ -34,7 +34,7 @@ use bevy_render::{
+     },
+     renderer::{RenderDevice, RenderQueue},
+     sync_world::RenderEntity,
+-    texture::{DefaultImageSampler, FallbackImage, GpuImage},
++    texture::{FallbackImage, GpuImage},
+     view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+     Extract,
+ };
+@@ -50,16 +50,9 @@ pub struct SpritePipeline {
+     view_layout: BindGroupLayoutDescriptor,
+     material_layout: BindGroupLayoutDescriptor,
+     shader: Handle<Shader>,
+-    pub dummy_white_gpu_image: GpuImage,
+ }
+ 
+-pub fn init_sprite_pipeline(
+-    mut commands: Commands,
+-    render_device: Res<RenderDevice>,
+-    default_sampler: Res<DefaultImageSampler>,
+-    render_queue: Res<RenderQueue>,
+-    asset_server: Res<AssetServer>,
+-) {
++pub fn init_sprite_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) {
+     let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
+     let view_layout = BindGroupLayoutDescriptor::new(
+         "sprite_view_layout",
+@@ -83,43 +76,10 @@ pub fn init_sprite_pipeline(
+             ),
+         ),
+     );
+-    let dummy_white_gpu_image = {
+-        let image = Image::default();
+-        let texture = render_device.create_texture(&image.texture_descriptor);
+-        let sampler = match image.sampler {
+-            ImageSampler::Default => (**default_sampler).clone(),
+-            ImageSampler::Descriptor(ref descriptor) => {
+-                render_device.create_sampler(&descriptor.as_wgpu())
+-            }
+-        };
+-
+-        if let Ok(format_size) = image.texture_descriptor.format.pixel_size() {
+-            render_queue.write_texture(
+-                texture.as_image_copy(),
+-                image.data.as_ref().expect("Image has no data"),
+-                TexelCopyBufferLayout {
+-                    offset: 0,
+-                    bytes_per_row: Some(image.width() * format_size as u32),
+-                    rows_per_image: None,
+-                },
+-                image.texture_descriptor.size,
+-            );
+-        }
+-        let texture_view = texture.create_view(&TextureViewDescriptor::default());
+-        GpuImage {
+-            texture,
+-            texture_view,
+-            texture_format: image.texture_descriptor.format,
+-            sampler,
+-            size: image.texture_descriptor.size,
+-            mip_level_count: image.texture_descriptor.mip_level_count,
+-        }
+-    };
+ 
+     commands.insert_resource(SpritePipeline {
+         view_layout,
+         material_layout,
+-        dummy_white_gpu_image,
+         shader: load_embedded_asset!(asset_server.as_ref(), "sprite.wgsl"),
+     });
+ }
+diff --git a/release-content/migration-guides/remove-dummy-white-gpu-image.md b/release-content/migration-guides/remove-dummy-white-gpu-image.md
+new file mode 100644
+index 0000000000000..5ef7058d06ad7
+--- /dev/null
++++ b/release-content/migration-guides/remove-dummy-white-gpu-image.md
+@@ -0,0 +1,10 @@
++---
++title: "Removed `dummy_white_gpu_image`"
++pull_requests: [21572]
++---
++
++`MeshPipeline`, `Mesh2dPipeline` and `SpritePipeline`  no longer have `dummy_white_gpu_image`.
++
++`MeshPipeline` and `Mesh2dPipeline` no longer have `get_image_texture()` in their `impl`.
++
++The method `build_dummy_white_gpu_image()` and `get_image_texture()` can be used if needed.

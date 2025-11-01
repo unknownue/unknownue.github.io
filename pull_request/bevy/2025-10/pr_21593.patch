@@ -1,0 +1,118 @@
+diff --git a/crates/bevy_animation/src/animation_event.rs b/crates/bevy_animation/src/animation_event.rs
+index 55bf5655855a6..824defc83a85b 100644
+--- a/crates/bevy_animation/src/animation_event.rs
++++ b/crates/bevy_animation/src/animation_event.rs
+@@ -7,17 +7,21 @@ use bevy_ecs::{
+     world::DeferredWorld,
+ };
+ 
+-/// An [`Event`] that an [`AnimationPlayer`](crate::AnimationPlayer) can trigger when playing an [`AnimationClip`](crate::AnimationClip).
+-/// See [`AnimationClip::add_event`](crate::AnimationClip::add_event).
++/// An [`Event`] that an [`AnimationPlayer`](crate::AnimationPlayer) or an [`AnimationTargetId`](crate::AnimationTargetId) can trigger when playing an [`AnimationClip`](crate::AnimationClip).
++///
++/// - If you used [`AnimationClip::add_event`](crate::AnimationClip::add_event), this will be triggered by the [`AnimationPlayer`](crate::AnimationPlayer).
++/// - If you used [`AnimationClip::add_event_to_target`](crate::AnimationClip::add_event_to_target), this will be triggered by the [`AnimationTargetId`](crate::AnimationTargetId).
+ ///
+ /// This trait can be derived.
+ pub trait AnimationEvent: Clone + for<'a> Event<Trigger<'a> = AnimationEventTrigger> {}
+ 
+-/// The [`Trigger`] implementation for [`AnimationEvent`]. This passes in the [`AnimationPlayer`](crate::AnimationPlayer)
+-/// context, and uses that to run any observers that target that entity.
++/// The [`Trigger`] implementation for [`AnimationEvent`]. This passes in either the [`AnimationPlayer`](crate::AnimationPlayer) or the [`AnimationTargetId`](crate::AnimationTargetId)
++/// context, and uses that to run any observers that target that entity. See [`AnimationEvent`] for when which entity is used.
++#[derive(Debug)]
+ pub struct AnimationEventTrigger {
+-    /// The [`AnimationPlayer`](crate::AnimationPlayer) where this [`AnimationEvent`] occurred.
+-    pub animation_player: Entity,
++    /// The [`AnimationPlayer`](crate::AnimationPlayer) or the [`AnimationTargetId`](crate::AnimationTargetId) where this [`AnimationEvent`] occurred.
++    /// See [`AnimationEvent`] for when which entity is used.
++    pub target: Entity,
+ }
+ 
+ #[expect(
+@@ -37,7 +41,7 @@ unsafe impl<E: AnimationEvent + for<'a> Event<Trigger<'a> = AnimationEventTrigge
+         trigger_context: &TriggerContext,
+         event: &mut E,
+     ) {
+-        let animation_player = self.animation_player;
++        let target = self.target;
+         // SAFETY:
+         // - `observers` come from `world` and match the event type `E`, enforced by the call to `trigger`
+         // - the passed in event pointer comes from `event`, which is an `Event`
+@@ -50,7 +54,7 @@ unsafe impl<E: AnimationEvent + for<'a> Event<Trigger<'a> = AnimationEventTrigge
+                 observers,
+                 event.into(),
+                 self.into(),
+-                animation_player,
++                target,
+                 trigger_context,
+             );
+         }
+diff --git a/crates/bevy_animation/src/lib.rs b/crates/bevy_animation/src/lib.rs
+index fb81224637ac1..146ce09c36f9d 100644
+--- a/crates/bevy_animation/src/lib.rs
++++ b/crates/bevy_animation/src/lib.rs
+@@ -326,13 +326,8 @@ impl AnimationClip {
+     pub fn add_event(&mut self, time: f32, event: impl AnimationEvent) {
+         self.add_event_fn(
+             time,
+-            move |commands: &mut Commands, entity: Entity, _time: f32, _weight: f32| {
+-                commands.trigger_with(
+-                    event.clone(),
+-                    AnimationEventTrigger {
+-                        animation_player: entity,
+-                    },
+-                );
++            move |commands: &mut Commands, target: Entity, _time: f32, _weight: f32| {
++                commands.trigger_with(event.clone(), AnimationEventTrigger { target });
+             },
+         );
+     }
+@@ -352,13 +347,8 @@ impl AnimationClip {
+         self.add_event_fn_to_target(
+             target_id,
+             time,
+-            move |commands: &mut Commands, entity: Entity, _time: f32, _weight: f32| {
+-                commands.trigger_with(
+-                    event.clone(),
+-                    AnimationEventTrigger {
+-                        animation_player: entity,
+-                    },
+-                );
++            move |commands: &mut Commands, target: Entity, _time: f32, _weight: f32| {
++                commands.trigger_with(event.clone(), AnimationEventTrigger { target });
+             },
+         );
+     }
+diff --git a/examples/animation/animated_mesh_events.rs b/examples/animation/animated_mesh_events.rs
+index 5898807cf45a3..5cb8f70ebdf3c 100644
+--- a/examples/animation/animated_mesh_events.rs
++++ b/examples/animation/animated_mesh_events.rs
+@@ -49,9 +49,7 @@ fn observe_on_step(
+     transforms: Query<&GlobalTransform>,
+     mut seeded_rng: ResMut<SeededRng>,
+ ) -> Result {
+-    let translation = transforms
+-        .get(step.trigger().animation_player)?
+-        .translation();
++    let translation = transforms.get(step.trigger().target)?.translation();
+     // Spawn a bunch of particles.
+     for _ in 0..14 {
+         let horizontal = seeded_rng.0.random::<Dir2>() * seeded_rng.0.random_range(8.0..12.0);
+diff --git a/release-content/migration-guides/animation-event-trigger-rename.md b/release-content/migration-guides/animation-event-trigger-rename.md
+new file mode 100644
+index 0000000000000..743bfae5ee114
+--- /dev/null
++++ b/release-content/migration-guides/animation-event-trigger-rename.md
+@@ -0,0 +1,11 @@
++---
++title: "`AnimationEventTrigger::animation_player` has been renamed to `AnimationEventTrigger::target`"
++pull_requests: [21593]
++---
++
++This field and its docs strongly suggested that it would point to an entity holding an `AnimationPlayer`, but that actually depends on how the event was registered.
++
++- If you used `AnimationClip::add_event`, the field really did point to the `AnimationPlayer`
++- But if you used `AnimationClip::add_event_to_target`, this field instead pointed to an `AnimationTargetId`
++
++To make this more clear, the field was renamed to `target` and the docs surrounding it improved.

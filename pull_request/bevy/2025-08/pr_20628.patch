@@ -1,0 +1,623 @@
+diff --git a/.gitignore b/.gitignore
+index 0d39edea49083..cdde3c7eec3c4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -22,6 +22,7 @@ Cargo.lock
+ assets/**/*.meta
+ crates/bevy_asset/imported_assets
+ imported_assets
++.web-asset-cache
+ 
+ # Bevy Examples
+ example_showcase_config.ron
+diff --git a/Cargo.toml b/Cargo.toml
+index 97bbfdddb0152..c064a3869c3c4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -550,6 +550,15 @@ file_watcher = ["bevy_internal/file_watcher"]
+ # Enables watching in memory asset providers for Bevy Asset hot-reloading
+ embedded_watcher = ["bevy_internal/embedded_watcher"]
+ 
++# Enables downloading assets from HTTP sources. Warning: there are security implications. Read the docs on WebAssetPlugin.
++http = ["bevy_internal/http"]
++
++# Enables downloading assets from HTTPS sources. Warning: there are security implications. Read the docs on WebAssetPlugin.
++https = ["bevy_internal/https"]
++
++# Enable caching downloaded assets on the filesystem. NOTE: this cache currently never invalidates entries!
++web_asset_cache = ["bevy_internal/web_asset_cache"]
++
+ # Enable stepping-based debugging of Bevy systems
+ bevy_debug_stepping = [
+   "bevy_internal/bevy_debug_stepping",
+@@ -1942,12 +1951,24 @@ path = "examples/asset/extra_source.rs"
+ doc-scrape-examples = true
+ 
+ [package.metadata.example.extra_asset_source]
+-name = "Extra asset source"
++name = "Extra Asset Source"
+ description = "Load an asset from a non-standard asset source"
+ category = "Assets"
+ # Uses non-standard asset path
+ wasm = false
+ 
++[[example]]
++name = "web_asset"
++path = "examples/asset/web_asset.rs"
++doc-scrape-examples = true
++required-features = ["https"]
++
++[package.metadata.example.web_asset]
++name = "Web Asset"
++description = "Load an asset from the web"
++category = "Assets"
++wasm = true
++
+ [[example]]
+ name = "hot_asset_reloading"
+ path = "examples/asset/hot_asset_reloading.rs"
+diff --git a/crates/bevy_asset/Cargo.toml b/crates/bevy_asset/Cargo.toml
+index 810299fc7349a..b4797dd4c8a7d 100644
+--- a/crates/bevy_asset/Cargo.toml
++++ b/crates/bevy_asset/Cargo.toml
+@@ -14,6 +14,9 @@ keywords = ["bevy"]
+ file_watcher = ["notify-debouncer-full", "watch", "multi_threaded"]
+ embedded_watcher = ["file_watcher"]
+ multi_threaded = ["bevy_tasks/multi_threaded"]
++http = ["blocking", "ureq"]
++https = ["blocking", "ureq", "ureq/rustls"]
++web_asset_cache = []
+ asset_processor = []
+ watch = []
+ trace = []
+@@ -87,6 +90,9 @@ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev", default-featu
+ 
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ notify-debouncer-full = { version = "0.5.0", default-features = false, optional = true }
++# updating ureq: while ureq is semver stable, it depends on rustls which is not, meaning unlikely but possible breaking changes on minor releases. https://github.com/bevyengine/bevy/pull/16366#issuecomment-2572890794
++ureq = { version = "3", optional = true, default-features = false }
++blocking = { version = "1.6", optional = true }
+ 
+ [dev-dependencies]
+ async-channel = "2"
+diff --git a/crates/bevy_asset/src/io/mod.rs b/crates/bevy_asset/src/io/mod.rs
+index 7bce061b2cf9d..778b96553f64b 100644
+--- a/crates/bevy_asset/src/io/mod.rs
++++ b/crates/bevy_asset/src/io/mod.rs
+@@ -14,6 +14,8 @@ pub mod memory;
+ pub mod processor_gated;
+ #[cfg(target_arch = "wasm32")]
+ pub mod wasm;
++#[cfg(any(feature = "http", feature = "https"))]
++pub mod web;
+ 
+ #[cfg(test)]
+ pub mod gated;
+@@ -48,7 +50,8 @@ pub enum AssetReaderError {
+     Io(Arc<std::io::Error>),
+ 
+     /// The HTTP request completed but returned an unhandled [HTTP response status code](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status).
+-    /// If the request fails before getting a status code (e.g. request timeout, interrupted connection, etc), expect [`AssetReaderError::Io`].
++    /// - If the request returns a 404 error, expect [`AssetReaderError::NotFound`].
++    /// - If the request fails before getting a status code (e.g. request timeout, interrupted connection, etc), expect [`AssetReaderError::Io`].
+     #[error("Encountered HTTP status {0:?} when loading asset")]
+     HttpError(u16),
+ }
+@@ -764,11 +767,16 @@ impl Reader for SliceReader<'_> {
+     }
+ }
+ 
+-/// Appends `.meta` to the given path.
++/// Appends `.meta` to the given path:
++/// - `foo` becomes `foo.meta`
++/// - `foo.bar` becomes `foo.bar.meta`
+ pub(crate) fn get_meta_path(path: &Path) -> PathBuf {
+     let mut meta_path = path.to_path_buf();
+     let mut extension = path.extension().unwrap_or_default().to_os_string();
+-    extension.push(".meta");
++    if !extension.is_empty() {
++        extension.push(".");
++    }
++    extension.push("meta");
+     meta_path.set_extension(extension);
+     meta_path
+ }
+@@ -785,3 +793,24 @@ impl Stream for EmptyPathStream {
+         Poll::Ready(None)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn get_meta_path_no_extension() {
++        assert_eq!(
++            get_meta_path(Path::new("foo")).to_str().unwrap(),
++            "foo.meta"
++        );
++    }
++
++    #[test]
++    fn get_meta_path_with_extension() {
++        assert_eq!(
++            get_meta_path(Path::new("foo.bar")).to_str().unwrap(),
++            "foo.bar.meta"
++        );
++    }
++}
+diff --git a/crates/bevy_asset/src/io/wasm.rs b/crates/bevy_asset/src/io/wasm.rs
+index 4ed7162d2bafc..0dd0ca8e0899d 100644
+--- a/crates/bevy_asset/src/io/wasm.rs
++++ b/crates/bevy_asset/src/io/wasm.rs
+@@ -52,7 +52,8 @@ fn js_value_to_err(context: &str) -> impl FnOnce(JsValue) -> std::io::Error + '_
+ }
+ 
+ impl HttpWasmAssetReader {
+-    async fn fetch_bytes(&self, path: PathBuf) -> Result<impl Reader, AssetReaderError> {
++    // Also used by [`WebAssetReader`](crate::web::WebAssetReader)
++    pub(crate) async fn fetch_bytes(&self, path: PathBuf) -> Result<impl Reader, AssetReaderError> {
+         // The JS global scope includes a self-reference via a specializing name, which can be used to determine the type of global context available.
+         let global: Global = js_sys::global().unchecked_into();
+         let promise = if !global.window().is_undefined() {
+diff --git a/crates/bevy_asset/src/io/web.rs b/crates/bevy_asset/src/io/web.rs
+new file mode 100644
+index 0000000000000..20aaafd20e8c7
+--- /dev/null
++++ b/crates/bevy_asset/src/io/web.rs
+@@ -0,0 +1,314 @@
++use crate::io::{AssetReader, AssetReaderError, Reader};
++use crate::io::{AssetSource, PathStream};
++use crate::{AssetApp, AssetPlugin};
++use alloc::{borrow::ToOwned, boxed::Box};
++use bevy_app::{App, Plugin};
++use bevy_tasks::ConditionalSendFuture;
++use blocking::unblock;
++use std::path::{Path, PathBuf};
++use tracing::warn;
++
++/// Adds the `http` and `https` asset sources to the app.
++///
++/// NOTE: Make sure to add this plugin *before* `AssetPlugin` to properly register http asset sources.
++///
++/// WARNING: be careful about where your URLs are coming from! URLs can potentially be exploited by an
++/// attacker to trigger vulnerabilities in our asset loaders, or DOS by downloading enormous files. We
++/// are not aware of any such vulnerabilities at the moment, just be careful!
++///
++/// Any asset path that begins with `http` (when the `http` feature is enabled) or `https` (when the
++/// `https` feature is enabled) will be loaded from the web via `fetch` (wasm) or `ureq` (native).
++///
++/// Example usage:
++///
++/// ```rust
++/// # use bevy_app::{App, Startup};
++/// # use bevy_ecs::prelude::{Commands, Res};
++/// # use bevy_asset::web::{WebAssetPlugin, AssetServer};
++/// # struct DefaultPlugins;
++/// # impl DefaultPlugins { fn set(plugin: WebAssetPlugin) -> WebAssetPlugin { plugin } }
++/// # use bevy_asset::web::AssetServer;
++/// # #[derive(Asset, TypePath, Default)]
++/// # struct Image;
++/// # #[derive(Component)]
++/// # struct Sprite;
++/// # impl Sprite { fn from_image(_: Handle<Image>) -> Self { Sprite } }
++/// # fn main() {
++/// App::new()
++///     .add_plugins(DefaultPlugins.set(WebAssetPlugin {
++///         silence_startup_warning: true,
++///     }))
++/// #   .add_systems(Startup, setup).run();
++/// # }
++/// // ...
++/// # fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
++/// commands.spawn(Sprite::from_image(asset_server.load("https://example.com/favicon.png")));
++/// # }
++/// ```
++///
++/// By default, `ureq`'s HTTP compression is disabled. To enable gzip and brotli decompression, add
++/// the following dependency and features to your Cargo.toml. This will improve bandwidth
++/// utilization when its supported by the server.
++///
++/// ```toml
++/// [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
++/// ureq = { version = "3", default-features = false, features = ["gzip", "brotli"] }
++/// ```
++#[derive(Default)]
++pub struct WebAssetPlugin {
++    pub silence_startup_warning: bool,
++}
++
++impl Plugin for WebAssetPlugin {
++    fn build(&self, app: &mut App) {
++        if !self.silence_startup_warning {
++            warn!("WebAssetPlugin is potentially insecure! Make sure to verify asset URLs are safe to load before loading them.\
++            If you promise you know what you're doing, you can silence this warning by setting silence_startup_warning: true\
++            in the WebAssetPlugin construction.");
++        }
++        if app.is_plugin_added::<AssetPlugin>() {
++            warn!("WebAssetPlugin must be added before AssetPlugin for it to work!");
++        }
++        #[cfg(feature = "http")]
++        app.register_asset_source(
++            "http",
++            AssetSource::build()
++                .with_reader(move || Box::new(WebAssetReader::Http))
++                .with_processed_reader(move || Box::new(WebAssetReader::Http)),
++        );
++
++        #[cfg(feature = "https")]
++        app.register_asset_source(
++            "https",
++            AssetSource::build()
++                .with_reader(move || Box::new(WebAssetReader::Https))
++                .with_processed_reader(move || Box::new(WebAssetReader::Https)),
++        );
++    }
++}
++
++/// Asset reader that treats paths as urls to load assets from.
++pub enum WebAssetReader {
++    /// Unencrypted connections.
++    Http,
++    /// Use TLS for setting up connections.
++    Https,
++}
++
++impl WebAssetReader {
++    fn make_uri(&self, path: &Path) -> PathBuf {
++        let prefix = match self {
++            Self::Http => "http://",
++            Self::Https => "https://",
++        };
++        PathBuf::from(prefix).join(path)
++    }
++
++    /// See [`crate::io::get_meta_path`]
++    fn make_meta_uri(&self, path: &Path) -> PathBuf {
++        let meta_path = crate::io::get_meta_path(path);
++        self.make_uri(&meta_path)
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++async fn get<'a>(path: PathBuf) -> Result<Box<dyn Reader>, AssetReaderError> {
++    use crate::io::wasm::HttpWasmAssetReader;
++
++    HttpWasmAssetReader::new("")
++        .fetch_bytes(path)
++        .await
++        .map(|r| Box::new(r) as Box<dyn Reader>)
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++async fn get(path: PathBuf) -> Result<Box<dyn Reader>, AssetReaderError> {
++    use crate::io::VecReader;
++    use alloc::{boxed::Box, vec::Vec};
++    use bevy_platform::sync::LazyLock;
++    use std::io::{self, BufReader, Read};
++
++    let str_path = path.to_str().ok_or_else(|| {
++        AssetReaderError::Io(
++            io::Error::other(std::format!("non-utf8 path: {}", path.display())).into(),
++        )
++    })?;
++
++    #[cfg(all(not(target_arch = "wasm32"), feature = "web_asset_cache"))]
++    if let Some(data) = web_asset_cache::try_load_from_cache(str_path).await? {
++        return Ok(Box::new(VecReader::new(data)));
++    }
++    use ureq::Agent;
++
++    static AGENT: LazyLock<Agent> = LazyLock::new(|| Agent::config_builder().build().new_agent());
++
++    let uri = str_path.to_owned();
++    // Use [`unblock`] to run the http request on a separately spawned thread as to not block bevy's
++    // async executor.
++    let response = unblock(|| AGENT.get(uri).call()).await;
++
++    match response {
++        Ok(mut response) => {
++            let mut reader = BufReader::new(response.body_mut().with_config().reader());
++
++            let mut buffer = Vec::new();
++            reader.read_to_end(&mut buffer)?;
++
++            #[cfg(all(not(target_arch = "wasm32"), feature = "web_asset_cache"))]
++            web_asset_cache::save_to_cache(str_path, &buffer).await?;
++
++            Ok(Box::new(VecReader::new(buffer)))
++        }
++        // ureq considers all >=400 status codes as errors
++        Err(ureq::Error::StatusCode(code)) => {
++            if code == 404 {
++                Err(AssetReaderError::NotFound(path))
++            } else {
++                Err(AssetReaderError::HttpError(code))
++            }
++        }
++        Err(err) => Err(AssetReaderError::Io(
++            io::Error::other(std::format!(
++                "unexpected error while loading asset {}: {}",
++                path.display(),
++                err
++            ))
++            .into(),
++        )),
++    }
++}
++
++impl AssetReader for WebAssetReader {
++    fn read<'a>(
++        &'a self,
++        path: &'a Path,
++    ) -> impl ConditionalSendFuture<Output = Result<Box<dyn Reader>, AssetReaderError>> {
++        get(self.make_uri(path))
++    }
++
++    async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<Box<dyn Reader>, AssetReaderError> {
++        let uri = self.make_meta_uri(path);
++        get(uri).await
++    }
++
++    async fn is_directory<'a>(&'a self, _path: &'a Path) -> Result<bool, AssetReaderError> {
++        Ok(false)
++    }
++
++    async fn read_directory<'a>(
++        &'a self,
++        path: &'a Path,
++    ) -> Result<Box<PathStream>, AssetReaderError> {
++        Err(AssetReaderError::NotFound(self.make_uri(path)))
++    }
++}
++
++/// A naive implementation of a cache for assets downloaded from the web that never invalidates.
++/// `ureq` currently does not support caching, so this is a simple workaround.
++/// It should eventually be replaced by `http-cache` or similar, see [tracking issue](https://github.com/06chaynes/http-cache/issues/91)
++#[cfg(all(not(target_arch = "wasm32"), feature = "web_asset_cache"))]
++mod web_asset_cache {
++    use alloc::string::String;
++    use alloc::vec::Vec;
++    use core::hash::{Hash, Hasher};
++    use futures_lite::AsyncWriteExt;
++    use std::collections::hash_map::DefaultHasher;
++    use std::io;
++    use std::path::PathBuf;
++
++    use crate::io::Reader;
++
++    const CACHE_DIR: &str = ".web-asset-cache";
++
++    fn url_to_hash(url: &str) -> String {
++        let mut hasher = DefaultHasher::new();
++        url.hash(&mut hasher);
++        std::format!("{:x}", hasher.finish())
++    }
++
++    pub async fn try_load_from_cache(url: &str) -> Result<Option<Vec<u8>>, io::Error> {
++        let filename = url_to_hash(url);
++        let cache_path = PathBuf::from(CACHE_DIR).join(&filename);
++
++        if cache_path.exists() {
++            let mut file = async_fs::File::open(&cache_path).await?;
++            let mut buffer = Vec::new();
++            file.read_to_end(&mut buffer).await?;
++            Ok(Some(buffer))
++        } else {
++            Ok(None)
++        }
++    }
++
++    pub async fn save_to_cache(url: &str, data: &[u8]) -> Result<(), io::Error> {
++        let filename = url_to_hash(url);
++        let cache_path = PathBuf::from(CACHE_DIR).join(&filename);
++
++        async_fs::create_dir_all(CACHE_DIR).await.ok();
++
++        let mut cache_file = async_fs::File::create(&cache_path).await?;
++        cache_file.write_all(data).await?;
++
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn make_http_uri() {
++        assert_eq!(
++            WebAssetReader::Http
++                .make_uri(Path::new("example.com/favicon.png"))
++                .to_str()
++                .unwrap(),
++            "http://example.com/favicon.png"
++        );
++    }
++
++    #[test]
++    fn make_https_uri() {
++        assert_eq!(
++            WebAssetReader::Https
++                .make_uri(Path::new("example.com/favicon.png"))
++                .to_str()
++                .unwrap(),
++            "https://example.com/favicon.png"
++        );
++    }
++
++    #[test]
++    fn make_http_meta_uri() {
++        assert_eq!(
++            WebAssetReader::Http
++                .make_meta_uri(Path::new("example.com/favicon.png"))
++                .to_str()
++                .unwrap(),
++            "http://example.com/favicon.png.meta"
++        );
++    }
++
++    #[test]
++    fn make_https_meta_uri() {
++        assert_eq!(
++            WebAssetReader::Https
++                .make_meta_uri(Path::new("example.com/favicon.png"))
++                .to_str()
++                .unwrap(),
++            "https://example.com/favicon.png.meta"
++        );
++    }
++
++    #[test]
++    fn make_https_without_extension_meta_uri() {
++        assert_eq!(
++            WebAssetReader::Https
++                .make_meta_uri(Path::new("example.com/favicon"))
++                .to_str()
++                .unwrap(),
++            "https://example.com/favicon.meta"
++        );
++    }
++}
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 9e3a611c318af..e9a87a6dc8f9d 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -254,6 +254,15 @@ debug_glam_assert = ["bevy_math/debug_glam_assert"]
+ 
+ default_font = ["bevy_text?/default_font"]
+ 
++# Enables downloading assets from HTTP sources
++http = ["bevy_asset?/http"]
++
++# Enables downloading assets from HTTPS sources
++https = ["bevy_asset?/https"]
++
++# Enable caching downloaded assets on the filesystem. NOTE: this cache currently never invalidates entries!
++web_asset_cache = ["bevy_asset?/web_asset_cache"]
++
+ # Enables the built-in asset processor for processed assets.
+ asset_processor = ["bevy_asset?/asset_processor"]
+ 
+diff --git a/crates/bevy_internal/src/default_plugins.rs b/crates/bevy_internal/src/default_plugins.rs
+index a314ab41b3612..83a32638b304d 100644
+--- a/crates/bevy_internal/src/default_plugins.rs
++++ b/crates/bevy_internal/src/default_plugins.rs
+@@ -21,6 +21,10 @@ plugin_group! {
+         #[cfg(feature = "std")]
+         #[custom(cfg(any(all(unix, not(target_os = "horizon")), windows)))]
+         bevy_app:::TerminalCtrlCHandlerPlugin,
++        // NOTE: Load this before AssetPlugin to properly register http asset sources.
++        #[cfg(feature = "bevy_asset")]
++        #[custom(cfg(any(feature = "http", feature = "https")))]
++        bevy_asset::io::web:::WebAssetPlugin,
+         #[cfg(feature = "bevy_asset")]
+         bevy_asset:::AssetPlugin,
+         #[cfg(feature = "bevy_scene")]
+diff --git a/deny.toml b/deny.toml
+index d22efdf153a41..a203dfaaa8808 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -23,6 +23,7 @@ allow = [
+   "BSD-3-Clause",
+   "BSL-1.0",
+   "CC0-1.0",
++  "CDLA-Permissive-2.0",
+   "ISC",
+   "MIT",
+   "MIT-0",
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 0451cbf0985c0..815fec670ffa4 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -98,6 +98,8 @@ The default feature set enables most of the expected features of a game engine,
+ |gif|GIF image format support|
+ |glam_assert|Enable assertions to check the validity of parameters passed to glam|
+ |hotpatching|Enable hotpatching of Bevy systems|
++|http|Enables downloading assets from HTTP sources. Warning: there are security implications. Read the docs on WebAssetPlugin.|
++|https|Enables downloading assets from HTTPS sources. Warning: there are security implications. Read the docs on WebAssetPlugin.|
+ |ico|ICO image format support|
+ |jpeg|JPEG image format support|
+ |libm|Uses the `libm` maths library instead of the one provided in `std` and `core`.|
+@@ -137,6 +139,7 @@ The default feature set enables most of the expected features of a game engine,
+ |track_location|Enables source location tracking for change detection and spawning/despawning, which can assist with debugging|
+ |wav|WAV audio format support|
+ |web|Enables use of browser APIs. Note this is currently only applicable on `wasm32` architectures.|
++|web_asset_cache|Enable caching downloaded assets on the filesystem. NOTE: this cache currently never invalidates entries!|
+ |webgpu|Enable support for WebGPU in Wasm. When enabled, this feature will override the `webgl2` feature and you won't be able to run Wasm builds with WebGL2, only with WebGPU.|
+ |webp|WebP image format support|
+ |zlib|For KTX2 supercompression|
+diff --git a/examples/README.md b/examples/README.md
+index 6b8cd0f25114b..311fdda46b0a1 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -256,10 +256,11 @@ Example | Description
+ [Custom Asset](../examples/asset/custom_asset.rs) | Implements a custom asset loader
+ [Custom Asset IO](../examples/asset/custom_asset_reader.rs) | Implements a custom AssetReader
+ [Embedded Asset](../examples/asset/embedded_asset.rs) | Embed an asset in the application binary and load it
+-[Extra asset source](../examples/asset/extra_source.rs) | Load an asset from a non-standard asset source
++[Extra Asset Source](../examples/asset/extra_source.rs) | Load an asset from a non-standard asset source
+ [Hot Reloading of Assets](../examples/asset/hot_asset_reloading.rs) | Demonstrates automatic reloading of assets when modified on disk
+ [Multi-asset synchronization](../examples/asset/multi_asset_sync.rs) | Demonstrates how to wait for multiple assets to be loaded.
+ [Repeated texture configuration](../examples/asset/repeated_texture.rs) | How to configure the texture to repeat instead of the default clamp to edges
++[Web Asset](../examples/asset/web_asset.rs) | Load an asset from the web
+ 
+ ### Async Tasks
+ 
+diff --git a/examples/asset/web_asset.rs b/examples/asset/web_asset.rs
+new file mode 100644
+index 0000000000000..affd50c29db34
+--- /dev/null
++++ b/examples/asset/web_asset.rs
+@@ -0,0 +1,22 @@
++//! Example usage of the `https` asset source to load assets from the web.
++//!
++//! Run with the feature `https`, and optionally `web_asset_cache`
++//! for a simple caching mechanism that never invalidates.
++//!
++use bevy::{asset::io::web::WebAssetPlugin, prelude::*};
++
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins.set(WebAssetPlugin {
++            silence_startup_warning: true,
++        }))
++        .add_systems(Startup, setup)
++        .run();
++}
++
++fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
++    commands.spawn(Camera2d);
++    let url = "https://raw.githubusercontent.com/bevyengine/bevy/refs/heads/main/assets/branding/bevy_bird_dark.png";
++    // Simply use a url where you would normally use an asset folder relative path
++    commands.spawn(Sprite::from_image(asset_server.load(url)));
++}
+diff --git a/release-content/release-notes/web_assets.md b/release-content/release-notes/web_assets.md
+new file mode 100644
+index 0000000000000..a7d06144aabda
+--- /dev/null
++++ b/release-content/release-notes/web_assets.md
+@@ -0,0 +1,21 @@
++---
++title: Web Assets
++authors: ["@johanhelsing", "@mrchantey", "@jf908", "@atlv24"]
++pull_requests: [20628]
++---
++
++Bevy now supports downloading assets from the web over http and https.
++Use the new `http` and `https` features to enable `http://` and `https://` URLs as asset paths.
++This functionality is powered by the [`ureq`](https://github.com/algesten/ureq) crate on native platforms and the fetch API on wasm.
++
++```rust
++let image = asset_server.load("https://example.com/image.png");
++commands.spawn(Sprite::from_image(image));
++```
++
++Security note: if using web assets, be careful about where your URLs are coming from! If you allow arbitrary URLs to enter the asset server, it can potentially be exploited by an attacker to trigger vulnerabilities in our asset loaders, or DOS by downloading enormous files. We are not aware of any such vulnerabilities at the moment, just be careful!
++
++By default these assets aren’t saved anywhere but you can enable the `web_asset_cache` feature to cache assets on your file system.
++
++The implementation has changed quite a bit but this feature originally started out as an upstreaming of the [`bevy_web_asset`](https://github.com/johanhelsing/bevy_web_asset) crate.
++Special thanks to @johanhelsing and bevy_web_asset's contributors!

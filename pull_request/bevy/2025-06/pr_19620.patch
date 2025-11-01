@@ -1,0 +1,876 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 1e2e3d94fe719..e6c75611ba787 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1284,9 +1284,9 @@ required-features = ["bevy_solari"]
+ 
+ [package.metadata.example.solari]
+ name = "Solari"
+-description = "Demonstrates realtime dynamic global illumination rendering using Bevy Solari."
++description = "Demonstrates realtime dynamic raytraced lighting using Bevy Solari."
+ category = "3D Rendering"
+-wasm = false
++wasm = false                                                                        # Raytracing is not supported on the web
+ 
+ [[example]]
+ name = "spherical_area_lights"
+diff --git a/crates/bevy_render/src/diagnostic/mod.rs b/crates/bevy_render/src/diagnostic/mod.rs
+index 7f046036a9be5..197b9f4e7f2a3 100644
+--- a/crates/bevy_render/src/diagnostic/mod.rs
++++ b/crates/bevy_render/src/diagnostic/mod.rs
+@@ -148,7 +148,7 @@ pub struct PassSpanGuard<'a, R: ?Sized, P> {
+ }
+ 
+ impl<R: RecordDiagnostics + ?Sized, P: Pass> PassSpanGuard<'_, R, P> {
+-    /// End the span. You have to provide the same encoder which was used to begin the span.
++    /// End the span. You have to provide the same pass which was used to begin the span.
+     pub fn end(self, pass: &mut P) {
+         self.recorder.end_pass_span(pass);
+         core::mem::forget(self);
+diff --git a/crates/bevy_solari/Cargo.toml b/crates/bevy_solari/Cargo.toml
+index 76cb751fe6e94..03976dea3fbc6 100644
+--- a/crates/bevy_solari/Cargo.toml
++++ b/crates/bevy_solari/Cargo.toml
+@@ -15,6 +15,7 @@ bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
+ bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
+ bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.17.0-dev" }
+ bevy_derive = { path = "../bevy_derive", version = "0.17.0-dev" }
++bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.17.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+@@ -27,8 +28,9 @@ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+ 
+ # other
+-tracing = { version = "0.1", default-features = false, features = ["std"] }
++bytemuck = { version = "1" }
+ derive_more = { version = "1", default-features = false, features = ["from"] }
++tracing = { version = "0.1", default-features = false, features = ["std"] }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/bevy_solari/src/lib.rs b/crates/bevy_solari/src/lib.rs
+index 022f44b5c5aee..416c850b04f41 100644
+--- a/crates/bevy_solari/src/lib.rs
++++ b/crates/bevy_solari/src/lib.rs
+@@ -6,6 +6,7 @@
+ //!
+ //! ![`bevy_solari` logo](https://raw.githubusercontent.com/bevyengine/bevy/assets/branding/bevy_solari.svg)
+ pub mod pathtracer;
++pub mod realtime;
+ pub mod scene;
+ 
+ /// The solari prelude.
+@@ -13,28 +14,28 @@ pub mod scene;
+ /// This includes the most common types in this crate, re-exported for your convenience.
+ pub mod prelude {
+     pub use super::SolariPlugin;
+-    pub use crate::pathtracer::Pathtracer;
++    pub use crate::realtime::SolariLighting;
+     pub use crate::scene::RaytracingMesh3d;
+ }
+ 
++use crate::realtime::SolariLightingPlugin;
++use crate::scene::RaytracingScenePlugin;
+ use bevy_app::{App, Plugin};
+ use bevy_render::settings::WgpuFeatures;
+-use pathtracer::PathtracingPlugin;
+-use scene::RaytracingScenePlugin;
+ 
+ /// An experimental plugin for raytraced lighting.
+ ///
+ /// This plugin provides:
+-/// * (Coming soon) - Raytraced direct and indirect lighting.
++/// * [`SolariLightingPlugin`] - Raytraced direct and indirect lighting (indirect lighting not yet implemented).
+ /// * [`RaytracingScenePlugin`] - BLAS building, resource and lighting binding.
+-/// * [`PathtracingPlugin`] - A non-realtime pathtracer for validation purposes.
++/// * [`pathtracer::PathtracingPlugin`] - A non-realtime pathtracer for validation purposes.
+ ///
+ /// To get started, add `RaytracingMesh3d` and `MeshMaterial3d::<StandardMaterial>` to your entities.
+ pub struct SolariPlugin;
+ 
+ impl Plugin for SolariPlugin {
+     fn build(&self, app: &mut App) {
+-        app.add_plugins((RaytracingScenePlugin, PathtracingPlugin));
++        app.add_plugins((RaytracingScenePlugin, SolariLightingPlugin));
+     }
+ }
+ 
+diff --git a/crates/bevy_solari/src/realtime/extract.rs b/crates/bevy_solari/src/realtime/extract.rs
+new file mode 100644
+index 0000000000000..8e80f023275ee
+--- /dev/null
++++ b/crates/bevy_solari/src/realtime/extract.rs
+@@ -0,0 +1,27 @@
++use super::{prepare::SolariLightingResources, SolariLighting};
++use bevy_ecs::system::{Commands, ResMut};
++use bevy_pbr::deferred::SkipDeferredLighting;
++use bevy_render::{camera::Camera, sync_world::RenderEntity, MainWorld};
++
++pub fn extract_solari_lighting(mut main_world: ResMut<MainWorld>, mut commands: Commands) {
++    let mut cameras_3d = main_world.query::<(RenderEntity, &Camera, Option<&mut SolariLighting>)>();
++
++    for (entity, camera, mut solari_lighting) in cameras_3d.iter_mut(&mut main_world) {
++        let mut entity_commands = commands
++            .get_entity(entity)
++            .expect("Camera entity wasn't synced.");
++        if solari_lighting.is_some() && camera.is_active {
++            entity_commands.insert((
++                solari_lighting.as_deref().unwrap().clone(),
++                SkipDeferredLighting,
++            ));
++            solari_lighting.as_mut().unwrap().reset = false;
++        } else {
++            entity_commands.remove::<(
++                SolariLighting,
++                SolariLightingResources,
++                SkipDeferredLighting,
++            )>();
++        }
++    }
++}
+diff --git a/crates/bevy_solari/src/realtime/mod.rs b/crates/bevy_solari/src/realtime/mod.rs
+new file mode 100644
+index 0000000000000..9308ab5cf89ac
+--- /dev/null
++++ b/crates/bevy_solari/src/realtime/mod.rs
+@@ -0,0 +1,91 @@
++mod extract;
++mod node;
++mod prepare;
++
++use crate::SolariPlugin;
++use bevy_app::{App, Plugin};
++use bevy_asset::embedded_asset;
++use bevy_core_pipeline::{
++    core_3d::graph::{Core3d, Node3d},
++    prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass},
++};
++use bevy_ecs::{component::Component, reflect::ReflectComponent, schedule::IntoScheduleConfigs};
++use bevy_pbr::DefaultOpaqueRendererMethod;
++use bevy_reflect::{std_traits::ReflectDefault, Reflect};
++use bevy_render::{
++    load_shader_library,
++    render_graph::{RenderGraphApp, ViewNodeRunner},
++    renderer::RenderDevice,
++    view::Hdr,
++    ExtractSchedule, Render, RenderApp, RenderSystems,
++};
++use extract::extract_solari_lighting;
++use node::SolariLightingNode;
++use prepare::prepare_solari_lighting_resources;
++use tracing::warn;
++
++pub struct SolariLightingPlugin;
++
++impl Plugin for SolariLightingPlugin {
++    fn build(&self, app: &mut App) {
++        embedded_asset!(app, "restir_di.wgsl");
++        load_shader_library!(app, "reservoir.wgsl");
++
++        app.register_type::<SolariLighting>()
++            .insert_resource(DefaultOpaqueRendererMethod::deferred());
++    }
++
++    fn finish(&self, app: &mut App) {
++        let render_app = app.sub_app_mut(RenderApp);
++
++        let render_device = render_app.world().resource::<RenderDevice>();
++        let features = render_device.features();
++        if !features.contains(SolariPlugin::required_wgpu_features()) {
++            warn!(
++                "SolariLightingPlugin not loaded. GPU lacks support for required features: {:?}.",
++                SolariPlugin::required_wgpu_features().difference(features)
++            );
++            return;
++        }
++        render_app
++            .add_systems(ExtractSchedule, extract_solari_lighting)
++            .add_systems(
++                Render,
++                prepare_solari_lighting_resources.in_set(RenderSystems::PrepareResources),
++            )
++            .add_render_graph_node::<ViewNodeRunner<SolariLightingNode>>(
++                Core3d,
++                node::graph::SolariLightingNode,
++            )
++            .add_render_graph_edges(
++                Core3d,
++                (Node3d::EndMainPass, node::graph::SolariLightingNode),
++            );
++    }
++}
++
++/// A component for a 3d camera entity to enable the Solari raytraced lighting system.
++///
++/// Must be used with `CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING)`, and
++/// `Msaa::Off`.
++#[derive(Component, Reflect, Clone)]
++#[reflect(Component, Default, Clone)]
++#[require(Hdr, DeferredPrepass, DepthPrepass, MotionVectorPrepass)]
++pub struct SolariLighting {
++    /// Set to true to delete the saved temporal history (past frames).
++    ///
++    /// Useful for preventing ghosting when the history is no longer
++    /// representative of the current frame, such as in sudden camera cuts.
++    ///
++    /// After setting this to true, it will automatically be toggled
++    /// back to false at the end of the frame.
++    pub reset: bool,
++}
++
++impl Default for SolariLighting {
++    fn default() -> Self {
++        Self {
++            reset: true, // No temporal history on the first frame
++        }
++    }
++}
+diff --git a/crates/bevy_solari/src/realtime/node.rs b/crates/bevy_solari/src/realtime/node.rs
+new file mode 100644
+index 0000000000000..6060bb3c15217
+--- /dev/null
++++ b/crates/bevy_solari/src/realtime/node.rs
+@@ -0,0 +1,200 @@
++use super::{prepare::SolariLightingResources, SolariLighting};
++use crate::scene::RaytracingSceneBindings;
++use bevy_asset::load_embedded_asset;
++use bevy_core_pipeline::prepass::ViewPrepassTextures;
++use bevy_diagnostic::FrameCount;
++use bevy_ecs::{
++    query::QueryItem,
++    world::{FromWorld, World},
++};
++use bevy_render::{
++    camera::ExtractedCamera,
++    diagnostic::RecordDiagnostics,
++    render_graph::{NodeRunError, RenderGraphContext, ViewNode},
++    render_resource::{
++        binding_types::{
++            storage_buffer_sized, texture_2d, texture_depth_2d, texture_storage_2d, uniform_buffer,
++        },
++        BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, CachedComputePipelineId,
++        ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache, PushConstantRange,
++        ShaderStages, StorageTextureAccess, TextureSampleType,
++    },
++    renderer::{RenderContext, RenderDevice},
++    view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
++};
++
++pub mod graph {
++    use bevy_render::render_graph::RenderLabel;
++
++    #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
++    pub struct SolariLightingNode;
++}
++
++pub struct SolariLightingNode {
++    bind_group_layout: BindGroupLayout,
++    initial_and_temporal_pipeline: CachedComputePipelineId,
++    spatial_and_shade_pipeline: CachedComputePipelineId,
++}
++
++impl ViewNode for SolariLightingNode {
++    type ViewQuery = (
++        &'static SolariLighting,
++        &'static SolariLightingResources,
++        &'static ExtractedCamera,
++        &'static ViewTarget,
++        &'static ViewPrepassTextures,
++        &'static ViewUniformOffset,
++    );
++
++    fn run(
++        &self,
++        _graph: &mut RenderGraphContext,
++        render_context: &mut RenderContext,
++        (
++            solari_lighting,
++            solari_lighting_resources,
++            camera,
++            view_target,
++            view_prepass_textures,
++            view_uniform_offset,
++        ): QueryItem<Self::ViewQuery>,
++        world: &World,
++    ) -> Result<(), NodeRunError> {
++        let pipeline_cache = world.resource::<PipelineCache>();
++        let scene_bindings = world.resource::<RaytracingSceneBindings>();
++        let view_uniforms = world.resource::<ViewUniforms>();
++        let frame_count = world.resource::<FrameCount>();
++        let (
++            Some(initial_and_temporal_pipeline),
++            Some(spatial_and_shade_pipeline),
++            Some(scene_bindings),
++            Some(viewport),
++            Some(gbuffer),
++            Some(depth_buffer),
++            Some(motion_vectors),
++            Some(view_uniforms),
++        ) = (
++            pipeline_cache.get_compute_pipeline(self.initial_and_temporal_pipeline),
++            pipeline_cache.get_compute_pipeline(self.spatial_and_shade_pipeline),
++            &scene_bindings.bind_group,
++            camera.physical_viewport_size,
++            view_prepass_textures.deferred_view(),
++            view_prepass_textures.depth_view(),
++            view_prepass_textures.motion_vectors_view(),
++            view_uniforms.uniforms.binding(),
++        )
++        else {
++            return Ok(());
++        };
++
++        let bind_group = render_context.render_device().create_bind_group(
++            "solari_lighting_bind_group",
++            &self.bind_group_layout,
++            &BindGroupEntries::sequential((
++                view_target.get_unsampled_color_attachment().view,
++                solari_lighting_resources.reservoirs_a.as_entire_binding(),
++                solari_lighting_resources.reservoirs_b.as_entire_binding(),
++                gbuffer,
++                depth_buffer,
++                motion_vectors,
++                view_uniforms,
++            )),
++        );
++
++        // Choice of number here is arbitrary
++        let frame_index = frame_count.0.wrapping_mul(5782582);
++
++        let diagnostics = render_context.diagnostic_recorder();
++        let command_encoder = render_context.command_encoder();
++
++        let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
++            label: Some("solari_lighting"),
++            timestamp_writes: None,
++        });
++        let pass_span = diagnostics.pass_span(&mut pass, "solari_lighting");
++
++        pass.set_bind_group(0, scene_bindings, &[]);
++        pass.set_bind_group(1, &bind_group, &[view_uniform_offset.offset]);
++
++        pass.set_pipeline(initial_and_temporal_pipeline);
++        pass.set_push_constants(
++            0,
++            bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
++        );
++        pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
++
++        pass.set_pipeline(spatial_and_shade_pipeline);
++        pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
++
++        pass_span.end(&mut pass);
++
++        Ok(())
++    }
++}
++
++impl FromWorld for SolariLightingNode {
++    fn from_world(world: &mut World) -> Self {
++        let render_device = world.resource::<RenderDevice>();
++        let pipeline_cache = world.resource::<PipelineCache>();
++        let scene_bindings = world.resource::<RaytracingSceneBindings>();
++
++        let bind_group_layout = render_device.create_bind_group_layout(
++            "solari_lighting_bind_group_layout",
++            &BindGroupLayoutEntries::sequential(
++                ShaderStages::COMPUTE,
++                (
++                    texture_storage_2d(
++                        ViewTarget::TEXTURE_FORMAT_HDR,
++                        StorageTextureAccess::WriteOnly,
++                    ),
++                    storage_buffer_sized(false, None),
++                    storage_buffer_sized(false, None),
++                    texture_2d(TextureSampleType::Uint),
++                    texture_depth_2d(),
++                    texture_2d(TextureSampleType::Float { filterable: true }),
++                    uniform_buffer::<ViewUniform>(true),
++                ),
++            ),
++        );
++
++        let initial_and_temporal_pipeline =
++            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
++                label: Some("solari_lighting_initial_and_temporal_pipeline".into()),
++                layout: vec![
++                    scene_bindings.bind_group_layout.clone(),
++                    bind_group_layout.clone(),
++                ],
++                push_constant_ranges: vec![PushConstantRange {
++                    stages: ShaderStages::COMPUTE,
++                    range: 0..8,
++                }],
++                shader: load_embedded_asset!(world, "restir_di.wgsl"),
++                shader_defs: vec![],
++                entry_point: "initial_and_temporal".into(),
++                zero_initialize_workgroup_memory: false,
++            });
++
++        let spatial_and_shade_pipeline =
++            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
++                label: Some("solari_lighting_spatial_and_shade_pipeline".into()),
++                layout: vec![
++                    scene_bindings.bind_group_layout.clone(),
++                    bind_group_layout.clone(),
++                ],
++                push_constant_ranges: vec![PushConstantRange {
++                    stages: ShaderStages::COMPUTE,
++                    range: 0..8,
++                }],
++                shader: load_embedded_asset!(world, "restir_di.wgsl"),
++                shader_defs: vec![],
++                entry_point: "spatial_and_shade".into(),
++                zero_initialize_workgroup_memory: false,
++            });
++
++        Self {
++            bind_group_layout,
++            initial_and_temporal_pipeline,
++            spatial_and_shade_pipeline,
++        }
++    }
++}
+diff --git a/crates/bevy_solari/src/realtime/prepare.rs b/crates/bevy_solari/src/realtime/prepare.rs
+new file mode 100644
+index 0000000000000..4f153bf0dc099
+--- /dev/null
++++ b/crates/bevy_solari/src/realtime/prepare.rs
+@@ -0,0 +1,65 @@
++use super::SolariLighting;
++use bevy_ecs::{
++    component::Component,
++    entity::Entity,
++    query::With,
++    system::{Commands, Query, Res},
++};
++use bevy_math::UVec2;
++use bevy_render::{
++    camera::ExtractedCamera,
++    render_resource::{Buffer, BufferDescriptor, BufferUsages},
++    renderer::RenderDevice,
++};
++
++/// Size of a Reservoir shader struct in bytes.
++const RESERVOIR_STRUCT_SIZE: u64 = 32;
++
++/// Internal rendering resources used for Solari lighting.
++#[derive(Component)]
++pub struct SolariLightingResources {
++    pub reservoirs_a: Buffer,
++    pub reservoirs_b: Buffer,
++    pub view_size: UVec2,
++}
++
++pub fn prepare_solari_lighting_resources(
++    query: Query<
++        (Entity, &ExtractedCamera, Option<&SolariLightingResources>),
++        With<SolariLighting>,
++    >,
++    render_device: Res<RenderDevice>,
++    mut commands: Commands,
++) {
++    for (entity, camera, solari_lighting_resources) in &query {
++        let Some(view_size) = camera.physical_viewport_size else {
++            continue;
++        };
++
++        if solari_lighting_resources.map(|r| r.view_size) == Some(view_size) {
++            continue;
++        }
++
++        let size = (view_size.x * view_size.y) as u64 * RESERVOIR_STRUCT_SIZE;
++
++        let reservoirs_a = render_device.create_buffer(&BufferDescriptor {
++            label: Some("solari_lighting_reservoirs_a"),
++            size,
++            usage: BufferUsages::STORAGE,
++            mapped_at_creation: false,
++        });
++
++        let reservoirs_b = render_device.create_buffer(&BufferDescriptor {
++            label: Some("solari_lighting_reservoirs_b"),
++            size,
++            usage: BufferUsages::STORAGE,
++            mapped_at_creation: false,
++        });
++
++        commands.entity(entity).insert(SolariLightingResources {
++            reservoirs_a,
++            reservoirs_b,
++            view_size,
++        });
++    }
++}
+diff --git a/crates/bevy_solari/src/realtime/reservoir.wgsl b/crates/bevy_solari/src/realtime/reservoir.wgsl
+new file mode 100644
+index 0000000000000..08a7e26f7cc9c
+--- /dev/null
++++ b/crates/bevy_solari/src/realtime/reservoir.wgsl
+@@ -0,0 +1,30 @@
++// https://intro-to-restir.cwyman.org/presentations/2023ReSTIR_Course_Notes.pdf
++
++#define_import_path bevy_solari::reservoir
++
++#import bevy_solari::sampling::LightSample
++
++const NULL_RESERVOIR_SAMPLE = 0xFFFFFFFFu;
++
++// Don't adjust the size of this struct without also adjusting RESERVOIR_STRUCT_SIZE.
++struct Reservoir {
++    sample: LightSample,
++    weight_sum: f32,
++    confidence_weight: f32,
++    unbiased_contribution_weight: f32,
++    _padding: f32,
++}
++
++fn empty_reservoir() -> Reservoir {
++    return Reservoir(
++        LightSample(vec2(NULL_RESERVOIR_SAMPLE, 0u), vec2(0.0)),
++        0.0,
++        0.0,
++        0.0,
++        0.0
++    );
++}
++
++fn reservoir_valid(reservoir: Reservoir) -> bool {
++    return reservoir.sample.light_id.x != NULL_RESERVOIR_SAMPLE;
++}
+diff --git a/crates/bevy_solari/src/realtime/restir_di.wgsl b/crates/bevy_solari/src/realtime/restir_di.wgsl
+new file mode 100644
+index 0000000000000..511fd63d12346
+--- /dev/null
++++ b/crates/bevy_solari/src/realtime/restir_di.wgsl
+@@ -0,0 +1,117 @@
++#import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
++#import bevy_pbr::pbr_deferred_types::unpack_24bit_normal
++#import bevy_pbr::rgb9e5::rgb9e5_to_vec3_
++#import bevy_pbr::utils::{rand_f, octahedral_decode}
++#import bevy_render::maths::PI
++#import bevy_render::view::View
++#import bevy_solari::reservoir::{Reservoir, empty_reservoir, reservoir_valid}
++#import bevy_solari::sampling::{generate_random_light_sample, calculate_light_contribution, trace_light_visibility}
++
++@group(1) @binding(0) var view_output: texture_storage_2d<rgba16float, write>;
++@group(1) @binding(1) var<storage, read_write> reservoirs_a: array<Reservoir>;
++@group(1) @binding(2) var<storage, read_write> reservoirs_b: array<Reservoir>;
++@group(1) @binding(3) var gbuffer: texture_2d<u32>;
++@group(1) @binding(4) var depth_buffer: texture_depth_2d;
++@group(1) @binding(5) var motion_vectors: texture_2d<f32>;
++@group(1) @binding(6) var<uniform> view: View;
++struct PushConstants { frame_index: u32, reset: u32 }
++var<push_constant> constants: PushConstants;
++
++const INITIAL_SAMPLES = 32u;
++const SPATIAL_REUSE_RADIUS_PIXELS = 30.0;
++const CONFIDENCE_WEIGHT_CAP = 20.0 * f32(INITIAL_SAMPLES);
++
++@compute @workgroup_size(8, 8, 1)
++fn initial_and_temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
++    if any(global_id.xy >= vec2u(view.viewport.zw)) { return; }
++
++    let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
++    var rng = pixel_index + constants.frame_index;
++
++    let depth = textureLoad(depth_buffer, global_id.xy, 0);
++    if depth == 0.0 {
++        reservoirs_b[pixel_index] = empty_reservoir();
++        return;
++    }
++    let gpixel = textureLoad(gbuffer, global_id.xy, 0);
++    let world_position = reconstruct_world_position(global_id.xy, depth);
++    let world_normal = octahedral_decode(unpack_24bit_normal(gpixel.a));
++    let base_color = pow(unpack4x8unorm(gpixel.r).rgb, vec3(2.2));
++    let diffuse_brdf = base_color / PI;
++
++    let initial_reservoir = generate_initial_reservoir(world_position, world_normal, diffuse_brdf, &rng);
++
++    reservoirs_b[pixel_index] = initial_reservoir;
++}
++
++@compute @workgroup_size(8, 8, 1)
++fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
++    if any(global_id.xy >= vec2u(view.viewport.zw)) { return; }
++
++    let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
++    var rng = pixel_index + constants.frame_index;
++
++    let depth = textureLoad(depth_buffer, global_id.xy, 0);
++    if depth == 0.0 {
++        reservoirs_a[pixel_index] = empty_reservoir();
++        textureStore(view_output, global_id.xy, vec4(vec3(0.0), 1.0));
++        return;
++    }
++    let gpixel = textureLoad(gbuffer, global_id.xy, 0);
++    let world_position = reconstruct_world_position(global_id.xy, depth);
++    let world_normal = octahedral_decode(unpack_24bit_normal(gpixel.a));
++    let base_color = pow(unpack4x8unorm(gpixel.r).rgb, vec3(2.2));
++    let diffuse_brdf = base_color / PI;
++    let emissive = rgb9e5_to_vec3_(gpixel.g);
++
++    let input_reservoir = reservoirs_b[pixel_index];
++
++    var radiance = vec3(0.0);
++    if reservoir_valid(input_reservoir) {
++        radiance = calculate_light_contribution(input_reservoir.sample, world_position, world_normal).radiance;
++    }
++
++    reservoirs_a[pixel_index] = input_reservoir;
++
++    var pixel_color = radiance * input_reservoir.unbiased_contribution_weight;
++    pixel_color *= view.exposure;
++    pixel_color *= diffuse_brdf;
++    pixel_color += emissive;
++    textureStore(view_output, global_id.xy, vec4(pixel_color, 1.0));
++}
++
++fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>, diffuse_brdf: vec3<f32>, rng: ptr<function, u32>) -> Reservoir{
++    var reservoir = empty_reservoir();
++    var reservoir_target_function = 0.0;
++    for (var i = 0u; i < INITIAL_SAMPLES; i++) {
++        let light_sample = generate_random_light_sample(rng);
++
++        let mis_weight = 1.0 / f32(INITIAL_SAMPLES);
++        let light_contribution = calculate_light_contribution(light_sample, world_position, world_normal);
++        let target_function = luminance(light_contribution.radiance * diffuse_brdf);
++        let resampling_weight = mis_weight * (target_function * light_contribution.inverse_pdf);
++
++        reservoir.weight_sum += resampling_weight;
++
++        if rand_f(rng) < resampling_weight / reservoir.weight_sum {
++            reservoir.sample = light_sample;
++            reservoir_target_function = target_function;
++        }
++    }
++
++    if reservoir_valid(reservoir) {
++        let inverse_target_function = select(0.0, 1.0 / reservoir_target_function, reservoir_target_function > 0.0);
++        reservoir.unbiased_contribution_weight = reservoir.weight_sum * inverse_target_function;
++        reservoir.unbiased_contribution_weight *= trace_light_visibility(reservoir.sample, world_position);
++    }
++
++    reservoir.confidence_weight = f32(INITIAL_SAMPLES);
++    return reservoir;
++}
++
++fn reconstruct_world_position(pixel_id: vec2<u32>, depth: f32) -> vec3<f32> {
++    let uv = (vec2<f32>(pixel_id) + 0.5) / view.viewport.zw;
++    let xy_ndc = (uv - vec2(0.5)) * vec2(2.0, -2.0);
++    let world_pos = view.world_from_clip * vec4(xy_ndc, depth, 1.0);
++    return world_pos.xyz / world_pos.w;
++}
+diff --git a/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl b/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
+index 99dbff9d89ae7..aad064590f263 100644
+--- a/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
++++ b/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
+@@ -71,7 +71,7 @@ struct DirectionalLight {
+ @group(0) @binding(9) var<storage> light_sources: array<LightSource>;
+ @group(0) @binding(10) var<storage> directional_lights: array<DirectionalLight>;
+ 
+-const RAY_T_MIN = 0.0001;
++const RAY_T_MIN = 0.01;
+ const RAY_T_MAX = 100000.0;
+ 
+ const RAY_NO_CULL = 0xFFu;
+diff --git a/crates/bevy_solari/src/scene/sampling.wgsl b/crates/bevy_solari/src/scene/sampling.wgsl
+index 4e2c8db33a230..06142192b6273 100644
+--- a/crates/bevy_solari/src/scene/sampling.wgsl
++++ b/crates/bevy_solari/src/scene/sampling.wgsl
+@@ -69,6 +69,7 @@ fn calculate_light_contribution(light_sample: LightSample, ray_origin: vec3<f32>
+ fn calculate_directional_light_contribution(light_sample: LightSample, directional_light_id: u32, origin_world_normal: vec3<f32>) -> LightContribution {
+     let directional_light = directional_lights[directional_light_id];
+ 
++#ifdef DIRECTIONAL_LIGHT_SOFT_SHADOWS
+     // Sample a random direction within a cone whose base is the sun approximated as a disk
+     // https://www.realtimerendering.com/raytracinggems/unofficial_RayTracingGems_v1.9.pdf#0004286901.INDD%3ASec30%3A305
+     let cos_theta = (1.0 - light_sample.random.x) + light_sample.random.x * directional_light.cos_theta_max;
+@@ -80,6 +81,9 @@ fn calculate_directional_light_contribution(light_sample: LightSample, direction
+ 
+     // Rotate the ray so that the cone it was sampled from is aligned with the light direction
+     ray_direction = build_orthonormal_basis(directional_light.direction_to_light) * ray_direction;
++#else
++    let ray_direction = directional_light.direction_to_light;
++#endif
+ 
+     let cos_theta_origin = saturate(dot(ray_direction, origin_world_normal));
+     let radiance = directional_light.luminance * cos_theta_origin;
+@@ -119,6 +123,7 @@ fn trace_light_visibility(light_sample: LightSample, ray_origin: vec3<f32>) -> f
+ fn trace_directional_light_visibility(light_sample: LightSample, directional_light_id: u32, ray_origin: vec3<f32>) -> f32 {
+     let directional_light = directional_lights[directional_light_id];
+ 
++#ifdef DIRECTIONAL_LIGHT_SOFT_SHADOWS
+     // Sample a random direction within a cone whose base is the sun approximated as a disk
+     // https://www.realtimerendering.com/raytracinggems/unofficial_RayTracingGems_v1.9.pdf#0004286901.INDD%3ASec30%3A305
+     let cos_theta = (1.0 - light_sample.random.x) + light_sample.random.x * directional_light.cos_theta_max;
+@@ -130,6 +135,9 @@ fn trace_directional_light_visibility(light_sample: LightSample, directional_lig
+ 
+     // Rotate the ray so that the cone it was sampled from is aligned with the light direction
+     ray_direction = build_orthonormal_basis(directional_light.direction_to_light) * ray_direction;
++#else
++    let ray_direction = directional_light.direction_to_light;
++#endif
+ 
+     let ray_hit = trace_ray(ray_origin, ray_direction, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+     return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
+diff --git a/examples/3d/solari.rs b/examples/3d/solari.rs
+index 389272cbb1c79..895df4d6fd413 100644
+--- a/examples/3d/solari.rs
++++ b/examples/3d/solari.rs
+@@ -1,28 +1,45 @@
+-//! Demonstrates realtime dynamic global illumination rendering using Bevy Solari.
++//! Demonstrates realtime dynamic raytraced lighting using Bevy Solari.
+ 
+ #[path = "../helpers/camera_controller.rs"]
+ mod camera_controller;
+ 
++use argh::FromArgs;
+ use bevy::{
+     prelude::*,
+     render::{camera::CameraMainTextureUsages, mesh::Indices, render_resource::TextureUsages},
+     scene::SceneInstanceReady,
+     solari::{
+-        pathtracer::Pathtracer,
+-        prelude::{RaytracingMesh3d, SolariPlugin},
++        pathtracer::{Pathtracer, PathtracingPlugin},
++        prelude::{RaytracingMesh3d, SolariLighting, SolariPlugin},
+     },
+ };
+ use camera_controller::{CameraController, CameraControllerPlugin};
+ use std::f32::consts::PI;
+ 
++/// `bevy_solari` demo.
++#[derive(FromArgs, Resource, Clone, Copy)]
++struct Args {
++    /// use the reference pathtracer instead of the realtime lighting system.
++    #[argh(switch)]
++    pathtracer: Option<bool>,
++}
++
+ fn main() {
+-    App::new()
+-        .add_plugins((DefaultPlugins, SolariPlugin, CameraControllerPlugin))
+-        .add_systems(Startup, setup)
+-        .run();
++    let args: Args = argh::from_env();
++
++    let mut app = App::new();
++    app.add_plugins((DefaultPlugins, SolariPlugin, CameraControllerPlugin))
++        .insert_resource(args)
++        .add_systems(Startup, setup);
++
++    if args.pathtracer == Some(true) {
++        app.add_plugins(PathtracingPlugin);
++    }
++
++    app.run();
+ }
+ 
+-fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
++fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<Args>) {
+     commands
+         .spawn(SceneRoot(asset_server.load(
+             GltfAssetLabel::Scene(0).from_asset("models/CornellBox/CornellBox.glb"),
+@@ -32,13 +49,13 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     commands.spawn((
+         DirectionalLight {
+             illuminance: light_consts::lux::FULL_DAYLIGHT,
+-            shadows_enabled: true,
++            shadows_enabled: false, // Solari replaces shadow mapping
+             ..default()
+         },
+         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.43, PI * -0.08, 0.0)),
+     ));
+ 
+-    commands.spawn((
++    let mut camera = commands.spawn((
+         Camera3d::default(),
+         Camera {
+             clear_color: ClearColorConfig::Custom(Color::BLACK),
+@@ -49,10 +66,16 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+             run_speed: 1500.0,
+             ..Default::default()
+         },
+-        Pathtracer::default(),
+-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
+         Transform::from_xyz(-278.0, 273.0, 800.0),
++        // Msaa::Off and CameraMainTextureUsages with STORAGE_BINDING are required for Solari
++        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
++        Msaa::Off,
+     ));
++    if args.pathtracer == Some(true) {
++        camera.insert(Pathtracer::default());
++    } else {
++        camera.insert(SolariLighting::default());
++    }
+ }
+ 
+ fn add_raytracing_meshes_on_scene_load(
+@@ -60,11 +83,14 @@ fn add_raytracing_meshes_on_scene_load(
+     children: Query<&Children>,
+     mesh: Query<&Mesh3d>,
+     mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
+     mut commands: Commands,
++    args: Res<Args>,
+ ) {
+-    // Ensure meshes are bery_solari compatible
++    // Ensure meshes are bevy_solari compatible
+     for (_, mesh) in meshes.iter_mut() {
+         mesh.remove_attribute(Mesh::ATTRIBUTE_UV_1.id);
++        mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR.id);
+         mesh.generate_tangents().unwrap();
+ 
+         if let Some(indices) = mesh.indices_mut() {
+@@ -74,12 +100,21 @@ fn add_raytracing_meshes_on_scene_load(
+         }
+     }
+ 
++    // Add raytracing mesh handles
+     for descendant in children.iter_descendants(trigger.target()) {
+         if let Ok(mesh) = mesh.get(descendant) {
+             commands
+                 .entity(descendant)
+-                .insert(RaytracingMesh3d(mesh.0.clone()))
+-                .remove::<Mesh3d>();
++                .insert(RaytracingMesh3d(mesh.0.clone()));
++
++            if args.pathtracer == Some(true) {
++                commands.entity(descendant).remove::<Mesh3d>();
++            }
+         }
+     }
++
++    // Increase material emissive intensity to make it prettier for the example
++    for (_, material) in materials.iter_mut() {
++        material.emissive *= 200.0;
++    }
+ }
+diff --git a/examples/README.md b/examples/README.md
+index 7b21d15da3ba0..1114802a04acb 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -185,7 +185,7 @@ Example | Description
+ [Shadow Biases](../examples/3d/shadow_biases.rs) | Demonstrates how shadow biases affect shadows in a 3d scene
+ [Shadow Caster and Receiver](../examples/3d/shadow_caster_receiver.rs) | Demonstrates how to prevent meshes from casting/receiving shadows in a 3d scene
+ [Skybox](../examples/3d/skybox.rs) | Load a cubemap texture onto a cube like a skybox and cycle through different compressed texture formats.
+-[Solari](../examples/3d/solari.rs) | Demonstrates realtime dynamic global illumination rendering using Bevy Solari.
++[Solari](../examples/3d/solari.rs) | Demonstrates realtime dynamic raytraced lighting using Bevy Solari.
+ [Specular Tint](../examples/3d/specular_tint.rs) | Demonstrates specular tints and maps
+ [Spherical Area Lights](../examples/3d/spherical_area_lights.rs) | Demonstrates how point light radius values affect light behavior
+ [Split Screen](../examples/3d/split_screen.rs) | Demonstrates how to render two cameras to the same window to accomplish "split screen"
+diff --git a/typos.toml b/typos.toml
+index e3a5c2bf4a8d1..16aab11772821 100644
+--- a/typos.toml
++++ b/typos.toml
+@@ -13,6 +13,7 @@ LOD = "LOD"                             # Level of detail
+ reparametrization = "reparametrization" # Mathematical term in curve context (reparameterize)
+ reparametrize = "reparametrize"
+ reparametrized = "reparametrized"
++mis = "mis"                             # mis - multiple importance sampling
+ 
+ # Match a Whole Word - Case Sensitive
+ [default.extend-identifiers]
