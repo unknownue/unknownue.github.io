@@ -1,0 +1,211 @@
+diff --git a/crates/bevy_solari/src/realtime/node.rs b/crates/bevy_solari/src/realtime/node.rs
+index 27fa95cd298bd..1bd392fa439e6 100644
+--- a/crates/bevy_solari/src/realtime/node.rs
++++ b/crates/bevy_solari/src/realtime/node.rs
+@@ -498,7 +498,7 @@ impl FromWorld for SolariLightingNode {
+                 "sample_radiance",
+                 load_embedded_asset!(world, "world_cache_update.wgsl"),
+                 None,
+-                vec![],
++                vec!["WORLD_CACHE_QUERY_ATOMIC_MAX_LIFETIME".into()],
+             ),
+             blend_new_world_cache_samples_pipeline: create_pipeline(
+                 "solari_lighting_blend_new_world_cache_samples_pipeline",
+diff --git a/crates/bevy_solari/src/realtime/prepare.rs b/crates/bevy_solari/src/realtime/prepare.rs
+index e4d13d3c72425..2a2e9584e7aeb 100644
+--- a/crates/bevy_solari/src/realtime/prepare.rs
++++ b/crates/bevy_solari/src/realtime/prepare.rs
+@@ -204,7 +204,7 @@ pub fn prepare_solari_lighting_resources(
+ 
+         let world_cache_active_cells_new_radiance =
+             render_device.create_buffer(&BufferDescriptor {
+-                label: Some("solari_lighting_world_cache_active_cells_new_irradiance"),
++                label: Some("solari_lighting_world_cache_active_cells_new_radiance"),
+                 size: WORLD_CACHE_SIZE * size_of::<[f32; 4]>() as u64,
+                 usage: BufferUsages::STORAGE,
+                 mapped_at_creation: false,
+diff --git a/crates/bevy_solari/src/realtime/restir_gi.wgsl b/crates/bevy_solari/src/realtime/restir_gi.wgsl
+index 7d3a60ac9e6d3..320772d65edbb 100644
+--- a/crates/bevy_solari/src/realtime/restir_gi.wgsl
++++ b/crates/bevy_solari/src/realtime/restir_gi.wgsl
+@@ -9,7 +9,7 @@
+ #import bevy_solari::gbuffer_utils::{gpixel_resolve, pixel_dissimilar, permute_pixel}
+ #import bevy_solari::sampling::{sample_random_light, trace_point_visibility}
+ #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, RAY_T_MIN, RAY_T_MAX}
+-#import bevy_solari::world_cache::query_world_cache
++#import bevy_solari::world_cache::{query_world_cache, WORLD_CACHE_CELL_LIFETIME}
+ 
+ @group(1) @binding(0) var view_output: texture_storage_2d<rgba16float, read_write>;
+ @group(1) @binding(5) var<storage, read_write> gi_reservoirs_a: array<Reservoir>;
+@@ -105,7 +105,7 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
+     reservoir.radiance = direct_lighting.radiance;
+     reservoir.unbiased_contribution_weight = direct_lighting.inverse_pdf * uniform_hemisphere_inverse_pdf();
+ #else
+-    reservoir.radiance = query_world_cache(sample_point.world_position, sample_point.geometric_world_normal, view.world_position, rng);
++    reservoir.radiance = query_world_cache(sample_point.world_position, sample_point.geometric_world_normal, view.world_position, WORLD_CACHE_CELL_LIFETIME, rng);
+     reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
+ #endif
+ 
+diff --git a/crates/bevy_solari/src/realtime/specular_gi.wgsl b/crates/bevy_solari/src/realtime/specular_gi.wgsl
+index 9900b190db9fc..335c5588271de 100644
+--- a/crates/bevy_solari/src/realtime/specular_gi.wgsl
++++ b/crates/bevy_solari/src/realtime/specular_gi.wgsl
+@@ -5,7 +5,7 @@
+ #import bevy_solari::gbuffer_utils::gpixel_resolve
+ #import bevy_solari::sampling::{sample_ggx_vndf, ggx_vndf_pdf}
+ #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, RAY_T_MIN, RAY_T_MAX}
+-#import bevy_solari::world_cache::query_world_cache
++#import bevy_solari::world_cache::{query_world_cache, WORLD_CACHE_CELL_LIFETIME}
+ 
+ @group(1) @binding(0) var view_output: texture_storage_2d<rgba16float, read_write>;
+ @group(1) @binding(5) var<storage, read_write> gi_reservoirs_a: array<Reservoir>;
+@@ -61,7 +61,7 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
+     textureStore(view_output, global_id.xy, pixel_color);
+ 
+ #ifdef VISUALIZE_WORLD_CACHE
+-    textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, &rng) * view.exposure, 1.0));
++    textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
+ #endif
+ }
+ 
+@@ -80,7 +80,7 @@ fn trace_glossy_path(initial_ray_origin: vec3<f32>, initial_wi: vec3<f32>, rng:
+ 
+         // Add world cache contribution
+         let diffuse_brdf = ray_hit.material.base_color / PI;
+-        radiance += throughput * diffuse_brdf * query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, rng);
++        radiance += throughput * diffuse_brdf * query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, WORLD_CACHE_CELL_LIFETIME, rng);
+ 
+         // Surface is very rough, terminate path in the world cache
+         if ray_hit.material.roughness > 0.1 && i != 0u { break; }
+diff --git a/crates/bevy_solari/src/realtime/world_cache_compact.wgsl b/crates/bevy_solari/src/realtime/world_cache_compact.wgsl
+index 95fc6969837d8..f5d7b7b217ab7 100644
+--- a/crates/bevy_solari/src/realtime/world_cache_compact.wgsl
++++ b/crates/bevy_solari/src/realtime/world_cache_compact.wgsl
+@@ -59,12 +59,14 @@ fn compact_world_cache_write_active_cells(
+     @builtin(local_invocation_index) thread_index: u32,
+ ) {
+     let compacted_index = world_cache_a[cell_id.x] + world_cache_b[workgroup_id.x];
+-    if world_cache_life[cell_id.x] != 0u {
++    let cell_active = world_cache_life[cell_id.x] != 0u;
++
++    if cell_active {
+         world_cache_active_cell_indices[compacted_index] = cell_id.x;
+     }
+ 
+     if thread_index == 1023u && workgroup_id.x == 1023u {
+-        world_cache_active_cells_count = compacted_index + 1u; // TODO: This is 1 even when there are zero active entries in the cache
++        world_cache_active_cells_count = compacted_index + u32(cell_active);
+         world_cache_active_cells_dispatch = vec3((world_cache_active_cells_count + 63u) / 64u, 1u, 1u);
+     }
+ }
+diff --git a/crates/bevy_solari/src/realtime/world_cache_query.wgsl b/crates/bevy_solari/src/realtime/world_cache_query.wgsl
+index 16cae496fa55a..45addedb663ba 100644
+--- a/crates/bevy_solari/src/realtime/world_cache_query.wgsl
++++ b/crates/bevy_solari/src/realtime/world_cache_query.wgsl
+@@ -5,12 +5,17 @@
+ 
+ /// How responsive the world cache is to changes in lighting (higher is less responsive, lower is more responsive)
+ const WORLD_CACHE_MAX_TEMPORAL_SAMPLES: f32 = 10.0;
++/// How many direct light samples each cell takes when updating each frame
++const WORLD_CACHE_DIRECT_LIGHT_SAMPLE_COUNT: u32 = 32u;
++/// Maximum amount of distance to trace GI rays between two cache cells
++const WORLD_CACHE_MAX_GI_RAY_DISTANCE: f32 = 50.0;
++
+ /// Maximum amount of frames a cell can live for without being queried
+-const WORLD_CACHE_CELL_LIFETIME: u32 = 4u;
++const WORLD_CACHE_CELL_LIFETIME: u32 = 30u;
+ /// Maximum amount of attempts to find a cache entry after a hash collision
+ const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 3u;
+ 
+-/// The size of a cache cell at the lowest LOD in meters
++/// Size of a cache cell at the lowest LOD in meters
+ const WORLD_CACHE_POSITION_BASE_CELL_SIZE: f32 = 0.25;
+ /// How fast the world cache transitions between LODs as a function of distance to the camera
+ const WORLD_CACHE_POSITION_LOD_SCALE: f32 = 8.0;
+@@ -40,7 +45,7 @@ struct WorldCacheGeometryData {
+ @group(1) @binding(22) var<storage, read_write> world_cache_active_cells_count: u32;
+ 
+ #ifndef WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER
+-fn query_world_cache(world_position: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32> {
++fn query_world_cache(world_position: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+     let cell_size = get_cell_size(world_position, view_position);
+ 
+     // https://tomclabault.github.io/blog/2025/regir, jitter_world_position_tangent_plane
+@@ -55,13 +60,21 @@ fn query_world_cache(world_position: vec3<f32>, world_normal: vec3<f32>, view_po
+ 
+     for (var i = 0u; i < WORLD_CACHE_MAX_SEARCH_STEPS; i++) {
+         let existing_checksum = atomicCompareExchangeWeak(&world_cache_checksums[key], WORLD_CACHE_EMPTY_CELL, checksum).old_value;
++
++        // Cell already exists or is empty - reset lifetime
++        if existing_checksum == checksum || existing_checksum == WORLD_CACHE_EMPTY_CELL {
++#ifndef WORLD_CACHE_QUERY_ATOMIC_MAX_LIFETIME
++            atomicStore(&world_cache_life[key], cell_lifetime);
++#else
++            atomicMax(&world_cache_life[key], cell_lifetime);
++#endif
++        }
++
+         if existing_checksum == checksum {
+-            // Cache entry already exists - get radiance and reset cell lifetime
+-            atomicStore(&world_cache_life[key], WORLD_CACHE_CELL_LIFETIME);
++            // Cache entry already exists - get radiance
+             return world_cache_radiance[key].rgb;
+         } else if existing_checksum == WORLD_CACHE_EMPTY_CELL {
+-            // Cell is empty - reset cell lifetime so that it starts getting updated next frame
+-            atomicStore(&world_cache_life[key], WORLD_CACHE_CELL_LIFETIME);
++            // Cell is empty - initialize it
+             world_cache_geometry_data[key].world_position = jittered_position;
+             world_cache_geometry_data[key].world_normal = world_normal;
+             return vec3(0.0);
+diff --git a/crates/bevy_solari/src/realtime/world_cache_update.wgsl b/crates/bevy_solari/src/realtime/world_cache_update.wgsl
+index 11d7a29c2c6be..f80094e0dffc6 100644
+--- a/crates/bevy_solari/src/realtime/world_cache_update.wgsl
++++ b/crates/bevy_solari/src/realtime/world_cache_update.wgsl
+@@ -6,9 +6,12 @@
+ #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, RAY_T_MIN}
+ #import bevy_solari::world_cache::{
+     WORLD_CACHE_MAX_TEMPORAL_SAMPLES,
++    WORLD_CACHE_DIRECT_LIGHT_SAMPLE_COUNT,
++    WORLD_CACHE_MAX_GI_RAY_DISTANCE,
+     query_world_cache,
+     world_cache_active_cells_count,
+     world_cache_active_cell_indices,
++    world_cache_life,
+     world_cache_geometry_data,
+     world_cache_radiance,
+     world_cache_active_cells_new_radiance,
+@@ -19,9 +22,6 @@
+ struct PushConstants { frame_index: u32, reset: u32 }
+ var<push_constant> constants: PushConstants;
+ 
+-const DIRECT_LIGHT_SAMPLE_COUNT: u32 = 32u;
+-const MAX_GI_RAY_DISTANCE: f32 = 4.0;
+-
+ @compute @workgroup_size(64, 1, 1)
+ fn sample_radiance(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_invocation_id) active_cell_id: vec3<u32>) {
+     if active_cell_id.x < world_cache_active_cells_count {
+@@ -35,10 +35,11 @@ fn sample_radiance(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(glob
+ 
+ #ifndef NO_MULTIBOUNCE
+         let ray_direction = sample_cosine_hemisphere(geometry_data.world_normal, &rng);
+-        let ray_hit = trace_ray(geometry_data.world_position, ray_direction, RAY_T_MIN, MAX_GI_RAY_DISTANCE, RAY_FLAG_NONE);
++        let ray_hit = trace_ray(geometry_data.world_position, ray_direction, RAY_T_MIN, WORLD_CACHE_MAX_GI_RAY_DISTANCE, RAY_FLAG_NONE);
+         if ray_hit.kind != RAY_QUERY_INTERSECTION_NONE {
+             let ray_hit = resolve_ray_hit_full(ray_hit);
+-            new_radiance += ray_hit.material.base_color * query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, &rng);
++            let cell_life = atomicLoad(&world_cache_life[cell_index]);
++            new_radiance += ray_hit.material.base_color * query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, cell_life, &rng);
+         }
+ #endif
+ 
+@@ -69,8 +70,8 @@ fn sample_random_light_ris(world_position: vec3<f32>, world_normal: vec3<f32>, w
+     var selected_sample_radiance = vec3(0.0);
+     var selected_sample_target_function = 0.0;
+     var selected_sample_world_position = vec4(0.0);
+-    let mis_weight = 1.0 / f32(DIRECT_LIGHT_SAMPLE_COUNT);
+-    for (var i = 0u; i < DIRECT_LIGHT_SAMPLE_COUNT; i++) {
++    let mis_weight = 1.0 / f32(WORLD_CACHE_DIRECT_LIGHT_SAMPLE_COUNT);
++    for (var i = 0u; i < WORLD_CACHE_DIRECT_LIGHT_SAMPLE_COUNT; i++) {
+         let tile_sample = light_tile_start + rand_range_u(1024u, rng);
+         let resolved_light_sample = unpack_resolved_light_sample(light_tile_resolved_samples[tile_sample], view.exposure);
+         let light_contribution = calculate_resolved_light_contribution(resolved_light_sample, world_position, world_normal);
