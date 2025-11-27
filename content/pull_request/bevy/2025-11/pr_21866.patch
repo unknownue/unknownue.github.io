@@ -1,0 +1,185 @@
+diff --git a/crates/bevy_render/src/renderer/mod.rs b/crates/bevy_render/src/renderer/mod.rs
+index cbc93d3b2a5c3..af716707fc44e 100644
+--- a/crates/bevy_render/src/renderer/mod.rs
++++ b/crates/bevy_render/src/renderer/mod.rs
+@@ -17,9 +17,11 @@ use crate::{
+     view::{ExtractedWindows, ViewTarget},
+ };
+ use alloc::sync::Arc;
++use bevy_camera::NormalizedRenderTarget;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{prelude::*, system::SystemState};
+ use bevy_platform::time::Instant;
++use bevy_render::camera::ExtractedCamera;
+ use bevy_time::TimeSender;
+ use bevy_window::RawHandleWrapperHolder;
+ use tracing::{debug, error, info, info_span, warn};
+@@ -29,7 +31,10 @@ use wgpu::{
+ };
+ 
+ /// Updates the [`RenderGraph`] with all of its nodes and then runs it to render the entire frame.
+-pub fn render_system(world: &mut World, state: &mut SystemState<Query<Entity, With<ViewTarget>>>) {
++pub fn render_system(
++    world: &mut World,
++    state: &mut SystemState<Query<(&ViewTarget, &ExtractedCamera)>>,
++) {
+     world.resource_scope(|world, mut graph: Mut<RenderGraph>| {
+         graph.update(world);
+     });
+@@ -77,23 +82,19 @@ pub fn render_system(world: &mut World, state: &mut SystemState<Query<Entity, Wi
+     {
+         let _span = info_span!("present_frames").entered();
+ 
+-        // Remove ViewTarget components to ensure swap chain TextureViews are dropped.
+-        // If all TextureViews aren't dropped before present, acquiring the next swap chain texture will fail.
+-        let view_entities = state.get(world).iter().collect::<Vec<_>>();
+-        for view_entity in view_entities {
+-            world.entity_mut(view_entity).remove::<ViewTarget>();
+-        }
+-
+-        let mut windows = world.resource_mut::<ExtractedWindows>();
+-        for window in windows.values_mut() {
+-            if let Some(surface_texture) = window.swap_chain_texture.take() {
+-                // TODO(clean): winit docs recommends calling pre_present_notify before this.
+-                // though `present()` doesn't present the frame, it schedules it to be presented
+-                // by wgpu.
+-                // https://docs.rs/winit/0.29.9/wasm32-unknown-unknown/winit/window/struct.Window.html#method.pre_present_notify
+-                surface_texture.present();
++        world.resource_scope(|world, mut windows: Mut<ExtractedWindows>| {
++            let views = state.get(world);
++            for (view_target, camera) in views.iter() {
++                if let Some(NormalizedRenderTarget::Window(window)) = camera.target
++                    && view_target.needs_present()
++                {
++                    let Some(window) = windows.get_mut(&window.entity()) else {
++                        continue;
++                    };
++                    window.present();
++                }
+             }
+-        }
++        });
+ 
+         #[cfg(feature = "tracing-tracy")]
+         tracing::event!(
+@@ -110,7 +111,7 @@ pub fn render_system(world: &mut World, state: &mut SystemState<Query<Entity, Wi
+     if let Err(error) = time_sender.0.try_send(Instant::now()) {
+         match error {
+             bevy_time::TrySendError::Full(_) => {
+-                panic!("The TimeSender channel should always be empty during render. You might need to add the bevy::core::time_system to your app.",);
++                panic!("The TimeSender channel should always be empty during render. You might need to add the bevy::core::time_system to your app.");
+             }
+             bevy_time::TrySendError::Disconnected(_) => {
+                 // ignore disconnected errors, the main world probably just got dropped during shutdown
+diff --git a/crates/bevy_render/src/texture/texture_attachment.rs b/crates/bevy_render/src/texture/texture_attachment.rs
+index cf0e057db0f21..269c2f1422820 100644
+--- a/crates/bevy_render/src/texture/texture_attachment.rs
++++ b/crates/bevy_render/src/texture/texture_attachment.rs
+@@ -159,4 +159,11 @@ impl OutputColorAttachment {
+             },
+         }
+     }
++
++    /// Returns `true` if this attachment has been written to by a render pass.
++    // we re-use is_first_call atomic to track usage, which assumes that calls to get_attachment
++    // are always consumed by a render pass that writes to the attachment
++    pub fn needs_present(&self) -> bool {
++        !self.is_first_call.load(Ordering::SeqCst)
++    }
+ }
+diff --git a/crates/bevy_render/src/view/mod.rs b/crates/bevy_render/src/view/mod.rs
+index ea95b7fad725b..9a3d610087c63 100644
+--- a/crates/bevy_render/src/view/mod.rs
++++ b/crates/bevy_render/src/view/mod.rs
+@@ -830,6 +830,11 @@ impl ViewTarget {
+         self.out_texture.get_attachment(clear_color)
+     }
+ 
++    /// Whether the final texture this view will render to needs to be presented.
++    pub fn needs_present(&self) -> bool {
++        self.out_texture.needs_present()
++    }
++
+     /// The format of the final texture this view will render to
+     #[inline]
+     pub fn out_texture_format(&self) -> TextureFormat {
+diff --git a/crates/bevy_render/src/view/window/mod.rs b/crates/bevy_render/src/view/window/mod.rs
+index 0b6cacea90e62..ae5389e906820 100644
+--- a/crates/bevy_render/src/view/window/mod.rs
++++ b/crates/bevy_render/src/view/window/mod.rs
+@@ -76,6 +76,20 @@ impl ExtractedWindow {
+         ));
+         self.swap_chain_texture = Some(SurfaceTexture::from(frame));
+     }
++
++    fn has_swapchain_texture(&self) -> bool {
++        self.swap_chain_texture_view.is_some() && self.swap_chain_texture.is_some()
++    }
++
++    pub fn present(&mut self) {
++        if let Some(surface_texture) = self.swap_chain_texture.take() {
++            // TODO(clean): winit docs recommends calling pre_present_notify before this.
++            // though `present()` doesn't present the frame, it schedules it to be presented
++            // by wgpu.
++            // https://docs.rs/winit/0.29.9/wasm32-unknown-unknown/winit/window/struct.Window.html#method.pre_present_notify
++            surface_texture.present();
++        }
++    }
+ }
+ 
+ #[derive(Default, Resource)]
+@@ -130,8 +144,13 @@ fn extract_windows(
+             alpha_mode: window.composite_alpha_mode,
+         });
+ 
+-        // NOTE: Drop the swap chain frame here
+-        extracted_window.swap_chain_texture_view = None;
++        if extracted_window.swap_chain_texture.is_none() {
++            // If we called present on the previous swap-chain texture last update,
++            // then drop the swap chain frame here, otherwise we can keep it for the
++            // next update as an optimization. `prepare_windows` will only acquire a new
++            // swap chain texture if needed.
++            extracted_window.swap_chain_texture_view = None;
++        }
+         extracted_window.size_changed = new_width != extracted_window.physical_width
+             || new_height != extracted_window.physical_height;
+         extracted_window.present_mode_changed =
+@@ -221,6 +240,11 @@ pub fn prepare_windows(
+             continue;
+         };
+ 
++        // We didn't present the previous frame, so we can keep using our existing swapchain texture.
++        if window.has_swapchain_texture() && !window.size_changed && !window.present_mode_changed {
++            continue;
++        }
++
+         // A recurring issue is hitting `wgpu::SurfaceError::Timeout` on certain Linux
+         // mesa driver implementations. This seems to be a quirk of some drivers.
+         // We'd rather keep panicking when not on Linux mesa, because in those case,
+@@ -300,13 +324,13 @@ pub fn create_surfaces(
+     // By accessing a NonSend resource, we tell the scheduler to put this system on the main thread,
+     // which is necessary for some OS's
+     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
+-    windows: Res<ExtractedWindows>,
++    mut windows: ResMut<ExtractedWindows>,
+     mut window_surfaces: ResMut<WindowSurfaces>,
+     render_instance: Res<RenderInstance>,
+     render_adapter: Res<RenderAdapter>,
+     render_device: Res<RenderDevice>,
+ ) {
+-    for window in windows.windows.values() {
++    for window in windows.windows.values_mut() {
+         let data = window_surfaces
+             .surfaces
+             .entry(window.entity)
+@@ -383,6 +407,10 @@ pub fn create_surfaces(
+             });
+ 
+         if window.size_changed || window.present_mode_changed {
++            // normally this is dropped on present but we double check here to be safe as failure to
++            // drop it will cause validation errors in wgpu
++            drop(window.swap_chain_texture.take());
++
+             data.configuration.width = window.physical_width;
+             data.configuration.height = window.physical_height;
+             data.configuration.present_mode = match window.present_mode {
