@@ -1,0 +1,190 @@
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 82f4976c49f1d..d672b6ae4d0b7 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -1653,7 +1653,7 @@ unsafe impl<T: Component> QueryData for &T {
+                 // SAFETY: set_table was previously called
+                 let table = unsafe { table.debug_checked_unwrap() };
+                 // SAFETY: Caller ensures `table_row` is in range.
+-                let item = unsafe { table.get(table_row.index()) };
++                let item = unsafe { table.get_unchecked(table_row.index()) };
+                 item.deref()
+             },
+             |sparse_set| {
+@@ -1841,13 +1841,14 @@ unsafe impl<'__w, T: Component> QueryData for Ref<'__w, T> {
+                     unsafe { table.debug_checked_unwrap() };
+ 
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let component = unsafe { table_components.get(table_row.index()) };
++                let component = unsafe { table_components.get_unchecked(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let added = unsafe { added_ticks.get(table_row.index()) };
++                let added = unsafe { added_ticks.get_unchecked(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let changed = unsafe { changed_ticks.get(table_row.index()) };
++                let changed = unsafe { changed_ticks.get_unchecked(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let caller = callers.map(|callers| unsafe { callers.get(table_row.index()) });
++                let caller =
++                    callers.map(|callers| unsafe { callers.get_unchecked(table_row.index()) });
+ 
+                 Ref {
+                     value: component.deref(),
+@@ -2053,13 +2054,14 @@ unsafe impl<'__w, T: Component<Mutability = Mutable>> QueryData for &'__w mut T
+                     unsafe { table.debug_checked_unwrap() };
+ 
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let component = unsafe { table_components.get(table_row.index()) };
++                let component = unsafe { table_components.get_unchecked(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let added = unsafe { added_ticks.get(table_row.index()) };
++                let added = unsafe { added_ticks.get_unchecked(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let changed = unsafe { changed_ticks.get(table_row.index()) };
++                let changed = unsafe { changed_ticks.get_unchecked(table_row.index()) };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let caller = callers.map(|callers| unsafe { callers.get(table_row.index()) });
++                let caller =
++                    callers.map(|callers| unsafe { callers.get_unchecked(table_row.index()) });
+ 
+                 Mut {
+                     value: component.deref_mut(),
+diff --git a/crates/bevy_ecs/src/query/filter.rs b/crates/bevy_ecs/src/query/filter.rs
+index d0261fae976a4..f8578d5d21705 100644
+--- a/crates/bevy_ecs/src/query/filter.rs
++++ b/crates/bevy_ecs/src/query/filter.rs
+@@ -850,7 +850,7 @@ unsafe impl<T: Component> QueryFilter for Added<T> {
+                 // SAFETY: set_table was previously called
+                 let table = unsafe { table.debug_checked_unwrap() };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let tick = unsafe { table.get(table_row.index()) };
++                let tick = unsafe { table.get_unchecked(table_row.index()) };
+ 
+                 tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+             },
+@@ -1078,7 +1078,7 @@ unsafe impl<T: Component> QueryFilter for Changed<T> {
+                 // SAFETY: set_table was previously called
+                 let table = unsafe { table.debug_checked_unwrap() };
+                 // SAFETY: The caller ensures `table_row` is in range.
+-                let tick = unsafe { table.get(table_row.index()) };
++                let tick = unsafe { table.get_unchecked(table_row.index()) };
+ 
+                 tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+             },
+diff --git a/crates/bevy_ptr/src/lib.rs b/crates/bevy_ptr/src/lib.rs
+index d4db3462d6af9..e76fcc9f57250 100644
+--- a/crates/bevy_ptr/src/lib.rs
++++ b/crates/bevy_ptr/src/lib.rs
+@@ -1056,7 +1056,29 @@ impl<'a> OwningPtr<'a, Unaligned> {
+     }
+ }
+ 
+-/// Conceptually equivalent to `&'a [T]` but with length information cut out for performance reasons
++/// Conceptually equivalent to `&'a [T]` but with length information cut out for performance
++/// reasons.
++///
++/// Because this type does not store the length of the slice, it is unable to do any sort of bounds
++/// checking. As such, only [`Self::get_unchecked()`] is available for indexing into the slice,
++/// where the user is responsible for checking the bounds.
++///
++/// When compiled in debug mode (`#[cfg(debug_assertion)]`), this type will store the length of the
++/// slice and perform bounds checking in [`Self::get_unchecked()`].
++///
++/// # Example
++///
++/// ```
++/// # use core::mem::size_of;
++/// # use bevy_ptr::ThinSlicePtr;
++/// #
++/// let slice: &[u32] = &[2, 4, 8];
++/// let thin_slice = ThinSlicePtr::from(slice);
++///
++/// assert_eq!(*unsafe { thin_slice.get_unchecked(0) }, 2);
++/// assert_eq!(*unsafe { thin_slice.get_unchecked(1) }, 4);
++/// assert_eq!(*unsafe { thin_slice.get_unchecked(2) }, 8);
++/// ```
+ pub struct ThinSlicePtr<'a, T> {
+     ptr: NonNull<T>,
+     #[cfg(debug_assertions)]
+@@ -1065,18 +1087,32 @@ pub struct ThinSlicePtr<'a, T> {
+ }
+ 
+ impl<'a, T> ThinSlicePtr<'a, T> {
+-    #[inline]
+-    /// Indexes the slice without doing bounds checks
++    /// Indexes the slice without performing bounds checks.
+     ///
+     /// # Safety
++    ///
+     /// `index` must be in-bounds.
+-    pub unsafe fn get(self, index: usize) -> &'a T {
++    #[inline]
++    pub unsafe fn get_unchecked(&self, index: usize) -> &'a T {
++        // We cannot use `debug_assert!` here because `self.len` does not exist when not in debug
++        // mode.
+         #[cfg(debug_assertions)]
+-        debug_assert!(index < self.len);
++        assert!(index < self.len, "tried to index out-of-bounds of a slice");
+ 
+-        let ptr = self.ptr.as_ptr();
+-        // SAFETY: `index` is in-bounds so the resulting pointer is valid to dereference.
+-        unsafe { &*ptr.add(index) }
++        // SAFETY: The caller guarantees `index` is in-bounds so that the resulting pointer is
++        // valid to dereference.
++        unsafe { &*self.ptr.add(index).as_ptr() }
++    }
++
++    /// Indexes the slice without performing bounds checks.
++    ///
++    /// # Safety
++    ///
++    /// `index` must be in-bounds.
++    #[deprecated(since = "0.18.0", note = "use get_unchecked() instead")]
++    pub unsafe fn get(self, index: usize) -> &'a T {
++        // SAFETY: The caller guarantees that `index` is in-bounds.
++        unsafe { self.get_unchecked(index) }
+     }
+ }
+ 
+@@ -1091,10 +1127,11 @@ impl<'a, T> Copy for ThinSlicePtr<'a, T> {}
+ impl<'a, T> From<&'a [T]> for ThinSlicePtr<'a, T> {
+     #[inline]
+     fn from(slice: &'a [T]) -> Self {
+-        let ptr = slice.as_ptr().cast_mut();
++        let ptr = slice.as_ptr().cast_mut().debug_ensure_aligned();
++
+         Self {
+-            // SAFETY: a reference can never be null
+-            ptr: unsafe { NonNull::new_unchecked(ptr.debug_ensure_aligned()) },
++            // SAFETY: A reference can never be null.
++            ptr: unsafe { NonNull::new_unchecked(ptr) },
+             #[cfg(debug_assertions)]
+             len: slice.len(),
+             _marker: PhantomData,
+diff --git a/release-content/migration-guides/thin_slice_ptr_get_unchecked.md b/release-content/migration-guides/thin_slice_ptr_get_unchecked.md
+new file mode 100644
+index 0000000000000..b9101992783c8
+--- /dev/null
++++ b/release-content/migration-guides/thin_slice_ptr_get_unchecked.md
+@@ -0,0 +1,21 @@
++---
++title: Rename `ThinSlicePtr::get()` to `ThinSlicePtr::get_unchecked()`
++pull_requests: [21823]
++---
++
++`ThinSlicePtr::get()` has been deprecated in favor of the new `ThinSlicePtr::get_unchecked()`
++method in order to more clearly signal that bounds checking is not performed. Beyond the name
++change, the only difference between these two methods is that `get_unchecked()` takes `&self` while
++`get()` takes `self`. In order to migrate, simply rename all usages of `get()` with
++`get_unchecked()`:
++
++```rust
++let slice: &[u32] = &[2, 4, 8];
++let thin_slice = ThinSlicePtr::from(slice);
++
++// 0.17
++let x = unsafe { thin_slice.get(0) };
++
++// 0.18
++let x = unsafe { thin_slice.get_unchecked(0) };
++```
