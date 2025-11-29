@@ -5,5 +5,5 @@ template = "pull_request.html"
 
 [extra]
 all_labels = ["A-Assets", "A-Build-System", "A-Cross-Cutting", "A-Dev-Tools", "A-Diagnostics", "A-ECS", "A-Gizmos", "A-Math", "A-Picking", "A-Pointers", "A-Rendering", "A-States", "A-Tasks", "A-Text", "A-Time", "A-UI", "A-Utils", "A-Windowing", "A-glTF", "C-Bug", "C-Code-Quality", "C-Dependencies", "C-Docs", "C-Examples", "C-Feature", "C-Performance", "C-Refinement", "C-Testing", "C-Usability", "D-Complex", "D-Macros", "D-Modest", "D-Shaders", "D-Straightforward", "D-Trivial", "D-Unsafe", "M-Migration-Guide", "M-Release-Note", "O-Android", "O-Embedded", "O-WebGPU", "P-High", "P-Regression", "S-Needs-SME", "X-Contentious", "X-Controversial"]
-unique_pr_count = 89
+unique_pr_count = 91
 +++
