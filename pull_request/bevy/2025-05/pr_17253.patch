@@ -1,0 +1,614 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f764793161a9b..96f9db5520420 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3510,6 +3510,17 @@ description = "An example for debugging viewport coordinates"
+ category = "UI (User Interface)"
+ wasm = true
+ 
++[[example]]
++name = "viewport_node"
++path = "examples/ui/viewport_node.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.viewport_node]
++name = "Viewport Node"
++description = "Demonstrates how to create a viewport node with picking support"
++category = "UI (User Interface)"
++wasm = true
++
+ # Window
+ [[example]]
+ name = "clear_color"
+diff --git a/crates/bevy_ui/Cargo.toml b/crates/bevy_ui/Cargo.toml
+index eb1e9ed0da698..2874d8738b3b2 100644
+--- a/crates/bevy_ui/Cargo.toml
++++ b/crates/bevy_ui/Cargo.toml
+@@ -35,6 +35,7 @@ bevy_platform = { path = "../bevy_platform", version = "0.16.0-dev", default-fea
+ # other
+ taffy = { version = "0.7" }
+ serde = { version = "1", features = ["derive"], optional = true }
++uuid = { version = "1.1", features = ["v4"], optional = true }
+ bytemuck = { version = "1.5", features = ["derive"] }
+ thiserror = { version = "2", default-features = false }
+ derive_more = { version = "1", default-features = false, features = ["from"] }
+@@ -51,7 +52,7 @@ serialize = [
+   "bevy_math/serialize",
+   "bevy_platform/serialize",
+ ]
+-bevy_ui_picking_backend = ["bevy_picking"]
++bevy_ui_picking_backend = ["bevy_picking", "dep:uuid"]
+ bevy_ui_debug = []
+ 
+ # Experimental features
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index 4db3073a90a18..1f53ffea506c4 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -19,6 +19,8 @@ pub mod widget;
+ pub mod picking_backend;
+ 
+ use bevy_derive::{Deref, DerefMut};
++#[cfg(feature = "bevy_ui_picking_backend")]
++use bevy_picking::PickSet;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ mod accessibility;
+ // This module is not re-exported, but is instead made public.
+@@ -39,7 +41,7 @@ pub use render::*;
+ pub use ui_material::*;
+ pub use ui_node::*;
+ 
+-use widget::{ImageNode, ImageNodeSize};
++use widget::{ImageNode, ImageNodeSize, ViewportNode};
+ 
+ /// The UI prelude.
+ ///
+@@ -59,7 +61,7 @@ pub mod prelude {
+             geometry::*,
+             ui_material::*,
+             ui_node::*,
+-            widget::{Button, ImageNode, Label, NodeImageMode},
++            widget::{Button, ImageNode, Label, NodeImageMode, ViewportNode},
+             Interaction, MaterialNode, UiMaterialPlugin, UiScale,
+         },
+         // `bevy_sprite` re-exports for texture slicing
+@@ -157,6 +159,7 @@ impl Plugin for UiPlugin {
+             .register_type::<UiTargetCamera>()
+             .register_type::<ImageNode>()
+             .register_type::<ImageNodeSize>()
++            .register_type::<ViewportNode>()
+             .register_type::<UiRect>()
+             .register_type::<UiScale>()
+             .register_type::<BorderColor>()
+@@ -187,7 +190,8 @@ impl Plugin for UiPlugin {
+             );
+ 
+         #[cfg(feature = "bevy_ui_picking_backend")]
+-        app.add_plugins(picking_backend::UiPickingPlugin);
++        app.add_plugins(picking_backend::UiPickingPlugin)
++            .add_systems(First, widget::viewport_picking.in_set(PickSet::PostInput));
+ 
+         let ui_layout_system_config = ui_layout_system
+             .in_set(UiSystem::Layout)
+@@ -205,9 +209,10 @@ impl Plugin for UiPlugin {
+                 ui_layout_system_config,
+                 ui_stack_system
+                     .in_set(UiSystem::Stack)
+-                    // the systems don't care about stack index
++                    // These systems don't care about stack index
+                     .ambiguous_with(update_clipping_system)
+                     .ambiguous_with(ui_layout_system)
++                    .ambiguous_with(widget::update_viewport_render_target_size)
+                     .in_set(AmbiguousWithTextSystem),
+                 update_clipping_system.after(TransformSystem::TransformPropagate),
+                 // Potential conflicts: `Assets<Image>`
+@@ -218,8 +223,16 @@ impl Plugin for UiPlugin {
+                     .in_set(UiSystem::Content)
+                     .in_set(AmbiguousWithTextSystem)
+                     .in_set(AmbiguousWithUpdateText2DLayout),
++                // Potential conflicts: `Assets<Image>`
++                // `widget::text_system` and `bevy_text::update_text2d_layout` run independently
++                // since this system will only ever update viewport images.
++                widget::update_viewport_render_target_size
++                    .in_set(UiSystem::PostLayout)
++                    .in_set(AmbiguousWithTextSystem)
++                    .in_set(AmbiguousWithUpdateText2DLayout),
+             ),
+         );
++
+         build_text_interop(app);
+ 
+         if !self.enable_rendering {
+diff --git a/crates/bevy_ui/src/render/mod.rs b/crates/bevy_ui/src/render/mod.rs
+index 97ba9cd7ee4e4..18532d288e627 100644
+--- a/crates/bevy_ui/src/render/mod.rs
++++ b/crates/bevy_ui/src/render/mod.rs
+@@ -7,7 +7,7 @@ pub mod ui_texture_slice_pipeline;
+ #[cfg(feature = "bevy_ui_debug")]
+ mod debug_overlay;
+ 
+-use crate::widget::ImageNode;
++use crate::widget::{ImageNode, ViewportNode};
+ use crate::{
+     BackgroundColor, BorderColor, BoxShadowSamples, CalculatedClip, ComputedNode,
+     ComputedNodeTarget, Outline, ResolvedBorderRadius, TextShadow, UiAntiAlias,
+@@ -107,6 +107,7 @@ pub enum RenderUiSystem {
+     ExtractImages,
+     ExtractTextureSlice,
+     ExtractBorders,
++    ExtractViewportNodes,
+     ExtractTextBackgrounds,
+     ExtractTextShadows,
+     ExtractText,
+@@ -152,6 +153,7 @@ pub fn build_ui_render(app: &mut App) {
+                 extract_uinode_background_colors.in_set(RenderUiSystem::ExtractBackgrounds),
+                 extract_uinode_images.in_set(RenderUiSystem::ExtractImages),
+                 extract_uinode_borders.in_set(RenderUiSystem::ExtractBorders),
++                extract_viewport_nodes.in_set(RenderUiSystem::ExtractViewportNodes),
+                 extract_text_background_colors.in_set(RenderUiSystem::ExtractTextBackgrounds),
+                 extract_text_shadows.in_set(RenderUiSystem::ExtractTextShadows),
+                 extract_text_sections.in_set(RenderUiSystem::ExtractText),
+@@ -697,6 +699,69 @@ pub fn extract_ui_camera_view(
+     transparent_render_phases.retain(|entity, _| live_entities.contains(entity));
+ }
+ 
++pub fn extract_viewport_nodes(
++    mut commands: Commands,
++    mut extracted_uinodes: ResMut<ExtractedUiNodes>,
++    camera_query: Extract<Query<&Camera>>,
++    uinode_query: Extract<
++        Query<(
++            Entity,
++            &ComputedNode,
++            &GlobalTransform,
++            &InheritedVisibility,
++            Option<&CalculatedClip>,
++            &ComputedNodeTarget,
++            &ViewportNode,
++        )>,
++    >,
++    camera_map: Extract<UiCameraMap>,
++) {
++    let mut camera_mapper = camera_map.get_mapper();
++    for (entity, uinode, transform, inherited_visibility, clip, camera, viewport_node) in
++        &uinode_query
++    {
++        // Skip invisible images
++        if !inherited_visibility.get() || uinode.is_empty() {
++            continue;
++        }
++
++        let Some(extracted_camera_entity) = camera_mapper.map(camera) else {
++            continue;
++        };
++
++        let Some(image) = camera_query
++            .get(viewport_node.camera)
++            .ok()
++            .and_then(|camera| camera.target.as_image())
++        else {
++            continue;
++        };
++
++        extracted_uinodes.uinodes.push(ExtractedUiNode {
++            render_entity: commands.spawn(TemporaryRenderEntity).id(),
++            stack_index: uinode.stack_index,
++            color: LinearRgba::WHITE,
++            rect: Rect {
++                min: Vec2::ZERO,
++                max: uinode.size,
++            },
++            clip: clip.map(|clip| clip.clip),
++            image: image.id(),
++            extracted_camera_entity,
++            item: ExtractedUiItem::Node {
++                atlas_scaling: None,
++                transform: transform.compute_matrix(),
++                flip_x: false,
++                flip_y: false,
++                border: uinode.border(),
++                border_radius: uinode.border_radius(),
++                node_type: NodeType::Rect,
++            },
++            main_entity: entity.into(),
++        });
++    }
++}
++
+ pub fn extract_text_sections(
+     mut commands: Commands,
+     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
+diff --git a/crates/bevy_ui/src/widget/mod.rs b/crates/bevy_ui/src/widget/mod.rs
+index 9be6a7673dbdf..bbd319e986f09 100644
+--- a/crates/bevy_ui/src/widget/mod.rs
++++ b/crates/bevy_ui/src/widget/mod.rs
+@@ -3,11 +3,11 @@
+ mod button;
+ mod image;
+ mod label;
+-
+ mod text;
++mod viewport;
+ 
+ pub use button::*;
+ pub use image::*;
+ pub use label::*;
+-
+ pub use text::*;
++pub use viewport::*;
+diff --git a/crates/bevy_ui/src/widget/viewport.rs b/crates/bevy_ui/src/widget/viewport.rs
+new file mode 100644
+index 0000000000000..9cdc348da5c17
+--- /dev/null
++++ b/crates/bevy_ui/src/widget/viewport.rs
+@@ -0,0 +1,176 @@
++use bevy_asset::Assets;
++use bevy_ecs::{
++    component::Component,
++    entity::Entity,
++    event::EventReader,
++    query::{Changed, Or},
++    reflect::ReflectComponent,
++    system::{Commands, Query, Res, ResMut},
++};
++use bevy_image::Image;
++use bevy_math::Rect;
++#[cfg(feature = "bevy_ui_picking_backend")]
++use bevy_picking::{
++    events::PointerState,
++    hover::HoverMap,
++    pointer::{Location, PointerId, PointerInput, PointerLocation},
++};
++use bevy_platform::collections::HashMap;
++use bevy_reflect::Reflect;
++use bevy_render::{
++    camera::{Camera, NormalizedRenderTarget},
++    render_resource::Extent3d,
++};
++use bevy_transform::components::GlobalTransform;
++use bevy_utils::default;
++#[cfg(feature = "bevy_ui_picking_backend")]
++use uuid::Uuid;
++
++use crate::{ComputedNode, Node};
++
++/// Component used to render a [`Camera::target`]  to a node.
++///
++/// # See Also
++///
++/// [`update_viewport_render_target_size`]
++#[derive(Component, Debug, Clone, Copy, Reflect)]
++#[reflect(Component, Debug)]
++#[require(Node)]
++#[cfg_attr(
++    feature = "bevy_ui_picking_backend",
++    require(PointerId::Custom(Uuid::new_v4()))
++)]
++pub struct ViewportNode {
++    /// The entity representing the [`Camera`] associated with this viewport.
++    ///
++    /// Note that removing the [`ViewportNode`] component will not despawn this entity.
++    pub camera: Entity,
++}
++
++impl ViewportNode {
++    /// Creates a new [`ViewportNode`] with a given `camera`.
++    pub fn new(camera: Entity) -> Self {
++        Self { camera }
++    }
++}
++
++#[cfg(feature = "bevy_ui_picking_backend")]
++/// Handles viewport picking logic.
++///
++/// Viewport entities that are being hovered or dragged will have all pointer inputs sent to them.
++pub fn viewport_picking(
++    mut commands: Commands,
++    mut viewport_query: Query<(
++        Entity,
++        &ViewportNode,
++        &PointerId,
++        &mut PointerLocation,
++        &ComputedNode,
++        &GlobalTransform,
++    )>,
++    camera_query: Query<&Camera>,
++    hover_map: Res<HoverMap>,
++    pointer_state: Res<PointerState>,
++    mut pointer_inputs: EventReader<PointerInput>,
++) {
++    // Handle hovered entities.
++    let mut viewport_picks: HashMap<Entity, PointerId> = hover_map
++        .iter()
++        .flat_map(|(hover_pointer_id, hits)| {
++            hits.iter()
++                .filter(|(entity, _)| viewport_query.contains(**entity))
++                .map(|(entity, _)| (*entity, *hover_pointer_id))
++        })
++        .collect();
++
++    // Handle dragged entities, which need to be considered for dragging in and out of viewports.
++    for ((pointer_id, _), pointer_state) in pointer_state.pointer_buttons.iter() {
++        for &target in pointer_state
++            .dragging
++            .keys()
++            .filter(|&entity| viewport_query.contains(*entity))
++        {
++            viewport_picks.insert(target, *pointer_id);
++        }
++    }
++
++    for (
++        viewport_entity,
++        &viewport,
++        &viewport_pointer_id,
++        mut viewport_pointer_location,
++        computed_node,
++        global_transform,
++    ) in &mut viewport_query
++    {
++        let Some(pick_pointer_id) = viewport_picks.get(&viewport_entity) else {
++            // Lift the viewport pointer if it's not being used.
++            viewport_pointer_location.location = None;
++            continue;
++        };
++        let Ok(camera) = camera_query.get(viewport.camera) else {
++            continue;
++        };
++        let Some(cam_viewport_size) = camera.logical_viewport_size() else {
++            continue;
++        };
++
++        // Create a `Rect` in *physical* coordinates centered at the node's GlobalTransform
++        let node_rect = Rect::from_center_size(
++            global_transform.translation().truncate(),
++            computed_node.size(),
++        );
++        // Location::position uses *logical* coordinates
++        let top_left = node_rect.min * computed_node.inverse_scale_factor();
++        let logical_size = computed_node.size() * computed_node.inverse_scale_factor();
++
++        let Some(target) = camera.target.as_image() else {
++            continue;
++        };
++
++        for input in pointer_inputs
++            .read()
++            .filter(|input| &input.pointer_id == pick_pointer_id)
++        {
++            let local_position = (input.location.position - top_left) / logical_size;
++            let position = local_position * cam_viewport_size;
++
++            let location = Location {
++                position,
++                target: NormalizedRenderTarget::Image(target.clone().into()),
++            };
++            viewport_pointer_location.location = Some(location.clone());
++
++            commands.send_event(PointerInput {
++                location,
++                pointer_id: viewport_pointer_id,
++                action: input.action,
++            });
++        }
++    }
++}
++
++/// Updates the size of the associated render target for viewports when the node size changes.
++pub fn update_viewport_render_target_size(
++    viewport_query: Query<
++        (&ViewportNode, &ComputedNode),
++        Or<(Changed<ComputedNode>, Changed<ViewportNode>)>,
++    >,
++    camera_query: Query<&Camera>,
++    mut images: ResMut<Assets<Image>>,
++) {
++    for (viewport, computed_node) in &viewport_query {
++        let camera = camera_query.get(viewport.camera).unwrap();
++        let size = computed_node.size();
++
++        let Some(image_handle) = camera.target.as_image() else {
++            continue;
++        };
++        let size = Extent3d {
++            width: u32::max(1, size.x as u32),
++            height: u32::max(1, size.y as u32),
++            ..default()
++        };
++        images.get_mut(image_handle).unwrap().resize(size);
++    }
++}
+diff --git a/examples/README.md b/examples/README.md
+index aa91006e72091..0ab0e37cdb13d 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -567,6 +567,7 @@ Example | Description
+ [UI Texture Slice Flipping and Tiling](../examples/ui/ui_texture_slice_flip_and_tile.rs) | Illustrates how to flip and tile images with 9 Slicing in UI
+ [UI Z-Index](../examples/ui/z_index.rs) | Demonstrates how to control the relative depth (z-position) of UI elements
+ [Viewport Debug](../examples/ui/viewport_debug.rs) | An example for debugging viewport coordinates
++[Viewport Node](../examples/ui/viewport_node.rs) | Demonstrates how to create a viewport node with picking support
+ [Window Fallthrough](../examples/ui/window_fallthrough.rs) | Illustrates how to access `winit::window::Window`'s `hittest` functionality.
+ 
+ ## Window
+diff --git a/examples/ui/viewport_node.rs b/examples/ui/viewport_node.rs
+new file mode 100644
+index 0000000000000..5e6964005d4a2
+--- /dev/null
++++ b/examples/ui/viewport_node.rs
+@@ -0,0 +1,148 @@
++//! A simple scene to demonstrate spawning a viewport widget. The example will demonstrate how to
++//! pick entities visible in the widget's view.
++
++use bevy::{
++    image::{TextureFormatPixelInfo, Volume},
++    picking::pointer::PointerInteraction,
++    prelude::*,
++    render::{
++        camera::RenderTarget,
++        render_resource::{
++            Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
++        },
++    },
++    ui::widget::ViewportNode,
++    window::PrimaryWindow,
++};
++
++fn main() {
++    App::new()
++        .add_plugins((DefaultPlugins, MeshPickingPlugin))
++        .add_systems(Startup, test)
++        .add_systems(Update, draw_mesh_intersections)
++        .run();
++}
++
++#[derive(Component, Reflect, Debug)]
++#[reflect(Component)]
++struct Shape;
++
++fn test(
++    mut commands: Commands,
++    window: Query<&Window, With<PrimaryWindow>>,
++    mut images: ResMut<Assets<Image>>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
++) {
++    // Spawn a UI camera
++    commands.spawn(Camera3d::default());
++
++    // Set up an texture for the 3D camera to render to
++    let window = window.single().unwrap();
++    let window_size = window.physical_size();
++    let size = Extent3d {
++        width: window_size.x,
++        height: window_size.y,
++        ..default()
++    };
++    let format = TextureFormat::Bgra8UnormSrgb;
++    let image = Image {
++        data: Some(vec![0; size.volume() * format.pixel_size()]),
++        texture_descriptor: TextureDescriptor {
++            label: None,
++            size,
++            dimension: TextureDimension::D2,
++            format,
++            mip_level_count: 1,
++            sample_count: 1,
++            usage: TextureUsages::TEXTURE_BINDING
++                | TextureUsages::COPY_DST
++                | TextureUsages::RENDER_ATTACHMENT,
++            view_formats: &[],
++        },
++        ..default()
++    };
++    let image_handle = images.add(image);
++
++    // Spawn the 3D camera
++    let camera = commands
++        .spawn((
++            Camera3d::default(),
++            Camera {
++                // Render this camera before our UI camera
++                order: -1,
++                target: RenderTarget::Image(image_handle.clone().into()),
++                ..default()
++            },
++        ))
++        .id();
++
++    // Spawn something for the 3D camera to look at
++    commands
++        .spawn((
++            Mesh3d(meshes.add(Cuboid::new(5.0, 5.0, 5.0))),
++            MeshMaterial3d(materials.add(Color::WHITE)),
++            Transform::from_xyz(0.0, 0.0, -10.0),
++            Shape,
++        ))
++        // We can observe pointer events on our objects as normal, the
++        // `bevy::ui::widgets::viewport_picking` system will take care of ensuring our viewport
++        // clicks pass through
++        .observe(on_drag_cuboid);
++
++    // Spawn our viewport widget
++    commands
++        .spawn((
++            Node {
++                position_type: PositionType::Absolute,
++                top: Val::Px(50.0),
++                left: Val::Px(50.0),
++                width: Val::Px(200.0),
++                height: Val::Px(200.0),
++                border: UiRect::all(Val::Px(5.0)),
++                ..default()
++            },
++            BorderColor(Color::WHITE),
++            ViewportNode::new(camera),
++        ))
++        .observe(on_drag_viewport);
++}
++
++fn on_drag_viewport(drag: Trigger<Pointer<Drag>>, mut node_query: Query<&mut Node>) {
++    if matches!(drag.button, PointerButton::Secondary) {
++        let mut node = node_query.get_mut(drag.target()).unwrap();
++
++        if let (Val::Px(top), Val::Px(left)) = (node.top, node.left) {
++            node.left = Val::Px(left + drag.delta.x);
++            node.top = Val::Px(top + drag.delta.y);
++        };
++    }
++}
++
++fn on_drag_cuboid(drag: Trigger<Pointer<Drag>>, mut transform_query: Query<&mut Transform>) {
++    if matches!(drag.button, PointerButton::Primary) {
++        let mut transform = transform_query.get_mut(drag.target()).unwrap();
++        transform.rotate_y(drag.delta.x * 0.02);
++        transform.rotate_x(drag.delta.y * 0.02);
++    }
++}
++
++fn draw_mesh_intersections(
++    pointers: Query<&PointerInteraction>,
++    untargetable: Query<Entity, Without<Shape>>,
++    mut gizmos: Gizmos,
++) {
++    for (point, normal) in pointers
++        .iter()
++        .flat_map(|interaction| interaction.iter())
++        .filter_map(|(entity, hit)| {
++            if !untargetable.contains(*entity) {
++                hit.position.zip(hit.normal)
++            } else {
++                None
++            }
++        })
++    {
++        gizmos.arrow(point, point + normal.normalize() * 0.5, Color::WHITE);
++    }
++}
+diff --git a/release-content/release-notes/viewport-node.md b/release-content/release-notes/viewport-node.md
+new file mode 100644
+index 0000000000000..a52631c0c13dc
+--- /dev/null
++++ b/release-content/release-notes/viewport-node.md
+@@ -0,0 +1,22 @@
++---
++title: `ViewportNode`
++authors: ["@chompaa", "@ickshonpe"]
++pull_requests: [17253]
++---
++
++Bevy UI now has a `ViewportNode` component, which lets you render camera output directly to a UI node. Furthermore, if the `bevy_ui_picking_backend` feature is enabled, you can pick using the rendered target. That is, you can use **any** picking backend through the viewport node, as per normal. In terms of UI, the API usage is really straightforward:
++
++```rust
++commands.spawn((
++  // `ViewportNode` requires `Node`, so we just need this component!
++  ViewportNode::new(camera)
++  // To disable picking "through" the viewport, just disable picking for the node.
++  // Pickable::IGNORE
++));
++```
++
++The referenced `camera` here does require its target to be a `RenderTarget::Image`. See the new [`viewport_node`](https://github.com/bevyengine/bevy/blob/v0.17.0/examples/ui/viewport_node.rs) for more implementation details.
++
++## Showcase
++
++`https://private-user-images.githubusercontent.com/26204416/402285264-39f44eac-2c2a-4fd9-a606-04171f806dc1.mp4?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NDU4NTY4MDgsIm5iZiI6MTc0NTg1NjUwOCwicGF0aCI6Ii8yNjIwNDQxNi80MDIyODUyNjQtMzlmNDRlYWMtMmMyYS00ZmQ5LWE2MDYtMDQxNzFmODA2ZGMxLm1wND9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNTA0MjglMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjUwNDI4VDE2MDgyOFomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTg0ZDU0OGFmM2Q3NTJmOWJkNDYzODMxNjkyOTBlYzFmNmQ2YWUzMGMzMjJjMjFiZWI0ZmY3ZjZkMjNiMzA5NzkmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0In0.DXec6l2SYDIpSCRssEB4o3er7ib3jUQ9t9fvjdY3hYw`

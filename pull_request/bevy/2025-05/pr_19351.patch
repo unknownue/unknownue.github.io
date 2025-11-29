@@ -1,0 +1,165 @@
+diff --git a/benches/benches/bevy_ecs/world/commands.rs b/benches/benches/bevy_ecs/world/commands.rs
+index 7b1cc29457e88..bedfb8e5af997 100644
+--- a/benches/benches/bevy_ecs/world/commands.rs
++++ b/benches/benches/bevy_ecs/world/commands.rs
+@@ -62,6 +62,31 @@ pub fn spawn_commands(criterion: &mut Criterion) {
+     group.finish();
+ }
+ 
++pub fn nonempty_spawn_commands(criterion: &mut Criterion) {
++    let mut group = criterion.benchmark_group("nonempty_spawn_commands");
++    group.warm_up_time(core::time::Duration::from_millis(500));
++    group.measurement_time(core::time::Duration::from_secs(4));
++
++    for entity_count in [100, 1_000, 10_000] {
++        group.bench_function(format!("{}_entities", entity_count), |bencher| {
++            let mut world = World::default();
++            let mut command_queue = CommandQueue::default();
++
++            bencher.iter(|| {
++                let mut commands = Commands::new(&mut command_queue, &world);
++                for i in 0..entity_count {
++                    if black_box(i % 2 == 0) {
++                        commands.spawn(A);
++                    }
++                }
++                command_queue.apply(&mut world);
++            });
++        });
++    }
++
++    group.finish();
++}
++
+ #[derive(Default, Component)]
+ struct Matrix([[f32; 4]; 4]);
+ 
+diff --git a/benches/benches/bevy_ecs/world/mod.rs b/benches/benches/bevy_ecs/world/mod.rs
+index e35dc999c2eb8..7158f2f033498 100644
+--- a/benches/benches/bevy_ecs/world/mod.rs
++++ b/benches/benches/bevy_ecs/world/mod.rs
+@@ -17,6 +17,7 @@ criterion_group!(
+     benches,
+     empty_commands,
+     spawn_commands,
++    nonempty_spawn_commands,
+     insert_commands,
+     fake_commands,
+     zero_sized_commands,
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index e4d4b26d97de9..68560120e4db6 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -943,6 +943,15 @@ impl Entities {
+         meta.spawned_or_despawned = MaybeUninit::new(SpawnedOrDespawned { by, at });
+     }
+ 
++    /// # Safety
++    ///  - `index` must be a valid entity index.
++    #[inline]
++    pub(crate) unsafe fn mark_spawn_despawn(&mut self, index: u32, by: MaybeLocation, at: Tick) {
++        // SAFETY: Caller guarantees that `index` a valid entity index
++        let meta = unsafe { self.meta.get_unchecked_mut(index as usize) };
++        meta.spawned_or_despawned = MaybeUninit::new(SpawnedOrDespawned { by, at });
++    }
++
+     /// Increments the `generation` of a freed [`Entity`]. The next entity ID allocated with this
+     /// `index` will count `generation` starting from the prior `generation` + the specified
+     /// value + 1.
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index 8b10b64b28ce2..8f08e450833b5 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -16,7 +16,7 @@ use core::marker::PhantomData;
+ use crate::{
+     self as bevy_ecs,
+     bundle::{Bundle, InsertMode, NoBundleEffect},
+-    change_detection::Mut,
++    change_detection::{MaybeLocation, Mut},
+     component::{Component, ComponentId, Mutable},
+     entity::{Entities, Entity, EntityClonerBuilder, EntityDoesNotExistError},
+     error::{ignore, warn, BevyError, CommandWithEntity, ErrorContext, HandleError},
+@@ -317,12 +317,24 @@ impl<'w, 's> Commands<'w, 's> {
+     /// - [`spawn`](Self::spawn) to spawn an entity with components.
+     /// - [`spawn_batch`](Self::spawn_batch) to spawn many entities
+     ///   with the same combination of components.
++    #[track_caller]
+     pub fn spawn_empty(&mut self) -> EntityCommands {
+         let entity = self.entities.reserve_entity();
+-        EntityCommands {
++        let mut entity_commands = EntityCommands {
+             entity,
+             commands: self.reborrow(),
+-        }
++        };
++        let caller = MaybeLocation::caller();
++        entity_commands.queue(move |entity: EntityWorldMut| {
++            let index = entity.id().index();
++            let world = entity.into_world_mut();
++            let tick = world.change_tick();
++            // SAFETY: Entity has been flushed
++            unsafe {
++                world.entities_mut().mark_spawn_despawn(index, caller, tick);
++            }
++        });
++        entity_commands
+     }
+ 
+     /// Spawns a new [`Entity`] with the given components
+@@ -369,9 +381,35 @@ impl<'w, 's> Commands<'w, 's> {
+     ///   with the same combination of components.
+     #[track_caller]
+     pub fn spawn<T: Bundle>(&mut self, bundle: T) -> EntityCommands {
+-        let mut entity = self.spawn_empty();
+-        entity.insert(bundle);
+-        entity
++        let entity = self.entities.reserve_entity();
++        let mut entity_commands = EntityCommands {
++            entity,
++            commands: self.reborrow(),
++        };
++        let caller = MaybeLocation::caller();
++
++        entity_commands.queue(move |mut entity: EntityWorldMut| {
++            // Store metadata about the spawn operation.
++            // This is the same as in `spawn_empty`, but merged into
++            // the same command for better performance.
++            let index = entity.id().index();
++            entity.world_scope(|world| {
++                let tick = world.change_tick();
++                // SAFETY: Entity has been flushed
++                unsafe {
++                    world.entities_mut().mark_spawn_despawn(index, caller, tick);
++                }
++            });
++
++            entity.insert_with_caller(
++                bundle,
++                InsertMode::Replace,
++                caller,
++                crate::relationship::RelationshipHookMode::Run,
++            );
++        });
++        // entity_command::insert(bundle, InsertMode::Replace)
++        entity_commands
+     }
+ 
+     /// Returns the [`EntityCommands`] for the given [`Entity`].
+@@ -2573,4 +2611,17 @@ mod tests {
+         assert!(world.contains_resource::<W<i32>>());
+         assert!(world.contains_resource::<W<f64>>());
+     }
++
++    #[test]
++    fn track_spawn_ticks() {
++        let mut world = World::default();
++        world.increment_change_tick();
++        let expected = world.change_tick();
++        let id = world.commands().spawn_empty().id();
++        world.flush();
++        assert_eq!(
++            Some(expected),
++            world.entities().entity_get_spawned_or_despawned_at(id)
++        );
++    }
+ }
