@@ -4,6 +4,6 @@ sort_by = "date"
 template = "pull_request.html"
 
 [extra]
-all_labels = ["C-Dependencies"]
-unique_pr_count = 3
+all_labels = ["A-Picking", "C-Code-Quality", "C-Dependencies", "D-Trivial"]
+unique_pr_count = 4
 +++
