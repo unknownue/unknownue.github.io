@@ -1,0 +1,128 @@
+diff --git a/crates/bevy_feathers/Cargo.toml b/crates/bevy_feathers/Cargo.toml
+index ef76d4c8aa6d3..bdcf8868c95da 100644
+--- a/crates/bevy_feathers/Cargo.toml
++++ b/crates/bevy_feathers/Cargo.toml
+@@ -31,6 +31,7 @@ bevy_ui = { path = "../bevy_ui", version = "0.18.0-dev", features = [
+ ] }
+ bevy_ui_render = { path = "../bevy_ui_render", version = "0.18.0-dev" }
+ bevy_window = { path = "../bevy_window", version = "0.18.0-dev" }
++bevy_derive = { path = "../bevy_derive", version = "0.18.0-dev" }
+ smol_str = { version = "0.2", default-features = false }
+ 
+ # other
+diff --git a/crates/bevy_feathers/src/cursor.rs b/crates/bevy_feathers/src/cursor.rs
+index 4a35e40a7af20..417a622fc41fe 100644
+--- a/crates/bevy_feathers/src/cursor.rs
++++ b/crates/bevy_feathers/src/cursor.rs
+@@ -1,5 +1,6 @@
+ //! Provides a way to automatically set the mouse cursor based on hovered entity.
+ use bevy_app::{App, Plugin, PreUpdate};
++use bevy_derive::Deref;
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -18,7 +19,7 @@ use bevy_window::{CursorIcon, SystemCursorIcon, Window};
+ 
+ /// A resource that specifies the cursor icon to be used when the mouse is not hovering over
+ /// any other entity. This is used to set the default cursor icon for the window.
+-#[derive(Resource, Debug, Clone, Default, Reflect)]
++#[derive(Deref, Resource, Debug, Clone, Default, Reflect)]
+ #[reflect(Resource, Debug, Default)]
+ pub struct DefaultCursor(pub EntityCursor);
+ 
+@@ -37,6 +38,13 @@ pub enum EntityCursor {
+     System(SystemCursorIcon),
+ }
+ 
++/// A component used to override any [`EntityCursor`] cursor changes.
++///
++/// This is meant for cases like loading where you don't want the cursor to imply you
++/// can interact with something.
++#[derive(Deref, Resource, Debug, Clone, Default, Reflect)]
++pub struct OverrideCursor(pub Option<EntityCursor>);
++
+ impl EntityCursor {
+     /// Convert the [`EntityCursor`] to a [`CursorIcon`] so that it can be inserted into a
+     /// window.
+@@ -80,19 +88,22 @@ pub(crate) fn update_cursor(
+     cursor_query: Query<&EntityCursor, Without<Window>>,
+     q_windows: Query<(Entity, Option<&CursorIcon>), With<Window>>,
+     r_default_cursor: Res<DefaultCursor>,
++    r_override_cursor: Res<OverrideCursor>,
+ ) {
+-    let cursor = hover_map
+-        .and_then(|hover_map| match hover_map.get(&PointerId::Mouse) {
+-            Some(hover_set) => hover_set.keys().find_map(|entity| {
+-                cursor_query.get(*entity).ok().or_else(|| {
+-                    parent_query
+-                        .iter_ancestors(*entity)
+-                        .find_map(|e| cursor_query.get(e).ok())
+-                })
+-            }),
+-            None => None,
+-        })
+-        .unwrap_or(&r_default_cursor.0);
++    let cursor = r_override_cursor.0.as_ref().unwrap_or_else(|| {
++        hover_map
++            .and_then(|hover_map| match hover_map.get(&PointerId::Mouse) {
++                Some(hover_set) => hover_set.keys().find_map(|entity| {
++                    cursor_query.get(*entity).ok().or_else(|| {
++                        parent_query
++                            .iter_ancestors(*entity)
++                            .find_map(|e| cursor_query.get(e).ok())
++                    })
++                }),
++                None => None,
++            })
++            .unwrap_or(&r_default_cursor)
++    });
+ 
+     for (entity, prev_cursor) in q_windows.iter() {
+         if let Some(prev_cursor) = prev_cursor
+@@ -111,6 +122,7 @@ impl Plugin for CursorIconPlugin {
+     fn build(&self, app: &mut App) {
+         if app.world().get_resource::<DefaultCursor>().is_none() {
+             app.init_resource::<DefaultCursor>();
++            app.init_resource::<OverrideCursor>();
+         }
+         app.add_systems(PreUpdate, update_cursor.in_set(PickingSystems::Last));
+     }
+diff --git a/examples/ui/feathers.rs b/examples/ui/feathers.rs
+index e6a31a7cad0a7..29f11789ef998 100644
+--- a/examples/ui/feathers.rs
++++ b/examples/ui/feathers.rs
+@@ -9,6 +9,7 @@ use bevy::{
+             ColorSlider, ColorSliderProps, ColorSwatch, ColorSwatchValue, SliderBaseColor,
+             SliderProps,
+         },
++        cursor::{EntityCursor, OverrideCursor},
+         dark_theme::create_dark_theme,
+         rounded_corners::RoundedCorners,
+         theme::{ThemeBackgroundColor, ThemedText, UiTheme},
+@@ -21,6 +22,7 @@ use bevy::{
+         checkbox_self_update, observe, slider_self_update, Activate, RadioButton, RadioGroup,
+         SliderPrecision, SliderStep, SliderValue, ValueChange,
+     },
++    window::SystemCursorIcon,
+ };
+ 
+ /// A struct to hold the state of various widgets shown in the demo.
+@@ -185,10 +187,15 @@ fn demo_root() -> impl Bundle {
+                     button(
+                         ButtonProps::default(),
+                         (),
+-                        Spawn((Text::new("Button"), ThemedText))
++                        Spawn((Text::new("Toggle override"), ThemedText))
+                     ),
+-                    observe(|_activate: On<Activate>| {
+-                        info!("Wide button clicked!");
++                    observe(|_activate: On<Activate>, mut ovr: ResMut<OverrideCursor>| {
++                        ovr.0 = if ovr.0.is_some() {
++                            None
++                        } else {
++                            Some(EntityCursor::System(SystemCursorIcon::Wait))
++                        };
++                        info!("Override cursor button clicked!");
+                     })
+                 ),
+                 (
