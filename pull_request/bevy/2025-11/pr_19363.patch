@@ -1,0 +1,303 @@
+diff --git a/crates/bevy_dev_tools/src/states.rs b/crates/bevy_dev_tools/src/states.rs
+index 93be4dbb257bd..db0706575d0be 100644
+--- a/crates/bevy_dev_tools/src/states.rs
++++ b/crates/bevy_dev_tools/src/states.rs
+@@ -13,6 +13,13 @@ pub fn log_transitions<S: States>(mut transitions: MessageReader<StateTransition
+         return;
+     };
+     let name = core::any::type_name::<S>();
+-    let StateTransitionEvent { exited, entered } = transition;
+-    info!("{} transition: {:?} => {:?}", name, exited, entered);
++    let StateTransitionEvent {
++        exited,
++        entered,
++        same_state_enforced,
++    } = transition;
++    info!(
++        "{} transition: {:?} => {:?} | same state enforced: {:?}",
++        name, exited, entered, same_state_enforced
++    );
+ }
+diff --git a/crates/bevy_state/src/app.rs b/crates/bevy_state/src/app.rs
+index a999f88337970..a22ce701c842c 100644
+--- a/crates/bevy_state/src/app.rs
++++ b/crates/bevy_state/src/app.rs
+@@ -101,6 +101,7 @@ impl AppExtStates for SubApp {
+             self.world_mut().write_message(StateTransitionEvent {
+                 exited: None,
+                 entered: Some(state),
++                same_state_enforced: false,
+             });
+             enable_state_scoped_entities::<S>(self);
+         } else {
+@@ -124,6 +125,7 @@ impl AppExtStates for SubApp {
+             self.world_mut().write_message(StateTransitionEvent {
+                 exited: None,
+                 entered: Some(state),
++                same_state_enforced: false,
+             });
+             enable_state_scoped_entities::<S>(self);
+         } else {
+@@ -135,6 +137,7 @@ impl AppExtStates for SubApp {
+             self.world_mut().write_message(StateTransitionEvent {
+                 exited: None,
+                 entered: Some(state),
++                same_state_enforced: false,
+             });
+         }
+ 
+@@ -159,6 +162,7 @@ impl AppExtStates for SubApp {
+             self.world_mut().write_message(StateTransitionEvent {
+                 exited: None,
+                 entered: state,
++                same_state_enforced: false,
+             });
+             enable_state_scoped_entities::<S>(self);
+         } else {
+@@ -188,6 +192,7 @@ impl AppExtStates for SubApp {
+             self.world_mut().write_message(StateTransitionEvent {
+                 exited: None,
+                 entered: state,
++                same_state_enforced: false,
+             });
+             enable_state_scoped_entities::<S>(self);
+         } else {
+diff --git a/crates/bevy_state/src/state/freely_mutable_state.rs b/crates/bevy_state/src/state/freely_mutable_state.rs
+index 2255c90143e85..b4fd26481e62c 100644
+--- a/crates/bevy_state/src/state/freely_mutable_state.rs
++++ b/crates/bevy_state/src/state/freely_mutable_state.rs
+@@ -52,11 +52,17 @@ fn apply_state_transition<S: FreelyMutableState>(
+     current_state: Option<ResMut<State<S>>>,
+     next_state: Option<ResMut<NextState<S>>>,
+ ) {
+-    let Some(next_state) = take_next_state(next_state) else {
++    let Some((next_state, same_state_enforced)) = take_next_state(next_state) else {
+         return;
+     };
+     let Some(current_state) = current_state else {
+         return;
+     };
+-    internal_apply_state_transition(event, commands, Some(current_state), Some(next_state));
++    internal_apply_state_transition(
++        event,
++        commands,
++        Some(current_state),
++        Some(next_state),
++        same_state_enforced,
++    );
+ }
+diff --git a/crates/bevy_state/src/state/resources.rs b/crates/bevy_state/src/state/resources.rs
+index 4bbe6d1b1f24e..0f5f0246289c7 100644
+--- a/crates/bevy_state/src/state/resources.rs
++++ b/crates/bevy_state/src/state/resources.rs
+@@ -127,12 +127,31 @@ pub enum NextState<S: FreelyMutableState> {
+     Unchanged,
+     /// There is a pending transition for state `S`
+     Pending(S),
++    /// There is a pending transition for state `S`
++    ///
++    /// This will trigger state transitions schedules even if the target state is the same as the current one.
++    ForcedPending(S),
+ }
+ 
+ impl<S: FreelyMutableState> NextState<S> {
+     /// Tentatively set a pending state transition to `Some(state)`.
++    ///
++    /// If `state` is the same as the current state, this will *not* trigger state
++    /// transition [`OnEnter`](crate::state::OnEnter) and [`OnExit`](crate::state::OnExit) schedules.
++    ///
++    /// If [`set_forced`](Self::set_forced) has already been called in the same frame with the same state, its behavior is kept.
+     pub fn set(&mut self, state: S) {
+-        *self = Self::Pending(state);
++        if !matches!(self, Self::ForcedPending(s) if s == &state) {
++            *self = Self::Pending(state);
++        }
++    }
++
++    /// Tentatively set a pending state transition to `Some(state)`.
++    ///
++    /// If `state` is the same as the current state, this will trigger state
++    /// transition [`OnEnter`](crate::state::OnEnter) and [`OnExit`](crate::state::OnExit) schedules.
++    pub fn set_forced(&mut self, state: S) {
++        *self = Self::ForcedPending(state);
+     }
+ 
+     /// Remove any pending changes to [`State<S>`]
+@@ -143,13 +162,17 @@ impl<S: FreelyMutableState> NextState<S> {
+ 
+ pub(crate) fn take_next_state<S: FreelyMutableState>(
+     next_state: Option<ResMut<NextState<S>>>,
+-) -> Option<S> {
++) -> Option<(S, bool)> {
+     let mut next_state = next_state?;
+ 
+     match core::mem::take(next_state.bypass_change_detection()) {
+         NextState::Pending(x) => {
+             next_state.set_changed();
+-            Some(x)
++            Some((x, false))
++        }
++        NextState::ForcedPending(x) => {
++            next_state.set_changed();
++            Some((x, true))
+         }
+         NextState::Unchanged => None,
+     }
+diff --git a/crates/bevy_state/src/state/state_set.rs b/crates/bevy_state/src/state/state_set.rs
+index b7e16900eef17..b850af83ddd89 100644
+--- a/crates/bevy_state/src/state/state_set.rs
++++ b/crates/bevy_state/src/state/state_set.rs
+@@ -112,7 +112,7 @@ impl<S: InnerStateSet> StateSet for S {
+                         None
+                     };
+ 
+-                internal_apply_state_transition(event, commands, current_state, new_state);
++                internal_apply_state_transition(event, commands, current_state, new_state, false);
+             };
+ 
+         schedule.configure_sets((
+@@ -190,9 +190,26 @@ impl<S: InnerStateSet> StateSet for S {
+                 } else {
+                     current_state.clone()
+                 };
+-                let new_state = initial_state.map(|x| next_state.or(current_state).unwrap_or(x));
+-
+-                internal_apply_state_transition(event, commands, current_state_res, new_state);
++                let same_state_enforced = next_state
++                    .as_ref()
++                    .map(|(_, same_state_enforced)| same_state_enforced)
++                    .cloned()
++                    .unwrap_or_default();
++
++                let new_state = initial_state.map(|x| {
++                    next_state
++                        .map(|(next, _)| next)
++                        .or(current_state)
++                        .unwrap_or(x)
++                });
++
++                internal_apply_state_transition(
++                    event,
++                    commands,
++                    current_state_res,
++                    new_state,
++                    same_state_enforced,
++                );
+             };
+ 
+         schedule.configure_sets((
+@@ -259,7 +276,7 @@ macro_rules! impl_state_set_sealed_tuples {
+                             None
+                         };
+ 
+-                        internal_apply_state_transition(message, commands, current_state, new_state);
++                        internal_apply_state_transition(message, commands, current_state, new_state, false);
+                     };
+ 
+                 schedule.configure_sets((
+@@ -311,9 +328,21 @@ macro_rules! impl_state_set_sealed_tuples {
+                         } else {
+                             current_state.clone()
+                         };
+-                        let new_state = initial_state.map(|x| next_state.or(current_state).unwrap_or(x));
+ 
+-                        internal_apply_state_transition(message, commands, current_state_res, new_state);
++                        let same_state_enforced = next_state
++                            .as_ref()
++                            .map(|(_, same_state_enforced)| same_state_enforced)
++                            .cloned()
++                            .unwrap_or_default();
++
++                        let new_state = initial_state.map(|x| {
++                            next_state
++                                .map(|(next, _)| next)
++                                .or(current_state)
++                                .unwrap_or(x)
++                        });
++
++                        internal_apply_state_transition(message, commands, current_state_res, new_state, same_state_enforced);
+                     };
+ 
+                 schedule.configure_sets((
+diff --git a/crates/bevy_state/src/state/transitions.rs b/crates/bevy_state/src/state/transitions.rs
+index c22ab855abf30..35d421bf0f711 100644
+--- a/crates/bevy_state/src/state/transitions.rs
++++ b/crates/bevy_state/src/state/transitions.rs
+@@ -67,6 +67,8 @@ pub struct StateTransitionEvent<S: States> {
+     pub exited: Option<S>,
+     /// The state being entered.
+     pub entered: Option<S>,
++    /// Enforce this transition even if `exited` and `entered` are the same
++    pub same_state_enforced: bool,
+ }
+ 
+ /// Applies state transitions and runs transitions schedules in order.
+@@ -135,6 +137,7 @@ pub(crate) fn internal_apply_state_transition<S: States>(
+     mut commands: Commands,
+     current_state: Option<ResMut<State<S>>>,
+     new_state: Option<S>,
++    same_state_enforced: bool,
+ ) {
+     match new_state {
+         Some(entered) => {
+@@ -153,6 +156,7 @@ pub(crate) fn internal_apply_state_transition<S: States>(
+                     event.write(StateTransitionEvent {
+                         exited: Some(exited.clone()),
+                         entered: Some(entered.clone()),
++                        same_state_enforced,
+                     });
+                 }
+                 None => {
+@@ -162,6 +166,7 @@ pub(crate) fn internal_apply_state_transition<S: States>(
+                     event.write(StateTransitionEvent {
+                         exited: None,
+                         entered: Some(entered.clone()),
++                        same_state_enforced,
+                     });
+                 }
+             };
+@@ -174,6 +179,7 @@ pub(crate) fn internal_apply_state_transition<S: States>(
+                 event.write(StateTransitionEvent {
+                     exited: Some(resource.get().clone()),
+                     entered: None,
++                    same_state_enforced,
+                 });
+             }
+         }
+@@ -217,7 +223,7 @@ pub(crate) fn run_enter<S: States>(
+     let Some(transition) = transition.0 else {
+         return;
+     };
+-    if transition.entered == transition.exited {
++    if transition.entered == transition.exited && !transition.same_state_enforced {
+         return;
+     }
+     let Some(entered) = transition.entered else {
+@@ -234,7 +240,7 @@ pub(crate) fn run_exit<S: States>(
+     let Some(transition) = transition.0 else {
+         return;
+     };
+-    if transition.entered == transition.exited {
++    if transition.entered == transition.exited && !transition.same_state_enforced {
+         return;
+     }
+     let Some(exited) = transition.exited else {
+diff --git a/release-content/migration-guides/same_state_transitions.md b/release-content/migration-guides/same_state_transitions.md
+new file mode 100644
+index 0000000000000..1ff1170003104
+--- /dev/null
++++ b/release-content/migration-guides/same_state_transitions.md
+@@ -0,0 +1,13 @@
++---
++title: Same State Transitions
++pull_requests: [19363]
++---
++
++It is now possible to change to the same state, triggering state transitions.
++
++```rust
++// Before: did nothing if the state was already `State::Menu`
++next_state.set(State::Menu);
++// After: trigger state transitions even if the state is already `State::Menu`
++next_state.set_forced(State::Menu);
++```

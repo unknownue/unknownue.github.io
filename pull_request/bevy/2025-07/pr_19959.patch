@@ -1,0 +1,205 @@
+diff --git a/crates/bevy_pbr/src/cluster/assign.rs b/crates/bevy_pbr/src/cluster/assign.rs
+index 84b2eb702eaf0..9dc9a56b5266c 100644
+--- a/crates/bevy_pbr/src/cluster/assign.rs
++++ b/crates/bevy_pbr/src/cluster/assign.rs
+@@ -1,5 +1,10 @@
+ //! Assigning objects to clusters.
+ 
++use bevy_camera::{
++    primitives::{Aabb, Frustum, HalfSpace, Sphere},
++    visibility::{RenderLayers, ViewVisibility},
++    Camera,
++};
+ use bevy_ecs::{
+     entity::Entity,
+     query::{Has, With},
+@@ -9,20 +14,18 @@ use bevy_math::{
+     ops::{self, sin_cos},
+     Mat4, UVec3, Vec2, Vec3, Vec3A, Vec3Swizzles as _, Vec4, Vec4Swizzles as _,
+ };
+-use bevy_render::{
+-    camera::Camera,
+-    primitives::{Aabb, Frustum, HalfSpace, Sphere},
+-    view::{RenderLayers, ViewVisibility},
+-};
+ use bevy_transform::components::GlobalTransform;
+ use bevy_utils::prelude::default;
+ use tracing::warn;
+ 
++use super::{
++    ClusterConfig, ClusterFarZMode, ClusteredDecal, Clusters, GlobalClusterSettings,
++    GlobalVisibleClusterableObjects, ViewClusterBindings, VisibleClusterableObjects,
++    MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS,
++};
+ use crate::{
+-    decal::clustered::ClusteredDecal, prelude::EnvironmentMapLight, ClusterConfig, ClusterFarZMode,
+-    Clusters, ExtractedPointLight, GlobalClusterSettings, GlobalVisibleClusterableObjects,
+-    LightProbe, PointLight, SpotLight, ViewClusterBindings, VisibleClusterableObjects,
+-    VolumetricLight, MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS,
++    prelude::EnvironmentMapLight, ExtractedPointLight, LightProbe, PointLight, SpotLight,
++    VolumetricLight,
+ };
+ 
+ const NDC_MIN: Vec2 = Vec2::NEG_ONE;
+diff --git a/crates/bevy_pbr/src/cluster/mod.rs b/crates/bevy_pbr/src/cluster/mod.rs
+index 7f90a4becbd38..e7f03cc55c35c 100644
+--- a/crates/bevy_pbr/src/cluster/mod.rs
++++ b/crates/bevy_pbr/src/cluster/mod.rs
+@@ -2,6 +2,8 @@
+ 
+ use core::num::NonZero;
+ 
++use bevy_asset::Handle;
++use bevy_camera::visibility;
+ use bevy_core_pipeline::core_3d::Camera3d;
+ use bevy_ecs::{
+     component::Component,
+@@ -12,23 +14,27 @@ use bevy_ecs::{
+     system::{Commands, Query, Res},
+     world::{FromWorld, World},
+ };
++use bevy_image::Image;
+ use bevy_math::{uvec4, AspectRatio, UVec2, UVec3, UVec4, Vec3Swizzles as _, Vec4};
+ use bevy_platform::collections::HashSet;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+     camera::Camera,
++    extract_component::ExtractComponent,
+     render_resource::{
+         BindingResource, BufferBindingType, ShaderSize as _, ShaderType, StorageBuffer,
+         UniformBuffer,
+     },
+     renderer::{RenderAdapter, RenderDevice, RenderQueue},
+     sync_world::RenderEntity,
++    view::{Visibility, VisibilityClass},
+     Extract,
+ };
++use bevy_transform::components::Transform;
+ use tracing::warn;
+ 
+ pub(crate) use crate::cluster::assign::assign_objects_to_clusters;
+-use crate::MeshPipeline;
++use crate::{LightVisibilityClass, MeshPipeline};
+ 
+ pub(crate) mod assign;
+ 
+@@ -230,6 +236,34 @@ struct ClusterableObjectCounts {
+     decals: u32,
+ }
+ 
++/// An object that projects a decal onto surfaces within its bounds.
++///
++/// Conceptually, a clustered decal is a 1×1×1 cube centered on its origin. It
++/// projects the given [`Self::image`] onto surfaces in the -Z direction (thus
++/// you may find [`Transform::looking_at`] useful).
++///
++/// Clustered decals are the highest-quality types of decals that Bevy supports,
++/// but they require bindless textures. This means that they presently can't be
++/// used on WebGL 2, WebGPU, macOS, or iOS. Bevy's clustered decals can be used
++/// with forward or deferred rendering and don't require a prepass.
++#[derive(Component, Debug, Clone, Reflect, ExtractComponent)]
++#[reflect(Component, Debug, Clone)]
++#[require(Transform, Visibility, VisibilityClass)]
++#[component(on_add = visibility::add_visibility_class::<LightVisibilityClass>)]
++pub struct ClusteredDecal {
++    /// The image that the clustered decal projects.
++    ///
++    /// This must be a 2D image. If it has an alpha channel, it'll be alpha
++    /// blended with the underlying surface and/or other decals. All decal
++    /// images in the scene must use the same sampler.
++    pub image: Handle<Image>,
++
++    /// An application-specific tag you can use for any purpose you want.
++    ///
++    /// See the `clustered_decals` example for an example of use.
++    pub tag: u32,
++}
++
+ enum ExtractedClusterableObjectElement {
+     ClusterHeader(ClusterableObjectCounts),
+     ClusterableObjectEntity(Entity),
+diff --git a/crates/bevy_pbr/src/decal/clustered.rs b/crates/bevy_pbr/src/decal/clustered.rs
+index 98f18ce0e4541..d4ac27a1f5e3e 100644
+--- a/crates/bevy_pbr/src/decal/clustered.rs
++++ b/crates/bevy_pbr/src/decal/clustered.rs
+@@ -17,12 +17,10 @@
+ use core::{num::NonZero, ops::Deref};
+ 
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{AssetId, Handle};
++use bevy_asset::AssetId;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+-    component::Component,
+     entity::{Entity, EntityHashMap},
+-    prelude::ReflectComponent,
+     query::With,
+     resource::Resource,
+     schedule::IntoScheduleConfigs as _,
+@@ -31,10 +29,9 @@ use bevy_ecs::{
+ use bevy_image::Image;
+ use bevy_math::Mat4;
+ use bevy_platform::collections::HashMap;
+-use bevy_reflect::Reflect;
+ pub use bevy_render::primitives::CubemapLayout;
+ use bevy_render::{
+-    extract_component::{ExtractComponent, ExtractComponentPlugin},
++    extract_component::ExtractComponentPlugin,
+     load_shader_library,
+     render_asset::RenderAssets,
+     render_resource::{
+@@ -44,15 +41,14 @@ use bevy_render::{
+     renderer::{RenderAdapter, RenderDevice, RenderQueue},
+     sync_world::RenderEntity,
+     texture::{FallbackImage, GpuImage},
+-    view::{self, ViewVisibility, Visibility, VisibilityClass},
++    view::ViewVisibility,
+     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+-use bevy_transform::{components::GlobalTransform, prelude::Transform};
++use bevy_transform::components::GlobalTransform;
+ use bytemuck::{Pod, Zeroable};
+ 
+-use crate::{
+-    binding_arrays_are_usable, prepare_lights, GlobalClusterableObjectMeta, LightVisibilityClass,
+-};
++pub use crate::ClusteredDecal;
++use crate::{binding_arrays_are_usable, prepare_lights, GlobalClusterableObjectMeta};
+ pub use crate::{DirectionalLightTexture, PointLightTexture, SpotLightTexture};
+ 
+ /// The maximum number of decals that can be present in a view.
+@@ -68,34 +64,6 @@ pub(crate) const MAX_VIEW_DECALS: usize = 8;
+ /// can still be added to a scene, but they won't project any decals.
+ pub struct ClusteredDecalPlugin;
+ 
+-/// An object that projects a decal onto surfaces within its bounds.
+-///
+-/// Conceptually, a clustered decal is a 1×1×1 cube centered on its origin. It
+-/// projects the given [`Self::image`] onto surfaces in the -Z direction (thus
+-/// you may find [`Transform::looking_at`] useful).
+-///
+-/// Clustered decals are the highest-quality types of decals that Bevy supports,
+-/// but they require bindless textures. This means that they presently can't be
+-/// used on WebGL 2, WebGPU, macOS, or iOS. Bevy's clustered decals can be used
+-/// with forward or deferred rendering and don't require a prepass.
+-#[derive(Component, Debug, Clone, Reflect, ExtractComponent)]
+-#[reflect(Component, Debug, Clone)]
+-#[require(Transform, Visibility, VisibilityClass)]
+-#[component(on_add = view::add_visibility_class::<LightVisibilityClass>)]
+-pub struct ClusteredDecal {
+-    /// The image that the clustered decal projects.
+-    ///
+-    /// This must be a 2D image. If it has an alpha channel, it'll be alpha
+-    /// blended with the underlying surface and/or other decals. All decal
+-    /// images in the scene must use the same sampler.
+-    pub image: Handle<Image>,
+-
+-    /// An application-specific tag you can use for any purpose you want.
+-    ///
+-    /// See the `clustered_decals` example for an example of use.
+-    pub tag: u32,
+-}
+-
+ /// Stores information about all the clustered decals in the scene.
+ #[derive(Resource, Default)]
+ pub struct RenderClusteredDecals {

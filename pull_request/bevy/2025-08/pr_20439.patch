@@ -1,0 +1,405 @@
+diff --git a/crates/bevy_asset/src/assets.rs b/crates/bevy_asset/src/assets.rs
+index 6e5b488ee0446..ebaa2cc971e4b 100644
+--- a/crates/bevy_asset/src/assets.rs
++++ b/crates/bevy_asset/src/assets.rs
+@@ -155,13 +155,13 @@ impl<A: Asset> DenseAssetStorage<A> {
+                 *value = Some(asset);
+                 Ok(exists)
+             } else {
+-                Err(InvalidGenerationError {
++                Err(InvalidGenerationError::Occupied {
+                     index,
+                     current_generation: *generation,
+                 })
+             }
+         } else {
+-            unreachable!("entries should always be valid after a flush");
++            Err(InvalidGenerationError::Removed { index })
+         }
+     }
+ 
+@@ -321,30 +321,43 @@ impl<A: Asset> Assets<A> {
+         self.handle_provider.reserve_handle().typed::<A>()
+     }
+ 
+-    /// Inserts the given `asset`, identified by the given `id`. If an asset already exists for `id`, it will be replaced.
+-    pub fn insert(&mut self, id: impl Into<AssetId<A>>, asset: A) {
++    /// Inserts the given `asset`, identified by the given `id`. If an asset already exists for
++    /// `id`, it will be replaced.
++    ///
++    /// Note: This will never return an error for UUID asset IDs.
++    pub fn insert(
++        &mut self,
++        id: impl Into<AssetId<A>>,
++        asset: A,
++    ) -> Result<(), InvalidGenerationError> {
+         match id.into() {
+-            AssetId::Index { index, .. } => {
+-                self.insert_with_index(index, asset).unwrap();
+-            }
++            AssetId::Index { index, .. } => self.insert_with_index(index, asset).map(|_| ()),
+             AssetId::Uuid { uuid } => {
+                 self.insert_with_uuid(uuid, asset);
++                Ok(())
+             }
+         }
+     }
+ 
+-    /// Retrieves an [`Asset`] stored for the given `id` if it exists. If it does not exist, it will be inserted using `insert_fn`.
++    /// Retrieves an [`Asset`] stored for the given `id` if it exists. If it does not exist, it will
++    /// be inserted using `insert_fn`.
++    ///
++    /// Note: This will never return an error for UUID asset IDs.
+     // PERF: Optimize this or remove it
+     pub fn get_or_insert_with(
+         &mut self,
+         id: impl Into<AssetId<A>>,
+         insert_fn: impl FnOnce() -> A,
+-    ) -> &mut A {
++    ) -> Result<&mut A, InvalidGenerationError> {
+         let id: AssetId<A> = id.into();
+         if self.get(id).is_none() {
+-            self.insert(id, insert_fn());
++            self.insert(id, insert_fn())?;
+         }
+-        self.get_mut(id).unwrap()
++        // This should be impossible since either, `self.get` was Some, in which case this succeeds,
++        // or `self.get` was None and we inserted it (and bailed out if there was an error).
++        Ok(self
++            .get_mut(id)
++            .expect("the Asset was none even though we checked or inserted"))
+     }
+ 
+     /// Returns `true` if the `id` exists in this collection. Otherwise it returns `false`.
+@@ -652,11 +665,15 @@ impl<'a, A: Asset> Iterator for AssetsMutIterator<'a, A> {
+ }
+ 
+ /// An error returned when an [`AssetIndex`] has an invalid generation.
+-#[derive(Error, Debug)]
+-#[error("AssetIndex {index:?} has an invalid generation. The current generation is: '{current_generation}'.")]
+-pub struct InvalidGenerationError {
+-    index: AssetIndex,
+-    current_generation: u32,
++#[derive(Error, Debug, PartialEq, Eq)]
++pub enum InvalidGenerationError {
++    #[error("AssetIndex {index:?} has an invalid generation. The current generation is: '{current_generation}'.")]
++    Occupied {
++        index: AssetIndex,
++        current_generation: u32,
++    },
++    #[error("AssetIndex {index:?} has been removed")]
++    Removed { index: AssetIndex },
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/bevy_asset/src/io/embedded/mod.rs b/crates/bevy_asset/src/io/embedded/mod.rs
+index c49d55ca4ab9b..c18bd73f0142f 100644
+--- a/crates/bevy_asset/src/io/embedded/mod.rs
++++ b/crates/bevy_asset/src/io/embedded/mod.rs
+@@ -376,7 +376,7 @@ macro_rules! load_internal_asset {
+                 .unwrap()
+                 .join($path_str)
+                 .to_string_lossy()
+-        ));
++        )).unwrap();
+     }};
+     // we can't support params without variadic arguments, so internal assets with additional params can't be hot-reloaded
+     ($app: ident, $handle: ident, $path_str: expr, $loader: expr $(, $param:expr)+) => {{
+@@ -389,7 +389,7 @@ macro_rules! load_internal_asset {
+                 .join($path_str)
+                 .to_string_lossy(),
+             $($param),+
+-        ));
++        )).unwrap();
+     }};
+ }
+ 
+@@ -398,18 +398,20 @@ macro_rules! load_internal_asset {
+ macro_rules! load_internal_binary_asset {
+     ($app: ident, $handle: expr, $path_str: expr, $loader: expr) => {{
+         let mut assets = $app.world_mut().resource_mut::<$crate::Assets<_>>();
+-        assets.insert(
+-            $handle.id(),
+-            ($loader)(
+-                include_bytes!($path_str).as_ref(),
+-                std::path::Path::new(file!())
+-                    .parent()
+-                    .unwrap()
+-                    .join($path_str)
+-                    .to_string_lossy()
+-                    .into(),
+-            ),
+-        );
++        assets
++            .insert(
++                $handle.id(),
++                ($loader)(
++                    include_bytes!($path_str).as_ref(),
++                    std::path::Path::new(file!())
++                        .parent()
++                        .unwrap()
++                        .join($path_str)
++                        .to_string_lossy()
++                        .into(),
++                ),
++            )
++            .unwrap();
+     }};
+ }
+ 
+diff --git a/crates/bevy_asset/src/lib.rs b/crates/bevy_asset/src/lib.rs
+index 8186b6315d5b4..d3fa1909db417 100644
+--- a/crates/bevy_asset/src/lib.rs
++++ b/crates/bevy_asset/src/lib.rs
+@@ -677,7 +677,7 @@ mod tests {
+         },
+         loader::{AssetLoader, LoadContext},
+         Asset, AssetApp, AssetEvent, AssetId, AssetLoadError, AssetLoadFailedEvent, AssetPath,
+-        AssetPlugin, AssetServer, Assets, LoadState, UnapprovedPathMode,
++        AssetPlugin, AssetServer, Assets, InvalidGenerationError, LoadState, UnapprovedPathMode,
+     };
+     use alloc::{
+         boxed::Box,
+@@ -2088,4 +2088,34 @@ mod tests {
+             Some(())
+         });
+     }
++
++    #[test]
++    fn insert_dropped_handle_returns_error() {
++        let mut app = App::new();
++
++        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
++            .init_asset::<TestAsset>();
++
++        let handle = app.world().resource::<Assets<TestAsset>>().reserve_handle();
++        // We still have the asset ID, but we've dropped the handle so the asset is no longer live.
++        let asset_id = handle.id();
++        drop(handle);
++
++        // Allow `Assets` to detect the dropped handle.
++        app.world_mut()
++            .run_system_cached(Assets::<TestAsset>::track_assets)
++            .unwrap();
++
++        let AssetId::Index { index, .. } = asset_id else {
++            unreachable!("Reserving a handle always produces an index");
++        };
++
++        // Try to insert an asset into the dropped handle's spot. This should not panic.
++        assert_eq!(
++            app.world_mut()
++                .resource_mut::<Assets<TestAsset>>()
++                .insert(asset_id, TestAsset),
++            Err(InvalidGenerationError::Removed { index })
++        );
++    }
+ }
+diff --git a/crates/bevy_asset/src/loader.rs b/crates/bevy_asset/src/loader.rs
+index 24405f0657d5e..7d9d4f96a0315 100644
+--- a/crates/bevy_asset/src/loader.rs
++++ b/crates/bevy_asset/src/loader.rs
+@@ -276,7 +276,11 @@ impl_downcast!(AssetContainer);
+ 
+ impl<A: Asset> AssetContainer for A {
+     fn insert(self: Box<Self>, id: UntypedAssetId, world: &mut World) {
+-        world.resource_mut::<Assets<A>>().insert(id.typed(), *self);
++        // We only ever call this if we know the asset is still alive, so it is fine to unwrap here.
++        world
++            .resource_mut::<Assets<A>>()
++            .insert(id.typed(), *self)
++            .expect("the AssetId is still valid");
+     }
+ 
+     fn asset_type_name(&self) -> &'static str {
+diff --git a/crates/bevy_asset/src/reflect.rs b/crates/bevy_asset/src/reflect.rs
+index a3148cecb73f5..063d3dccc8fb7 100644
+--- a/crates/bevy_asset/src/reflect.rs
++++ b/crates/bevy_asset/src/reflect.rs
+@@ -4,7 +4,9 @@ use core::any::{Any, TypeId};
+ use bevy_ecs::world::{unsafe_world_cell::UnsafeWorldCell, World};
+ use bevy_reflect::{FromReflect, FromType, PartialReflect, Reflect};
+ 
+-use crate::{Asset, AssetId, Assets, Handle, UntypedAssetId, UntypedHandle};
++use crate::{
++    Asset, AssetId, Assets, Handle, InvalidGenerationError, UntypedAssetId, UntypedHandle,
++};
+ 
+ /// Type data for the [`TypeRegistry`](bevy_reflect::TypeRegistry) used to operate on reflected [`Asset`]s.
+ ///
+@@ -24,7 +26,8 @@ pub struct ReflectAsset {
+     // - may only be used to access **at most one** access at once
+     get_unchecked_mut: unsafe fn(UnsafeWorldCell<'_>, UntypedAssetId) -> Option<&mut dyn Reflect>,
+     add: fn(&mut World, &dyn PartialReflect) -> UntypedHandle,
+-    insert: fn(&mut World, UntypedAssetId, &dyn PartialReflect),
++    insert:
++        fn(&mut World, UntypedAssetId, &dyn PartialReflect) -> Result<(), InvalidGenerationError>,
+     len: fn(&World) -> usize,
+     ids: for<'w> fn(&'w World) -> Box<dyn Iterator<Item = UntypedAssetId> + 'w>,
+     remove: fn(&mut World, UntypedAssetId) -> Option<Box<dyn Reflect>>,
+@@ -116,8 +119,8 @@ impl ReflectAsset {
+         world: &mut World,
+         asset_id: impl Into<UntypedAssetId>,
+         value: &dyn PartialReflect,
+-    ) {
+-        (self.insert)(world, asset_id.into(), value);
++    ) -> Result<(), InvalidGenerationError> {
++        (self.insert)(world, asset_id.into(), value)
+     }
+ 
+     /// Equivalent of [`Assets::remove`]
+@@ -173,7 +176,7 @@ impl<A: Asset + FromReflect> FromType<A> for ReflectAsset {
+                 let mut assets = world.resource_mut::<Assets<A>>();
+                 let value: A = FromReflect::from_reflect(value)
+                     .expect("could not call `FromReflect::from_reflect` in `ReflectAsset::set`");
+-                assets.insert(asset_id.typed_debug_checked(), value);
++                assets.insert(asset_id.typed_debug_checked(), value)
+             },
+             len: |world| {
+                 let assets = world.resource::<Assets<A>>();
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs b/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
+index 805e67ec97c6e..d552fe9c950bb 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
++++ b/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
+@@ -51,7 +51,8 @@ impl Plugin for AutoExposurePlugin {
+             .register_asset_reflect::<AutoExposureCompensationCurve>();
+         app.world_mut()
+             .resource_mut::<Assets<AutoExposureCompensationCurve>>()
+-            .insert(&Handle::default(), AutoExposureCompensationCurve::default());
++            .insert(&Handle::default(), AutoExposureCompensationCurve::default())
++            .unwrap();
+ 
+         app.register_type::<AutoExposure>();
+         app.add_plugins(ExtractComponentPlugin::<AutoExposure>::default());
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index 2947927b0cec5..2c3242f8647eb 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -283,7 +283,8 @@ impl Plugin for PbrPlugin {
+                     base_color: Color::srgb(1.0, 0.0, 0.5),
+                     ..Default::default()
+                 },
+-            );
++            )
++            .unwrap();
+ 
+         let has_bluenoise = app
+             .get_sub_app(RenderApp)
+diff --git a/crates/bevy_render/src/texture/mod.rs b/crates/bevy_render/src/texture/mod.rs
+index 78cc78a9a132f..8ba7a444a3c76 100644
+--- a/crates/bevy_render/src/texture/mod.rs
++++ b/crates/bevy_render/src/texture/mod.rs
+@@ -88,8 +88,12 @@ impl Plugin for ImagePlugin {
+ 
+         let mut image_assets = app.world_mut().resource_mut::<Assets<Image>>();
+ 
+-        image_assets.insert(&Handle::default(), Image::default());
+-        image_assets.insert(&TRANSPARENT_IMAGE_HANDLE, Image::transparent());
++        image_assets
++            .insert(&Handle::default(), Image::default())
++            .unwrap();
++        image_assets
++            .insert(&TRANSPARENT_IMAGE_HANDLE, Image::transparent())
++            .unwrap();
+ 
+         #[cfg(feature = "compressed_image_saver")]
+         if let Some(processor) = app
+diff --git a/crates/bevy_scene/src/lib.rs b/crates/bevy_scene/src/lib.rs
+index b088fb9871055..7463dea682062 100644
+--- a/crates/bevy_scene/src/lib.rs
++++ b/crates/bevy_scene/src/lib.rs
+@@ -194,7 +194,8 @@ mod tests {
+ 
+         app.world_mut()
+             .resource_mut::<Assets<Scene>>()
+-            .insert(&scene_handle, scene_1);
++            .insert(&scene_handle, scene_1)
++            .unwrap();
+ 
+         app.update();
+ 
+@@ -247,7 +248,8 @@ mod tests {
+ 
+         app.world_mut()
+             .resource_mut::<Assets<Scene>>()
+-            .insert(&scene_handle, scene_2);
++            .insert(&scene_handle, scene_2)
++            .unwrap();
+ 
+         app.update();
+         app.update();
+@@ -332,7 +334,8 @@ mod tests {
+         let scene_1 = create_dynamic_scene(scene_1, app.world());
+         app.world_mut()
+             .resource_mut::<Assets<DynamicScene>>()
+-            .insert(&scene_handle, scene_1);
++            .insert(&scene_handle, scene_1)
++            .unwrap();
+ 
+         app.update();
+ 
+@@ -387,7 +390,8 @@ mod tests {
+ 
+         app.world_mut()
+             .resource_mut::<Assets<DynamicScene>>()
+-            .insert(&scene_handle, scene_2);
++            .insert(&scene_handle, scene_2)
++            .unwrap();
+ 
+         app.update();
+         app.update();
+diff --git a/crates/bevy_sprite/src/mesh2d/color_material.rs b/crates/bevy_sprite/src/mesh2d/color_material.rs
+index d814cfc384c5b..981734ea76c0a 100644
+--- a/crates/bevy_sprite/src/mesh2d/color_material.rs
++++ b/crates/bevy_sprite/src/mesh2d/color_material.rs
+@@ -26,7 +26,8 @@ impl Plugin for ColorMaterialPlugin {
+                     color: Color::srgb(1.0, 0.0, 1.0),
+                     ..Default::default()
+                 },
+-            );
++            )
++            .unwrap();
+     }
+ }
+ 
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 71b82a03f4741..f240f831e6f33 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -143,7 +143,7 @@ impl Plugin for TextPlugin {
+             use bevy_asset::{AssetId, Assets};
+             let mut assets = app.world_mut().resource_mut::<Assets<_>>();
+             let asset = Font::try_from_bytes(DEFAULT_FONT_DATA.to_vec()).unwrap();
+-            assets.insert(AssetId::default(), asset);
++            assets.insert(AssetId::default(), asset).unwrap();
+         };
+     }
+ }
+diff --git a/examples/3d/tonemapping.rs b/examples/3d/tonemapping.rs
+index 987ceda70da70..c0ba5e81036a2 100644
+--- a/examples/3d/tonemapping.rs
++++ b/examples/3d/tonemapping.rs
+@@ -254,7 +254,7 @@ fn resize_image(
+             let size = image_changed.size_f32().normalize_or_zero() * 1.4;
+             // Resize Mesh
+             let quad = Mesh::from(Rectangle::from_size(size));
+-            meshes.insert(mesh_h, quad);
++            meshes.insert(mesh_h, quad).unwrap();
+         }
+     }
+ }
+diff --git a/release-content/migration-guides/assets-insert-result.md b/release-content/migration-guides/assets-insert-result.md
+new file mode 100644
+index 0000000000000..c18279b941793
+--- /dev/null
++++ b/release-content/migration-guides/assets-insert-result.md
+@@ -0,0 +1,9 @@
++---
++title: `Assets::insert` and `Assets::get_or_insert_with` now return `Result`.
++pull_requests: [20439]
++---
++
++In previous versions of Bevy, there was a bug where inserting an asset into an `AssetId` whose handle was dropped would result in a panic. Now this is an error! Calling `Assets::insert` and
++`Assets::get_or_insert_with` returns an error you can inspect.
++
++To match the previous behavior, just `unwrap()` the result.
