@@ -1,0 +1,307 @@
+diff --git a/.github/actions/install-linux-deps/action.yml b/.github/actions/install-linux-deps/action.yml
+index c494200e5a649..401eaa76d2562 100644
+--- a/.github/actions/install-linux-deps/action.yml
++++ b/.github/actions/install-linux-deps/action.yml
+@@ -33,6 +33,10 @@ inputs:
+     description: Install xkb (libxkbcommon-dev)
+     required: false
+     default: "false"
++  x264:
++    description: Install x264 (libx264-dev)
++    required: false
++    default: "false"
+ runs:
+   using: composite
+   steps:
+@@ -47,3 +51,4 @@ runs:
+         ${{ fromJSON(inputs.udev) && 'libudev-dev' || '' }}
+         ${{ fromJSON(inputs.wayland) && 'libwayland-dev' || '' }}
+         ${{ fromJSON(inputs.xkb) && 'libxkbcommon-dev' || '' }}
++        ${{ fromJSON(inputs.x264) && 'libx264-164 libx264-dev' || '' }}
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index b687b032e3d13..ed7694c281301 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -83,6 +83,7 @@ jobs:
+         with:
+           wayland: true
+           xkb: true
++          x264: true
+       - name: CI job
+         # See tools/ci/src/main.rs for the commands this runs
+         run: cargo run -p ci -- lints
+@@ -371,6 +372,7 @@ jobs:
+         with:
+           wayland: true
+           xkb: true
++          x264: true
+       - name: Build and check doc
+         # See tools/ci/src/main.rs for the commands this runs
+         run: cargo run -p ci -- doc
+diff --git a/crates/bevy_dev_tools/Cargo.toml b/crates/bevy_dev_tools/Cargo.toml
+index dc218f023baef..36854b3f5088e 100644
+--- a/crates/bevy_dev_tools/Cargo.toml
++++ b/crates/bevy_dev_tools/Cargo.toml
+@@ -10,6 +10,7 @@ keywords = ["bevy"]
+ 
+ [features]
+ bevy_ci_testing = ["serde", "ron"]
++screenrecording = ["x264"]
+ webgl = ["bevy_render/webgl"]
+ webgpu = ["bevy_render/webgpu"]
+ 
+@@ -21,6 +22,7 @@ bevy_camera = { path = "../bevy_camera", version = "0.18.0-dev" }
+ bevy_color = { path = "../bevy_color", version = "0.18.0-dev" }
+ bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.18.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.18.0-dev" }
++bevy_image = { path = "../bevy_image", version = "0.18.0-dev" }
+ bevy_input = { path = "../bevy_input", version = "0.18.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.18.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.18.0-dev" }
+@@ -38,6 +40,7 @@ bevy_state = { path = "../bevy_state", version = "0.18.0-dev" }
+ serde = { version = "1.0", features = ["derive"], optional = true }
+ ron = { version = "0.12", optional = true }
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
++x264 = { version = "0.5.0", optional = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/bevy_dev_tools/src/easy_screenshot.rs b/crates/bevy_dev_tools/src/easy_screenshot.rs
+index 4bfacf995f261..4b5933038313e 100644
+--- a/crates/bevy_dev_tools/src/easy_screenshot.rs
++++ b/crates/bevy_dev_tools/src/easy_screenshot.rs
+@@ -1,10 +1,26 @@
++#[cfg(feature = "screenrecording")]
++use core::time::Duration;
+ use std::time::{SystemTime, UNIX_EPOCH};
++#[cfg(feature = "screenrecording")]
++use std::{fs::File, io::Write, sync::mpsc::channel};
+ 
+ use bevy_app::{App, Plugin, Update};
+ use bevy_ecs::prelude::*;
++#[cfg(feature = "screenrecording")]
++use bevy_image::Image;
+ use bevy_input::{common_conditions::input_just_pressed, keyboard::KeyCode};
++#[cfg(feature = "screenrecording")]
++use bevy_render::view::screenshot::ScreenshotCaptured;
+ use bevy_render::view::screenshot::{save_to_disk, Screenshot};
++#[cfg(feature = "screenrecording")]
++use bevy_time::Time;
+ use bevy_window::{PrimaryWindow, Window};
++#[cfg(feature = "screenrecording")]
++use tracing::info;
++#[cfg(feature = "screenrecording")]
++use x264::{Colorspace, Encoder, Setup};
++#[cfg(feature = "screenrecording")]
++pub use x264::{Preset, Tune};
+ 
+ /// File format the screenshot will be saved in
+ #[derive(Clone, Copy)]
+@@ -65,3 +81,179 @@ impl Plugin for EasyScreenshotPlugin {
+         );
+     }
+ }
++
++#[cfg(feature = "screenrecording")]
++/// Add this plugin to your app to enable easy screen recording.
++pub struct EasyScreenRecordPlugin {
++    /// The key to toggle recording.
++    pub toggle: KeyCode,
++    /// h264 encoder preset
++    pub preset: Preset,
++    /// h264 encoder tune
++    pub tune: Tune,
++    /// target frame time
++    pub frame_time: Duration,
++}
++
++#[cfg(feature = "screenrecording")]
++impl Default for EasyScreenRecordPlugin {
++    fn default() -> Self {
++        EasyScreenRecordPlugin {
++            toggle: KeyCode::Space,
++            preset: Preset::Medium,
++            tune: Tune::Animation,
++            frame_time: Duration::from_millis(33),
++        }
++    }
++}
++
++#[cfg(feature = "screenrecording")]
++enum RecordCommand {
++    Start(String, Preset, Tune),
++    Stop,
++    Frame(Image),
++}
++
++#[cfg(feature = "screenrecording")]
++/// Controls screen recording
++#[derive(Message)]
++pub enum RecordScreen {
++    /// Starts screen recording
++    Start,
++    /// Stops screen recording
++    Stop,
++}
++
++#[cfg(feature = "screenrecording")]
++impl Plugin for EasyScreenRecordPlugin {
++    fn build(&self, app: &mut App) {
++        let (tx, rx) = channel::<RecordCommand>();
++
++        let frame_time = self.frame_time;
++
++        std::thread::spawn(move || {
++            let mut encoder: Option<Encoder> = None;
++            let mut setup = None;
++            let mut file: Option<File> = None;
++            let mut frame = 0;
++            loop {
++                let Ok(next) = rx.recv() else {
++                    break;
++                };
++                match next {
++                    RecordCommand::Start(name, preset, tune) => {
++                        info!("starting recording at {}", name);
++                        file = Some(File::create(name).unwrap());
++                        setup = Some(Setup::preset(preset, tune, false, true).high());
++                    }
++                    RecordCommand::Stop => {
++                        info!("stopping recording");
++                        if let Some(encoder) = encoder.take() {
++                            let mut flush = encoder.flush();
++                            let mut file = file.take().unwrap();
++                            while let Some(result) = flush.next() {
++                                let (data, _) = result.unwrap();
++                                file.write_all(data.entirety()).unwrap();
++                            }
++                        }
++                    }
++                    RecordCommand::Frame(image) => {
++                        if let Some(setup) = setup.take() {
++                            let mut new_encoder = setup
++                                .fps((1000 / frame_time.as_millis()) as u32, 1)
++                                .build(Colorspace::RGB, image.width() as i32, image.height() as i32)
++                                .unwrap();
++                            let headers = new_encoder.headers().unwrap();
++                            file.as_mut()
++                                .unwrap()
++                                .write_all(headers.entirety())
++                                .unwrap();
++                            encoder = Some(new_encoder);
++                        }
++                        if let Some(encoder) = encoder.as_mut() {
++                            let pts = (frame_time.as_millis() * frame) as i64;
++
++                            frame += 1;
++                            let (data, _) = encoder
++                                .encode(
++                                    pts,
++                                    x264::Image::rgb(
++                                        image.width() as i32,
++                                        image.height() as i32,
++                                        &image.try_into_dynamic().unwrap().to_rgb8(),
++                                    ),
++                                )
++                                .unwrap();
++                            file.as_mut().unwrap().write_all(data.entirety()).unwrap();
++                        }
++                    }
++                }
++            }
++        });
++
++        let frame_time = self.frame_time;
++
++        app.add_message::<RecordScreen>().add_systems(
++            Update,
++            (
++                (move |mut messages: MessageWriter<RecordScreen>, mut recording: Local<bool>| {
++                    *recording = !*recording;
++                    if *recording {
++                        messages.write(RecordScreen::Start);
++                    } else {
++                        messages.write(RecordScreen::Stop);
++                    }
++                })
++                .run_if(input_just_pressed(self.toggle)),
++                {
++                    let tx = tx.clone();
++                    let preset = self.preset;
++                    let tune = self.tune;
++                    move |mut commands: Commands,
++                          mut recording: Local<bool>,
++                          mut messages: MessageReader<RecordScreen>,
++                          window: Single<&Window, With<PrimaryWindow>>,
++                          current_screenshot: Query<(), With<Screenshot>>,
++                          mut virtual_time: ResMut<Time<bevy_time::Virtual>>| {
++                        match messages.read().last() {
++                            Some(RecordScreen::Start) => {
++                                let since_the_epoch = SystemTime::now()
++                                    .duration_since(UNIX_EPOCH)
++                                    .expect("time should go forward");
++                                let filename = format!(
++                                    "{}-{}.h264",
++                                    window.title,
++                                    since_the_epoch.as_millis(),
++                                );
++                                tx.send(RecordCommand::Start(filename, preset, tune))
++                                    .unwrap();
++                                *recording = true;
++                                virtual_time.pause();
++                            }
++                            Some(RecordScreen::Stop) => {
++                                tx.send(RecordCommand::Stop).unwrap();
++                                *recording = false;
++                                virtual_time.unpause();
++                            }
++                            _ => {}
++                        }
++                        if *recording && current_screenshot.single().is_err() {
++                            let tx = tx.clone();
++                            commands.spawn(Screenshot::primary_window()).observe(
++                                move |screenshot_captured: On<ScreenshotCaptured>,
++                                      mut virtual_time: ResMut<Time<bevy_time::Virtual>>,
++                                      mut time: ResMut<Time<()>>| {
++                                    let img = screenshot_captured.image.clone();
++                                    tx.send(RecordCommand::Frame(img)).unwrap();
++                                    virtual_time.advance_by(frame_time);
++                                    *time = virtual_time.as_generic();
++                                },
++                            );
++                        }
++                    }
++                },
++            )
++                .chain(),
++        );
++    }
++}
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index c894e3664405f..7aac25bb4b432 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -430,6 +430,8 @@ hotpatching = ["bevy_app/hotpatching", "bevy_ecs/hotpatching"]
+ 
+ debug = ["bevy_utils/debug", "bevy_ecs/debug"]
+ 
++screenrecording = ["bevy_dev_tools/screenrecording"]
++
+ [dependencies]
+ # bevy (no_std)
+ bevy_app = { path = "../bevy_app", version = "0.18.0-dev", default-features = false, features = [
+diff --git a/release-content/release-notes/easy_marketing_material.md b/release-content/release-notes/easy_marketing_material.md
+new file mode 100644
+index 0000000000000..953db7e9dcaf2
+--- /dev/null
++++ b/release-content/release-notes/easy_marketing_material.md
+@@ -0,0 +1,9 @@
++---
++title: Helpers to Produce Marketing Material
++authors: ["@mockersf"]
++pull_requests: [21235, 21237]
++---
++
++Bevy can take a screenshot of what's rendered since 0.11. This is now easier to setup to help you create marketing material, so that you can take screenshot with consistent formatting with the new `EasyScreenshotPlugin`. With its default settings, once you add this plugin to your application, a PNG screenshot will be taken when you press the `PrintScreen` key. You can change the trigger key, or the screenshot format between PNG, JPEG or BMP.
++
++It is now possible to record a movie from Bevy, with the new `EasyScreenRecordPlugin`. This plugins add a toggle key, space bar by default, that will toggle screen recording. Recording can also be started and stopped programmatically with the `RecordScreen` messages.
