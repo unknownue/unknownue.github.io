@@ -1,0 +1,680 @@
+diff --git a/crates/bevy_gltf/src/convert_coordinates.rs b/crates/bevy_gltf/src/convert_coordinates.rs
+index e28992934815e..3ccb52e95ef7e 100644
+--- a/crates/bevy_gltf/src/convert_coordinates.rs
++++ b/crates/bevy_gltf/src/convert_coordinates.rs
+@@ -1,34 +1,16 @@
+-use core::f32::consts::PI;
++//! Utilities for converting from glTF's [standard coordinate system](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#coordinate-system-and-units)
++//! to Bevy's.
++use serde::{Deserialize, Serialize};
+ 
+ use bevy_math::{Mat4, Quat, Vec3};
+ use bevy_transform::components::Transform;
+ 
+ pub(crate) trait ConvertCoordinates {
+-    /// Converts the glTF coordinates to Bevy's coordinate system.
+-    /// - glTF:
+-    ///   - forward: Z
+-    ///   - up: Y
+-    ///   - right: -X
+-    /// - Bevy:
+-    ///   - forward: -Z
+-    ///   - up: Y
+-    ///   - right: X
+-    ///
+-    /// See <https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#coordinate-system-and-units>
++    /// Converts from glTF coordinates to Bevy's coordinate system. See
++    /// [`GltfConvertCoordinates`] for an explanation of the conversion.
+     fn convert_coordinates(self) -> Self;
+ }
+ 
+-pub(crate) trait ConvertCameraCoordinates {
+-    /// Like `convert_coordinates`, but uses the following for the lens rotation:
+-    /// - forward: -Z
+-    /// - up: Y
+-    /// - right: X
+-    ///
+-    /// The same convention is used for lights.
+-    /// See <https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#view-matrix>
+-    fn convert_camera_coordinates(self) -> Self;
+-}
+-
+ impl ConvertCoordinates for Vec3 {
+     fn convert_coordinates(self) -> Self {
+         Vec3::new(-self.x, self.y, -self.z)
+@@ -48,34 +30,87 @@ impl ConvertCoordinates for [f32; 4] {
+     }
+ }
+ 
+-impl ConvertCoordinates for Quat {
+-    fn convert_coordinates(self) -> Self {
+-        // Solution of q' = r q r*
+-        Quat::from_array([-self.x, self.y, -self.z, self.w])
+-    }
++/// Options for converting scenes and assets from glTF's [standard coordinate system](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#coordinate-system-and-units)
++/// (+Z forward) to Bevy's coordinate system (-Z forward).
++///
++/// The exact coordinate system conversion is as follows:
++/// - glTF:
++///   - forward: +Z
++///   - up: +Y
++///   - right: -X
++/// - Bevy:
++///   - forward: -Z
++///   - up: +Y
++///   - right: +X
++///
++/// Note that some glTF files may not follow the glTF standard.
++///
++/// If your glTF scene is +Z forward and you want it converted to match Bevy's
++/// `Transform::forward`, enable the `rotate_scene_entity` option. If you also want `Mesh`
++/// assets to be converted, enable the `rotate_meshes` option.
++///
++/// Cameras and lights in glTF files are an exception - they already use Bevy's
++/// coordinate system. This means cameras and lights will match
++/// `Transform::forward` even if conversion is disabled.
++#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize)]
++pub struct GltfConvertCoordinates {
++    /// If true, convert scenes by rotating the top-level transform of the scene entity.
++    ///
++    /// This will ensure that [`Transform::forward`] of the "root" entity (the one with [`SceneInstance`](bevy_scene::SceneInstance))
++    /// aligns with the "forward" of the glTF scene.
++    ///
++    /// The glTF loader creates an entity for each glTF scene. Entities are
++    /// then created for each node within the glTF scene. Nodes without a
++    /// parent in the glTF scene become children of the scene entity.
++    ///
++    /// This option only changes the transform of the scene entity. It does not
++    /// directly change the transforms of node entities - it only changes them
++    /// indirectly through transform inheritance.
++    pub rotate_scene_entity: bool,
++
++    /// If true, convert mesh assets. This includes skinned mesh bind poses.
++    ///
++    /// This option only changes mesh assets and the transforms of entities that
++    /// instance meshes. It does not change the transforms of entities that
++    /// correspond to glTF nodes.
++    pub rotate_meshes: bool,
+ }
+ 
+-impl ConvertCoordinates for Mat4 {
+-    fn convert_coordinates(self) -> Self {
+-        let m: Mat4 = Mat4::from_scale(Vec3::new(-1.0, 1.0, -1.0));
+-        // Same as the original matrix
+-        let m_inv = m;
+-        m_inv * self * m
++impl GltfConvertCoordinates {
++    const CONVERSION_TRANSFORM: Transform =
++        Transform::from_rotation(Quat::from_xyzw(0.0, 1.0, 0.0, 0.0));
++
++    fn conversion_mat4() -> Mat4 {
++        Mat4::from_scale(Vec3::new(-1.0, 1.0, -1.0))
+     }
+-}
+ 
+-impl ConvertCoordinates for Transform {
+-    fn convert_coordinates(mut self) -> Self {
+-        self.translation = self.translation.convert_coordinates();
+-        self.rotation = self.rotation.convert_coordinates();
+-        self
++    pub(crate) fn scene_conversion_transform(&self) -> Transform {
++        if self.rotate_scene_entity {
++            Self::CONVERSION_TRANSFORM
++        } else {
++            Transform::IDENTITY
++        }
++    }
++
++    pub(crate) fn mesh_conversion_transform(&self) -> Transform {
++        if self.rotate_meshes {
++            Self::CONVERSION_TRANSFORM
++        } else {
++            Transform::IDENTITY
++        }
++    }
++
++    pub(crate) fn mesh_conversion_transform_inverse(&self) -> Transform {
++        // We magically know that the transform is its own inverse. We still
++        // make a distinction at the interface level in case that changes.
++        self.mesh_conversion_transform()
+     }
+-}
+ 
+-impl ConvertCameraCoordinates for Transform {
+-    fn convert_camera_coordinates(mut self) -> Self {
+-        self.translation = self.translation.convert_coordinates();
+-        self.rotate_y(PI);
+-        self
++    pub(crate) fn mesh_conversion_mat4(&self) -> Mat4 {
++        if self.rotate_meshes {
++            Self::conversion_mat4()
++        } else {
++            Mat4::IDENTITY
++        }
+     }
+ }
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index ea9ec7659405e..d9a8640803d53 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -128,7 +128,7 @@
+ //! See the [glTF Extension Registry](https://github.com/KhronosGroup/glTF/blob/main/extensions/README.md) for more information on extensions.
+ 
+ mod assets;
+-mod convert_coordinates;
++pub mod convert_coordinates;
+ mod label;
+ mod loader;
+ mod vertex_attributes;
+@@ -155,7 +155,7 @@ pub mod prelude {
+     pub use crate::{assets::Gltf, assets::GltfExtras, label::GltfAssetLabel};
+ }
+ 
+-use crate::extensions::GltfExtensionHandlers;
++use crate::{convert_coordinates::GltfConvertCoordinates, extensions::GltfExtensionHandlers};
+ 
+ pub use {assets::*, label::GltfAssetLabel, loader::*};
+ 
+@@ -198,19 +198,9 @@ pub struct GltfPlugin {
+     /// Can be modified with the [`DefaultGltfImageSampler`] resource.
+     pub default_sampler: ImageSamplerDescriptor,
+ 
+-    /// _CAUTION: This is an experimental feature with [known issues](https://github.com/bevyengine/bevy/issues/20621). Behavior may change in future versions._
+-    ///
+-    /// How to convert glTF coordinates on import. Assuming glTF cameras, glTF lights, and glTF meshes had global identity transforms,
+-    /// their Bevy [`Transform::forward`](bevy_transform::components::Transform::forward) will be pointing in the following global directions:
+-    /// - When set to `false`
+-    ///   - glTF cameras and glTF lights: global -Z,
+-    ///   - glTF models: global +Z.
+-    /// - When set to `true`
+-    ///   - glTF cameras and glTF lights: global +Z,
+-    ///   - glTF models: global -Z.
+-    ///
+-    /// The default is `false`.
+-    pub use_model_forward_direction: bool,
++    /// The default glTF coordinate conversion setting. This can be overridden
++    /// per-load by [`GltfLoaderSettings::convert_coordinates`].
++    pub convert_coordinates: GltfConvertCoordinates,
+ 
+     /// Registry for custom vertex attributes.
+     ///
+@@ -223,7 +213,7 @@ impl Default for GltfPlugin {
+         GltfPlugin {
+             default_sampler: ImageSamplerDescriptor::linear(),
+             custom_vertex_attributes: HashMap::default(),
+-            use_model_forward_direction: false,
++            convert_coordinates: GltfConvertCoordinates::default(),
+         }
+     }
+ }
+@@ -276,7 +266,7 @@ impl Plugin for GltfPlugin {
+             supported_compressed_formats,
+             custom_vertex_attributes: self.custom_vertex_attributes.clone(),
+             default_sampler,
+-            default_use_model_forward_direction: self.use_model_forward_direction,
++            default_convert_coordinates: self.convert_coordinates,
+             extensions: extensions.0.clone(),
+         });
+     }
+diff --git a/crates/bevy_gltf/src/loader/gltf_ext/scene.rs b/crates/bevy_gltf/src/loader/gltf_ext/scene.rs
+index d02a131002771..83e6778b99e37 100644
+--- a/crates/bevy_gltf/src/loader/gltf_ext/scene.rs
++++ b/crates/bevy_gltf/src/loader/gltf_ext/scene.rs
+@@ -10,10 +10,7 @@ use itertools::Itertools;
+ #[cfg(feature = "bevy_animation")]
+ use bevy_platform::collections::{HashMap, HashSet};
+ 
+-use crate::{
+-    convert_coordinates::{ConvertCameraCoordinates as _, ConvertCoordinates as _},
+-    GltfError,
+-};
++use crate::GltfError;
+ 
+ pub(crate) fn node_name(node: &Node) -> Name {
+     let name = node
+@@ -29,8 +26,8 @@ pub(crate) fn node_name(node: &Node) -> Name {
+ /// on [`Node::transform()`](gltf::Node::transform) directly because it uses optimized glam types and
+ /// if `libm` feature of `bevy_math` crate is enabled also handles cross
+ /// platform determinism properly.
+-pub(crate) fn node_transform(node: &Node, convert_coordinates: bool) -> Transform {
+-    let transform = match node.transform() {
++pub(crate) fn node_transform(node: &Node) -> Transform {
++    match node.transform() {
+         gltf::scene::Transform::Matrix { matrix } => {
+             Transform::from_matrix(Mat4::from_cols_array_2d(&matrix))
+         }
+@@ -43,15 +40,6 @@ pub(crate) fn node_transform(node: &Node, convert_coordinates: bool) -> Transfor
+             rotation: bevy_math::Quat::from_array(rotation),
+             scale: Vec3::from(scale),
+         },
+-    };
+-    if convert_coordinates {
+-        if node.camera().is_some() || node.light().is_some() {
+-            transform.convert_camera_coordinates()
+-        } else {
+-            transform.convert_coordinates()
+-        }
+-    } else {
+-        transform
+     }
+ }
+ 
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index 68e5eb41dc69d..acd222729aeca 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -58,8 +58,9 @@ use thiserror::Error;
+ use tracing::{error, info_span, warn};
+ 
+ use crate::{
+-    vertex_attributes::convert_attribute, Gltf, GltfAssetLabel, GltfExtras, GltfMaterialExtras,
+-    GltfMaterialName, GltfMeshExtras, GltfMeshName, GltfNode, GltfSceneExtras, GltfSkin,
++    convert_coordinates::ConvertCoordinates as _, vertex_attributes::convert_attribute, Gltf,
++    GltfAssetLabel, GltfExtras, GltfMaterialExtras, GltfMaterialName, GltfMeshExtras, GltfMeshName,
++    GltfNode, GltfSceneExtras, GltfSkin,
+ };
+ 
+ #[cfg(feature = "bevy_animation")]
+@@ -77,7 +78,7 @@ use self::{
+         texture::{texture_handle, texture_sampler, texture_transform_to_affine2},
+     },
+ };
+-use crate::convert_coordinates::ConvertCoordinates as _;
++use crate::convert_coordinates::GltfConvertCoordinates;
+ 
+ /// An error that occurs when loading a glTF file.
+ #[derive(Error, Debug)]
+@@ -150,17 +151,9 @@ pub struct GltfLoader {
+     pub custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
+     /// Arc to default [`ImageSamplerDescriptor`].
+     pub default_sampler: Arc<Mutex<ImageSamplerDescriptor>>,
+-    /// How to convert glTF coordinates on import. Assuming glTF cameras, glTF lights, and glTF meshes had global identity transforms,
+-    /// their Bevy [`Transform::forward`](bevy_transform::components::Transform::forward) will be pointing in the following global directions:
+-    /// - When set to `false`
+-    ///   - glTF cameras and glTF lights: global -Z,
+-    ///   - glTF models: global +Z.
+-    /// - When set to `true`
+-    ///   - glTF cameras and glTF lights: global +Z,
+-    ///   - glTF models: global -Z.
+-    ///
+-    /// The default is `false`.
+-    pub default_use_model_forward_direction: bool,
++    /// The default glTF coordinate conversion setting. This can be overridden
++    /// per-load by [`GltfLoaderSettings::convert_coordinates`].
++    pub default_convert_coordinates: GltfConvertCoordinates,
+     /// glTF extension data processors.
+     /// These are Bevy-side processors designed to access glTF
+     /// extension data during the loading process.
+@@ -210,19 +203,10 @@ pub struct GltfLoaderSettings {
+     pub default_sampler: Option<ImageSamplerDescriptor>,
+     /// If true, the loader will ignore sampler data from gltf and use the default sampler.
+     pub override_sampler: bool,
+-    /// _CAUTION: This is an experimental feature with [known issues](https://github.com/bevyengine/bevy/issues/20621). Behavior may change in future versions._
+-    ///
+-    /// How to convert glTF coordinates on import. Assuming glTF cameras, glTF lights, and glTF meshes had global unit transforms,
+-    /// their Bevy [`Transform::forward`](bevy_transform::components::Transform::forward) will be pointing in the following global directions:
+-    /// - When set to `false`
+-    ///   - glTF cameras and glTF lights: global -Z,
+-    ///   - glTF models: global +Z.
+-    /// - When set to `true`
+-    ///   - glTF cameras and glTF lights: global +Z,
+-    ///   - glTF models: global -Z.
++    /// Overrides the default glTF coordinate conversion setting.
+     ///
+-    /// If `None`, uses the global default set by [`GltfPlugin::use_model_forward_direction`](crate::GltfPlugin::use_model_forward_direction).
+-    pub use_model_forward_direction: Option<bool>,
++    /// If `None`, uses the global default set by [`GltfPlugin::convert_coordinates`](crate::GltfPlugin::convert_coordinates).
++    pub convert_coordinates: Option<GltfConvertCoordinates>,
+ }
+ 
+ impl Default for GltfLoaderSettings {
+@@ -236,7 +220,7 @@ impl Default for GltfLoaderSettings {
+             include_source: false,
+             default_sampler: None,
+             override_sampler: false,
+-            use_model_forward_direction: None,
++            convert_coordinates: None,
+         }
+     }
+ }
+@@ -288,9 +272,9 @@ impl GltfLoader {
+             Default::default()
+         };
+ 
+-        let convert_coordinates = match settings.use_model_forward_direction {
++        let convert_coordinates = match settings.convert_coordinates {
+             Some(convert_coordinates) => convert_coordinates,
+-            None => loader.default_use_model_forward_direction,
++            None => loader.default_convert_coordinates,
+         };
+ 
+         #[cfg(feature = "bevy_animation")]
+@@ -336,16 +320,7 @@ impl GltfLoader {
+                         match outputs {
+                             ReadOutputs::Translations(tr) => {
+                                 let translation_property = animated_field!(Transform::translation);
+-                                let translations: Vec<Vec3> = tr
+-                                    .map(Vec3::from)
+-                                    .map(|verts| {
+-                                        if convert_coordinates {
+-                                            Vec3::convert_coordinates(verts)
+-                                        } else {
+-                                            verts
+-                                        }
+-                                    })
+-                                    .collect();
++                                let translations: Vec<Vec3> = tr.map(Vec3::from).collect();
+                                 if keyframe_timestamps.len() == 1 {
+                                     Some(VariableCurve::new(AnimatableCurve::new(
+                                         translation_property,
+@@ -401,17 +376,8 @@ impl GltfLoader {
+                             }
+                             ReadOutputs::Rotations(rots) => {
+                                 let rotation_property = animated_field!(Transform::rotation);
+-                                let rotations: Vec<Quat> = rots
+-                                    .into_f32()
+-                                    .map(Quat::from_array)
+-                                    .map(|quat| {
+-                                        if convert_coordinates {
+-                                            Quat::convert_coordinates(quat)
+-                                        } else {
+-                                            quat
+-                                        }
+-                                    })
+-                                    .collect();
++                                let rotations: Vec<Quat> =
++                                    rots.into_f32().map(Quat::from_array).collect();
+                                 if keyframe_timestamps.len() == 1 {
+                                     Some(VariableCurve::new(AnimatableCurve::new(
+                                         rotation_property,
+@@ -756,7 +722,7 @@ impl GltfLoader {
+                         accessor,
+                         &buffer_data,
+                         &loader.custom_vertex_attributes,
+-                        convert_coordinates,
++                        convert_coordinates.rotate_meshes,
+                     ) {
+                         Ok((attribute, values)) => mesh.insert_attribute(attribute, values),
+                         Err(err) => warn!("{}", err),
+@@ -783,7 +749,7 @@ impl GltfLoader {
+                         };
+                         let morph_target_image = MorphTargetImage::new(
+                             morph_target_reader.map(|i| PrimitiveMorphAttributesIter {
+-                                convert_coordinates,
++                                convert_coordinates: convert_coordinates.rotate_meshes,
+                                 positions: i.0,
+                                 normals: i.1,
+                                 tangents: i.2,
+@@ -887,15 +853,11 @@ impl GltfLoader {
+                 let local_to_bone_bind_matrices: Vec<Mat4> = reader
+                     .read_inverse_bind_matrices()
+                     .map(|mats| {
+-                        mats.map(|mat| Mat4::from_cols_array_2d(&mat))
+-                            .map(|mat| {
+-                                if convert_coordinates {
+-                                    mat.convert_coordinates()
+-                                } else {
+-                                    mat
+-                                }
+-                            })
+-                            .collect()
++                        mats.map(|mat| {
++                            Mat4::from_cols_array_2d(&mat)
++                                * convert_coordinates.mesh_conversion_mat4()
++                        })
++                        .collect()
+                     })
+                     .unwrap_or_else(|| {
+                         core::iter::repeat_n(Mat4::IDENTITY, gltf_skin.joints().len()).collect()
+@@ -978,7 +940,7 @@ impl GltfLoader {
+                 &node,
+                 children,
+                 mesh,
+-                node_transform(&node, convert_coordinates),
++                node_transform(&node),
+                 skin,
+                 node.extras().as_deref().map(GltfExtras::from),
+             );
+@@ -1011,8 +973,10 @@ impl GltfLoader {
+             let mut entity_to_skin_index_map = EntityHashMap::default();
+             let mut scene_load_context = load_context.begin_labeled_asset();
+ 
++            let world_root_transform = convert_coordinates.scene_conversion_transform();
++
+             let world_root_id = world
+-                .spawn((Transform::default(), Visibility::default()))
++                .spawn((world_root_transform, Visibility::default()))
+                 .with_children(|parent| {
+                     for node in scene.nodes() {
+                         let result = load_node(
+@@ -1030,7 +994,7 @@ impl GltfLoader {
+                             #[cfg(feature = "bevy_animation")]
+                             None,
+                             &gltf.document,
+-                            convert_coordinates,
++                            &convert_coordinates,
+                             &mut extensions,
+                         );
+                         if result.is_err() {
+@@ -1487,11 +1451,11 @@ fn load_node(
+     #[cfg(feature = "bevy_animation")] animation_roots: &HashSet<usize>,
+     #[cfg(feature = "bevy_animation")] mut animation_context: Option<AnimationContext>,
+     document: &Document,
+-    convert_coordinates: bool,
++    convert_coordinates: &GltfConvertCoordinates,
+     extensions: &mut [Box<dyn extensions::GltfExtensionHandler>],
+ ) -> Result<(), GltfError> {
+     let mut gltf_error = None;
+-    let transform = node_transform(gltf_node, convert_coordinates);
++    let transform = node_transform(gltf_node);
+     let world_transform = *parent_transform * transform;
+     // according to https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#instantiation,
+     // if the determinant of the transform is negative we must invert the winding order of
+@@ -1607,12 +1571,18 @@ fn load_node(
+                 };
+                 let bounds = primitive.bounding_box();
+ 
++                // Apply the inverse of the conversion transform that's been
++                // applied to the mesh asset. This preserves the mesh's relation
++                // to the node transform.
++                let mesh_entity_transform = convert_coordinates.mesh_conversion_transform_inverse();
++
+                 let mut mesh_entity = parent.spawn((
+                     // TODO: handle missing label handle errors here?
+                     Mesh3d(load_context.get_label_handle(primitive_label.to_string())),
+                     MeshMaterial3d::<StandardMaterial>(
+                         load_context.get_label_handle(&material_label),
+                     ),
++                    mesh_entity_transform,
+                 ));
+ 
+                 let target_count = primitive.morph_targets().len();
+@@ -1638,7 +1608,7 @@ fn load_node(
+                 let mut bounds_min = Vec3::from_slice(&bounds.min);
+                 let mut bounds_max = Vec3::from_slice(&bounds.max);
+ 
+-                if convert_coordinates {
++                if convert_coordinates.rotate_meshes {
+                     let converted_min = bounds_min.convert_coordinates();
+                     let converted_max = bounds_max.convert_coordinates();
+ 
+diff --git a/examples/testbed/3d.rs b/examples/testbed/3d.rs
+index 0a54d332ac81c..64183894865e0 100644
+--- a/examples/testbed/3d.rs
++++ b/examples/testbed/3d.rs
+@@ -351,7 +351,10 @@ mod gizmos {
+ 
+ mod gltf_coordinate_conversion {
+     use bevy::{
+-        color::palettes::basic::*, gltf::GltfLoaderSettings, prelude::*, scene::SceneInstanceReady,
++        color::palettes::basic::*,
++        gltf::{convert_coordinates::GltfConvertCoordinates, GltfLoaderSettings},
++        prelude::*,
++        scene::SceneInstanceReady,
+     };
+ 
+     const CURRENT_SCENE: super::Scene = super::Scene::GltfCoordinateConversion;
+@@ -395,7 +398,10 @@ mod gltf_coordinate_conversion {
+                 SceneRoot(asset_server.load_with_settings(
+                     GltfAssetLabel::Scene(0).from_asset("models/Faces/faces.glb"),
+                     |s: &mut GltfLoaderSettings| {
+-                        s.use_model_forward_direction = Some(true);
++                        s.convert_coordinates = Some(GltfConvertCoordinates {
++                            rotate_scene_entity: true,
++                            rotate_meshes: true,
++                        });
+                     },
+                 )),
+                 DespawnOnExit(CURRENT_SCENE),
+diff --git a/examples/tools/scene_viewer/main.rs b/examples/tools/scene_viewer/main.rs
+index 7a33843c78626..1a87c8072e234 100644
+--- a/examples/tools/scene_viewer/main.rs
++++ b/examples/tools/scene_viewer/main.rs
+@@ -14,7 +14,7 @@ use bevy::{
+     camera::primitives::{Aabb, Sphere},
+     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+     core_pipeline::prepass::{DeferredPrepass, DepthPrepass},
+-    gltf::GltfPlugin,
++    gltf::{convert_coordinates::GltfConvertCoordinates, GltfPlugin},
+     pbr::DefaultOpaqueRendererMethod,
+     prelude::*,
+     render::experimental::occlusion_culling::OcclusionCulling,
+@@ -49,17 +49,20 @@ struct Args {
+     /// spawn a light even if the scene already has one
+     #[argh(switch)]
+     add_light: Option<bool>,
+-    /// enable `GltfPlugin::use_model_forward_direction`
++    /// enable `GltfPlugin::convert_coordinates::scenes`
+     #[argh(switch)]
+-    use_model_forward_direction: Option<bool>,
++    convert_scene_coordinates: Option<bool>,
++    /// enable `GltfPlugin::convert_coordinates::meshes`
++    #[argh(switch)]
++    convert_mesh_coordinates: Option<bool>,
+ }
+ 
+ impl Args {
+     fn rotation(&self) -> Quat {
+-        if self.use_model_forward_direction == Some(true) {
++        if self.convert_scene_coordinates == Some(true) {
+             // If the scene is converted then rotate everything else to match. This
+             // makes comparisons easier - the scene will always face the same way
+-            // relative to the camera.
++            // relative to the cameras and lights.
+             Quat::from_xyzw(0.0, 1.0, 0.0, 0.0)
+         } else {
+             Quat::IDENTITY
+@@ -92,7 +95,10 @@ fn main() {
+                 ..default()
+             })
+             .set(GltfPlugin {
+-                use_model_forward_direction: args.use_model_forward_direction.unwrap_or(false),
++                convert_coordinates: GltfConvertCoordinates {
++                    rotate_scene_entity: args.convert_scene_coordinates == Some(true),
++                    rotate_meshes: args.convert_mesh_coordinates == Some(true),
++                },
+                 ..default()
+             }),
+         FreeCameraPlugin,
+diff --git a/release-content/migration-guides/gltf-coordinate-conversion.md b/release-content/migration-guides/gltf-coordinate-conversion.md
+new file mode 100644
+index 0000000000000..fda7db176f789
+--- /dev/null
++++ b/release-content/migration-guides/gltf-coordinate-conversion.md
+@@ -0,0 +1,96 @@
++---
++title: glTF Coordinate Conversion
++pull_requests: [20394]
++---
++
++**Bevy 0.17** added experimental options for coordinate conversion of glTF
++files - `GltfPlugin::use_model_forward_direction` and
++`GltfLoaderSettings::use_model_forward_direction`. In **Bevy 0.18** these
++options have changed. The options are disabled by default, so if you haven't
++enabled them then your glTFs will work the same as before.
++
++The goal of coordinate conversion is to take objects that face forward in the
++glTF and change them to match the direction of Bevy's `Transform::forward`.
++Conversion is necessary because glTF's standard scene forward is +Z, while
++Bevy's is -Z (although not all glTF files follow the standard, and there are
++exceptions for cameras and lights).
++
++In 0.17 the conversion was applied to nodes and meshes within glTF scenes.
++This worked well for some users, but had
++[bugs](https://github.com/bevyengine/bevy/issues/20621) and didn't work well for
++other users. In particular, node conversion caused issues with cameras and
++lights.
++
++In 0.18 there are two changes. Firstly, the `use_model_forward_direction` option
++has been renamed to `convert_coordinates`, and is now a struct with two separate
++options.
++
++```diff
++ struct GltfPlugin {
++     ...
++-    use_model_forward_direction: bool,
+++    convert_coordinates: GltfConvertCoordinates,
++ }
++```
++
++```rust
++struct GltfConvertCoordinates {
++    rotate_scene_entity: bool,
++    rotate_meshes: bool,
++}
++```
++
++Secondly, the conversion behavior has changed. Nodes within the glTF scene are
++no longer converted - instead a new conversion is applied to the scene entity
++and mesh primitive entities. Whether these changes affect you will depend on how
++you're using glTFs.
++
++- If you never enabled the 0.17 conversion then you don't need to change
++  anything - conversion remains disabled by default in 0.18. To check if you
++  enabled the conversion, search for `use_model_forward_direction`.
++
++- If you simply spawn your glTF via `SceneRoot` and want it to visually match
++  the `Transform::forward` of the entity it's spawned on, then you're still
++  supported. The internals of the scene will be different in 0.18, but the
++  visual result will be the same. The only option you need to enable is `GltfConvertCoordinates::rotate_scene_entity`.
++
++- If you want the `Mesh` assets in your glTF to be converted then you're
++  supported by the `GltfConvertCoordinates::rotate_meshes` option. This can be
++  combined with the `rotate_scene_entity` option if you want both.
++
++- If you enabled the 0.17 conversion and aren't sure what to enable in 0.18,
++  try enabling both the `rotate_scene_entity` and `rotate_meshes` options. This
++  will be closest to the 0.17 behavior.
++
++- If you tried the 0.17 conversion but found it caused issues with cameras or
++  lights, then the 0.18 conversion should fix these issues.
++
++- If you relied on node conversion, you'll find that 0.18 no longer applies that
++  conversion. This change was made to avoid bugs and give other users more
++  options.
++
++If you want to try out glTF coordinate conversion, the simplest method is to
++set `GltfPlugin::convert_coordinates` - this option can be set on app startup,
++and is applied to all glTFs when they're loaded. For an app that uses
++`DefaultPlugins`, the example below shows how to enable just scene conversion.
++
++```rust
++App::new()
++    .add_plugins(DefaultPlugins.set(GltfPlugin {
++        convert_coordinates: GltfConvertCoordinates { rotate_scene_entity: true, ..default() },
++        ..default()
++    }))
++    .run();
++```
++
++If you want finer control, you can choose the option per-glTF with
++`GltfLoaderSettings`.
++
++```rust
++let handle = asset_server.load_with_settings(
++    "fox.gltf#Scene0",
++    |settings: &mut GltfLoaderSettings| {
++        settings.convert_coordinates = Some(GltfConvertCoordinates { rotate_scene_entity: true, ..default() });
++    },
++);
++```
