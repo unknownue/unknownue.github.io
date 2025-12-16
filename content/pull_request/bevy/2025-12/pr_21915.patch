@@ -1,0 +1,576 @@
+diff --git a/crates/bevy_sprite/src/texture_slice/border_rect.rs b/crates/bevy_sprite/src/texture_slice/border_rect.rs
+index d11e64660ee61..1f95fbe438128 100644
+--- a/crates/bevy_sprite/src/texture_slice/border_rect.rs
++++ b/crates/bevy_sprite/src/texture_slice/border_rect.rs
+@@ -1,64 +1,56 @@
++use bevy_math::Vec2;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ 
+-/// Defines the extents of the border of a rectangle.
++/// Defines border insets that shrink a rectangle from its minimum and maximum corners.
+ ///
+-/// This struct is used to represent thickness or offsets from the edges
+-/// of a rectangle (left, right, top, and bottom), with values increasing inwards.
++/// This struct is used to represent thickness or offsets from the four edges
++/// of a rectangle, with values increasing inwards.
+ #[derive(Default, Copy, Clone, PartialEq, Debug, Reflect)]
+ #[reflect(Clone, PartialEq, Default)]
+ pub struct BorderRect {
+-    /// Extent of the border along the left edge
+-    pub left: f32,
+-    /// Extent of the border along the right edge
+-    pub right: f32,
+-    /// Extent of the border along the top edge
+-    pub top: f32,
+-    /// Extent of the border along the bottom edge
+-    pub bottom: f32,
++    /// Inset applied to the rectangle’s minimum corner
++    pub min_inset: Vec2,
++    /// Inset applied to the rectangle’s maximum corner
++    pub max_inset: Vec2,
+ }
+ 
+ impl BorderRect {
+     /// An empty border with zero thickness along each edge
+     pub const ZERO: Self = Self::all(0.);
+ 
+-    /// Creates a border with the same `extent` along each edge
++    /// Creates a border with the same `inset` along each edge
+     #[must_use]
+     #[inline]
+-    pub const fn all(extent: f32) -> Self {
++    pub const fn all(inset: f32) -> Self {
+         Self {
+-            left: extent,
+-            right: extent,
+-            top: extent,
+-            bottom: extent,
++            min_inset: Vec2::splat(inset),
++            max_inset: Vec2::splat(inset),
+         }
+     }
+ 
+-    /// Creates a new border with the `left` and `right` extents equal to `horizontal`, and `top` and `bottom` extents equal to `vertical`.
++    /// Creates a new border with the `min.x` and `max.x` insets equal to `horizontal`, and the `min.y` and `max.y` insets equal to `vertical`.
+     #[must_use]
+     #[inline]
+     pub const fn axes(horizontal: f32, vertical: f32) -> Self {
++        let insets = Vec2::new(horizontal, vertical);
+         Self {
+-            left: horizontal,
+-            right: horizontal,
+-            top: vertical,
+-            bottom: vertical,
++            min_inset: insets,
++            max_inset: insets,
+         }
+     }
+ }
+ 
+ impl From<f32> for BorderRect {
+-    fn from(extent: f32) -> Self {
+-        Self::all(extent)
++    fn from(inset: f32) -> Self {
++        Self::all(inset)
+     }
+ }
+ 
+ impl From<[f32; 4]> for BorderRect {
+-    fn from([left, right, top, bottom]: [f32; 4]) -> Self {
++    fn from([min_x, max_x, min_y, max_y]: [f32; 4]) -> Self {
+         Self {
+-            left,
+-            right,
+-            top,
+-            bottom,
++            min_inset: Vec2::new(min_x, min_y),
++            max_inset: Vec2::new(max_x, max_y),
+         }
+     }
+ }
+@@ -67,10 +59,8 @@ impl core::ops::Add for BorderRect {
+     type Output = Self;
+ 
+     fn add(mut self, rhs: Self) -> Self::Output {
+-        self.left += rhs.left;
+-        self.right += rhs.right;
+-        self.top += rhs.top;
+-        self.bottom += rhs.bottom;
++        self.min_inset += rhs.min_inset;
++        self.max_inset += rhs.max_inset;
+         self
+     }
+ }
+@@ -79,10 +69,8 @@ impl core::ops::Sub for BorderRect {
+     type Output = Self;
+ 
+     fn sub(mut self, rhs: Self) -> Self::Output {
+-        self.left -= rhs.left;
+-        self.right -= rhs.right;
+-        self.top -= rhs.top;
+-        self.bottom -= rhs.bottom;
++        self.min_inset -= rhs.min_inset;
++        self.max_inset -= rhs.max_inset;
+         self
+     }
+ }
+@@ -91,10 +79,8 @@ impl core::ops::Mul<f32> for BorderRect {
+     type Output = Self;
+ 
+     fn mul(mut self, rhs: f32) -> Self::Output {
+-        self.left *= rhs;
+-        self.right *= rhs;
+-        self.top *= rhs;
+-        self.bottom *= rhs;
++        self.min_inset *= rhs;
++        self.max_inset *= rhs;
+         self
+     }
+ }
+@@ -103,10 +89,8 @@ impl core::ops::Div<f32> for BorderRect {
+     type Output = Self;
+ 
+     fn div(mut self, rhs: f32) -> Self::Output {
+-        self.left /= rhs;
+-        self.right /= rhs;
+-        self.top /= rhs;
+-        self.bottom /= rhs;
++        self.min_inset /= rhs;
++        self.max_inset /= rhs;
+         self
+     }
+ }
+diff --git a/crates/bevy_sprite/src/texture_slice/slicer.rs b/crates/bevy_sprite/src/texture_slice/slicer.rs
+index 3f8ea1c0b4abd..c00e76de7c3a9 100644
+--- a/crates/bevy_sprite/src/texture_slice/slicer.rs
++++ b/crates/bevy_sprite/src/texture_slice/slicer.rs
+@@ -51,10 +51,11 @@ impl TextureSlicer {
+     fn corner_slices(&self, base_rect: Rect, render_size: Vec2) -> [TextureSlice; 4] {
+         let coef = render_size / base_rect.size();
+         let BorderRect {
+-            left,
+-            right,
+-            top,
+-            bottom,
++            min_inset: Vec2 { x: left, y: top },
++            max_inset: Vec2 {
++                x: right,
++                y: bottom,
++            },
+         } = self.border;
+         let min_coef = coef.x.min(coef.y).min(self.max_corner_scale);
+         [
+@@ -121,10 +122,10 @@ impl TextureSlicer {
+             // Left
+             TextureSlice {
+                 texture_rect: Rect {
+-                    min: base_rect.min + vec2(0.0, self.border.top),
++                    min: base_rect.min + vec2(0.0, self.border.min_inset.y),
+                     max: vec2(
+-                        base_rect.min.x + self.border.left,
+-                        base_rect.max.y - self.border.bottom,
++                        base_rect.min.x + self.border.min_inset.x,
++                        base_rect.max.y - self.border.max_inset.y,
+                     ),
+                 },
+                 draw_size: vec2(
+@@ -140,10 +141,10 @@ impl TextureSlicer {
+             TextureSlice {
+                 texture_rect: Rect {
+                     min: vec2(
+-                        base_rect.max.x - self.border.right,
+-                        base_rect.min.y + self.border.top,
++                        base_rect.max.x - self.border.max_inset.x,
++                        base_rect.min.y + self.border.min_inset.y,
+                     ),
+-                    max: base_rect.max - vec2(0.0, self.border.bottom),
++                    max: base_rect.max - vec2(0.0, self.border.max_inset.y),
+                 },
+                 draw_size: vec2(
+                     tr_corner.draw_size.x,
+@@ -169,10 +170,10 @@ impl TextureSlicer {
+             // Top
+             TextureSlice {
+                 texture_rect: Rect {
+-                    min: base_rect.min + vec2(self.border.left, 0.0),
++                    min: base_rect.min + vec2(self.border.min_inset.x, 0.0),
+                     max: vec2(
+-                        base_rect.max.x - self.border.right,
+-                        base_rect.min.y + self.border.top,
++                        base_rect.max.x - self.border.max_inset.x,
++                        base_rect.min.y + self.border.min_inset.y,
+                     ),
+                 },
+                 draw_size: vec2(
+@@ -188,10 +189,10 @@ impl TextureSlicer {
+             TextureSlice {
+                 texture_rect: Rect {
+                     min: vec2(
+-                        base_rect.min.x + self.border.left,
+-                        base_rect.max.y - self.border.bottom,
++                        base_rect.min.x + self.border.min_inset.x,
++                        base_rect.max.y - self.border.max_inset.y,
+                     ),
+-                    max: base_rect.max - vec2(self.border.right, 0.0),
++                    max: base_rect.max - vec2(self.border.max_inset.x, 0.0),
+                 },
+                 draw_size: vec2(
+                     render_size.x - (bl_corner.draw_size.x + br_corner.draw_size.x),
+@@ -216,8 +217,9 @@ impl TextureSlicer {
+     #[must_use]
+     pub fn compute_slices(&self, rect: Rect, render_size: Option<Vec2>) -> Vec<TextureSlice> {
+         let render_size = render_size.unwrap_or_else(|| rect.size());
+-        if self.border.left + self.border.right >= rect.size().x
+-            || self.border.top + self.border.bottom >= rect.size().y
++        if (self.border.min_inset + self.border.max_inset)
++            .cmpge(rect.size())
++            .any()
+         {
+             tracing::error!(
+                 "TextureSlicer::border has out of bounds values. No slicing will be applied"
+@@ -238,8 +240,8 @@ impl TextureSlicer {
+         // Center
+         let center = TextureSlice {
+             texture_rect: Rect {
+-                min: rect.min + vec2(self.border.left, self.border.top),
+-                max: rect.max - vec2(self.border.right, self.border.bottom),
++                min: rect.min + self.border.min_inset,
++                max: rect.max - self.border.max_inset,
+             },
+             draw_size: vec2(
+                 render_size.x - (corners[0].draw_size.x + corners[1].draw_size.x),
+@@ -296,12 +298,7 @@ mod test {
+     #[test]
+     fn test_horizontal_sizes_uniform() {
+         let slicer = TextureSlicer {
+-            border: BorderRect {
+-                left: 10.,
+-                right: 10.,
+-                top: 10.,
+-                bottom: 10.,
+-            },
++            border: BorderRect::all(10.),
+             center_scale_mode: SliceScaleMode::Stretch,
+             sides_scale_mode: SliceScaleMode::Stretch,
+             max_corner_scale: 1.0,
+@@ -329,10 +326,8 @@ mod test {
+     fn test_horizontal_sizes_non_uniform_bigger() {
+         let slicer = TextureSlicer {
+             border: BorderRect {
+-                left: 20.,
+-                right: 10.,
+-                top: 10.,
+-                bottom: 10.,
++                min_inset: Vec2::new(20., 10.),
++                max_inset: Vec2::splat(10.),
+             },
+             center_scale_mode: SliceScaleMode::Stretch,
+             sides_scale_mode: SliceScaleMode::Stretch,
+@@ -361,10 +356,8 @@ mod test {
+     fn test_horizontal_sizes_non_uniform_smaller() {
+         let slicer = TextureSlicer {
+             border: BorderRect {
+-                left: 5.,
+-                right: 10.,
+-                top: 10.,
+-                bottom: 10.,
++                min_inset: Vec2::new(5., 10.),
++                max_inset: Vec2::splat(10.),
+             },
+             center_scale_mode: SliceScaleMode::Stretch,
+             sides_scale_mode: SliceScaleMode::Stretch,
+@@ -406,10 +399,8 @@ mod test {
+     fn test_horizontal_sizes_non_uniform_zero() {
+         let slicer = TextureSlicer {
+             border: BorderRect {
+-                left: 0.,
+-                right: 10.,
+-                top: 10.,
+-                bottom: 10.,
++                min_inset: Vec2::new(0., 10.),
++                max_inset: Vec2::splat(10.),
+             },
+             center_scale_mode: SliceScaleMode::Stretch,
+             sides_scale_mode: SliceScaleMode::Stretch,
+diff --git a/crates/bevy_ui/src/layout/mod.rs b/crates/bevy_ui/src/layout/mod.rs
+index 68b8c69dbd9e9..6464ea8e27a4d 100644
+--- a/crates/bevy_ui/src/layout/mod.rs
++++ b/crates/bevy_ui/src/layout/mod.rs
+@@ -254,10 +254,8 @@ pub fn ui_layout_system(
+             node.bypass_change_detection().content_size = content_size;
+ 
+             let taffy_rect_to_border_rect = |rect: taffy::Rect<f32>| BorderRect {
+-                left: rect.left,
+-                right: rect.right,
+-                top: rect.top,
+-                bottom: rect.bottom,
++                min_inset: Vec2::new(rect.left, rect.top),
++                max_inset: Vec2::new(rect.right, rect.bottom),
+             };
+ 
+             node.bypass_change_detection().border = taffy_rect_to_border_rect(layout.border);
+diff --git a/crates/bevy_ui/src/ui_node.rs b/crates/bevy_ui/src/ui_node.rs
+index 7ab5cd97a9bfc..e3cf6feae28d1 100644
+--- a/crates/bevy_ui/src/ui_node.rs
++++ b/crates/bevy_ui/src/ui_node.rs
+@@ -6,7 +6,7 @@ use bevy_camera::{visibility::Visibility, Camera, RenderTarget};
+ use bevy_color::{Alpha, Color};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{prelude::*, system::SystemParam};
+-use bevy_math::{vec4, BVec2, Rect, UVec2, Vec2, Vec4Swizzles};
++use bevy_math::{BVec2, Rect, UVec2, Vec2, Vec4, Vec4Swizzles};
+ use bevy_reflect::prelude::*;
+ use bevy_sprite::BorderRect;
+ use bevy_utils::once;
+@@ -196,12 +196,7 @@ impl ComputedNode {
+             let sm = s.x.min(s.y);
+             r.min(sm)
+         }
+-        let b = vec4(
+-            self.border.left,
+-            self.border.top,
+-            self.border.right,
+-            self.border.bottom,
+-        );
++        let b = Vec4::from((self.border.min_inset, self.border.max_inset));
+         let s = self.size() - b.xy() - b.zw();
+         ResolvedBorderRadius {
+             top_left: clamp_corner(self.border_radius.top_left, s, b.xy()),
+@@ -223,8 +218,7 @@ impl ComputedNode {
+     #[inline]
+     pub fn content_inset(&self) -> BorderRect {
+         let mut content_inset = self.border + self.padding;
+-        content_inset.right += self.scrollbar_size.x;
+-        content_inset.bottom += self.scrollbar_size.y;
++        content_inset.max_inset += self.scrollbar_size;
+         content_inset
+     }
+ 
+@@ -285,10 +279,8 @@ impl ComputedNode {
+             OverflowClipBox::PaddingBox => self.border(),
+         };
+ 
+-        clip_rect.min.x += clip_inset.left;
+-        clip_rect.min.y += clip_inset.top;
+-        clip_rect.max.x -= clip_inset.right;
+-        clip_rect.max.y -= clip_inset.bottom;
++        clip_rect.min += clip_inset.min_inset;
++        clip_rect.max -= clip_inset.max_inset;
+ 
+         if overflow.x == OverflowAxis::Visible {
+             clip_rect.min.x = -f32::INFINITY;
+@@ -314,10 +306,8 @@ impl ComputedNode {
+     #[inline]
+     pub fn padding_box(&self) -> Rect {
+         let mut out = self.border_box();
+-        out.min.x += self.border.left;
+-        out.max.x -= self.border.right;
+-        out.min.y += self.border.top;
+-        out.max.y -= self.border.bottom;
++        out.min += self.border.min_inset;
++        out.max -= self.border.max_inset;
+         out
+     }
+ 
+@@ -327,10 +317,8 @@ impl ComputedNode {
+     pub fn content_box(&self) -> Rect {
+         let mut out = self.border_box();
+         let content_inset = self.content_inset();
+-        out.min.x += content_inset.left;
+-        out.max.x -= content_inset.right;
+-        out.min.y += content_inset.top;
+-        out.max.y -= content_inset.bottom;
++        out.min += content_inset.min_inset;
++        out.max -= content_inset.max_inset;
+         out
+     }
+ 
+@@ -356,9 +344,9 @@ impl ComputedNode {
+         }
+         let content_inset = self.content_inset();
+         let half_size = 0.5 * self.size;
+-        let min_x = -half_size.x + content_inset.left;
+-        let max_x = half_size.x - content_inset.right;
+-        let min_y = half_size.y - content_inset.bottom;
++        let min_x = -half_size.x + content_inset.min_inset.x;
++        let max_x = half_size.x - content_inset.max_inset.x;
++        let min_y = half_size.y - content_inset.max_inset.y;
+         let max_y = min_y + self.scrollbar_size.y;
+         let gutter = Rect {
+             min: Vec2::new(min_x, min_y),
+@@ -383,10 +371,10 @@ impl ComputedNode {
+         }
+         let content_inset = self.content_inset();
+         let half_size = 0.5 * self.size;
+-        let min_x = half_size.x - content_inset.right;
++        let min_x = half_size.x - content_inset.max_inset.x;
+         let max_x = min_x + self.scrollbar_size.x;
+-        let min_y = -half_size.y + content_inset.top;
+-        let max_y = half_size.y - content_inset.bottom;
++        let min_y = -half_size.y + content_inset.min_inset.y;
++        let max_y = half_size.y - content_inset.max_inset.y;
+         let gutter = Rect {
+             min: Vec2::new(min_x, min_y),
+             max: Vec2::new(max_x, max_y),
+@@ -3165,10 +3153,8 @@ mod tests {
+         let node = ComputedNode {
+             size: Vec2::new(100.0, 60.0),
+             border: BorderRect {
+-                left: 5.0,
+-                right: 7.0,
+-                top: 3.0,
+-                bottom: 9.0,
++                min_inset: Vec2::new(5.0, 3.0),
++                max_inset: Vec2::new(7.0, 9.0),
+             },
+             ..Default::default()
+         };
+@@ -3183,10 +3169,8 @@ mod tests {
+         let node = ComputedNode {
+             size: Vec2::new(80.0, 40.0),
+             padding: BorderRect {
+-                left: 4.0,
+-                right: 6.0,
+-                top: 2.0,
+-                bottom: 8.0,
++                min_inset: Vec2::new(4.0, 2.0),
++                max_inset: Vec2::new(6.0, 8.0),
+             },
+             ..Default::default()
+         };
+diff --git a/crates/bevy_ui/src/update.rs b/crates/bevy_ui/src/update.rs
+index ff2317e9fecdd..3a21307f1dc06 100644
+--- a/crates/bevy_ui/src/update.rs
++++ b/crates/bevy_ui/src/update.rs
+@@ -109,10 +109,8 @@ fn update_clipping(
+             crate::OverflowClipBox::PaddingBox => computed_node.border(),
+         };
+ 
+-        clip_rect.min.x += clip_inset.left;
+-        clip_rect.min.y += clip_inset.top;
+-        clip_rect.max.x -= clip_inset.right;
+-        clip_rect.max.y -= clip_inset.bottom;
++        clip_rect.min += clip_inset.min_inset;
++        clip_rect.max -= clip_inset.max_inset;
+ 
+         clip_rect = clip_rect
+             .inflate(node.overflow_clip_margin.margin.max(0.) / computed_node.inverse_scale_factor);
+diff --git a/crates/bevy_ui_render/src/gradient.rs b/crates/bevy_ui_render/src/gradient.rs
+index f6070d34f328c..75303f75a7d1d 100644
+--- a/crates/bevy_ui_render/src/gradient.rs
++++ b/crates/bevy_ui_render/src/gradient.rs
+@@ -864,10 +864,10 @@ pub fn prepare_gradient(
+                                     gradient.border_radius.bottom_left,
+                                 ],
+                                 border: [
+-                                    gradient.border.left,
+-                                    gradient.border.top,
+-                                    gradient.border.right,
+-                                    gradient.border.bottom,
++                                    gradient.border.min_inset.x,
++                                    gradient.border.min_inset.y,
++                                    gradient.border.max_inset.x,
++                                    gradient.border.max_inset.y,
+                                 ],
+                                 size: rect_size.xy().into(),
+                                 g_start,
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index fb8b5c9b51af5..c5289eb2c79e7 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -1705,7 +1705,12 @@ pub fn prepare_uinodes(
+                                 color,
+                                 flags: flags | shader_flags::CORNERS[i],
+                                 radius: (*border_radius).into(),
+-                                border: [border.left, border.top, border.right, border.bottom],
++                                border: [
++                                    border.min_inset.x,
++                                    border.min_inset.y,
++                                    border.max_inset.x,
++                                    border.max_inset.y,
++                                ],
+                                 size: rect_size.into(),
+                                 point: points[i].into(),
+                             });
+diff --git a/crates/bevy_ui_render/src/ui_material_pipeline.rs b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+index 5398dba2f08f7..fbe579edbe53d 100644
+--- a/crates/bevy_ui_render/src/ui_material_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+@@ -517,10 +517,10 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
+                             size: extracted_uinode.rect.size().into(),
+                             radius: extracted_uinode.border_radius,
+                             border: [
+-                                extracted_uinode.border.left,
+-                                extracted_uinode.border.top,
+-                                extracted_uinode.border.right,
+-                                extracted_uinode.border.bottom,
++                                extracted_uinode.border.min_inset.x,
++                                extracted_uinode.border.min_inset.y,
++                                extracted_uinode.border.max_inset.x,
++                                extracted_uinode.border.max_inset.y,
+                             ],
+                         });
+                     }
+diff --git a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+index 14eeb5c35cac2..03256bb55edb6 100644
+--- a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+@@ -732,18 +732,18 @@ fn compute_texture_slices(
+ 
+             // calculate the normalized extents of the nine-patched image slices
+             let slices = [
+-                border_rect.left / image_size.x,
+-                border_rect.top / image_size.y,
+-                1. - border_rect.right / image_size.x,
+-                1. - border_rect.bottom / image_size.y,
++                border_rect.min_inset.x / image_size.x,
++                border_rect.min_inset.y / image_size.y,
++                1. - border_rect.max_inset.x / image_size.x,
++                1. - border_rect.max_inset.y / image_size.y,
+             ];
+ 
+             // calculate the normalized extents of the target slices
+             let border = [
+-                (border_rect.left / target_size.x) * min_coeff,
+-                (border_rect.top / target_size.y) * min_coeff,
+-                1. - (border_rect.right / target_size.x) * min_coeff,
+-                1. - (border_rect.bottom / target_size.y) * min_coeff,
++                (border_rect.min_inset.x / target_size.x) * min_coeff,
++                (border_rect.min_inset.y / target_size.y) * min_coeff,
++                1. - (border_rect.max_inset.x / target_size.x) * min_coeff,
++                1. - (border_rect.max_inset.y / target_size.y) * min_coeff,
+             ];
+ 
+             let image_side_width = image_size.x * (slices[2] - slices[0]);
+diff --git a/crates/bevy_ui_widgets/src/popover.rs b/crates/bevy_ui_widgets/src/popover.rs
+index 59a811aa1ffb0..eb32d2d61f5ea 100644
+--- a/crates/bevy_ui_widgets/src/popover.rs
++++ b/crates/bevy_ui_widgets/src/popover.rs
+@@ -118,11 +118,8 @@ fn position_popover(
+         };
+         // Computed node size includes the border, but since absolute positioning doesn't include
+         // border we need to remove it from the calculations.
+-        let parent_size = parent_node.size()
+-            - Vec2::new(
+-                parent_node.border.left + parent_node.border.right,
+-                parent_node.border.top + parent_node.border.bottom,
+-            );
++        let parent_size =
++            parent_node.size() - parent_node.border.min_inset - parent_node.border.max_inset;
+         let parent_rect = scale_rect(
+             Rect::from_center_size(parent_transform.translation, parent_size),
+             parent_node.inverse_scale_factor,
+diff --git a/release-content/migration-guides/BorderRects_fields_are_now_vec2s.md b/release-content/migration-guides/BorderRects_fields_are_now_vec2s.md
+new file mode 100644
+index 0000000000000..d9f6407c919c6
+--- /dev/null
++++ b/release-content/migration-guides/BorderRects_fields_are_now_vec2s.md
+@@ -0,0 +1,8 @@
++---
++title: "`BorderRect` now has `Vec2` fields"
++pull_requests: [21581]
++---
++
++The directional BorderRect fields (`left`, `right`, `top`, and `bottom`) have been replaced with `min_inset` and `max_inset` `Vec2` fields.
++
++Using `min_inset` and `max_inset` removes the need to interpret `top` or `bottom` relative to the coordinate system, so the same logic will work consistently in both UI and 2D.
