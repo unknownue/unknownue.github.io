@@ -1,0 +1,304 @@
+diff --git a/crates/bevy_state/src/app.rs b/crates/bevy_state/src/app.rs
+index fb0bb6104366d..3d79fd7e8a56c 100644
+--- a/crates/bevy_state/src/app.rs
++++ b/crates/bevy_state/src/app.rs
+@@ -5,8 +5,9 @@ use log::warn;
+ 
+ use crate::{
+     state::{
+-        setup_state_transitions_in_world, ComputedStates, FreelyMutableState, NextState, State,
+-        StateTransition, StateTransitionEvent, StateTransitionSystems, States, SubStates,
++        setup_state_transitions_in_world, ComputedStates, FreelyMutableState, NextState,
++        PreviousState, State, StateTransition, StateTransitionEvent, StateTransitionSystems,
++        States, SubStates,
+     },
+     state_scoped::{despawn_entities_on_enter_state, despawn_entities_on_exit_state},
+ };
+@@ -215,6 +216,7 @@ impl AppExtStates for SubApp {
+     {
+         self.register_type::<S>();
+         self.register_type::<State<S>>();
++        self.register_type::<PreviousState<S>>();
+         self.register_type_data::<S, crate::reflect::ReflectState>();
+         self
+     }
+@@ -227,6 +229,7 @@ impl AppExtStates for SubApp {
+         self.register_type::<S>();
+         self.register_type::<State<S>>();
+         self.register_type::<NextState<S>>();
++        self.register_type::<PreviousState<S>>();
+         self.register_type_data::<S, crate::reflect::ReflectState>();
+         self.register_type_data::<S, crate::reflect::ReflectFreelyMutableState>();
+         self
+diff --git a/crates/bevy_state/src/lib.rs b/crates/bevy_state/src/lib.rs
+index 31e8b5bea8aac..ddbdbf2581bfc 100644
+--- a/crates/bevy_state/src/lib.rs
++++ b/crates/bevy_state/src/lib.rs
+@@ -89,8 +89,8 @@ pub mod prelude {
+         condition::*,
+         state::{
+             last_transition, ComputedStates, EnterSchedules, ExitSchedules, NextState, OnEnter,
+-            OnExit, OnTransition, State, StateSet, StateTransition, StateTransitionEvent, States,
+-            SubStates, TransitionSchedules,
++            OnExit, OnTransition, PreviousState, State, StateSet, StateTransition,
++            StateTransitionEvent, States, SubStates, TransitionSchedules,
+         },
+         state_scoped::{DespawnOnEnter, DespawnOnExit},
+     };
+diff --git a/crates/bevy_state/src/state/freely_mutable_state.rs b/crates/bevy_state/src/state/freely_mutable_state.rs
+index d16cf8ea42147..a7b22e1ef8a29 100644
+--- a/crates/bevy_state/src/state/freely_mutable_state.rs
++++ b/crates/bevy_state/src/state/freely_mutable_state.rs
+@@ -5,7 +5,7 @@ use bevy_ecs::{
+     system::{Commands, IntoSystem, ResMut},
+ };
+ 
+-use super::{states::States, take_next_state, transitions::*, NextState, State};
++use super::{states::States, take_next_state, transitions::*, NextState, PreviousState, State};
+ 
+ /// This trait allows a state to be mutated directly using the [`NextState<S>`](crate::state::NextState) resource.
+ ///
+@@ -50,6 +50,7 @@ fn apply_state_transition<S: FreelyMutableState>(
+     event: MessageWriter<StateTransitionEvent<S>>,
+     commands: Commands,
+     current_state: Option<ResMut<State<S>>>,
++    previous_state: Option<ResMut<PreviousState<S>>>,
+     next_state: Option<ResMut<NextState<S>>>,
+ ) {
+     let Some((next_state, allow_same_state_transitions)) = take_next_state(next_state) else {
+@@ -62,6 +63,7 @@ fn apply_state_transition<S: FreelyMutableState>(
+         event,
+         commands,
+         Some(current_state),
++        previous_state,
+         Some(next_state),
+         allow_same_state_transitions,
+     );
+diff --git a/crates/bevy_state/src/state/resources.rs b/crates/bevy_state/src/state/resources.rs
+index e4376499f94e7..f82effd304d5d 100644
+--- a/crates/bevy_state/src/state/resources.rs
++++ b/crates/bevy_state/src/state/resources.rs
+@@ -91,6 +91,63 @@ impl<S: States> Deref for State<S> {
+     }
+ }
+ 
++/// The previous state of [`State<S>`].
++///
++/// This resource holds the state value that was active immediately **before** the
++/// most recent state transition. It is primarily useful for logic that runs
++/// during state exit or transition schedules ([`OnExit`](crate::state::OnExit), [`OnTransition`](crate::state::OnTransition)).
++///
++/// It is inserted into the world only after the first state transition occurs. It will
++/// remain present even if the primary state is removed (e.g., when a
++/// [`SubStates`](crate::state::SubStates) or [`ComputedStates`](crate::state::ComputedStates) instance ceases to exist).
++///
++/// Use `Option<Res<PreviousState<S>>>` to access it, as it will not exist
++/// before the first transition.
++///
++/// ```
++/// use bevy_state::prelude::*;
++/// use bevy_ecs::prelude::*;
++/// use bevy_state_macros::States;
++///
++/// #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, States)]
++/// enum GameState {
++///     #[default]
++///     MainMenu,
++///     InGame,
++/// }
++///
++/// // This system might run in an OnExit schedule
++/// fn log_previous_state(previous_state: Option<Res<PreviousState<GameState>>>) {
++///     if let Some(previous) = previous_state {
++///         // If this system is in OnExit(InGame), the previous state is what we
++///         // were in before InGame.
++///         println!("Transitioned from: {:?}", previous.get());
++///     }
++/// }
++/// ```
++#[derive(Resource, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(
++    feature = "bevy_reflect",
++    derive(bevy_reflect::Reflect),
++    reflect(Resource, Debug, PartialEq)
++)]
++pub struct PreviousState<S: States>(pub(crate) S);
++
++impl<S: States> PreviousState<S> {
++    /// Get the previous state.
++    pub fn get(&self) -> &S {
++        &self.0
++    }
++}
++
++impl<S: States> Deref for PreviousState<S> {
++    type Target = S;
++
++    fn deref(&self) -> &Self::Target {
++        &self.0
++    }
++}
++
+ /// The next state of [`State<S>`].
+ ///
+ /// This can be fetched as a resource and used to queue state transitions.
+diff --git a/crates/bevy_state/src/state/state_set.rs b/crates/bevy_state/src/state/state_set.rs
+index a9589f495b509..73e1cbf3c328e 100644
+--- a/crates/bevy_state/src/state/state_set.rs
++++ b/crates/bevy_state/src/state/state_set.rs
+@@ -10,8 +10,8 @@ use self::sealed::StateSetSealed;
+ use super::{
+     computed_states::ComputedStates, internal_apply_state_transition, last_transition, run_enter,
+     run_exit, run_transition, sub_states::SubStates, take_next_state, ApplyStateTransition,
+-    EnterSchedules, ExitSchedules, NextState, State, StateTransitionEvent, StateTransitionSystems,
+-    States, TransitionSchedules,
++    EnterSchedules, ExitSchedules, NextState, PreviousState, State, StateTransitionEvent,
++    StateTransitionSystems, States, TransitionSchedules,
+ };
+ 
+ mod sealed {
+@@ -99,6 +99,7 @@ impl<S: InnerStateSet> StateSet for S {
+              event: MessageWriter<StateTransitionEvent<T>>,
+              commands: Commands,
+              current_state: Option<ResMut<State<T>>>,
++             previous_state: Option<ResMut<PreviousState<T>>>,
+              state_set: Option<Res<State<S::RawState>>>| {
+                 if parent_changed.is_empty() {
+                     return;
+@@ -116,6 +117,7 @@ impl<S: InnerStateSet> StateSet for S {
+                     event,
+                     commands,
+                     current_state,
++                    previous_state,
+                     new_state,
+                     T::ALLOW_SAME_STATE_TRANSITIONS,
+                 );
+@@ -176,6 +178,7 @@ impl<S: InnerStateSet> StateSet for S {
+              event: MessageWriter<StateTransitionEvent<T>>,
+              commands: Commands,
+              current_state_res: Option<ResMut<State<T>>>,
++             previous_state: Option<ResMut<PreviousState<T>>>,
+              next_state_res: Option<ResMut<NextState<T>>>,
+              state_set: Option<Res<State<S::RawState>>>| {
+                 let parent_changed = parent_changed.read().last().is_some();
+@@ -213,6 +216,7 @@ impl<S: InnerStateSet> StateSet for S {
+                     event,
+                     commands,
+                     current_state_res,
++                    previous_state,
+                     new_state,
+                     same_state_enforced,
+                 );
+@@ -270,6 +274,7 @@ macro_rules! impl_state_set_sealed_tuples {
+                      message: MessageWriter<StateTransitionEvent<T>>,
+                      commands: Commands,
+                      current_state: Option<ResMut<State<T>>>,
++                     previous_state: Option<ResMut<PreviousState<T>>>,
+                      ($($val),*,): ($(Option<Res<State<$param::RawState>>>),*,)| {
+                         if ($($evt.is_empty())&&*) {
+                             return;
+@@ -282,7 +287,7 @@ macro_rules! impl_state_set_sealed_tuples {
+                             None
+                         };
+ 
+-                        internal_apply_state_transition(message, commands, current_state, new_state, false);
++                        internal_apply_state_transition(message, commands, current_state, previous_state, new_state, false);
+                     };
+ 
+                 schedule.configure_sets((
+@@ -314,6 +319,7 @@ macro_rules! impl_state_set_sealed_tuples {
+                      message: MessageWriter<StateTransitionEvent<T>>,
+                      commands: Commands,
+                      current_state_res: Option<ResMut<State<T>>>,
++                     previous_state: Option<ResMut<PreviousState<T>>>,
+                      next_state_res: Option<ResMut<NextState<T>>>,
+                      ($($val),*,): ($(Option<Res<State<$param::RawState>>>),*,)| {
+                         let parent_changed = ($($evt.read().last().is_some())||*);
+@@ -348,7 +354,7 @@ macro_rules! impl_state_set_sealed_tuples {
+                                 .unwrap_or(x)
+                         });
+ 
+-                        internal_apply_state_transition(message, commands, current_state_res, new_state, same_state_enforced);
++                        internal_apply_state_transition(message, commands, current_state_res, previous_state, new_state, same_state_enforced);
+                     };
+ 
+                 schedule.configure_sets((
+diff --git a/crates/bevy_state/src/state/transitions.rs b/crates/bevy_state/src/state/transitions.rs
+index deb6a63bab152..a0d0fb7ab9212 100644
+--- a/crates/bevy_state/src/state/transitions.rs
++++ b/crates/bevy_state/src/state/transitions.rs
+@@ -7,7 +7,10 @@ use bevy_ecs::{
+     world::World,
+ };
+ 
+-use super::{resources::State, states::States};
++use super::{
++    resources::{PreviousState, State},
++    states::States,
++};
+ 
+ /// The label of a [`Schedule`] that **only** runs whenever [`State<S>`] enters the provided state.
+ ///
+@@ -136,6 +139,7 @@ pub(crate) fn internal_apply_state_transition<S: States>(
+     mut event: MessageWriter<StateTransitionEvent<S>>,
+     mut commands: Commands,
+     current_state: Option<ResMut<State<S>>>,
++    mut previous_state: Option<ResMut<PreviousState<S>>>,
+     new_state: Option<S>,
+     allow_same_state_transitions: bool,
+ ) {
+@@ -158,6 +162,12 @@ pub(crate) fn internal_apply_state_transition<S: States>(
+                         entered: Some(entered.clone()),
+                         allow_same_state_transitions,
+                     });
++
++                    if let Some(ref mut previous_state) = previous_state {
++                        previous_state.0 = exited;
++                    } else {
++                        commands.insert_resource(PreviousState(exited));
++                    }
+                 }
+                 None => {
+                     // If the [`State<S>`] resource does not exist, we create it, compute dependent states, send a transition event and register the `OnEnter` schedule.
+@@ -168,19 +178,32 @@ pub(crate) fn internal_apply_state_transition<S: States>(
+                         entered: Some(entered.clone()),
+                         allow_same_state_transitions,
+                     });
++
++                    // When [`State<S>`] is initialized, there can be stale data in
++                    // [`PreviousState<S>`] from a prior transition to `None`, so we remove it.
++                    if previous_state.is_some() {
++                        commands.remove_resource::<PreviousState<S>>();
++                    }
+                 }
+             };
+         }
+         None => {
+             // We first remove the [`State<S>`] resource, and if one existed we compute dependent states, send a transition event and run the `OnExit` schedule.
+             if let Some(resource) = current_state {
++                let exited = resource.get().clone();
+                 commands.remove_resource::<State<S>>();
+ 
+                 event.write(StateTransitionEvent {
+-                    exited: Some(resource.get().clone()),
++                    exited: Some(exited.clone()),
+                     entered: None,
+                     allow_same_state_transitions,
+                 });
++
++                if let Some(ref mut previous_state) = previous_state {
++                    previous_state.0 = exited;
++                } else {
++                    commands.insert_resource(PreviousState(exited));
++                }
+             }
+         }
+     }
+@@ -206,6 +229,7 @@ pub fn setup_state_transitions_in_world(world: &mut World) {
+         )
+             .chain(),
+     );
++
+     schedules.insert(schedule);
+ }
+ 
