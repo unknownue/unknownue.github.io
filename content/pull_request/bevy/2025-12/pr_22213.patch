@@ -1,0 +1,460 @@
+diff --git a/crates/bevy_asset/src/lib.rs b/crates/bevy_asset/src/lib.rs
+index 1c1a5a72dcc2e..97745b769020c 100644
+--- a/crates/bevy_asset/src/lib.rs
++++ b/crates/bevy_asset/src/lib.rs
+@@ -710,14 +710,14 @@ mod tests {
+         handle::Handle,
+         io::{
+             gated::{GateOpener, GatedReader},
+-            memory::{Dir, MemoryAssetReader},
++            memory::{Dir, MemoryAssetReader, MemoryAssetWriter},
+             AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceEvent, AssetSourceId,
+             AssetWatcher, Reader, ReaderRequiredFeatures,
+         },
+         loader::{AssetLoader, LoadContext},
+         Asset, AssetApp, AssetEvent, AssetId, AssetLoadError, AssetLoadFailedEvent, AssetPath,
+         AssetPlugin, AssetServer, Assets, InvalidGenerationError, LoadState, LoadedAsset,
+-        UnapprovedPathMode, UntypedHandle,
++        UnapprovedPathMode, UntypedHandle, WriteDefaultMetaError,
+     };
+     use alloc::{
+         boxed::Box,
+@@ -909,12 +909,18 @@ mod tests {
+         let mut app = App::new();
+         let dir = Dir::default();
+         let dir_clone = dir.clone();
++        let dir_clone2 = dir.clone();
+         app.register_asset_source(
+             AssetSourceId::Default,
+             AssetSourceBuilder::new(move || {
+                 Box::new(MemoryAssetReader {
+                     root: dir_clone.clone(),
+                 })
++            })
++            .with_writer(move |_| {
++                Some(Box::new(MemoryAssetWriter {
++                    root: dir_clone2.clone(),
++                }))
+             }),
+         )
+         .add_plugins((
+@@ -2766,4 +2772,62 @@ mod tests {
+             Some(())
+         });
+     }
++
++    pub(crate) fn read_asset_as_string(dir: &Dir, path: &Path) -> String {
++        let bytes = dir.get_asset(path).unwrap();
++        str::from_utf8(bytes.value()).unwrap().to_string()
++    }
++
++    pub(crate) fn read_meta_as_string(dir: &Dir, path: &Path) -> String {
++        let bytes = dir.get_metadata(path).unwrap();
++        str::from_utf8(bytes.value()).unwrap().to_string()
++    }
++
++    #[test]
++    fn writes_default_meta_for_loader() {
++        let (mut app, source) = create_app();
++
++        app.register_asset_loader(CoolTextLoader);
++
++        const ASSET_PATH: &str = "abc.cool.ron";
++        source.insert_asset_text(Path::new(ASSET_PATH), "blah");
++
++        let asset_server = app.world().resource::<AssetServer>().clone();
++        bevy_tasks::block_on(asset_server.write_default_loader_meta_file_for_path(ASSET_PATH))
++            .unwrap();
++
++        assert_eq!(
++            read_meta_as_string(&source, Path::new(ASSET_PATH)),
++            r#"(
++    meta_format_version: "1.0",
++    asset: Load(
++        loader: "bevy_asset::tests::CoolTextLoader",
++        settings: (),
++    ),
++)"#
++        );
++    }
++
++    #[test]
++    fn write_default_meta_does_not_overwrite() {
++        let (mut app, source) = create_app();
++
++        app.register_asset_loader(CoolTextLoader);
++
++        const ASSET_PATH: &str = "abc.cool.ron";
++        source.insert_asset_text(Path::new(ASSET_PATH), "blah");
++        const META_TEXT: &str = "hey i'm walkin here!";
++        source.insert_meta_text(Path::new(ASSET_PATH), META_TEXT);
++
++        let asset_server = app.world().resource::<AssetServer>().clone();
++        assert!(matches!(
++            bevy_tasks::block_on(asset_server.write_default_loader_meta_file_for_path(ASSET_PATH)),
++            Err(WriteDefaultMetaError::MetaAlreadyExists)
++        ));
++
++        assert_eq!(
++            read_meta_as_string(&source, Path::new(ASSET_PATH)),
++            META_TEXT
++        );
++    }
+ }
+diff --git a/crates/bevy_asset/src/meta.rs b/crates/bevy_asset/src/meta.rs
+index bf51a3391d8a9..9d309bd83348d 100644
+--- a/crates/bevy_asset/src/meta.rs
++++ b/crates/bevy_asset/src/meta.rs
+@@ -163,9 +163,14 @@ impl<L: AssetLoader, P: Process> AssetMetaDyn for AssetMeta<L, P> {
+         }
+     }
+     fn serialize(&self) -> Vec<u8> {
+-        ron::ser::to_string_pretty(&self, PrettyConfig::default())
+-            .expect("type is convertible to ron")
+-            .into_bytes()
++        ron::ser::to_string_pretty(
++            &self,
++            // This defaults to \r\n on Windows, so hard-code it to \n so it's consistent for
++            // testing.
++            PrettyConfig::default().new_line("\n"),
++        )
++        .expect("type is convertible to ron")
++        .into_bytes()
+     }
+     fn processed_info(&self) -> &Option<ProcessedInfo> {
+         &self.processed_info
+diff --git a/crates/bevy_asset/src/processor/mod.rs b/crates/bevy_asset/src/processor/mod.rs
+index 565b234aeddb7..b43bab28758ed 100644
+--- a/crates/bevy_asset/src/processor/mod.rs
++++ b/crates/bevy_asset/src/processor/mod.rs
+@@ -77,8 +77,6 @@ use tracing::{debug, error, trace, warn};
+ #[cfg(feature = "trace")]
+ use {
+     alloc::string::ToString,
+-    bevy_reflect::TypePath,
+-    bevy_tasks::ConditionalSendFuture,
+     tracing::{info_span, instrument::Instrument},
+ };
+ 
+@@ -754,8 +752,6 @@ impl AssetProcessor {
+             .processors
+             .write()
+             .unwrap_or_else(PoisonError::into_inner);
+-        #[cfg(feature = "trace")]
+-        let processor = InstrumentedAssetProcessor(processor);
+         let processor = Arc::new(processor);
+         processors
+             .type_path_to_processor
+@@ -1195,9 +1191,17 @@ impl AssetProcessor {
+                     reader_for_process,
+                     &mut new_processed_info,
+                 );
+-                processor
+-                    .process(&mut context, settings, &mut *writer)
+-                    .await?
++                let process = processor.process(&mut context, settings, &mut *writer);
++                #[cfg(feature = "trace")]
++                let process = {
++                    let span = info_span!(
++                        "asset processing",
++                        processor = processor.type_path(),
++                        asset = asset_path.to_string(),
++                    );
++                    process.instrument(span)
++                };
++                process.await?
+             };
+ 
+             writer
+@@ -1504,32 +1508,6 @@ impl ProcessingState {
+     }
+ }
+ 
+-#[cfg(feature = "trace")]
+-#[derive(TypePath)]
+-struct InstrumentedAssetProcessor<T>(T);
+-
+-#[cfg(feature = "trace")]
+-impl<T: Process> Process for InstrumentedAssetProcessor<T> {
+-    type Settings = T::Settings;
+-    type OutputLoader = T::OutputLoader;
+-
+-    fn process(
+-        &self,
+-        context: &mut ProcessContext,
+-        settings: &Self::Settings,
+-        writer: &mut crate::io::Writer,
+-    ) -> impl ConditionalSendFuture<
+-        Output = Result<<Self::OutputLoader as crate::AssetLoader>::Settings, ProcessError>,
+-    > {
+-        let span = info_span!(
+-            "asset processing",
+-            processor = T::type_path(),
+-            asset = context.path().to_string(),
+-        );
+-        self.0.process(context, settings, writer).instrument(span)
+-    }
+-}
+-
+ /// The (successful) result of processing an asset
+ #[derive(Debug, Clone)]
+ pub enum ProcessResult {
+diff --git a/crates/bevy_asset/src/processor/process.rs b/crates/bevy_asset/src/processor/process.rs
+index 925aa8a8afb0b..80f0e8a2eb878 100644
+--- a/crates/bevy_asset/src/processor/process.rs
++++ b/crates/bevy_asset/src/processor/process.rs
+@@ -245,6 +245,8 @@ pub trait ErasedProcessor: Send + Sync {
+     /// Deserialized `meta` as type-erased [`AssetMeta`], operating under the assumption that it matches the meta
+     /// for the underlying [`Process`] impl.
+     fn deserialize_meta(&self, meta: &[u8]) -> Result<Box<dyn AssetMetaDyn>, DeserializeMetaError>;
++    /// Returns the type-path of the original [`Process`].
++    fn type_path(&self) -> &'static str;
+     /// Returns the default type-erased [`AssetMeta`] for the underlying [`Process`] impl.
+     fn default_meta(&self) -> Box<dyn AssetMetaDyn>;
+ }
+@@ -281,6 +283,10 @@ impl<P: Process> ErasedProcessor for P {
+         Ok(Box::new(meta))
+     }
+ 
++    fn type_path(&self) -> &'static str {
++        P::type_path()
++    }
++
+     fn default_meta(&self) -> Box<dyn AssetMetaDyn> {
+         Box::new(AssetMeta::<(), P>::new(AssetAction::Process {
+             processor: P::type_path().to_string(),
+diff --git a/crates/bevy_asset/src/processor/tests.rs b/crates/bevy_asset/src/processor/tests.rs
+index 3bf573613fc96..5a02b819e098b 100644
+--- a/crates/bevy_asset/src/processor/tests.rs
++++ b/crates/bevy_asset/src/processor/tests.rs
+@@ -33,9 +33,13 @@ use crate::{
+         ProcessError, ProcessorState, ProcessorTransactionLog, ProcessorTransactionLogFactory,
+     },
+     saver::AssetSaver,
+-    tests::{run_app_until, CoolText, CoolTextLoader, CoolTextRon, SubText},
++    tests::{
++        read_asset_as_string, read_meta_as_string, run_app_until, CoolText, CoolTextLoader,
++        CoolTextRon, SubText,
++    },
+     transformer::{AssetTransformer, TransformedAsset},
+     Asset, AssetApp, AssetLoader, AssetMode, AssetPath, AssetPlugin, LoadContext,
++    WriteDefaultMetaError,
+ };
+ 
+ #[derive(TypePath)]
+@@ -324,6 +328,9 @@ fn create_app_with_asset_processor(extra_sources: &[String]) -> AppWithProcessor
+                 root: source_dir.clone(),
+             },
+         );
++        let source_memory_writer = MemoryAssetWriter {
++            root: source_dir.clone(),
++        };
+         let processed_memory_reader = MemoryAssetReader {
+             root: processed_dir.clone(),
+         };
+@@ -340,6 +347,7 @@ fn create_app_with_asset_processor(extra_sources: &[String]) -> AppWithProcessor
+         app.register_asset_source(
+             source_id,
+             AssetSourceBuilder::new(move || Box::new(source_memory_reader.clone()))
++                .with_writer(move |_| Some(Box::new(source_memory_writer.clone())))
+                 .with_watcher(move |sender: async_channel::Sender<AssetSourceEvent>| {
+                     source_event_sender_sender.send_blocking(sender).unwrap();
+                     Some(Box::new(FakeWatcher))
+@@ -500,11 +508,6 @@ impl MutateAsset<CoolText> for AddText {
+     }
+ }
+ 
+-fn read_asset_as_string(dir: &Dir, path: &Path) -> String {
+-    let bytes = dir.get_asset(path).unwrap();
+-    str::from_utf8(bytes.value()).unwrap().to_string()
+-}
+-
+ #[test]
+ fn no_meta_or_default_processor_copies_asset() {
+     // Assets without a meta file or a default processor should still be accessible in the
+@@ -1728,3 +1731,82 @@ fn only_reprocesses_wrong_hash_on_startup() {
+         serialize_as_cool_text("dep_changed processed DIFFERENT processed")
+     );
+ }
++
++#[test]
++fn writes_default_meta_for_processor() {
++    let AppWithProcessor {
++        mut app,
++        default_source_dirs: ProcessingDirs { source, .. },
++        ..
++    } = create_app_with_asset_processor(&[]);
++
++    type CoolTextProcessor = LoadTransformAndSave<
++        CoolTextLoader,
++        RootAssetTransformer<AddText, CoolText>,
++        CoolTextSaver,
++    >;
++
++    app.register_asset_processor(CoolTextProcessor::new(
++        RootAssetTransformer::new(AddText("blah".to_string())),
++        CoolTextSaver,
++    ))
++    .set_default_asset_processor::<CoolTextProcessor>("cool.ron");
++
++    const ASSET_PATH: &str = "abc.cool.ron";
++    source.insert_asset_text(Path::new(ASSET_PATH), &serialize_as_cool_text("blah"));
++
++    let processor = app.world().resource::<AssetProcessor>().clone();
++    bevy_tasks::block_on(processor.write_default_meta_file_for_path(ASSET_PATH)).unwrap();
++
++    assert_eq!(
++        read_meta_as_string(&source, Path::new(ASSET_PATH)),
++        r#"(
++    meta_format_version: "1.0",
++    asset: Process(
++        processor: "bevy_asset::processor::process::LoadTransformAndSave<bevy_asset::tests::CoolTextLoader, bevy_asset::processor::tests::RootAssetTransformer<bevy_asset::processor::tests::AddText, bevy_asset::tests::CoolText>, bevy_asset::processor::tests::CoolTextSaver>",
++        settings: (
++            loader_settings: (),
++            transformer_settings: (),
++            saver_settings: (),
++        ),
++    ),
++)"#
++    );
++}
++
++#[test]
++fn write_default_meta_does_not_overwrite() {
++    let AppWithProcessor {
++        mut app,
++        default_source_dirs: ProcessingDirs { source, .. },
++        ..
++    } = create_app_with_asset_processor(&[]);
++
++    type CoolTextProcessor = LoadTransformAndSave<
++        CoolTextLoader,
++        RootAssetTransformer<AddText, CoolText>,
++        CoolTextSaver,
++    >;
++
++    app.register_asset_processor(CoolTextProcessor::new(
++        RootAssetTransformer::new(AddText("blah".to_string())),
++        CoolTextSaver,
++    ))
++    .set_default_asset_processor::<CoolTextProcessor>("cool.ron");
++
++    const ASSET_PATH: &str = "abc.cool.ron";
++    source.insert_asset_text(Path::new(ASSET_PATH), &serialize_as_cool_text("blah"));
++    const META_TEXT: &str = "hey i'm walkin here!";
++    source.insert_meta_text(Path::new(ASSET_PATH), META_TEXT);
++
++    let processor = app.world().resource::<AssetProcessor>().clone();
++    assert!(matches!(
++        bevy_tasks::block_on(processor.write_default_meta_file_for_path(ASSET_PATH)),
++        Err(WriteDefaultMetaError::MetaAlreadyExists)
++    ));
++
++    assert_eq!(
++        read_meta_as_string(&source, Path::new(ASSET_PATH)),
++        META_TEXT
++    );
++}
+diff --git a/crates/bevy_asset/src/server/loaders.rs b/crates/bevy_asset/src/server/loaders.rs
+index 6e0aeb1c58a11..c258fdfe3a92f 100644
+--- a/crates/bevy_asset/src/server/loaders.rs
++++ b/crates/bevy_asset/src/server/loaders.rs
+@@ -5,22 +5,12 @@ use crate::{
+ use alloc::{boxed::Box, sync::Arc, vec::Vec};
+ use async_broadcast::RecvError;
+ use bevy_platform::collections::HashMap;
+-#[cfg(feature = "trace")]
+-use bevy_reflect::TypePath;
+ use bevy_tasks::IoTaskPool;
+ use bevy_utils::TypeIdMap;
+ use core::any::TypeId;
+ use thiserror::Error;
+ use tracing::warn;
+ 
+-#[cfg(feature = "trace")]
+-use {
+-    crate::io::ReaderRequiredFeatures,
+-    alloc::string::ToString,
+-    bevy_tasks::ConditionalSendFuture,
+-    tracing::{info_span, instrument::Instrument},
+-};
+-
+ #[derive(Default)]
+ pub(crate) struct AssetLoaders {
+     loaders: Vec<MaybeAssetLoader>,
+@@ -43,8 +33,6 @@ impl AssetLoaders {
+         let loader_asset_type = TypeId::of::<L::Asset>();
+         let loader_asset_type_name = core::any::type_name::<L::Asset>();
+ 
+-        #[cfg(feature = "trace")]
+-        let loader = InstrumentedAssetLoader(loader);
+         let loader = Arc::new(loader);
+ 
+         let (loader_index, is_new) =
+@@ -314,39 +302,6 @@ impl MaybeAssetLoader {
+     }
+ }
+ 
+-#[cfg(feature = "trace")]
+-#[derive(TypePath)]
+-struct InstrumentedAssetLoader<T>(T);
+-
+-#[cfg(feature = "trace")]
+-impl<T: AssetLoader> AssetLoader for InstrumentedAssetLoader<T> {
+-    type Asset = T::Asset;
+-    type Settings = T::Settings;
+-    type Error = T::Error;
+-
+-    fn load(
+-        &self,
+-        reader: &mut dyn crate::io::Reader,
+-        settings: &Self::Settings,
+-        load_context: &mut crate::LoadContext,
+-    ) -> impl ConditionalSendFuture<Output = Result<Self::Asset, Self::Error>> {
+-        let span = info_span!(
+-            "asset loading",
+-            loader = T::type_path(),
+-            asset = load_context.path().to_string(),
+-        );
+-        self.0.load(reader, settings, load_context).instrument(span)
+-    }
+-
+-    fn reader_required_features(settings: &Self::Settings) -> ReaderRequiredFeatures {
+-        T::reader_required_features(settings)
+-    }
+-
+-    fn extensions(&self) -> &[&str] {
+-        self.0.extensions()
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use alloc::{format, string::String};
+diff --git a/crates/bevy_asset/src/server/mod.rs b/crates/bevy_asset/src/server/mod.rs
+index 293291f5860dc..639da9ef3ee87 100644
+--- a/crates/bevy_asset/src/server/mod.rs
++++ b/crates/bevy_asset/src/server/mod.rs
+@@ -1543,9 +1543,19 @@ impl AssetServer {
+         let asset_path = asset_path.clone_owned();
+         let load_context =
+             LoadContext::new(self, asset_path.clone(), load_dependencies, populate_hashes);
+-        AssertUnwindSafe(loader.load(reader, settings, load_context))
+-            .catch_unwind()
+-            .await
++        let load = AssertUnwindSafe(loader.load(reader, settings, load_context)).catch_unwind();
++        #[cfg(feature = "trace")]
++        let load = {
++            use tracing::Instrument;
++
++            let span = tracing::info_span!(
++                "asset loading",
++                loader = loader.type_path(),
++                asset = asset_path.to_string()
++            );
++            load.instrument(span)
++        };
++        load.await
+             .map_err(|_| AssetLoadError::AssetLoaderPanic {
+                 path: asset_path.clone_owned(),
+                 loader_name: loader.type_path(),
