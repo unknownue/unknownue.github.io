@@ -1,0 +1,1170 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b7ab3efcdbd2a..ce3b87468e628 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4912,3 +4912,14 @@ name = "Clustered Decal Maps"
+ description = "Demonstrates normal and metallic-roughness maps of decals"
+ category = "3D Rendering"
+ wasm = false
++
++[[example]]
++name = "mirror"
++path = "examples/3d/mirror.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.mirror]
++name = "Mirror"
++description = "Demonstrates how to create a mirror with a second camera"
++category = "3D Rendering"
++wasm = true
+diff --git a/assets/shaders/screen_space_texture_material.wgsl b/assets/shaders/screen_space_texture_material.wgsl
+new file mode 100644
+index 0000000000000..141d75639b489
+--- /dev/null
++++ b/assets/shaders/screen_space_texture_material.wgsl
+@@ -0,0 +1,37 @@
++// A shader that samples its emissive texture at screen space positions rather
++// than UVs.
++//
++// This is used for the mirror example: `examples/3d/mirror.rs`.
++
++#import bevy_pbr::{
++    forward_io::{VertexOutput, FragmentOutput},
++    pbr_bindings::emissive_texture,
++    pbr_fragment::pbr_input_from_standard_material,
++    pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing}
++}
++
++// This is unused, but it's here to satisfy `ExtendedMaterial` requirements.
++// See the comment in `ScreenSpaceTextureExtension` in `examples/3d/mirror.rs`
++// for more information.
++struct ScreenSpaceTextureMaterial {
++    // An unused value.
++    dummy: f32,
++}
++
++@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> material: ScreenSpaceTextureMaterial;
++
++@fragment
++fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
++    var pbr_input = pbr_input_from_standard_material(in, is_front);
++
++    // Use zero alpha to avoid multiplying the emissive by the view exposure.
++    pbr_input.material.emissive = vec4(
++        textureLoad(emissive_texture, vec2<i32>(floor(in.position.xy)), 0).rgb,
++        0.0
++    );
++
++    var out: FragmentOutput;
++    out.color = apply_pbr_lighting(pbr_input);
++    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
++    return out;
++}
+diff --git a/crates/bevy_camera/src/camera.rs b/crates/bevy_camera/src/camera.rs
+index d68f4c29b5bbf..dd5f1019abe6e 100644
+--- a/crates/bevy_camera/src/camera.rs
++++ b/crates/bevy_camera/src/camera.rs
+@@ -365,6 +365,15 @@ pub struct Camera {
+     pub msaa_writeback: MsaaWriteback,
+     /// The clear color operation to perform on the render target.
+     pub clear_color: ClearColorConfig,
++    /// Whether to switch culling mode so that materials that request backface
++    /// culling cull front faces, and vice versa.
++    ///
++    /// This is typically used for cameras that mirror the world that they
++    /// render across a plane, because doing that flips the winding of each
++    /// polygon.
++    ///
++    /// This setting doesn't affect materials that disable backface culling.
++    pub invert_culling: bool,
+     /// If set, this camera will be a sub camera of a large view, defined by a [`SubCameraView`].
+     pub sub_camera_view: Option<SubCameraView>,
+ }
+@@ -380,6 +389,7 @@ impl Default for Camera {
+             output_mode: Default::default(),
+             msaa_writeback: MsaaWriteback::default(),
+             clear_color: Default::default(),
++            invert_culling: false,
+             sub_camera_view: None,
+         }
+     }
+diff --git a/crates/bevy_camera/src/primitives.rs b/crates/bevy_camera/src/primitives.rs
+index db02eb80f96a5..628371d9bdb55 100644
+--- a/crates/bevy_camera/src/primitives.rs
++++ b/crates/bevy_camera/src/primitives.rs
+@@ -729,6 +729,7 @@ mod tests {
+             aspect_ratio: 1.0,
+             near: 1.0,
+             far: 100.0,
++            ..PerspectiveProjection::default()
+         };
+         proj.compute_frustum(&GlobalTransform::from_translation(Vec3::new(2.0, 2.0, 0.0)))
+     }
+@@ -743,6 +744,7 @@ mod tests {
+             near,
+             far,
+             fov,
++            ..PerspectiveProjection::default()
+         };
+         proj.compute_frustum(&GlobalTransform::IDENTITY)
+     }
+diff --git a/crates/bevy_camera/src/projection.rs b/crates/bevy_camera/src/projection.rs
+index 12a6dd89e8d15..7fcbb6930b37e 100644
+--- a/crates/bevy_camera/src/projection.rs
++++ b/crates/bevy_camera/src/projection.rs
+@@ -4,7 +4,7 @@ use core::ops::{Deref, DerefMut};
+ use crate::{primitives::Frustum, visibility::VisibilitySystems};
+ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_ecs::prelude::*;
+-use bevy_math::{ops, AspectRatio, Mat4, Rect, Vec2, Vec3A, Vec4};
++use bevy_math::{ops, vec4, AspectRatio, Mat4, Rect, Vec2, Vec3A, Vec4};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect, ReflectDeserialize, ReflectSerialize};
+ use bevy_transform::{components::GlobalTransform, TransformSystems};
+ use derive_more::derive::From;
+@@ -307,11 +307,38 @@ pub struct PerspectiveProjection {
+     ///
+     /// Defaults to a value of `1000.0`.
+     pub far: f32,
++
++    /// The orientation of a custom clipping plane, as well as its distance from
++    /// the camera.
++    ///
++    /// If you supply a plane here, anything in front of the plane will be
++    /// clipped out. This is useful for portals and mirrors, in order to clip
++    /// any geometry that would pass through the plane of the portal or mirror.
++    ///
++    /// The X, Y, and Z components of the vector describe its normal, in view
++    /// space. This normal vector must have length 1, and it should point away
++    /// from the camera. (That is, only geometry on the side of the plane that
++    /// the normal points toward will be rendered.) The W component of the
++    /// vector must be the *negative shortest signed distance* from the camera
++    /// to the plane, again in view space.  This final component can also be
++    /// computed as -(N ·  Q), where N is the normal of the plane and Q is any
++    /// point on it.
++    ///
++    /// By default, this is (0, 0, -1, -[`Self::near`]), which describes a near
++    /// plane located [`Self::near`] meters away pointing directly away from the
++    /// camera.
++    ///
++    /// See the `calculate_mirror_camera_transform_and_projection` function in
++    /// the `mirror` example for an exhaustive example of usage.
++    pub near_clip_plane: Vec4,
+ }
+ 
+ impl CameraProjection for PerspectiveProjection {
+     fn get_clip_from_view(&self) -> Mat4 {
+-        Mat4::perspective_infinite_reverse_rh(self.fov, self.aspect_ratio, self.near)
++        let mut matrix =
++            Mat4::perspective_infinite_reverse_rh(self.fov, self.aspect_ratio, self.near);
++        self.adjust_perspective_matrix_for_clip_plane(&mut matrix);
++        matrix
+     }
+ 
+     fn get_clip_from_view_for_sub(&self, sub_view: &super::SubCameraView) -> Mat4 {
+@@ -347,12 +374,15 @@ impl CameraProjection for PerspectiveProjection {
+         let a = (right_prime + left_prime) / (right_prime - left_prime);
+         let b = (top_prime + bottom_prime) / (top_prime - bottom_prime);
+ 
+-        Mat4::from_cols(
++        let mut matrix = Mat4::from_cols(
+             Vec4::new(x, 0.0, 0.0, 0.0),
+             Vec4::new(0.0, y, 0.0, 0.0),
+             Vec4::new(a, b, 0.0, -1.0),
+             Vec4::new(0.0, 0.0, self.near, 0.0),
+-        )
++        );
++
++        self.adjust_perspective_matrix_for_clip_plane(&mut matrix);
++        matrix
+     }
+ 
+     fn update(&mut self, width: f32, height: f32) {
+@@ -391,7 +421,79 @@ impl Default for PerspectiveProjection {
+             near: 0.1,
+             far: 1000.0,
+             aspect_ratio: 1.0,
++            near_clip_plane: vec4(0.0, 0.0, -1.0, -0.1),
++        }
++    }
++}
++
++impl PerspectiveProjection {
++    /// Adjusts the perspective matrix for an oblique clip plane if necessary.
++    ///
++    /// This changes the near and (infinite) far planes so that they correctly
++    /// clip everything in front of the [`Self::near_clip_plane`]. See [Lengyel
++    /// 2005] for an exhaustive treatment of the way this works. Custom near
++    /// clip planes are typically used for portals and mirrors; see
++    /// `examples/3d/mirror.rs` for an example of usage.
++    fn adjust_perspective_matrix_for_clip_plane(&self, matrix: &mut Mat4) {
++        // If we don't have an oblique clip plane, save ourselves the trouble.
++        if self.near_clip_plane == vec4(0.0, 0.0, -1.0, -self.near) {
++            return;
+         }
++
++        // To understand this, refer to [Lengyel 2005]. The notation follows the
++        // paper. The formulas are different because the paper uses a standard
++        // OpenGL convention (near -1, far 1), while we use a reversed Vulkan
++        // convention (near 1, far 0).
++        //
++        // [Lengyel 2005]: https://terathon.com/lengyel/Lengyel-Oblique.pdf
++        let c = self.near_clip_plane;
++
++        // First, calculate the position of Q′, the corner in clip space lying
++        // opposite from the near clip plane. This is identical to equation (7).
++        // Note that this is a point at infinity in view space, because we use
++        // an infinite far plane, but in clip space it's finite.
++        let q_prime = vec4(c.x.signum(), c.y.signum(), 0.0, 1.0);
++
++        // Now convert that point to view space. This *will* be a point at
++        // infinity, but that's OK because we're in homogeneous coordinates.
++        let q = matrix.inverse() * q_prime;
++
++        // Here we're computing the scaling factor to apply to the near plane so
++        // that the far plane will intersect Q. This one differs from the paper.
++        // Using the notation Mᵢ to mean the *i*th row of the matrix M, start by
++        // observing that the near plane (z = 1) is described by M₄ - M₃ and the
++        // far plane (z = 0) is described by simply M₃. So:
++        //
++        // * Equation (4) becomes C = M₄ - M₃.
++        // * Equation (5) becomes M′₃ = M₄ - C.
++        // * Equation (6) becomes F = M′₃ = M₄ - C.
++        // * Equation (8) becomes F = M₄ - aC.
++        // * Equation (9) becomes F ·  Q = 0 ⇒ (M₄ - aC) ·  Q = 0.
++        //
++        // And, solving the modified equation (9), we get:
++        //
++        //          M₄ ·  Q
++        //      a = ⎯⎯⎯⎯⎯⎯
++        //           C ·  Q
++        //
++        // Because M₄ = (0, 0, -1, 0) (just as it is in the paper), this reduces to:
++        //
++        //           -Qz
++        //      a = ⎯⎯⎯⎯⎯
++        //          C ·  Q
++        //
++        // Which is what we calculate here.
++        let a = -q.z / c.dot(q);
++
++        // Finally, we have the revised equation (10), which is M′₃ = M₄ - aC.
++        // Similarly to the above, this simplifies to M′₃ = (0, 0, -1, 0) - aC.
++        let m3_prime = Vec4::NEG_Z - c * a;
++
++        // We have the replacement third row; write it in.
++        matrix.x_axis.z = m3_prime.x;
++        matrix.y_axis.z = m3_prime.y;
++        matrix.z_axis.z = m3_prime.z;
++        matrix.w_axis.z = m3_prime.w;
+     }
+ }
+ 
+diff --git a/crates/bevy_math/src/lib.rs b/crates/bevy_math/src/lib.rs
+index cbf861d818870..f49c019bede78 100644
+--- a/crates/bevy_math/src/lib.rs
++++ b/crates/bevy_math/src/lib.rs
+@@ -35,6 +35,7 @@ pub mod cubic_splines;
+ mod direction;
+ mod float_ord;
+ mod isometry;
++mod mat3;
+ pub mod ops;
+ pub mod primitives;
+ mod ray;
+@@ -54,6 +55,7 @@ pub use compass::{CompassOctant, CompassQuadrant};
+ pub use direction::*;
+ pub use float_ord::*;
+ pub use isometry::{Isometry2d, Isometry3d};
++pub use mat3::*;
+ pub use ops::FloatPow;
+ pub use ray::{Ray2d, Ray3d};
+ pub use rects::*;
+diff --git a/crates/bevy_math/src/mat3.rs b/crates/bevy_math/src/mat3.rs
+new file mode 100644
+index 0000000000000..62cd1ee58c7f5
+--- /dev/null
++++ b/crates/bevy_math/src/mat3.rs
+@@ -0,0 +1,30 @@
++//! Extra utilities for 3×3 matrices.
++
++use glam::{Mat3A, Vec3, Vec3A};
++
++/// Creates a 3×3 matrix that reflects points across the plane at the origin
++/// with the given normal.
++///
++/// This is also known as a [Householder matrix]. It has the general form I -
++/// 2NNᵀ, where N is the normal of the plane and I is the identity matrix.
++///
++/// If the plane across which points are to be reflected isn't at the origin,
++/// you can create a translation matrix that translates the points to the
++/// origin, then apply the matrix that this function returns on top of that, and
++/// finally translate back to the original position.
++///
++/// See the `mirror` example for a demonstration of how you might use this
++/// function.
++///
++/// [Householder matrix]: https://en.wikipedia.org/wiki/Householder_transformation
++#[doc(alias = "householder")]
++pub fn reflection_matrix(plane_normal: Vec3) -> Mat3A {
++    // N times Nᵀ.
++    let n_nt = Mat3A::from_cols(
++        Vec3A::from(plane_normal) * plane_normal.x,
++        Vec3A::from(plane_normal) * plane_normal.y,
++        Vec3A::from(plane_normal) * plane_normal.z,
++    );
++
++    Mat3A::IDENTITY - n_nt * 2.0
++}
+diff --git a/crates/bevy_pbr/src/deferred/mod.rs b/crates/bevy_pbr/src/deferred/mod.rs
+index 10cd2b9c10074..41766372d9f36 100644
+--- a/crates/bevy_pbr/src/deferred/mod.rs
++++ b/crates/bevy_pbr/src/deferred/mod.rs
+@@ -501,6 +501,10 @@ pub fn prepare_deferred_lighting_pipelines(
+             view_key |= MeshPipelineKey::ATMOSPHERE;
+         }
+ 
++        if view.invert_culling {
++            view_key |= MeshPipelineKey::INVERT_CULLING;
++        }
++
+         // Always true, since we're in the deferred lighting pipeline
+         view_key |= MeshPipelineKey::DEFERRED_PREPASS;
+ 
+diff --git a/crates/bevy_pbr/src/pbr_material.rs b/crates/bevy_pbr/src/pbr_material.rs
+index 2d19f863efc7e..84bfc6ff53b39 100644
+--- a/crates/bevy_pbr/src/pbr_material.rs
++++ b/crates/bevy_pbr/src/pbr_material.rs
+@@ -1531,15 +1531,19 @@ impl Material for StandardMaterial {
+             }
+         }
+ 
+-        descriptor.primitive.cull_mode = if key
+-            .bind_group_data
+-            .contains(StandardMaterialKey::CULL_FRONT)
+-        {
+-            Some(Face::Front)
+-        } else if key.bind_group_data.contains(StandardMaterialKey::CULL_BACK) {
+-            Some(Face::Back)
+-        } else {
+-            None
++        // Generally, we want to cull front faces if `CULL_FRONT` is present and
++        // backfaces if `CULL_BACK` is present. However, if the view has
++        // `INVERT_CULLING` on (usually used for mirrors and the like), we do
++        // the opposite.
++        descriptor.primitive.cull_mode = match (
++            key.bind_group_data
++                .contains(StandardMaterialKey::CULL_FRONT),
++            key.bind_group_data.contains(StandardMaterialKey::CULL_BACK),
++            key.mesh_key.contains(MeshPipelineKey::INVERT_CULLING),
++        ) {
++            (true, false, false) | (false, true, true) => Some(Face::Front),
++            (false, true, false) | (true, false, true) => Some(Face::Back),
++            _ => None,
+         };
+ 
+         if let Some(label) = &mut descriptor.label {
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index f6640a63985e7..9c95f0711493d 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -1344,6 +1344,7 @@ pub fn prepare_lights(
+                         clip_from_view: cube_face_projection,
+                         hdr: false,
+                         color_grading: Default::default(),
++                        invert_culling: false,
+                     },
+                     *frustum,
+                     LightEntity::Point {
+@@ -1446,6 +1447,7 @@ pub fn prepare_lights(
+                     clip_from_world: None,
+                     hdr: false,
+                     color_grading: Default::default(),
++                    invert_culling: false,
+                 },
+                 *spot_light_frustum.unwrap(),
+                 LightEntity::Spot { light_entity },
+@@ -1594,6 +1596,7 @@ pub fn prepare_lights(
+                         clip_from_world: Some(cascade.clip_from_world),
+                         hdr: false,
+                         color_grading: Default::default(),
++                        invert_culling: false,
+                     },
+                     frustum,
+                     LightEntity::Directional {
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 6e4b3b8aebd8d..013849e8ee8d2 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -389,6 +389,10 @@ pub fn check_views_need_specialization(
+             view_key |= MeshPipelineKey::ATMOSPHERE;
+         }
+ 
++        if view.invert_culling {
++            view_key |= MeshPipelineKey::INVERT_CULLING;
++        }
++
+         if let Some(projection) = projection {
+             view_key |= match projection {
+                 Projection::Perspective(_) => MeshPipelineKey::VIEW_PROJECTION_PERSPECTIVE,
+@@ -2101,7 +2105,8 @@ bitflags::bitflags! {
+         const OIT_ENABLED                       = 1 << 20;
+         const DISTANCE_FOG                      = 1 << 21;
+         const ATMOSPHERE                        = 1 << 22;
+-        const LAST_FLAG                         = Self::ATMOSPHERE.bits();
++        const INVERT_CULLING                    = 1 << 23;
++        const LAST_FLAG                         = Self::INVERT_CULLING.bits();
+ 
+         // Bitfields
+         const MSAA_RESERVED_BITS                = Self::MSAA_MASK_BITS << Self::MSAA_SHIFT_BITS;
+diff --git a/crates/bevy_render/src/camera.rs b/crates/bevy_render/src/camera.rs
+index 41a5cd99d5d37..5c9cf002c2c07 100644
+--- a/crates/bevy_render/src/camera.rs
++++ b/crates/bevy_render/src/camera.rs
+@@ -552,6 +552,7 @@ pub fn extract_cameras(
+                         viewport_size.y,
+                     ),
+                     color_grading,
++                    invert_culling: camera.invert_culling,
+                 },
+                 render_visible_entities,
+                 *frustum,
+diff --git a/crates/bevy_render/src/view/mod.rs b/crates/bevy_render/src/view/mod.rs
+index 3c105a5774250..cc39266a6ddec 100644
+--- a/crates/bevy_render/src/view/mod.rs
++++ b/crates/bevy_render/src/view/mod.rs
+@@ -302,6 +302,16 @@ pub struct ExtractedView {
+     // uvec4(origin.x, origin.y, width, height)
+     pub viewport: UVec4,
+     pub color_grading: ColorGrading,
++
++    /// Whether to switch culling mode so that materials that request backface
++    /// culling cull front faces, and vice versa.
++    ///
++    /// This is typically used for cameras that mirror the world that they
++    /// render across a plane, because doing that flips the winding of each
++    /// polygon.
++    ///
++    /// This setting doesn't affect materials that disable backface culling.
++    pub invert_culling: bool,
+ }
+ 
+ impl ExtractedView {
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index c385bca66d35d..c79c8c43e405d 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -808,6 +808,7 @@ pub fn extract_ui_camera_view(
+                             physical_viewport_rect.size(),
+                         )),
+                         color_grading: Default::default(),
++                        invert_culling: false,
+                     },
+                     // Link to the main camera view.
+                     UiViewTarget(render_entity),
+diff --git a/examples/3d/mirror.rs b/examples/3d/mirror.rs
+new file mode 100644
+index 0000000000000..b6d0cf8cebadf
+--- /dev/null
++++ b/examples/3d/mirror.rs
+@@ -0,0 +1,677 @@
++//! Demonstrates how to create a mirror with a second camera.
++
++use std::f32::consts::FRAC_PI_2;
++
++use bevy::{
++    asset::RenderAssetUsages,
++    color::palettes::css::GREEN,
++    input::mouse::AccumulatedMouseMotion,
++    math::{reflection_matrix, uvec2, vec3},
++    pbr::{ExtendedMaterial, MaterialExtension},
++    prelude::*,
++    render::render_resource::{
++        AsBindGroup, Extent3d, TextureDimension, TextureFormat, TextureUsages,
++    },
++    shader::ShaderRef,
++    window::{PrimaryWindow, WindowResized},
++};
++
++use crate::widgets::{RadioButton, WidgetClickEvent, WidgetClickSender};
++
++#[path = "../helpers/widgets.rs"]
++mod widgets;
++
++/// A resource that stores a handle to the image that contains the rendered
++/// mirror world.
++#[derive(Resource)]
++struct MirrorImage(Handle<Image>);
++
++/// A marker component for the camera that renders the mirror world.
++#[derive(Component)]
++struct MirrorCamera;
++
++/// A marker component for the mirror mesh itself.
++#[derive(Component)]
++struct Mirror;
++
++/// The dummy material extension that we use for the mirror surface.
++///
++/// This shader samples its emissive texture at the screen space position of
++/// each fragment rather than at the UVs. Effectively, this uses a PBR shader as
++/// a mask that copies a portion of the emissive texture to the screen, all in
++/// screen space.
++///
++/// We use [`ExtendedMaterial`], as that's the easiest way to implement custom
++/// shaders that modify the built-in [`StandardMaterial`]. We don't require any
++/// extra data to be passed to the shader beyond the [`StandardMaterial`] PBR
++/// fields, but currently Bevy requires at least one field to be present in the
++/// extended material, so we simply have an unused field.
++#[derive(Clone, AsBindGroup, Asset, Reflect)]
++struct ScreenSpaceTextureExtension {
++    /// An unused value that we have just to satisfy [`ExtendedMaterial`]
++    /// requirements.
++    #[uniform(100)]
++    dummy: f32,
++}
++
++impl MaterialExtension for ScreenSpaceTextureExtension {
++    fn fragment_shader() -> ShaderRef {
++        "shaders/screen_space_texture_material.wgsl".into()
++    }
++}
++
++/// The action that will be performed when the user drags the mouse: either
++/// moving the camera or moving the rigged model.
++#[derive(Clone, Copy, PartialEq, Default)]
++enum DragAction {
++    /// Dragging will move the camera.
++    #[default]
++    MoveCamera,
++    /// Dragging will move the animated fox.
++    MoveFox,
++}
++
++/// The settings that the user has currently chosen.
++///
++/// Currently, this just consists of the [`DragAction`].
++#[derive(Resource, Default)]
++struct AppStatus {
++    /// The action that will be performed when the user drags the mouse: either
++    /// moving the camera or moving the rigged model.
++    drag_action: DragAction,
++}
++
++/// A marker component for the help text at the top of the screen.
++#[derive(Clone, Copy, Component)]
++struct HelpText;
++
++/// The coordinates that the camera looks at.
++const CAMERA_TARGET: Vec3 = vec3(-25.0, 20.0, 0.0);
++/// The camera stays this distance in meters from the camera target.
++const CAMERA_ORBIT_DISTANCE: f32 = 500.0;
++/// The speed at which the user can move the camera vertically, in radians per
++/// mouse input unit.
++const CAMERA_PITCH_SPEED: f32 = 0.003;
++/// The speed at which the user can move the camera horizontally, in radians per
++/// mouse input unit.
++const CAMERA_YAW_SPEED: f32 = 0.004;
++// Limiting pitch stops some unexpected rotation past 90° up or down.
++const CAMERA_PITCH_LIMIT: f32 = FRAC_PI_2 - 0.01;
++
++/// The angle that the mirror faces.
++///
++/// The mirror is rotated across the X axis in this many radians.
++const MIRROR_ROTATION_ANGLE: f32 = -FRAC_PI_2;
++const MIRROR_POSITION: Vec3 = vec3(-25.0, 75.0, 0.0);
++
++/// The path to the animated fox model.
++static FOX_ASSET_PATH: &str = "models/animated/Fox.glb";
++
++/// The app entry point.
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins.set(WindowPlugin {
++            primary_window: Some(Window {
++                title: "Bevy Mirror Example".into(),
++                ..default()
++            }),
++            ..default()
++        }))
++        .add_plugins(MaterialPlugin::<
++            ExtendedMaterial<StandardMaterial, ScreenSpaceTextureExtension>,
++        >::default())
++        .init_resource::<AppStatus>()
++        .add_message::<WidgetClickEvent<DragAction>>()
++        .add_systems(Startup, setup)
++        .add_systems(Update, handle_window_resize_messages)
++        .add_systems(Update, (move_camera_on_mouse_down, move_fox_on_mouse_down))
++        .add_systems(Update, widgets::handle_ui_interactions::<DragAction>)
++        .add_systems(
++            Update,
++            (handle_mouse_action_change, update_radio_buttons)
++                .after(widgets::handle_ui_interactions::<DragAction>),
++        )
++        .add_systems(
++            Update,
++            update_mirror_camera_on_main_camera_transform_change.after(move_camera_on_mouse_down),
++        )
++        .add_systems(Update, play_fox_animation)
++        .add_systems(Update, update_help_text)
++        .run();
++}
++
++/// A startup system that spawns the scene and sets up the mirror render target.
++fn setup(
++    mut commands: Commands,
++    windows_query: Query<&Window>,
++    asset_server: Res<AssetServer>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut standard_materials: ResMut<Assets<StandardMaterial>>,
++    mut screen_space_texture_materials: ResMut<
++        Assets<ExtendedMaterial<StandardMaterial, ScreenSpaceTextureExtension>>,
++    >,
++    mut images: ResMut<Assets<Image>>,
++    app_status: Res<AppStatus>,
++) {
++    // Spawn the main camera.
++    let camera_projection = PerspectiveProjection::default();
++    let camera_transform = spawn_main_camera(&mut commands, &camera_projection);
++
++    // Spawn the light.
++    spawn_light(&mut commands);
++
++    // Spawn the objects reflected in the mirror.
++    spawn_ground_plane(&mut commands, &mut meshes, &mut standard_materials);
++    spawn_fox(&mut commands, &asset_server);
++
++    // Spawn the mirror and associated camera.
++    let mirror_render_target_image =
++        create_mirror_texture_resource(&mut commands, &windows_query, &mut images);
++    let mirror_transform = spawn_mirror(
++        &mut commands,
++        &mut meshes,
++        &mut screen_space_texture_materials,
++        mirror_render_target_image.clone(),
++    );
++    spawn_mirror_camera(
++        &mut commands,
++        &camera_transform,
++        &camera_projection,
++        &mirror_transform,
++        mirror_render_target_image,
++    );
++
++    // Spawn the UI.
++    spawn_buttons(&mut commands);
++    spawn_help_text(&mut commands, &app_status);
++}
++
++/// Spawns the main camera (not the mirror camera).
++fn spawn_main_camera(
++    commands: &mut Commands,
++    camera_projection: &PerspectiveProjection,
++) -> Transform {
++    let camera_transform = Transform::from_translation(
++        vec3(-2.0, 1.0, -2.0).normalize_or_zero() * CAMERA_ORBIT_DISTANCE,
++    )
++    .looking_at(CAMERA_TARGET, Vec3::Y);
++
++    commands.spawn((
++        Camera3d::default(),
++        camera_transform,
++        Projection::Perspective(camera_projection.clone()),
++    ));
++
++    camera_transform
++}
++
++/// Spawns a directional light to illuminate the scene.
++fn spawn_light(commands: &mut Commands) {
++    commands.spawn((
++        DirectionalLight {
++            illuminance: 5000.0,
++            ..default()
++        },
++        Transform::from_xyz(-85.0, 16.0, -200.0).looking_at(vec3(-50.0, 0.0, 100.0), Vec3::Y),
++    ));
++}
++
++/// Spawns the circular ground plane object.
++fn spawn_ground_plane(
++    commands: &mut Commands,
++    meshes: &mut Assets<Mesh>,
++    standard_materials: &mut Assets<StandardMaterial>,
++) {
++    commands.spawn((
++        Mesh3d(meshes.add(Circle::new(200.0))),
++        MeshMaterial3d(standard_materials.add(Color::from(GREEN))),
++        Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2))
++            .with_translation(vec3(-25.0, 0.0, 0.0)),
++    ));
++}
++
++/// Creates the initial image that the mirror camera will render the mirror
++/// world to.
++fn create_mirror_texture_resource(
++    commands: &mut Commands,
++    windows_query: &Query<&Window>,
++    images: &mut Assets<Image>,
++) -> Handle<Image> {
++    let window = windows_query.iter().next().expect("No window found");
++    let window_size = uvec2(window.physical_width(), window.physical_height());
++    let image = create_mirror_texture_image(images, window_size);
++    commands.insert_resource(MirrorImage(image.clone()));
++    image
++}
++
++/// Spawns the camera that renders the mirror world.
++fn spawn_mirror_camera(
++    commands: &mut Commands,
++    camera_transform: &Transform,
++    camera_projection: &PerspectiveProjection,
++    mirror_transform: &Transform,
++    mirror_render_target: Handle<Image>,
++) {
++    let (mirror_camera_transform, mirror_camera_projection) =
++        calculate_mirror_camera_transform_and_projection(
++            camera_transform,
++            camera_projection,
++            mirror_transform,
++        );
++
++    commands.spawn((
++        Camera3d::default(),
++        Camera {
++            order: -1,
++            target: mirror_render_target.clone().into(),
++            // Reflecting the model across the mirror will flip the winding of
++            // all the polygons. Therefore, in order to properly backface cull,
++            // we need to turn on `invert_culling`.
++            invert_culling: true,
++            ..default()
++        },
++        mirror_camera_transform,
++        Projection::Perspective(mirror_camera_projection),
++        MirrorCamera,
++    ));
++}
++
++/// Spawns the animated fox.
++///
++/// Note that this doesn't play the animation; that's handled in
++/// [`play_fox_animation`].
++fn spawn_fox(commands: &mut Commands, asset_server: &AssetServer) {
++    commands.spawn((
++        SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(FOX_ASSET_PATH))),
++        Transform::from_xyz(-50.0, 0.0, -100.0),
++    ));
++}
++
++/// Spawns the mirror plane mesh and returns its transform.
++fn spawn_mirror(
++    commands: &mut Commands,
++    meshes: &mut Assets<Mesh>,
++    screen_space_texture_materials: &mut Assets<
++        ExtendedMaterial<StandardMaterial, ScreenSpaceTextureExtension>,
++    >,
++    mirror_render_target: Handle<Image>,
++) -> Transform {
++    let mirror_transform = Transform::from_scale(vec3(300.0, 1.0, 150.0))
++        .with_rotation(Quat::from_rotation_x(MIRROR_ROTATION_ANGLE))
++        .with_translation(MIRROR_POSITION);
++
++    commands.spawn((
++        Mesh3d(meshes.add(Plane3d::default().mesh().size(1.0, 1.0))),
++        MeshMaterial3d(screen_space_texture_materials.add(ExtendedMaterial {
++            base: StandardMaterial {
++                base_color: Color::BLACK,
++                emissive: Color::WHITE.into(),
++                emissive_texture: Some(mirror_render_target),
++                perceptual_roughness: 0.0,
++                metallic: 1.0,
++                ..default()
++            },
++            extension: ScreenSpaceTextureExtension { dummy: 0.0 },
++        })),
++        mirror_transform,
++        Mirror,
++    ));
++
++    mirror_transform
++}
++
++/// Spawns the buttons at the bottom of the screen.
++fn spawn_buttons(commands: &mut Commands) {
++    // Spawn the radio buttons that allow the user to select an object to
++    // control.
++    commands.spawn((
++        widgets::main_ui_node(),
++        children![widgets::option_buttons(
++            "Drag Action",
++            &[
++                (DragAction::MoveCamera, "Move Camera"),
++                (DragAction::MoveFox, "Move Fox"),
++            ],
++        )],
++    ));
++}
++
++/// Given the transform and projection of the main camera, returns an
++/// appropriate transform and projection for the mirror camera.
++fn calculate_mirror_camera_transform_and_projection(
++    main_camera_transform: &Transform,
++    main_camera_projection: &PerspectiveProjection,
++    mirror_transform: &Transform,
++) -> (Transform, PerspectiveProjection) {
++    // Calculate the reflection matrix (a.k.a. Householder matrix) that will
++    // reflect the scene across the mirror plane.
++    //
++    // Note that you must calculate this in *matrix* form and only *afterward*
++    // convert to a `Transform` instead of composing `Transform`s. This is
++    // because the reflection matrix has non-uniform scale, and composing
++    // transforms can't always handle composition of matrices with non-uniform
++    // scales.
++    let mirror_camera_transform = Transform::from_matrix(
++        Mat4::from_mat3a(reflection_matrix(Vec3::NEG_Z)) * main_camera_transform.to_matrix(),
++    );
++
++    // Compute the distance from the camera to the mirror plane. This will be
++    // used to calculate the distance to the near clip plane for the mirror
++    // world.
++    let distance_from_camera_to_mirror = InfinitePlane3d::new(mirror_transform.rotation * Vec3::Y)
++        .signed_distance(
++            Isometry3d::IDENTITY,
++            mirror_transform.translation - main_camera_transform.translation,
++        );
++
++    // Compute the normal of the mirror plane in view space.
++    let view_from_world = main_camera_transform.compute_affine().matrix3.inverse();
++    let mirror_projection_plane_normal =
++        (view_from_world * (mirror_transform.rotation * Vec3::NEG_Y)).normalize();
++
++    // Compute the final projection. It should match the main camera projection,
++    // except that `near` and `near_normal` should be set to the updated near
++    // plane and near normal plane as above.
++    let mirror_camera_projection = PerspectiveProjection {
++        near_clip_plane: mirror_projection_plane_normal.extend(distance_from_camera_to_mirror),
++        ..*main_camera_projection
++    };
++
++    (mirror_camera_transform, mirror_camera_projection)
++}
++
++/// A system that resizes the render target image when the user resizes the window.
++///
++/// Since the image that stores the rendered mirror world has the same physical
++/// size as the window, we need to reallocate it and reattach it to the mirror
++/// material whenever the window size changes.
++fn handle_window_resize_messages(
++    windows_query: Query<&Window>,
++    mut mirror_cameras_query: Query<&mut Camera, With<MirrorCamera>>,
++    mut images: ResMut<Assets<Image>>,
++    mut mirror_image: ResMut<MirrorImage>,
++    mut screen_space_texture_materials: ResMut<
++        Assets<ExtendedMaterial<StandardMaterial, ScreenSpaceTextureExtension>>,
++    >,
++    mut resize_messages: MessageReader<WindowResized>,
++) {
++    // We run at most once, regardless of the number of window resize messages
++    // there were this frame.
++    let Some(resize_message) = resize_messages.read().next() else {
++        return;
++    };
++    let Ok(window) = windows_query.get(resize_message.window) else {
++        return;
++    };
++
++    let window_size = uvec2(window.physical_width(), window.physical_height());
++    let image = create_mirror_texture_image(&mut images, window_size);
++    images.remove(mirror_image.0.id());
++
++    mirror_image.0 = image.clone();
++
++    for mut mirror_camera in mirror_cameras_query.iter_mut() {
++        mirror_camera.target = image.clone().into();
++    }
++
++    for (_, material) in screen_space_texture_materials.iter_mut() {
++        material.base.emissive_texture = Some(image.clone());
++    }
++}
++
++/// Creates the image that will be used to store the reflected scene.
++fn create_mirror_texture_image(images: &mut Assets<Image>, window_size: UVec2) -> Handle<Image> {
++    let mirror_image_extent = Extent3d {
++        width: window_size.x,
++        height: window_size.y,
++        depth_or_array_layers: 1,
++    };
++
++    let mut image = Image::new_uninit(
++        mirror_image_extent,
++        TextureDimension::D2,
++        TextureFormat::Bgra8UnormSrgb,
++        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
++    );
++    image.texture_descriptor.usage |=
++        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
++
++    images.add(image)
++}
++
++// Moves the fox when the user moves the mouse with the left button down.
++fn move_fox_on_mouse_down(
++    mut scene_roots_query: Query<&mut Transform, With<SceneRoot>>,
++    windows_query: Query<&Window, With<PrimaryWindow>>,
++    cameras_query: Query<(&Camera, &GlobalTransform)>,
++    interactions_query: Query<&Interaction, With<RadioButton>>,
++    buttons: Res<ButtonInput<MouseButton>>,
++    app_status: Res<AppStatus>,
++) {
++    // Only process the mouse motion if the left mouse button is pressed, the
++    // mouse action is set to move the fox, and the pointer isn't over a UI
++    // widget.
++    if app_status.drag_action != DragAction::MoveFox
++        || !buttons.pressed(MouseButton::Left)
++        || interactions_query
++            .iter()
++            .any(|interaction| *interaction != Interaction::None)
++    {
++        return;
++    }
++
++    // Find out where the user clicked the mouse.
++    let Some(mouse_position) = windows_query
++        .iter()
++        .next()
++        .and_then(Window::cursor_position)
++    else {
++        return;
++    };
++
++    // Grab the camera.
++    let Some((camera, camera_transform)) = cameras_query.iter().next() else {
++        return;
++    };
++
++    // Figure out where the user clicked on the plane.
++    let Ok(ray) = camera.viewport_to_world(camera_transform, mouse_position) else {
++        return;
++    };
++    let Some(ray_distance) = ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Y)) else {
++        return;
++    };
++    let plane_intersection = ray.origin + ray.direction.normalize() * ray_distance;
++
++    // Move the fox.
++    for mut transform in scene_roots_query.iter_mut() {
++        transform.translation = transform.translation.with_xz(plane_intersection.xz());
++    }
++}
++
++/// A system that changes the drag action when the user clicks on one of the
++/// radio buttons.
++fn handle_mouse_action_change(
++    mut app_status: ResMut<AppStatus>,
++    mut messages: MessageReader<WidgetClickEvent<DragAction>>,
++) {
++    for message in messages.read() {
++        app_status.drag_action = **message;
++    }
++}
++
++/// A system that updates the radio buttons at the bottom of the screen to
++/// reflect the current drag action.
++fn update_radio_buttons(
++    mut widgets_query: Query<(
++        Entity,
++        Option<&mut BackgroundColor>,
++        Has<Text>,
++        &WidgetClickSender<DragAction>,
++    )>,
++    app_status: Res<AppStatus>,
++    mut text_ui_writer: TextUiWriter,
++) {
++    for (entity, maybe_bg_color, has_text, sender) in &mut widgets_query {
++        let selected = app_status.drag_action == **sender;
++        if let Some(mut bg_color) = maybe_bg_color {
++            widgets::update_ui_radio_button(&mut bg_color, selected);
++        }
++        if has_text {
++            widgets::update_ui_radio_button_text(entity, &mut text_ui_writer, selected);
++        }
++    }
++}
++
++/// A system that processes user mouse actions that move the camera.
++///
++/// This is mostly copied from `examples/camera/camera_orbit.rs`.
++fn move_camera_on_mouse_down(
++    mut main_cameras_query: Query<&mut Transform, (With<Camera>, Without<MirrorCamera>)>,
++    interactions_query: Query<&Interaction, With<RadioButton>>,
++    mouse_buttons: Res<ButtonInput<MouseButton>>,
++    mouse_motion: Res<AccumulatedMouseMotion>,
++    app_status: Res<AppStatus>,
++) {
++    // Only process the mouse motion if the left mouse button is pressed, the
++    // mouse action is set to move the fox, and the pointer isn't over a UI
++    // widget.
++    if app_status.drag_action != DragAction::MoveCamera
++        || !mouse_buttons.pressed(MouseButton::Left)
++        || interactions_query
++            .iter()
++            .any(|interaction| *interaction != Interaction::None)
++    {
++        return;
++    }
++
++    let delta = mouse_motion.delta;
++
++    // Mouse motion is one of the few inputs that should not be multiplied by delta time,
++    // as we are already receiving the full movement since the last frame was rendered. Multiplying
++    // by delta time here would make the movement slower that it should be.
++    let delta_pitch = delta.y * CAMERA_PITCH_SPEED;
++    let delta_yaw = delta.x * CAMERA_YAW_SPEED;
++
++    for mut main_camera_transform in &mut main_cameras_query {
++        // Obtain the existing pitch and yaw values from the transform.
++        let (yaw, pitch, _) = main_camera_transform.rotation.to_euler(EulerRot::YXZ);
++
++        // Establish the new yaw and pitch, preventing the pitch value from exceeding our limits.
++        let pitch = (pitch + delta_pitch).clamp(-CAMERA_PITCH_LIMIT, CAMERA_PITCH_LIMIT);
++        let yaw = yaw + delta_yaw;
++        main_camera_transform.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
++
++        // Adjust the translation to maintain the correct orientation toward the orbit target.
++        // In our example it's a static target, but this could easily be customized.
++        let target = Vec3::ZERO;
++        main_camera_transform.translation =
++            target - main_camera_transform.forward() * CAMERA_ORBIT_DISTANCE;
++    }
++}
++
++/// Updates the position, rotation, and projection of the mirror camera when the
++/// main camera is moved.
++///
++/// When the main camera is moved, the mirror camera must be moved to match it.
++/// The *projection* on the mirror camera must also be altered, because the
++/// projection takes the view-space rotation of and distance to the mirror into
++/// account.
++fn update_mirror_camera_on_main_camera_transform_change(
++    main_cameras_query: Query<
++        (&Transform, &Projection),
++        (Changed<Transform>, With<Camera>, Without<MirrorCamera>),
++    >,
++    mut mirror_cameras_query: Query<
++        (&mut Transform, &mut Projection),
++        (With<Camera>, With<MirrorCamera>, Without<Mirror>),
++    >,
++    mirrors_query: Query<&Transform, (Without<MirrorCamera>, With<Mirror>)>,
++) {
++    let Some((main_camera_transform, Projection::Perspective(main_camera_projection))) =
++        main_cameras_query.iter().next()
++    else {
++        return;
++    };
++
++    let Some(mirror_transform) = mirrors_query.iter().next() else {
++        return;
++    };
++
++    // Here we need the transforms of both the camera and the mirror in order to
++    // properly calculate the new projection.
++    let (new_mirror_camera_transform, new_mirror_camera_projection) =
++        calculate_mirror_camera_transform_and_projection(
++            main_camera_transform,
++            main_camera_projection,
++            mirror_transform,
++        );
++
++    for (mut mirror_camera_transform, mut mirror_camera_projection) in &mut mirror_cameras_query {
++        *mirror_camera_transform = new_mirror_camera_transform;
++        *mirror_camera_projection = Projection::Perspective(new_mirror_camera_projection.clone());
++    }
++}
++
++/// Plays the initial animation on the fox model.
++fn play_fox_animation(
++    mut commands: Commands,
++    mut animation_players_query: Query<
++        (Entity, &mut AnimationPlayer),
++        Without<AnimationGraphHandle>,
++    >,
++    asset_server: Res<AssetServer>,
++    mut animation_graphs: ResMut<Assets<AnimationGraph>>,
++) {
++    // Only pick up animation players that don't already have an animation graph
++    // handle.
++    // This ensures that we only start playing the animation once.
++    if animation_players_query.is_empty() {
++        return;
++    }
++
++    let fox_animation = asset_server.load(GltfAssetLabel::Animation(0).from_asset(FOX_ASSET_PATH));
++    let (fox_animation_graph, fox_animation_node) =
++        AnimationGraph::from_clip(fox_animation.clone());
++    let fox_animation_graph = animation_graphs.add(fox_animation_graph);
++
++    for (entity, mut animation_player) in animation_players_query.iter_mut() {
++        commands
++            .entity(entity)
++            .insert(AnimationGraphHandle(fox_animation_graph.clone()));
++        animation_player.play(fox_animation_node).repeat();
++    }
++}
++
++/// Spawns the help text at the top of the screen.
++fn spawn_help_text(commands: &mut Commands, app_status: &AppStatus) {
++    commands.spawn((
++        Text::new(create_help_string(app_status)),
++        Node {
++            position_type: PositionType::Absolute,
++            top: px(12),
++            left: px(12),
++            ..default()
++        },
++        HelpText,
++    ));
++}
++
++/// Creates the help string at the top left of the screen.
++fn create_help_string(app_status: &AppStatus) -> String {
++    format!(
++        "Click and drag to move the {}",
++        match app_status.drag_action {
++            DragAction::MoveCamera => "camera",
++            DragAction::MoveFox => "fox",
++        }
++    )
++}
++
++/// Updates the help text in the top left of the screen to reflect the current
++/// drag mode.
++fn update_help_text(mut help_text: Query<&mut Text, With<HelpText>>, app_status: Res<AppStatus>) {
++    for mut text in &mut help_text {
++        text.0 = create_help_string(&app_status);
++    }
++}
+diff --git a/examples/README.md b/examples/README.md
+index 5e405d346f0cf..324fac7163be3 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -168,6 +168,7 @@ Example | Description
+ [Lines](../examples/3d/lines.rs) | Create a custom material to draw 3d lines
+ [Mesh Ray Cast](../examples/3d/mesh_ray_cast.rs) | Demonstrates ray casting with the `MeshRayCast` system parameter
+ [Meshlet](../examples/3d/meshlet.rs) | Meshlet rendering for dense high-poly scenes (experimental)
++[Mirror](../examples/3d/mirror.rs) | Demonstrates how to create a mirror with a second camera
+ [Mixed lighting](../examples/3d/mixed_lighting.rs) | Demonstrates how to combine baked and dynamic lighting
+ [Motion Blur](../examples/3d/motion_blur.rs) | Demonstrates per-pixel motion blur
+ [Occlusion Culling](../examples/3d/occlusion_culling.rs) | Demonstration of Occlusion Culling
+diff --git a/examples/math/custom_primitives.rs b/examples/math/custom_primitives.rs
+index a7e5777dfd21c..ba2976d7a8472 100644
+--- a/examples/math/custom_primitives.rs
++++ b/examples/math/custom_primitives.rs
+@@ -70,6 +70,7 @@ const PROJECTION_3D: Projection = Projection::Perspective(PerspectiveProjection
+     near: 0.1,
+     far: 1000.0,
+     aspect_ratio: 1.0,
++    near_clip_plane: vec4(0.0, 0.0, -1.0, -0.1),
+ });
+ 
+ /// State for tracking the currently displayed shape

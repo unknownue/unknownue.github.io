@@ -1,0 +1,531 @@
+diff --git a/crates/bevy_core_pipeline/Cargo.toml b/crates/bevy_core_pipeline/Cargo.toml
+index 68dccf17d2080..7dfe8f0ab5791 100644
+--- a/crates/bevy_core_pipeline/Cargo.toml
++++ b/crates/bevy_core_pipeline/Cargo.toml
+@@ -20,6 +20,7 @@ bevy_app = { path = "../bevy_app", version = "0.18.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.18.0-dev" }
+ bevy_color = { path = "../bevy_color", version = "0.18.0-dev" }
+ bevy_derive = { path = "../bevy_derive", version = "0.18.0-dev" }
++bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.18.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.18.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.18.0-dev" }
+ bevy_camera = { path = "../bevy_camera", version = "0.18.0-dev" }
+diff --git a/crates/bevy_core_pipeline/src/core_3d/mod.rs b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+index 0e5a07b870e83..5a090b5da610a 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/mod.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+@@ -73,12 +73,14 @@ pub const DEPTH_TEXTURE_SAMPLING_SUPPORTED: bool = true;
+ use core::ops::Range;
+ 
+ use bevy_camera::{Camera, Camera3d, Camera3dDepthLoadOp};
++use bevy_diagnostic::FrameCount;
+ use bevy_render::{
+     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
+     camera::CameraRenderGraph,
+     experimental::occlusion_culling::OcclusionCulling,
+     mesh::allocator::SlabId,
+     render_phase::PhaseItemBatchSetKey,
++    texture::CachedTexture,
+     view::{prepare_view_targets, NoIndirectDrawing, RetainedViewEntity},
+ };
+ pub use main_opaque_pass_3d_node::*;
+@@ -124,9 +126,10 @@ use crate::{
+     },
+     prepass::{
+         node::{EarlyPrepassNode, LatePrepassNode},
+-        AlphaMask3dPrepass, DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass,
+-        Opaque3dPrepass, OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey,
+-        ViewPrepassTextures, MOTION_VECTOR_PREPASS_FORMAT, NORMAL_PREPASS_FORMAT,
++        AlphaMask3dPrepass, DeferredPrepass, DeferredPrepassDoubleBuffer, DepthPrepass,
++        DepthPrepassDoubleBuffer, MotionVectorPrepass, NormalPrepass, Opaque3dPrepass,
++        OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey, ViewPrepassTextures,
++        MOTION_VECTOR_PREPASS_FORMAT, NORMAL_PREPASS_FORMAT,
+     },
+     skybox::SkyboxPlugin,
+     tonemapping::{DebandDither, Tonemapping, TonemappingNode},
+@@ -676,6 +679,8 @@ pub fn extract_camera_prepass_phase(
+                 Has<NormalPrepass>,
+                 Has<MotionVectorPrepass>,
+                 Has<DeferredPrepass>,
++                Has<DepthPrepassDoubleBuffer>,
++                Has<DeferredPrepassDoubleBuffer>,
+             ),
+             With<Camera3d>,
+         >,
+@@ -694,6 +699,8 @@ pub fn extract_camera_prepass_phase(
+         normal_prepass,
+         motion_vector_prepass,
+         deferred_prepass,
++        depth_prepass_double_buffer,
++        deferred_prepass_double_buffer,
+     ) in cameras_3d.iter()
+     {
+         if !camera.is_active {
+@@ -761,6 +768,18 @@ pub fn extract_camera_prepass_phase(
+         } else {
+             camera_commands.remove::<DeferredPrepass>();
+         }
++
++        if depth_prepass_double_buffer {
++            camera_commands.insert(DepthPrepassDoubleBuffer);
++        } else {
++            camera_commands.remove::<DepthPrepassDoubleBuffer>();
++        }
++
++        if deferred_prepass_double_buffer {
++            camera_commands.insert(DeferredPrepassDoubleBuffer);
++        } else {
++            camera_commands.remove::<DeferredPrepassDoubleBuffer>();
++        }
+     }
+ 
+     opaque_3d_prepass_phases.retain(|view_entity, _| live_entities.contains(view_entity));
+@@ -973,6 +992,7 @@ pub fn prepare_prepass_textures(
+     mut commands: Commands,
+     mut texture_cache: ResMut<TextureCache>,
+     render_device: Res<RenderDevice>,
++    frame_count: Res<FrameCount>,
+     opaque_3d_prepass_phases: Res<ViewBinnedRenderPhases<Opaque3dPrepass>>,
+     alpha_mask_3d_prepass_phases: Res<ViewBinnedRenderPhases<AlphaMask3dPrepass>>,
+     opaque_3d_deferred_phases: Res<ViewBinnedRenderPhases<Opaque3dDeferred>>,
+@@ -986,11 +1006,15 @@ pub fn prepare_prepass_textures(
+         Has<NormalPrepass>,
+         Has<MotionVectorPrepass>,
+         Has<DeferredPrepass>,
++        Has<DepthPrepassDoubleBuffer>,
++        Has<DeferredPrepassDoubleBuffer>,
+     )>,
+ ) {
+-    let mut depth_textures = <HashMap<_, _>>::default();
++    let mut depth_textures1 = <HashMap<_, _>>::default();
++    let mut depth_textures2 = <HashMap<_, _>>::default();
+     let mut normal_textures = <HashMap<_, _>>::default();
+-    let mut deferred_textures = <HashMap<_, _>>::default();
++    let mut deferred_textures1: HashMap<_, _> = <HashMap<_, _>>::default();
++    let mut deferred_textures2: HashMap<_, _> = <HashMap<_, _>>::default();
+     let mut deferred_lighting_id_textures = <HashMap<_, _>>::default();
+     let mut motion_vectors_textures = <HashMap<_, _>>::default();
+     for (
+@@ -1002,6 +1026,8 @@ pub fn prepare_prepass_textures(
+         normal_prepass,
+         motion_vector_prepass,
+         deferred_prepass,
++        depth_prepass_double_buffer,
++        deferred_prepass_double_buffer,
+     ) in &views_3d
+     {
+         if !opaque_3d_prepass_phases.contains_key(&view.retained_view_entity)
+@@ -1019,12 +1045,33 @@ pub fn prepare_prepass_textures(
+ 
+         let size = physical_target_size.to_extents();
+ 
+-        let cached_depth_texture = depth_prepass.then(|| {
+-            depth_textures
++        let cached_depth_texture1 = depth_prepass.then(|| {
++            depth_textures1
++                .entry(camera.target.clone())
++                .or_insert_with(|| {
++                    let descriptor = TextureDescriptor {
++                        label: Some("prepass_depth_texture_1"),
++                        size,
++                        mip_level_count: 1,
++                        sample_count: msaa.samples(),
++                        dimension: TextureDimension::D2,
++                        format: CORE_3D_DEPTH_FORMAT,
++                        usage: TextureUsages::COPY_DST
++                            | TextureUsages::RENDER_ATTACHMENT
++                            | TextureUsages::TEXTURE_BINDING,
++                        view_formats: &[],
++                    };
++                    texture_cache.get(&render_device, descriptor)
++                })
++                .clone()
++        });
++
++        let cached_depth_texture2 = depth_prepass_double_buffer.then(|| {
++            depth_textures2
+                 .entry(camera.target.clone())
+                 .or_insert_with(|| {
+                     let descriptor = TextureDescriptor {
+-                        label: Some("prepass_depth_texture"),
++                        label: Some("prepass_depth_texture_2"),
+                         size,
+                         mip_level_count: 1,
+                         sample_count: msaa.samples(),
+@@ -1032,8 +1079,7 @@ pub fn prepare_prepass_textures(
+                         format: CORE_3D_DEPTH_FORMAT,
+                         usage: TextureUsages::COPY_DST
+                             | TextureUsages::RENDER_ATTACHMENT
+-                            | TextureUsages::TEXTURE_BINDING
+-                            | TextureUsages::COPY_SRC, // TODO: Remove COPY_SRC, double buffer instead (for bevy_solari)
++                            | TextureUsages::TEXTURE_BINDING,
+                         view_formats: &[],
+                     };
+                     texture_cache.get(&render_device, descriptor)
+@@ -1085,22 +1131,43 @@ pub fn prepare_prepass_textures(
+                 .clone()
+         });
+ 
+-        let cached_deferred_texture = deferred_prepass.then(|| {
+-            deferred_textures
++        let cached_deferred_texture1 = deferred_prepass.then(|| {
++            deferred_textures1
++                .entry(camera.target.clone())
++                .or_insert_with(|| {
++                    texture_cache.get(
++                        &render_device,
++                        TextureDescriptor {
++                            label: Some("prepass_deferred_texture_1"),
++                            size,
++                            mip_level_count: 1,
++                            sample_count: 1,
++                            dimension: TextureDimension::D2,
++                            format: DEFERRED_PREPASS_FORMAT,
++                            usage: TextureUsages::RENDER_ATTACHMENT
++                                | TextureUsages::TEXTURE_BINDING,
++                            view_formats: &[],
++                        },
++                    )
++                })
++                .clone()
++        });
++
++        let cached_deferred_texture2 = deferred_prepass_double_buffer.then(|| {
++            deferred_textures2
+                 .entry(camera.target.clone())
+                 .or_insert_with(|| {
+                     texture_cache.get(
+                         &render_device,
+                         TextureDescriptor {
+-                            label: Some("prepass_deferred_texture"),
++                            label: Some("prepass_deferred_texture_2"),
+                             size,
+                             mip_level_count: 1,
+                             sample_count: 1,
+                             dimension: TextureDimension::D2,
+                             format: DEFERRED_PREPASS_FORMAT,
+                             usage: TextureUsages::RENDER_ATTACHMENT
+-                                | TextureUsages::TEXTURE_BINDING
+-                                | TextureUsages::COPY_SRC, // TODO: Remove COPY_SRC, double buffer instead (for bevy_solari)
++                                | TextureUsages::TEXTURE_BINDING,
+                             view_formats: &[],
+                         },
+                     )
+@@ -1131,20 +1198,54 @@ pub fn prepare_prepass_textures(
+         });
+ 
+         commands.entity(entity).insert(ViewPrepassTextures {
+-            depth: cached_depth_texture
+-                .map(|t| ColorAttachment::new(t, None, Some(LinearRgba::BLACK))),
++            depth: package_double_buffered_texture(
++                cached_depth_texture1,
++                cached_depth_texture2,
++                frame_count.0,
++            ),
+             normal: cached_normals_texture
+-                .map(|t| ColorAttachment::new(t, None, Some(LinearRgba::BLACK))),
++                .map(|t| ColorAttachment::new(t, None, None, Some(LinearRgba::BLACK))),
+             // Red and Green channels are X and Y components of the motion vectors
+             // Blue channel doesn't matter, but set to 0.0 for possible faster clear
+             // https://gpuopen.com/performance/#clears
+             motion_vectors: cached_motion_vectors_texture
+-                .map(|t| ColorAttachment::new(t, None, Some(LinearRgba::BLACK))),
+-            deferred: cached_deferred_texture
+-                .map(|t| ColorAttachment::new(t, None, Some(LinearRgba::BLACK))),
++                .map(|t| ColorAttachment::new(t, None, None, Some(LinearRgba::BLACK))),
++            deferred: package_double_buffered_texture(
++                cached_deferred_texture1,
++                cached_deferred_texture2,
++                frame_count.0,
++            ),
+             deferred_lighting_pass_id: cached_deferred_lighting_pass_id_texture
+-                .map(|t| ColorAttachment::new(t, None, Some(LinearRgba::BLACK))),
++                .map(|t| ColorAttachment::new(t, None, None, Some(LinearRgba::BLACK))),
+             size,
+         });
+     }
+ }
++
++fn package_double_buffered_texture(
++    texture1: Option<CachedTexture>,
++    texture2: Option<CachedTexture>,
++    frame_count: u32,
++) -> Option<ColorAttachment> {
++    match (texture1, texture2) {
++        (Some(t1), None) => Some(ColorAttachment::new(
++            t1,
++            None,
++            None,
++            Some(LinearRgba::BLACK),
++        )),
++        (Some(t1), Some(t2)) if frame_count.is_multiple_of(2) => Some(ColorAttachment::new(
++            t1,
++            None,
++            Some(t2),
++            Some(LinearRgba::BLACK),
++        )),
++        (Some(t1), Some(t2)) => Some(ColorAttachment::new(
++            t2,
++            None,
++            Some(t1),
++            Some(LinearRgba::BLACK),
++        )),
++        _ => None,
++    }
++}
+diff --git a/crates/bevy_core_pipeline/src/prepass/mod.rs b/crates/bevy_core_pipeline/src/prepass/mod.rs
+index 7b3cc05a66aa1..c4ad850b348b7 100644
+--- a/crates/bevy_core_pipeline/src/prepass/mod.rs
++++ b/crates/bevy_core_pipeline/src/prepass/mod.rs
+@@ -77,6 +77,18 @@ pub struct MotionVectorPrepass;
+ #[reflect(Component, Default)]
+ pub struct DeferredPrepass;
+ 
++/// Allows querying the previous frame's [`DepthPrepass`].
++#[derive(Component, Default, Reflect, Clone)]
++#[reflect(Component, Default, Clone)]
++#[require(DepthPrepass)]
++pub struct DepthPrepassDoubleBuffer;
++
++/// Allows querying the previous frame's [`DeferredPrepass`].
++#[derive(Component, Default, Reflect, Clone)]
++#[reflect(Component, Default, Clone)]
++#[require(DeferredPrepass)]
++pub struct DeferredPrepassDoubleBuffer;
++
+ /// View matrices from the previous frame.
+ ///
+ /// Useful for temporal rendering techniques that need access to last frame's camera data.
+@@ -128,6 +140,12 @@ impl ViewPrepassTextures {
+         self.depth.as_ref().map(|t| &t.texture.default_view)
+     }
+ 
++    pub fn previous_depth_view(&self) -> Option<&TextureView> {
++        self.depth
++            .as_ref()
++            .and_then(|t| t.previous_frame_texture.as_ref().map(|t| &t.default_view))
++    }
++
+     pub fn normal_view(&self) -> Option<&TextureView> {
+         self.normal.as_ref().map(|t| &t.texture.default_view)
+     }
+@@ -141,6 +159,12 @@ impl ViewPrepassTextures {
+     pub fn deferred_view(&self) -> Option<&TextureView> {
+         self.deferred.as_ref().map(|t| &t.texture.default_view)
+     }
++
++    pub fn previous_deferred_view(&self) -> Option<&TextureView> {
++        self.deferred
++            .as_ref()
++            .and_then(|t| t.previous_frame_texture.as_ref().map(|t| &t.default_view))
++    }
+ }
+ 
+ /// Opaque phase of the 3D prepass.
+diff --git a/crates/bevy_render/src/texture/texture_attachment.rs b/crates/bevy_render/src/texture/texture_attachment.rs
+index 269c2f1422820..cc1f0efd12c10 100644
+--- a/crates/bevy_render/src/texture/texture_attachment.rs
++++ b/crates/bevy_render/src/texture/texture_attachment.rs
+@@ -12,6 +12,7 @@ use wgpu::{
+ pub struct ColorAttachment {
+     pub texture: CachedTexture,
+     pub resolve_target: Option<CachedTexture>,
++    pub previous_frame_texture: Option<CachedTexture>,
+     clear_color: Option<LinearRgba>,
+     is_first_call: Arc<AtomicBool>,
+ }
+@@ -20,11 +21,13 @@ impl ColorAttachment {
+     pub fn new(
+         texture: CachedTexture,
+         resolve_target: Option<CachedTexture>,
++        previous_frame_texture: Option<CachedTexture>,
+         clear_color: Option<LinearRgba>,
+     ) -> Self {
+         Self {
+             texture,
+             resolve_target,
++            previous_frame_texture,
+             clear_color,
+             is_first_call: Arc::new(AtomicBool::new(true)),
+         }
+diff --git a/crates/bevy_render/src/view/mod.rs b/crates/bevy_render/src/view/mod.rs
+index e9898c9deaddf..6871fc0bb8596 100644
+--- a/crates/bevy_render/src/view/mod.rs
++++ b/crates/bevy_render/src/view/mod.rs
+@@ -1141,8 +1141,8 @@ pub fn prepare_view_targets(
+         let converted_clear_color = clear_color.map(Into::into);
+ 
+         let main_textures = MainTargetTextures {
+-            a: ColorAttachment::new(a.clone(), sampled.clone(), converted_clear_color),
+-            b: ColorAttachment::new(b.clone(), sampled.clone(), converted_clear_color),
++            a: ColorAttachment::new(a.clone(), sampled.clone(), None, converted_clear_color),
++            b: ColorAttachment::new(b.clone(), sampled.clone(), None, converted_clear_color),
+             main_texture: main_texture.clone(),
+         };
+ 
+diff --git a/crates/bevy_solari/src/realtime/mod.rs b/crates/bevy_solari/src/realtime/mod.rs
+index 2c85e73083936..0ab1e13fe6029 100644
+--- a/crates/bevy_solari/src/realtime/mod.rs
++++ b/crates/bevy_solari/src/realtime/mod.rs
+@@ -7,7 +7,10 @@ use bevy_app::{App, Plugin};
+ use bevy_asset::embedded_asset;
+ use bevy_core_pipeline::{
+     core_3d::graph::{Core3d, Node3d},
+-    prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass},
++    prepass::{
++        DeferredPrepass, DeferredPrepassDoubleBuffer, DepthPrepass, DepthPrepassDoubleBuffer,
++        MotionVectorPrepass,
++    },
+ };
+ use bevy_ecs::{component::Component, reflect::ReflectComponent, schedule::IntoScheduleConfigs};
+ use bevy_pbr::DefaultOpaqueRendererMethod;
+@@ -87,7 +90,14 @@ impl Plugin for SolariLightingPlugin {
+ /// `Msaa::Off`.
+ #[derive(Component, Reflect, Clone)]
+ #[reflect(Component, Default, Clone)]
+-#[require(Hdr, DeferredPrepass, DepthPrepass, MotionVectorPrepass)]
++#[require(
++    Hdr,
++    DeferredPrepass,
++    DepthPrepass,
++    MotionVectorPrepass,
++    DeferredPrepassDoubleBuffer,
++    DepthPrepassDoubleBuffer
++)]
+ pub struct SolariLighting {
+     /// Set to true to delete the saved temporal history (past frames).
+     ///
+diff --git a/crates/bevy_solari/src/realtime/node.rs b/crates/bevy_solari/src/realtime/node.rs
+index 68e36beb92ffe..9e280cd0e1416 100644
+--- a/crates/bevy_solari/src/realtime/node.rs
++++ b/crates/bevy_solari/src/realtime/node.rs
+@@ -14,7 +14,6 @@ use bevy_ecs::{
+     query::QueryItem,
+     world::{FromWorld, World},
+ };
+-use bevy_image::ToExtents;
+ use bevy_render::{
+     diagnostic::RecordDiagnostics,
+     render_graph::{NodeRunError, RenderGraphContext, ViewNode},
+@@ -127,6 +126,8 @@ impl ViewNode for SolariLightingNode {
+             Some(gbuffer),
+             Some(depth_buffer),
+             Some(motion_vectors),
++            Some(previous_gbuffer),
++            Some(previous_depth_buffer),
+             Some(view_uniforms),
+             Some(previous_view_uniforms),
+         ) = (
+@@ -147,6 +148,8 @@ impl ViewNode for SolariLightingNode {
+             view_prepass_textures.deferred_view(),
+             view_prepass_textures.depth_view(),
+             view_prepass_textures.motion_vectors_view(),
++            view_prepass_textures.previous_deferred_view(),
++            view_prepass_textures.previous_depth_view(),
+             view_uniforms.uniforms.binding(),
+             previous_view_uniforms.uniforms.binding(),
+         )
+@@ -177,8 +180,8 @@ impl ViewNode for SolariLightingNode {
+                 gbuffer,
+                 depth_buffer,
+                 motion_vectors,
+-                &s.previous_gbuffer.1,
+-                &s.previous_depth.1,
++                previous_gbuffer,
++                previous_depth_buffer,
+                 view_uniforms,
+                 previous_view_uniforms,
+                 s.world_cache_checksums.as_entire_binding(),
+@@ -334,31 +337,6 @@ impl ViewNode for SolariLightingNode {
+         pass.dispatch_workgroups(dx, dy, 1);
+ 
+         pass_span.end(&mut pass);
+-        drop(pass);
+-
+-        // TODO: Remove these copies, and double buffer instead
+-        command_encoder.copy_texture_to_texture(
+-            view_prepass_textures
+-                .deferred
+-                .clone()
+-                .unwrap()
+-                .texture
+-                .texture
+-                .as_image_copy(),
+-            solari_lighting_resources.previous_gbuffer.0.as_image_copy(),
+-            solari_lighting_resources.view_size.to_extents(),
+-        );
+-        command_encoder.copy_texture_to_texture(
+-            view_prepass_textures
+-                .depth
+-                .clone()
+-                .unwrap()
+-                .texture
+-                .texture
+-                .as_image_copy(),
+-            solari_lighting_resources.previous_depth.0.as_image_copy(),
+-            solari_lighting_resources.view_size.to_extents(),
+-        );
+ 
+         Ok(())
+     }
+diff --git a/crates/bevy_solari/src/realtime/prepare.rs b/crates/bevy_solari/src/realtime/prepare.rs
+index 266ce6d071939..b166c93b1754a 100644
+--- a/crates/bevy_solari/src/realtime/prepare.rs
++++ b/crates/bevy_solari/src/realtime/prepare.rs
+@@ -4,7 +4,6 @@ use bevy_anti_alias::dlss::{
+     Dlss, DlssRayReconstructionFeature, ViewDlssRayReconstructionTextures,
+ };
+ use bevy_camera::MainPassResolutionOverride;
+-use bevy_core_pipeline::{core_3d::CORE_3D_DEPTH_FORMAT, deferred::DEFERRED_PREPASS_FORMAT};
+ #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+ use bevy_ecs::query::Has;
+ use bevy_ecs::{
+@@ -50,8 +49,6 @@ pub struct SolariLightingResources {
+     pub di_reservoirs_b: (Texture, TextureView),
+     pub gi_reservoirs_a: Buffer,
+     pub gi_reservoirs_b: Buffer,
+-    pub previous_gbuffer: (Texture, TextureView),
+-    pub previous_depth: (Texture, TextureView),
+     pub world_cache_checksums: Buffer,
+     pub world_cache_life: Buffer,
+     pub world_cache_radiance: Buffer,
+@@ -151,30 +148,6 @@ pub fn prepare_solari_lighting_resources(
+         let gi_reservoirs_a = gi_reservoirs("solari_lighting_gi_reservoirs_a");
+         let gi_reservoirs_b = gi_reservoirs("solari_lighting_gi_reservoirs_b");
+ 
+-        let previous_gbuffer = render_device.create_texture(&TextureDescriptor {
+-            label: Some("solari_lighting_previous_gbuffer"),
+-            size: view_size.to_extents(),
+-            mip_level_count: 1,
+-            sample_count: 1,
+-            dimension: TextureDimension::D2,
+-            format: DEFERRED_PREPASS_FORMAT,
+-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+-            view_formats: &[],
+-        });
+-        let previous_gbuffer_view = previous_gbuffer.create_view(&TextureViewDescriptor::default());
+-
+-        let previous_depth = render_device.create_texture(&TextureDescriptor {
+-            label: Some("solari_lighting_previous_depth"),
+-            size: view_size.to_extents(),
+-            mip_level_count: 1,
+-            sample_count: 1,
+-            dimension: TextureDimension::D2,
+-            format: CORE_3D_DEPTH_FORMAT,
+-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+-            view_formats: &[],
+-        });
+-        let previous_depth_view = previous_depth.create_view(&TextureViewDescriptor::default());
+-
+         let world_cache_checksums = render_device.create_buffer(&BufferDescriptor {
+             label: Some("solari_lighting_world_cache_checksums"),
+             size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
+@@ -259,8 +232,6 @@ pub fn prepare_solari_lighting_resources(
+             di_reservoirs_b,
+             gi_reservoirs_a,
+             gi_reservoirs_b,
+-            previous_gbuffer: (previous_gbuffer, previous_gbuffer_view),
+-            previous_depth: (previous_depth, previous_depth_view),
+             world_cache_checksums,
+             world_cache_life,
+             world_cache_radiance,

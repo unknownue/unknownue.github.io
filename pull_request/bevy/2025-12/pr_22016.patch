@@ -1,0 +1,83 @@
+diff --git a/crates/bevy_reflect/derive/src/registration.rs b/crates/bevy_reflect/derive/src/registration.rs
+index 2d8174cfb6095..d3ec6e0ad68a7 100644
+--- a/crates/bevy_reflect/derive/src/registration.rs
++++ b/crates/bevy_reflect/derive/src/registration.rs
+@@ -49,7 +49,7 @@ pub(crate) fn impl_get_type_registration<'a>(
+                 registration.insert::<#bevy_reflect_path::ReflectFromPtr>(#bevy_reflect_path::FromType::<Self>::from_type());
+                 #from_reflect_data
+                 #serialization_data
+-                #(registration.insert::<#registration_data>(#bevy_reflect_path::FromType::<Self>::from_type());)*
++                #(registration.register_type_data::<#registration_data, Self>();)*
+                 registration
+             }
+ 
+diff --git a/crates/bevy_reflect/src/lib.rs b/crates/bevy_reflect/src/lib.rs
+index 72397bfe39674..7ead2e662e3f9 100644
+--- a/crates/bevy_reflect/src/lib.rs
++++ b/crates/bevy_reflect/src/lib.rs
+@@ -3606,6 +3606,36 @@ bevy_reflect::tests::Test {
+             assert!(registry.contains(TypeId::of::<OpaqueStructReflect>()));
+             assert!(registry.contains(TypeId::of::<ZSTOpaqueStructReflect>()));
+         }
++
++        #[test]
++        fn type_data_dependency() {
++            #[derive(Reflect)]
++            #[reflect(A)]
++            struct X;
++
++            #[derive(Clone)]
++            struct ReflectA;
++
++            impl<T> FromType<T> for ReflectA {
++                fn from_type() -> Self {
++                    ReflectA
++                }
++
++                fn insert_dependencies(type_registration: &mut TypeRegistration) {
++                    type_registration.insert(ReflectB);
++                }
++            }
++
++            #[derive(Clone)]
++            struct ReflectB;
++
++            let mut registry = TypeRegistry::new();
++            registry.register::<X>();
++
++            let registration = registry.get(TypeId::of::<X>()).unwrap();
++            assert!(registration.data::<ReflectA>().is_some());
++            assert!(registration.data::<ReflectB>().is_some());
++        }
+     }
+ 
+     #[cfg(feature = "glam")]
+diff --git a/crates/bevy_reflect/src/type_registry.rs b/crates/bevy_reflect/src/type_registry.rs
+index 5c79a7bd77840..bf1950b7af9cb 100644
+--- a/crates/bevy_reflect/src/type_registry.rs
++++ b/crates/bevy_reflect/src/type_registry.rs
+@@ -588,6 +588,13 @@ impl TypeRegistration {
+         self.data.insert(TypeId::of::<T>(), Box::new(data));
+     }
+ 
++    /// Inserts the [`TypeData`] instance of `T` created for `V`, and inserts any
++    /// [`TypeData`] dependencies for that combination of `T` and `V`.
++    pub fn register_type_data<T: TypeData + FromType<V>, V>(&mut self) {
++        self.insert(T::from_type());
++        T::insert_dependencies(self);
++    }
++
+     /// Returns a reference to the value of type `T` in this registration's
+     /// [type data].
+     ///
+@@ -747,6 +754,10 @@ where
+ pub trait FromType<T> {
+     /// Creates an instance of `Self` for type `T`.
+     fn from_type() -> Self;
++    /// Inserts [`TypeData`] dependencies of this [`TypeData`].
++    /// This is especially useful for trait [`TypeData`] that has a supertrait (ex: `A: B`).
++    /// When the [`TypeData`] for `A` is inserted, the `B` [`TypeData`] will also be inserted.
++    fn insert_dependencies(_type_registration: &mut TypeRegistration) {}
+ }
+ 
+ /// A struct used to serialize reflected instances of a type.

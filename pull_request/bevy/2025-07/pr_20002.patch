@@ -1,0 +1,1243 @@
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs b/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
+index 7a33df99d897d..805e67ec97c6e 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
++++ b/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
+@@ -9,7 +9,7 @@ use bevy_render::{
+         Buffer, BufferDescriptor, BufferUsages, PipelineCache, SpecializedComputePipelines,
+     },
+     renderer::RenderDevice,
+-    ExtractSchedule, Render, RenderApp, RenderSystems,
++    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ 
+ mod buffers;
+@@ -25,7 +25,9 @@ use pipeline::{AutoExposurePass, AutoExposurePipeline, ViewAutoExposurePipeline}
+ pub use settings::AutoExposure;
+ 
+ use crate::{
+-    auto_exposure::compensation_curve::GpuAutoExposureCompensationCurve,
++    auto_exposure::{
++        compensation_curve::GpuAutoExposureCompensationCurve, pipeline::init_auto_exposure_pipeline,
++    },
+     core_3d::graph::{Core3d, Node3d},
+ };
+ 
+@@ -61,6 +63,10 @@ impl Plugin for AutoExposurePlugin {
+         render_app
+             .init_resource::<SpecializedComputePipelines<AutoExposurePipeline>>()
+             .init_resource::<AutoExposureBuffers>()
++            .add_systems(
++                RenderStartup,
++                (init_auto_exposure_pipeline, init_auto_exposure_resources),
++            )
+             .add_systems(ExtractSchedule, extract_buffers)
+             .add_systems(
+                 Render,
+@@ -75,30 +81,17 @@ impl Plugin for AutoExposurePlugin {
+                 (Node3d::EndMainPass, node::AutoExposure, Node3d::Tonemapping),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app.init_resource::<AutoExposurePipeline>();
+-        render_app.init_resource::<AutoExposureResources>();
+-    }
+ }
+ 
+-impl FromWorld for AutoExposureResources {
+-    fn from_world(world: &mut World) -> Self {
+-        Self {
+-            histogram: world
+-                .resource::<RenderDevice>()
+-                .create_buffer(&BufferDescriptor {
+-                    label: Some("histogram buffer"),
+-                    size: pipeline::HISTOGRAM_BIN_COUNT * 4,
+-                    usage: BufferUsages::STORAGE,
+-                    mapped_at_creation: false,
+-                }),
+-        }
+-    }
++pub fn init_auto_exposure_resources(mut commands: Commands, render_device: Res<RenderDevice>) {
++    commands.insert_resource(AutoExposureResources {
++        histogram: render_device.create_buffer(&BufferDescriptor {
++            label: Some("histogram buffer"),
++            size: pipeline::HISTOGRAM_BIN_COUNT * 4,
++            usage: BufferUsages::STORAGE,
++            mapped_at_creation: false,
++        }),
++    });
+ }
+ 
+ fn queue_view_auto_exposure_pipelines(
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs b/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs
+index 4a2afa939edaf..459f4c01667d2 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs
++++ b/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs
+@@ -47,31 +47,31 @@ pub enum AutoExposurePass {
+ 
+ pub const HISTOGRAM_BIN_COUNT: u64 = 64;
+ 
+-impl FromWorld for AutoExposurePipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        Self {
+-            histogram_layout: render_device.create_bind_group_layout(
+-                "compute histogram bind group",
+-                &BindGroupLayoutEntries::sequential(
+-                    ShaderStages::COMPUTE,
+-                    (
+-                        uniform_buffer::<GlobalsUniform>(false),
+-                        uniform_buffer::<AutoExposureUniform>(false),
+-                        texture_2d(TextureSampleType::Float { filterable: false }),
+-                        texture_2d(TextureSampleType::Float { filterable: false }),
+-                        texture_1d(TextureSampleType::Float { filterable: false }),
+-                        uniform_buffer::<AutoExposureCompensationCurveUniform>(false),
+-                        storage_buffer_sized(false, NonZero::<u64>::new(HISTOGRAM_BIN_COUNT * 4)),
+-                        storage_buffer_sized(false, NonZero::<u64>::new(4)),
+-                        storage_buffer::<ViewUniform>(true),
+-                    ),
++pub fn init_auto_exposure_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    asset_server: Res<AssetServer>,
++) {
++    commands.insert_resource(AutoExposurePipeline {
++        histogram_layout: render_device.create_bind_group_layout(
++            "compute histogram bind group",
++            &BindGroupLayoutEntries::sequential(
++                ShaderStages::COMPUTE,
++                (
++                    uniform_buffer::<GlobalsUniform>(false),
++                    uniform_buffer::<AutoExposureUniform>(false),
++                    texture_2d(TextureSampleType::Float { filterable: false }),
++                    texture_2d(TextureSampleType::Float { filterable: false }),
++                    texture_1d(TextureSampleType::Float { filterable: false }),
++                    uniform_buffer::<AutoExposureCompensationCurveUniform>(false),
++                    storage_buffer_sized(false, NonZero::<u64>::new(HISTOGRAM_BIN_COUNT * 4)),
++                    storage_buffer_sized(false, NonZero::<u64>::new(4)),
++                    storage_buffer::<ViewUniform>(true),
+                 ),
+             ),
+-            histogram_shader: load_embedded_asset!(world, "auto_exposure.wgsl"),
+-        }
+-    }
++        ),
++        histogram_shader: load_embedded_asset!(asset_server.as_ref(), "auto_exposure.wgsl"),
++    });
+ }
+ 
+ impl SpecializedComputePipeline for AutoExposurePipeline {
+diff --git a/crates/bevy_core_pipeline/src/blit/mod.rs b/crates/bevy_core_pipeline/src/blit/mod.rs
+index f515cdc58ce92..69897d333d883 100644
+--- a/crates/bevy_core_pipeline/src/blit/mod.rs
++++ b/crates/bevy_core_pipeline/src/blit/mod.rs
+@@ -1,6 +1,6 @@
+ use crate::FullscreenShader;
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+ use bevy_ecs::prelude::*;
+ use bevy_render::{
+     render_resource::{
+@@ -8,7 +8,7 @@ use bevy_render::{
+         *,
+     },
+     renderer::RenderDevice,
+-    RenderApp,
++    RenderApp, RenderStartup,
+ };
+ use bevy_utils::default;
+ 
+@@ -19,18 +19,14 @@ impl Plugin for BlitPlugin {
+     fn build(&self, app: &mut App) {
+         embedded_asset!(app, "blit.wgsl");
+ 
+-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            render_app.allow_ambiguous_resource::<SpecializedRenderPipelines<BlitPipeline>>();
+-        }
+-    }
+-
+-    fn finish(&self, app: &mut App) {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
++
+         render_app
+-            .init_resource::<BlitPipeline>()
+-            .init_resource::<SpecializedRenderPipelines<BlitPipeline>>();
++            .allow_ambiguous_resource::<SpecializedRenderPipelines<BlitPipeline>>()
++            .init_resource::<SpecializedRenderPipelines<BlitPipeline>>()
++            .add_systems(RenderStartup, init_blit_pipeline);
+     }
+ }
+ 
+@@ -42,30 +38,31 @@ pub struct BlitPipeline {
+     pub fragment_shader: Handle<Shader>,
+ }
+ 
+-impl FromWorld for BlitPipeline {
+-    fn from_world(render_world: &mut World) -> Self {
+-        let render_device = render_world.resource::<RenderDevice>();
+-
+-        let layout = render_device.create_bind_group_layout(
+-            "blit_bind_group_layout",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::FRAGMENT,
+-                (
+-                    texture_2d(TextureSampleType::Float { filterable: false }),
+-                    sampler(SamplerBindingType::NonFiltering),
+-                ),
++pub fn init_blit_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++) {
++    let layout = render_device.create_bind_group_layout(
++        "blit_bind_group_layout",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
++            (
++                texture_2d(TextureSampleType::Float { filterable: false }),
++                sampler(SamplerBindingType::NonFiltering),
+             ),
+-        );
++        ),
++    );
+ 
+-        let sampler = render_device.create_sampler(&SamplerDescriptor::default());
++    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
+ 
+-        BlitPipeline {
+-            layout,
+-            sampler,
+-            fullscreen_shader: render_world.resource::<FullscreenShader>().clone(),
+-            fragment_shader: load_embedded_asset!(render_world, "blit.wgsl"),
+-        }
+-    }
++    commands.insert_resource(BlitPipeline {
++        layout,
++        sampler,
++        fullscreen_shader: fullscreen_shader.clone(),
++        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "blit.wgsl"),
++    });
+ }
+ 
+ impl BlitPipeline {
+diff --git a/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs b/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
+index aa8d3d37afc3e..481f51762e2c3 100644
+--- a/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
++++ b/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
+@@ -1,12 +1,11 @@
+ use crate::FullscreenShader;
+ 
+ use super::{Bloom, BLOOM_TEXTURE_FORMAT};
+-use bevy_asset::{load_embedded_asset, Handle};
++use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+ use bevy_ecs::{
+     prelude::{Component, Entity},
+     resource::Resource,
+     system::{Commands, Query, Res, ResMut},
+-    world::{FromWorld, World},
+ };
+ use bevy_math::{Vec2, Vec4};
+ use bevy_render::{
+@@ -53,42 +52,43 @@ pub struct BloomUniforms {
+     pub aspect: f32,
+ }
+ 
+-impl FromWorld for BloomDownsamplingPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        // Bind group layout
+-        let bind_group_layout = render_device.create_bind_group_layout(
+-            "bloom_downsampling_bind_group_layout_with_settings",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::FRAGMENT,
+-                (
+-                    // Input texture binding
+-                    texture_2d(TextureSampleType::Float { filterable: true }),
+-                    // Sampler binding
+-                    sampler(SamplerBindingType::Filtering),
+-                    // Downsampling settings binding
+-                    uniform_buffer::<BloomUniforms>(true),
+-                ),
++pub fn init_bloom_downsampling_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++) {
++    // Bind group layout
++    let bind_group_layout = render_device.create_bind_group_layout(
++        "bloom_downsampling_bind_group_layout_with_settings",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
++            (
++                // Input texture binding
++                texture_2d(TextureSampleType::Float { filterable: true }),
++                // Sampler binding
++                sampler(SamplerBindingType::Filtering),
++                // Downsampling settings binding
++                uniform_buffer::<BloomUniforms>(true),
+             ),
+-        );
+-
+-        // Sampler
+-        let sampler = render_device.create_sampler(&SamplerDescriptor {
+-            min_filter: FilterMode::Linear,
+-            mag_filter: FilterMode::Linear,
+-            address_mode_u: AddressMode::ClampToEdge,
+-            address_mode_v: AddressMode::ClampToEdge,
+-            ..Default::default()
+-        });
+-
+-        BloomDownsamplingPipeline {
+-            bind_group_layout,
+-            sampler,
+-            fullscreen_shader: world.resource::<FullscreenShader>().clone(),
+-            fragment_shader: load_embedded_asset!(world, "bloom.wgsl"),
+-        }
+-    }
++        ),
++    );
++
++    // Sampler
++    let sampler = render_device.create_sampler(&SamplerDescriptor {
++        min_filter: FilterMode::Linear,
++        mag_filter: FilterMode::Linear,
++        address_mode_u: AddressMode::ClampToEdge,
++        address_mode_v: AddressMode::ClampToEdge,
++        ..Default::default()
++    });
++
++    commands.insert_resource(BloomDownsamplingPipeline {
++        bind_group_layout,
++        sampler,
++        fullscreen_shader: fullscreen_shader.clone(),
++        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "bloom.wgsl"),
++    });
+ }
+ 
+ impl SpecializedRenderPipeline for BloomDownsamplingPipeline {
+diff --git a/crates/bevy_core_pipeline/src/bloom/mod.rs b/crates/bevy_core_pipeline/src/bloom/mod.rs
+index d57af1cd018b9..0308ebe72e508 100644
+--- a/crates/bevy_core_pipeline/src/bloom/mod.rs
++++ b/crates/bevy_core_pipeline/src/bloom/mod.rs
+@@ -6,6 +6,10 @@ use bevy_image::ToExtents;
+ pub use settings::{Bloom, BloomCompositeMode, BloomPrefilter};
+ 
+ use crate::{
++    bloom::{
++        downsampling_pipeline::init_bloom_downsampling_pipeline,
++        upsampling_pipeline::init_bloom_upscaling_pipeline,
++    },
+     core_2d::graph::{Core2d, Node2d},
+     core_3d::graph::{Core3d, Node3d},
+ };
+@@ -25,7 +29,7 @@ use bevy_render::{
+     renderer::{RenderContext, RenderDevice},
+     texture::{CachedTexture, TextureCache},
+     view::ViewTarget,
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use downsampling_pipeline::{
+     prepare_downsampling_pipeline, BloomDownsamplingPipeline, BloomDownsamplingPipelineIds,
+@@ -59,6 +63,13 @@ impl Plugin for BloomPlugin {
+         render_app
+             .init_resource::<SpecializedRenderPipelines<BloomDownsamplingPipeline>>()
+             .init_resource::<SpecializedRenderPipelines<BloomUpsamplingPipeline>>()
++            .add_systems(
++                RenderStartup,
++                (
++                    init_bloom_downsampling_pipeline,
++                    init_bloom_upscaling_pipeline,
++                ),
++            )
+             .add_systems(
+                 Render,
+                 (
+@@ -81,15 +92,6 @@ impl Plugin for BloomPlugin {
+                 (Node2d::EndMainPass, Node2d::Bloom, Node2d::Tonemapping),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        render_app
+-            .init_resource::<BloomDownsamplingPipeline>()
+-            .init_resource::<BloomUpsamplingPipeline>();
+-    }
+ }
+ 
+ #[derive(Default)]
+diff --git a/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs b/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
+index 4a5c4d50f946d..91e550b787139 100644
+--- a/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
++++ b/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
+@@ -3,12 +3,11 @@ use crate::FullscreenShader;
+ use super::{
+     downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode, BLOOM_TEXTURE_FORMAT,
+ };
+-use bevy_asset::{load_embedded_asset, Handle};
++use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+ use bevy_ecs::{
+     prelude::{Component, Entity},
+     resource::Resource,
+     system::{Commands, Query, Res, ResMut},
+-    world::{FromWorld, World},
+ };
+ use bevy_render::{
+     render_resource::{
+@@ -41,31 +40,32 @@ pub struct BloomUpsamplingPipelineKeys {
+     final_pipeline: bool,
+ }
+ 
+-impl FromWorld for BloomUpsamplingPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        let bind_group_layout = render_device.create_bind_group_layout(
+-            "bloom_upsampling_bind_group_layout",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::FRAGMENT,
+-                (
+-                    // Input texture
+-                    texture_2d(TextureSampleType::Float { filterable: true }),
+-                    // Sampler
+-                    sampler(SamplerBindingType::Filtering),
+-                    // BloomUniforms
+-                    uniform_buffer::<BloomUniforms>(true),
+-                ),
++pub fn init_bloom_upscaling_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++) {
++    let bind_group_layout = render_device.create_bind_group_layout(
++        "bloom_upsampling_bind_group_layout",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
++            (
++                // Input texture
++                texture_2d(TextureSampleType::Float { filterable: true }),
++                // Sampler
++                sampler(SamplerBindingType::Filtering),
++                // BloomUniforms
++                uniform_buffer::<BloomUniforms>(true),
+             ),
+-        );
++        ),
++    );
+ 
+-        BloomUpsamplingPipeline {
+-            bind_group_layout,
+-            fullscreen_shader: world.resource::<FullscreenShader>().clone(),
+-            fragment_shader: load_embedded_asset!(world, "bloom.wgsl"),
+-        }
+-    }
++    commands.insert_resource(BloomUpsamplingPipeline {
++        bind_group_layout,
++        fullscreen_shader: fullscreen_shader.clone(),
++        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "bloom.wgsl"),
++    });
+ }
+ 
+ impl SpecializedRenderPipeline for BloomUpsamplingPipeline {
+diff --git a/crates/bevy_core_pipeline/src/dof/mod.rs b/crates/bevy_core_pipeline/src/dof/mod.rs
+index c3b39e8181a9b..0bd5c79365d12 100644
+--- a/crates/bevy_core_pipeline/src/dof/mod.rs
++++ b/crates/bevy_core_pipeline/src/dof/mod.rs
+@@ -25,7 +25,7 @@ use bevy_ecs::{
+     resource::Resource,
+     schedule::IntoScheduleConfigs as _,
+     system::{lifetimeless::Read, Commands, Query, Res, ResMut},
+-    world::{FromWorld, World},
++    world::World,
+ };
+ use bevy_image::BevyDefault as _;
+ use bevy_math::ops;
+@@ -55,7 +55,7 @@ use bevy_render::{
+         prepare_view_targets, ExtractedView, Msaa, ViewDepthTexture, ViewTarget, ViewUniform,
+         ViewUniformOffset, ViewUniforms,
+     },
+-    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
++    Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_utils::{default, once};
+ use smallvec::SmallVec;
+@@ -219,6 +219,7 @@ impl Plugin for DepthOfFieldPlugin {
+         render_app
+             .init_resource::<SpecializedRenderPipelines<DepthOfFieldPipeline>>()
+             .init_resource::<DepthOfFieldGlobalBindGroup>()
++            .add_systems(RenderStartup, init_dof_global_bind_group_layout)
+             .add_systems(ExtractSchedule, extract_depth_of_field_settings)
+             .add_systems(
+                 Render,
+@@ -248,14 +249,6 @@ impl Plugin for DepthOfFieldPlugin {
+                 (Node3d::Bloom, Node3d::DepthOfField, Node3d::Tonemapping),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app.init_resource::<DepthOfFieldGlobalBindGroupLayout>();
+-    }
+ }
+ 
+ /// The node in the render graph for depth of field.
+@@ -504,38 +497,34 @@ impl DepthOfField {
+     }
+ }
+ 
+-impl FromWorld for DepthOfFieldGlobalBindGroupLayout {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        // Create the bind group layout that will be shared among all instances
+-        // of the depth of field shader.
+-        let layout = render_device.create_bind_group_layout(
+-            Some("depth of field global bind group layout"),
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::FRAGMENT,
+-                (
+-                    // `dof_params`
+-                    uniform_buffer::<DepthOfFieldUniform>(true),
+-                    // `color_texture_sampler`
+-                    sampler(SamplerBindingType::Filtering),
+-                ),
++pub fn init_dof_global_bind_group_layout(mut commands: Commands, render_device: Res<RenderDevice>) {
++    // Create the bind group layout that will be shared among all instances
++    // of the depth of field shader.
++    let layout = render_device.create_bind_group_layout(
++        Some("depth of field global bind group layout"),
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
++            (
++                // `dof_params`
++                uniform_buffer::<DepthOfFieldUniform>(true),
++                // `color_texture_sampler`
++                sampler(SamplerBindingType::Filtering),
+             ),
+-        );
+-
+-        // Create the color texture sampler.
+-        let sampler = render_device.create_sampler(&SamplerDescriptor {
+-            label: Some("depth of field sampler"),
+-            mag_filter: FilterMode::Linear,
+-            min_filter: FilterMode::Linear,
+-            ..default()
+-        });
++        ),
++    );
+ 
+-        DepthOfFieldGlobalBindGroupLayout {
+-            color_texture_sampler: sampler,
+-            layout,
+-        }
+-    }
++    // Create the color texture sampler.
++    let sampler = render_device.create_sampler(&SamplerDescriptor {
++        label: Some("depth of field sampler"),
++        mag_filter: FilterMode::Linear,
++        min_filter: FilterMode::Linear,
++        ..default()
++    });
++
++    commands.insert_resource(DepthOfFieldGlobalBindGroupLayout {
++        color_texture_sampler: sampler,
++        layout,
++    });
+ }
+ 
+ /// Creates the bind group layouts for the depth of field effect that are
+diff --git a/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs b/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs
+index 2080efdabb97b..d41df4d355304 100644
+--- a/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs
++++ b/crates/bevy_core_pipeline/src/experimental/mip_generation/mod.rs
+@@ -25,7 +25,7 @@ use bevy_ecs::{
+     world::{FromWorld, World},
+ };
+ use bevy_math::{uvec2, UVec2, Vec4Swizzles as _};
+-use bevy_render::batching::gpu_preprocessing::GpuPreprocessingSupport;
++use bevy_render::{batching::gpu_preprocessing::GpuPreprocessingSupport, RenderStartup};
+ use bevy_render::{
+     experimental::occlusion_culling::{
+         OcclusionCulling, OcclusionCullingSubview, OcclusionCullingSubviewEntities,
+@@ -100,6 +100,7 @@ impl Plugin for MipGenerationPlugin {
+                     Node3d::EndMainPassPostProcessing,
+                 ),
+             )
++            .add_systems(RenderStartup, init_depth_pyramid_dummy_texture)
+             .add_systems(
+                 Render,
+                 create_downsample_depth_pipelines.in_set(RenderSystems::Prepare),
+@@ -116,13 +117,6 @@ impl Plugin for MipGenerationPlugin {
+                     .after(prepare_core_3d_depth_textures),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        render_app.init_resource::<DepthPyramidDummyTexture>();
+-    }
+ }
+ 
+ /// The nodes that produce a hierarchical Z-buffer, also known as a depth
+@@ -523,16 +517,14 @@ impl SpecializedComputePipeline for DownsampleDepthPipeline {
+ #[derive(Resource, Deref, DerefMut)]
+ pub struct DepthPyramidDummyTexture(TextureView);
+ 
+-impl FromWorld for DepthPyramidDummyTexture {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        DepthPyramidDummyTexture(create_depth_pyramid_dummy_texture(
+-            render_device,
++pub fn init_depth_pyramid_dummy_texture(mut commands: Commands, render_device: Res<RenderDevice>) {
++    commands.insert_resource(DepthPyramidDummyTexture(
++        create_depth_pyramid_dummy_texture(
++            &render_device,
+             "depth pyramid dummy texture",
+             "depth pyramid dummy texture view",
+-        ))
+-    }
++        ),
++    ));
+ }
+ 
+ /// Creates a placeholder texture that can be bound to a depth pyramid binding
+diff --git a/crates/bevy_core_pipeline/src/lib.rs b/crates/bevy_core_pipeline/src/lib.rs
+index 3526b3e8fbb1e..bc3159de18712 100644
+--- a/crates/bevy_core_pipeline/src/lib.rs
++++ b/crates/bevy_core_pipeline/src/lib.rs
+@@ -81,9 +81,6 @@ impl Plugin for CorePipelinePlugin {
+                 OrderIndependentTransparencyPlugin,
+                 MipGenerationPlugin,
+             ));
+-    }
+-
+-    fn finish(&self, app: &mut App) {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/mod.rs b/crates/bevy_core_pipeline/src/motion_blur/mod.rs
+index a2b44704f6c59..dfb50c5f5d620 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/mod.rs
++++ b/crates/bevy_core_pipeline/src/motion_blur/mod.rs
+@@ -20,7 +20,7 @@ use bevy_render::{
+     extract_component::{ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin},
+     render_graph::{RenderGraphExt, ViewNodeRunner},
+     render_resource::{ShaderType, SpecializedRenderPipelines},
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ 
+ pub mod node;
+@@ -143,6 +143,7 @@ impl Plugin for MotionBlurPlugin {
+ 
+         render_app
+             .init_resource::<SpecializedRenderPipelines<pipeline::MotionBlurPipeline>>()
++            .add_systems(RenderStartup, pipeline::init_motion_blur_pipeline)
+             .add_systems(
+                 Render,
+                 pipeline::prepare_motion_blur_pipelines.in_set(RenderSystems::Prepare),
+@@ -162,12 +163,4 @@ impl Plugin for MotionBlurPlugin {
+                 ),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app.init_resource::<pipeline::MotionBlurPipeline>();
+-    }
+ }
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs b/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
+index 904d6c6c5408d..66112254abe80 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
++++ b/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
+@@ -1,12 +1,11 @@
+ use crate::FullscreenShader;
+-use bevy_asset::{load_embedded_asset, Handle};
++use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+     query::With,
+     resource::Resource,
+     system::{Commands, Query, Res, ResMut},
+-    world::FromWorld,
+ };
+ use bevy_image::BevyDefault as _;
+ use bevy_render::{
+@@ -94,14 +93,19 @@ impl MotionBlurPipeline {
+     }
+ }
+ 
+-impl FromWorld for MotionBlurPipeline {
+-    fn from_world(render_world: &mut bevy_ecs::world::World) -> Self {
+-        let render_device = render_world.resource::<RenderDevice>().clone();
+-
+-        let fullscreen_shader = render_world.resource::<FullscreenShader>().clone();
+-        let fragment_shader = load_embedded_asset!(render_world, "motion_blur.wgsl");
+-        MotionBlurPipeline::new(&render_device, fullscreen_shader, fragment_shader)
+-    }
++pub fn init_motion_blur_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++) {
++    let fullscreen_shader = fullscreen_shader.clone();
++    let fragment_shader = load_embedded_asset!(asset_server.as_ref(), "motion_blur.wgsl");
++    commands.insert_resource(MotionBlurPipeline::new(
++        &render_device,
++        fullscreen_shader,
++        fragment_shader,
++    ));
+ }
+ 
+ #[derive(PartialEq, Eq, Hash, Clone, Copy)]
+diff --git a/crates/bevy_core_pipeline/src/oit/mod.rs b/crates/bevy_core_pipeline/src/oit/mod.rs
+index 52d5d2ddc4bfd..9c20f4739d752 100644
+--- a/crates/bevy_core_pipeline/src/oit/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/mod.rs
+@@ -14,7 +14,7 @@ use bevy_render::{
+     render_resource::{BufferUsages, BufferVec, DynamicUniformBuffer, ShaderType, TextureUsages},
+     renderer::{RenderDevice, RenderQueue},
+     view::Msaa,
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_window::PrimaryWindow;
+ use resolve::{
+@@ -113,10 +113,12 @@ impl Plugin for OrderIndependentTransparencyPlugin {
+             return;
+         };
+ 
+-        render_app.add_systems(
+-            Render,
+-            prepare_oit_buffers.in_set(RenderSystems::PrepareResources),
+-        );
++        render_app
++            .add_systems(RenderStartup, init_oit_buffers)
++            .add_systems(
++                Render,
++                prepare_oit_buffers.in_set(RenderSystems::PrepareResources),
++            );
+ 
+         render_app
+             .add_render_graph_node::<ViewNodeRunner<OitResolveNode>>(Core3d, OitResolvePass)
+@@ -129,14 +131,6 @@ impl Plugin for OrderIndependentTransparencyPlugin {
+                 ),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app.init_resource::<OitBuffers>();
+-    }
+ }
+ 
+ // WARN This should only happen for cameras with the [`OrderIndependentTransparencySettings`] component
+@@ -192,32 +186,31 @@ pub struct OitBuffers {
+     pub settings: DynamicUniformBuffer<OrderIndependentTransparencySettings>,
+ }
+ 
+-impl FromWorld for OitBuffers {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let render_queue = world.resource::<RenderQueue>();
+-
+-        // initialize buffers with something so there's a valid binding
++pub fn init_oit_buffers(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    render_queue: Res<RenderQueue>,
++) {
++    // initialize buffers with something so there's a valid binding
+ 
+-        let mut layers = BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
+-        layers.set_label(Some("oit_layers"));
+-        layers.reserve(1, render_device);
+-        layers.write_buffer(render_device, render_queue);
++    let mut layers = BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
++    layers.set_label(Some("oit_layers"));
++    layers.reserve(1, &render_device);
++    layers.write_buffer(&render_device, &render_queue);
+ 
+-        let mut layer_ids = BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
+-        layer_ids.set_label(Some("oit_layer_ids"));
+-        layer_ids.reserve(1, render_device);
+-        layer_ids.write_buffer(render_device, render_queue);
++    let mut layer_ids = BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
++    layer_ids.set_label(Some("oit_layer_ids"));
++    layer_ids.reserve(1, &render_device);
++    layer_ids.write_buffer(&render_device, &render_queue);
+ 
+-        let mut settings = DynamicUniformBuffer::default();
+-        settings.set_label(Some("oit_settings"));
++    let mut settings = DynamicUniformBuffer::default();
++    settings.set_label(Some("oit_settings"));
+ 
+-        Self {
+-            layers,
+-            layer_ids,
+-            settings,
+-        }
+-    }
++    commands.insert_resource(OitBuffers {
++        layers,
++        layer_ids,
++        settings,
++    });
+ }
+ 
+ #[derive(Component)]
+diff --git a/crates/bevy_core_pipeline/src/post_process/mod.rs b/crates/bevy_core_pipeline/src/post_process/mod.rs
+index ce77fc1a7508c..6d9a7669f2221 100644
+--- a/crates/bevy_core_pipeline/src/post_process/mod.rs
++++ b/crates/bevy_core_pipeline/src/post_process/mod.rs
+@@ -3,7 +3,7 @@
+ //! Currently, this consists only of chromatic aberration.
+ 
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{embedded_asset, load_embedded_asset, Assets, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Assets, Handle};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     component::Component,
+@@ -13,7 +13,7 @@ use bevy_ecs::{
+     resource::Resource,
+     schedule::IntoScheduleConfigs as _,
+     system::{lifetimeless::Read, Commands, Query, Res, ResMut},
+-    world::{FromWorld, World},
++    world::World,
+ };
+ use bevy_image::{BevyDefault, Image};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+@@ -37,7 +37,7 @@ use bevy_render::{
+     renderer::{RenderContext, RenderDevice, RenderQueue},
+     texture::GpuImage,
+     view::{ExtractedView, ViewTarget},
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_utils::prelude::default;
+ 
+@@ -211,6 +211,7 @@ impl Plugin for PostProcessingPlugin {
+             .insert_resource(DefaultChromaticAberrationLut(default_lut))
+             .init_resource::<SpecializedRenderPipelines<PostProcessingPipeline>>()
+             .init_resource::<PostProcessingUniformBuffers>()
++            .add_systems(RenderStartup, init_post_processing_pipeline)
+             .add_systems(
+                 Render,
+                 (
+@@ -240,13 +241,6 @@ impl Plugin for PostProcessingPlugin {
+                 (Node2d::Bloom, Node2d::PostProcessing, Node2d::Tonemapping),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        render_app.init_resource::<PostProcessingPipeline>();
+-    }
+ }
+ 
+ impl Default for ChromaticAberration {
+@@ -259,55 +253,56 @@ impl Default for ChromaticAberration {
+     }
+ }
+ 
+-impl FromWorld for PostProcessingPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        // Create our single bind group layout.
+-        let bind_group_layout = render_device.create_bind_group_layout(
+-            Some("postprocessing bind group layout"),
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::FRAGMENT,
+-                (
+-                    // Chromatic aberration source:
+-                    texture_2d(TextureSampleType::Float { filterable: true }),
+-                    // Chromatic aberration source sampler:
+-                    sampler(SamplerBindingType::Filtering),
+-                    // Chromatic aberration LUT:
+-                    texture_2d(TextureSampleType::Float { filterable: true }),
+-                    // Chromatic aberration LUT sampler:
+-                    sampler(SamplerBindingType::Filtering),
+-                    // Chromatic aberration settings:
+-                    uniform_buffer::<ChromaticAberrationUniform>(true),
+-                ),
++pub fn init_post_processing_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++) {
++    // Create our single bind group layout.
++    let bind_group_layout = render_device.create_bind_group_layout(
++        Some("postprocessing bind group layout"),
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
++            (
++                // Chromatic aberration source:
++                texture_2d(TextureSampleType::Float { filterable: true }),
++                // Chromatic aberration source sampler:
++                sampler(SamplerBindingType::Filtering),
++                // Chromatic aberration LUT:
++                texture_2d(TextureSampleType::Float { filterable: true }),
++                // Chromatic aberration LUT sampler:
++                sampler(SamplerBindingType::Filtering),
++                // Chromatic aberration settings:
++                uniform_buffer::<ChromaticAberrationUniform>(true),
+             ),
+-        );
+-
+-        // Both source and chromatic aberration LUTs should be sampled
+-        // bilinearly.
+-
+-        let source_sampler = render_device.create_sampler(&SamplerDescriptor {
+-            mipmap_filter: FilterMode::Linear,
+-            min_filter: FilterMode::Linear,
+-            mag_filter: FilterMode::Linear,
+-            ..default()
+-        });
++        ),
++    );
+ 
+-        let chromatic_aberration_lut_sampler = render_device.create_sampler(&SamplerDescriptor {
+-            mipmap_filter: FilterMode::Linear,
+-            min_filter: FilterMode::Linear,
+-            mag_filter: FilterMode::Linear,
+-            ..default()
+-        });
+-
+-        PostProcessingPipeline {
+-            bind_group_layout,
+-            source_sampler,
+-            chromatic_aberration_lut_sampler,
+-            fullscreen_shader: world.resource::<FullscreenShader>().clone(),
+-            fragment_shader: load_embedded_asset!(world, "post_process.wgsl"),
+-        }
+-    }
++    // Both source and chromatic aberration LUTs should be sampled
++    // bilinearly.
++
++    let source_sampler = render_device.create_sampler(&SamplerDescriptor {
++        mipmap_filter: FilterMode::Linear,
++        min_filter: FilterMode::Linear,
++        mag_filter: FilterMode::Linear,
++        ..default()
++    });
++
++    let chromatic_aberration_lut_sampler = render_device.create_sampler(&SamplerDescriptor {
++        mipmap_filter: FilterMode::Linear,
++        min_filter: FilterMode::Linear,
++        mag_filter: FilterMode::Linear,
++        ..default()
++    });
++
++    commands.insert_resource(PostProcessingPipeline {
++        bind_group_layout,
++        source_sampler,
++        chromatic_aberration_lut_sampler,
++        fullscreen_shader: fullscreen_shader.clone(),
++        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "post_process.wgsl"),
++    });
+ }
+ 
+ impl SpecializedRenderPipeline for PostProcessingPipeline {
+diff --git a/crates/bevy_core_pipeline/src/skybox/mod.rs b/crates/bevy_core_pipeline/src/skybox/mod.rs
+index 40524cf221a76..f80bbbf770c22 100644
+--- a/crates/bevy_core_pipeline/src/skybox/mod.rs
++++ b/crates/bevy_core_pipeline/src/skybox/mod.rs
+@@ -1,5 +1,5 @@
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+ use bevy_ecs::{
+     prelude::{Component, Entity},
+     query::{QueryItem, With},
+@@ -25,13 +25,16 @@ use bevy_render::{
+     renderer::RenderDevice,
+     texture::GpuImage,
+     view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniforms},
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_transform::components::Transform;
+ use bevy_utils::default;
+ use prepass::SkyboxPrepassPipeline;
+ 
+-use crate::{core_3d::CORE_3D_DEPTH_FORMAT, prepass::PreviousViewUniforms};
++use crate::{
++    core_3d::CORE_3D_DEPTH_FORMAT, prepass::PreviousViewUniforms,
++    skybox::prepass::init_skybox_prepass_pipeline,
++};
+ 
+ pub mod prepass;
+ 
+@@ -54,6 +57,10 @@ impl Plugin for SkyboxPlugin {
+             .init_resource::<SpecializedRenderPipelines<SkyboxPipeline>>()
+             .init_resource::<SpecializedRenderPipelines<SkyboxPrepassPipeline>>()
+             .init_resource::<PreviousViewUniforms>()
++            .add_systems(
++                RenderStartup,
++                (init_skybox_pipeline, init_skybox_prepass_pipeline),
++            )
+             .add_systems(
+                 Render,
+                 (
+@@ -65,17 +72,6 @@ impl Plugin for SkyboxPlugin {
+                 ),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        let shader = load_embedded_asset!(render_app.world(), "skybox.wgsl");
+-        let render_device = render_app.world().resource::<RenderDevice>().clone();
+-        render_app
+-            .insert_resource(SkyboxPipeline::new(&render_device, shader))
+-            .init_resource::<SkyboxPrepassPipeline>();
+-    }
+ }
+ 
+ /// Adds a skybox to a 3D camera, based on a cubemap texture.
+@@ -179,6 +175,15 @@ impl SkyboxPipeline {
+     }
+ }
+ 
++fn init_skybox_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    asset_server: Res<AssetServer>,
++) {
++    let shader = load_embedded_asset!(asset_server.as_ref(), "skybox.wgsl");
++    commands.insert_resource(SkyboxPipeline::new(&render_device, shader));
++}
++
+ #[derive(PartialEq, Eq, Hash, Clone, Copy)]
+ struct SkyboxPipelineKey {
+     hdr: bool,
+diff --git a/crates/bevy_core_pipeline/src/skybox/prepass.rs b/crates/bevy_core_pipeline/src/skybox/prepass.rs
+index 2133e133fe2ad..e80422a3cee30 100644
+--- a/crates/bevy_core_pipeline/src/skybox/prepass.rs
++++ b/crates/bevy_core_pipeline/src/skybox/prepass.rs
+@@ -1,13 +1,12 @@
+ //! Adds motion vector support to skyboxes. See [`SkyboxPrepassPipeline`] for details.
+ 
+-use bevy_asset::{load_embedded_asset, Handle};
++use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+     query::{Has, With},
+     resource::Resource,
+     system::{Commands, Query, Res, ResMut},
+-    world::{FromWorld, World},
+ };
+ use bevy_render::{
+     render_resource::{
+@@ -59,25 +58,26 @@ pub struct RenderSkyboxPrepassPipeline(pub CachedRenderPipelineId);
+ #[derive(Component)]
+ pub struct SkyboxPrepassBindGroup(pub BindGroup);
+ 
+-impl FromWorld for SkyboxPrepassPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-
+-        Self {
+-            bind_group_layout: render_device.create_bind_group_layout(
+-                "skybox_prepass_bind_group_layout",
+-                &BindGroupLayoutEntries::sequential(
+-                    ShaderStages::FRAGMENT,
+-                    (
+-                        uniform_buffer::<ViewUniform>(true),
+-                        uniform_buffer::<PreviousViewData>(true),
+-                    ),
++pub fn init_skybox_prepass_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++) {
++    commands.insert_resource(SkyboxPrepassPipeline {
++        bind_group_layout: render_device.create_bind_group_layout(
++            "skybox_prepass_bind_group_layout",
++            &BindGroupLayoutEntries::sequential(
++                ShaderStages::FRAGMENT,
++                (
++                    uniform_buffer::<ViewUniform>(true),
++                    uniform_buffer::<PreviousViewData>(true),
+                 ),
+             ),
+-            fullscreen_shader: world.resource::<FullscreenShader>().clone(),
+-            fragment_shader: load_embedded_asset!(world, "skybox_prepass.wgsl"),
+-        }
+-    }
++        ),
++        fullscreen_shader: fullscreen_shader.clone(),
++        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "skybox_prepass.wgsl"),
++    });
+ }
+ 
+ impl SpecializedRenderPipeline for SkyboxPrepassPipeline {
+diff --git a/crates/bevy_core_pipeline/src/tonemapping/mod.rs b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+index bd0004d3422d3..2eb3d267e34c5 100644
+--- a/crates/bevy_core_pipeline/src/tonemapping/mod.rs
++++ b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+@@ -1,5 +1,5 @@
+ use bevy_app::prelude::*;
+-use bevy_asset::{embedded_asset, load_embedded_asset, Assets, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Assets, Handle};
+ use bevy_ecs::prelude::*;
+ use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+@@ -16,7 +16,7 @@ use bevy_render::{
+     renderer::RenderDevice,
+     texture::{FallbackImage, GpuImage},
+     view::{ExtractedView, ViewTarget, ViewUniform},
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bitflags::bitflags;
+ #[cfg(not(feature = "tonemapping_luts"))]
+@@ -95,18 +95,12 @@ impl Plugin for TonemappingPlugin {
+         };
+         render_app
+             .init_resource::<SpecializedRenderPipelines<TonemappingPipeline>>()
++            .add_systems(RenderStartup, init_tonemapping_pipeline)
+             .add_systems(
+                 Render,
+                 prepare_view_tonemapping_pipelines.in_set(RenderSystems::Prepare),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        render_app.init_resource::<TonemappingPipeline>();
+-    }
+ }
+ 
+ #[derive(Resource)]
+@@ -291,36 +285,37 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
+     }
+ }
+ 
+-impl FromWorld for TonemappingPipeline {
+-    fn from_world(render_world: &mut World) -> Self {
+-        let mut entries = DynamicBindGroupLayoutEntries::new_with_indices(
+-            ShaderStages::FRAGMENT,
++pub fn init_tonemapping_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    fullscreen_shader: Res<FullscreenShader>,
++    asset_server: Res<AssetServer>,
++) {
++    let mut entries = DynamicBindGroupLayoutEntries::new_with_indices(
++        ShaderStages::FRAGMENT,
++        (
++            (0, uniform_buffer::<ViewUniform>(true)),
+             (
+-                (0, uniform_buffer::<ViewUniform>(true)),
+-                (
+-                    1,
+-                    texture_2d(TextureSampleType::Float { filterable: false }),
+-                ),
+-                (2, sampler(SamplerBindingType::NonFiltering)),
++                1,
++                texture_2d(TextureSampleType::Float { filterable: false }),
+             ),
+-        );
+-        let lut_layout_entries = get_lut_bind_group_layout_entries();
+-        entries =
+-            entries.extend_with_indices(((3, lut_layout_entries[0]), (4, lut_layout_entries[1])));
++            (2, sampler(SamplerBindingType::NonFiltering)),
++        ),
++    );
++    let lut_layout_entries = get_lut_bind_group_layout_entries();
++    entries = entries.extend_with_indices(((3, lut_layout_entries[0]), (4, lut_layout_entries[1])));
+ 
+-        let render_device = render_world.resource::<RenderDevice>();
+-        let tonemap_texture_bind_group = render_device
+-            .create_bind_group_layout("tonemapping_hdr_texture_bind_group_layout", &entries);
++    let tonemap_texture_bind_group = render_device
++        .create_bind_group_layout("tonemapping_hdr_texture_bind_group_layout", &entries);
+ 
+-        let sampler = render_device.create_sampler(&SamplerDescriptor::default());
++    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
+ 
+-        TonemappingPipeline {
+-            texture_bind_group: tonemap_texture_bind_group,
+-            sampler,
+-            fullscreen_shader: render_world.resource::<FullscreenShader>().clone(),
+-            fragment_shader: load_embedded_asset!(render_world, "tonemapping.wgsl"),
+-        }
+-    }
++    commands.insert_resource(TonemappingPipeline {
++        texture_bind_group: tonemap_texture_bind_group,
++        sampler,
++        fullscreen_shader: fullscreen_shader.clone(),
++        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "tonemapping.wgsl"),
++    });
+ }
+ 
+ #[derive(Component)]
+diff --git a/release-content/migration-guides/render_startup.md b/release-content/migration-guides/render_startup.md
+index ecb1b002d39d3..e888bd75883ba 100644
+--- a/release-content/migration-guides/render_startup.md
++++ b/release-content/migration-guides/render_startup.md
+@@ -1,6 +1,6 @@
+ ---
+ title: Many render resources now initialized in `RenderStartup`
+-pull_requests: [19841, 19926, 19885, 19886, 19897, 19898, 19901, 20147]
++pull_requests: [19841, 19926, 19885, 19886, 19897, 19898, 19901, 20002, 20147]
+ ---
+ 
+ Many render resources are **no longer present** during `Plugin::finish`. Instead they are
+@@ -15,6 +15,15 @@ The following are the (public) resources that are now initialized in `RenderStar
+ - `FxaaPipeline`
+ - `SmaaPipelines`
+ - `TaaPipeline`
++- `AutoExposurePipeline`
++- `MotionBlurPipeline`
++- `SkyboxPrepassPipeline`
++- `BlitPipeline`
++- `DepthOfFieldGlobalBindGroupLayout`
++- `DepthPyramidDummyTexture`
++- `OitBuffers`
++- `PostProcessingPipeline`
++- `TonemappingPipeline`
+ - `BoxShadowPipeline`
+ - `GradientPipeline`
+ - `UiPipeline`
