@@ -1,0 +1,176 @@
+diff --git a/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs b/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs
+index 00eae83a75a7f..da9d24dd536ff 100644
+--- a/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs
++++ b/crates/bevy_ecs/src/schedule/auto_insert_apply_deferred.rs
+@@ -1,6 +1,7 @@
+ use alloc::{boxed::Box, collections::BTreeSet, vec::Vec};
+ 
+-use bevy_platform::collections::{HashMap, HashSet};
++use bevy_platform::{collections::HashMap, hash::FixedHasher};
++use indexmap::IndexSet;
+ 
+ use crate::{
+     schedule::{graph::Dag, SystemKey, SystemSetKey},
+@@ -222,7 +223,7 @@ impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+     fn collapse_set(
+         &mut self,
+         set: SystemSetKey,
+-        systems: &HashSet<SystemKey>,
++        systems: &IndexSet<SystemKey, FixedHasher>,
+         dependency_flattening: &DiGraph<NodeId>,
+     ) -> impl Iterator<Item = (NodeId, NodeId)> {
+         if systems.is_empty() {
+diff --git a/crates/bevy_ecs/src/schedule/graph/dag.rs b/crates/bevy_ecs/src/schedule/graph/dag.rs
+index 38021505b7fed..9feafc550e2e9 100644
+--- a/crates/bevy_ecs/src/schedule/graph/dag.rs
++++ b/crates/bevy_ecs/src/schedule/graph/dag.rs
+@@ -10,6 +10,7 @@ use bevy_platform::{
+     hash::FixedHasher,
+ };
+ use fixedbitset::FixedBitSet;
++use indexmap::IndexSet;
+ use thiserror::Error;
+ 
+ use crate::{
+@@ -502,7 +503,7 @@ impl<N: GraphNodeId, S: BuildHasher> Debug for DagAnalysis<N, S> {
+ }
+ 
+ /// A mapping of keys to groups of values in a [`Dag`].
+-pub struct DagGroups<K, V, S = FixedHasher>(HashMap<K, HashSet<V, S>, S>);
++pub struct DagGroups<K, V, S = FixedHasher>(HashMap<K, IndexSet<V, S>, S>);
+ 
+ impl<K: Eq + Hash, V: Clone + Eq + Hash, S: BuildHasher + Default> DagGroups<K, V, S> {
+     /// Groups nodes in this DAG by a key type `K`, collecting value nodes `V`
+@@ -527,7 +528,7 @@ impl<K: Eq + Hash, V: Clone + Eq + Hash, S: BuildHasher + Default> DagGroups<K,
+     where
+         N: GraphNodeId + TryInto<K, Error = V>,
+     {
+-        let mut groups: HashMap<K, HashSet<V, S>, S> =
++        let mut groups: HashMap<K, IndexSet<V, S>, S> =
+             HashMap::with_capacity_and_hasher(capacity, Default::default());
+ 
+         // Iterate in reverse topological order (bottom-up) so we hit children before parents.
+@@ -536,7 +537,7 @@ impl<K: Eq + Hash, V: Clone + Eq + Hash, S: BuildHasher + Default> DagGroups<K,
+                 continue;
+             };
+ 
+-            let mut children = HashSet::default();
++            let mut children = IndexSet::default();
+ 
+             for node in graph.neighbors_directed(id, Outgoing) {
+                 match node.try_into() {
+@@ -571,7 +572,7 @@ impl<K: GraphNodeId, V: GraphNodeId, S: BuildHasher> DagGroups<K, V, S> {
+     pub fn flatten<N>(
+         &self,
+         dag: Dag<N>,
+-        mut collapse_group: impl FnMut(K, &HashSet<V, S>, &Dag<N>, &mut Vec<(N, N)>),
++        mut collapse_group: impl FnMut(K, &IndexSet<V, S>, &Dag<N>, &mut Vec<(N, N)>),
+     ) -> Dag<V>
+     where
+         N: GraphNodeId + TryInto<V, Error = K> + From<K> + From<V>,
+@@ -680,7 +681,7 @@ impl<K: GraphNodeId, V: GraphNodeId, S: BuildHasher> DagGroups<K, V, S> {
+ }
+ 
+ impl<K, V, S> Deref for DagGroups<K, V, S> {
+-    type Target = HashMap<K, HashSet<V, S>, S>;
++    type Target = HashMap<K, IndexSet<V, S>, S>;
+ 
+     fn deref(&self) -> &Self::Target {
+         &self.0
+diff --git a/crates/bevy_ecs/src/schedule/pass.rs b/crates/bevy_ecs/src/schedule/pass.rs
+index 5a3d52f0767d3..833f98ea0f32d 100644
+--- a/crates/bevy_ecs/src/schedule/pass.rs
++++ b/crates/bevy_ecs/src/schedule/pass.rs
+@@ -1,14 +1,18 @@
+ use alloc::{boxed::Box, vec::Vec};
+-use bevy_platform::collections::HashSet;
+-use core::any::{Any, TypeId};
++use core::{
++    any::{Any, TypeId},
++    fmt::Debug,
++};
++
++use bevy_platform::hash::FixedHasher;
++use bevy_utils::TypeIdMap;
++use indexmap::IndexSet;
+ 
+ use super::{DiGraph, NodeId, ScheduleBuildError, ScheduleGraph};
+ use crate::{
+     schedule::{graph::Dag, SystemKey, SystemSetKey},
+     world::World,
+ };
+-use bevy_utils::TypeIdMap;
+-use core::fmt::Debug;
+ 
+ /// A pass for modular modification of the dependency graph.
+ pub trait ScheduleBuildPass: Send + Sync + Debug + 'static {
+@@ -24,7 +28,7 @@ pub trait ScheduleBuildPass: Send + Sync + Debug + 'static {
+     fn collapse_set(
+         &mut self,
+         set: SystemSetKey,
+-        systems: &HashSet<SystemKey>,
++        systems: &IndexSet<SystemKey, FixedHasher>,
+         dependency_flattening: &DiGraph<NodeId>,
+     ) -> impl Iterator<Item = (NodeId, NodeId)>;
+ 
+@@ -49,7 +53,7 @@ pub(super) trait ScheduleBuildPassObj: Send + Sync + Debug {
+     fn collapse_set(
+         &mut self,
+         set: SystemSetKey,
+-        systems: &HashSet<SystemKey>,
++        systems: &IndexSet<SystemKey, FixedHasher>,
+         dependency_flattening: &DiGraph<NodeId>,
+         dependencies_to_add: &mut Vec<(NodeId, NodeId)>,
+     );
+@@ -68,7 +72,7 @@ impl<T: ScheduleBuildPass> ScheduleBuildPassObj for T {
+     fn collapse_set(
+         &mut self,
+         set: SystemSetKey,
+-        systems: &HashSet<SystemKey>,
++        systems: &IndexSet<SystemKey, FixedHasher>,
+         dependency_flattening: &DiGraph<NodeId>,
+         dependencies_to_add: &mut Vec<(NodeId, NodeId)>,
+     ) {
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index bc636ecfd1490..e31b048881061 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -20,7 +20,7 @@ use core::{
+     fmt::{Debug, Write},
+ };
+ use fixedbitset::FixedBitSet;
+-use indexmap::IndexMap;
++use indexmap::{IndexMap, IndexSet};
+ use log::{info, warn};
+ use pass::ScheduleBuildPassObj;
+ use thiserror::Error;
+@@ -924,7 +924,7 @@ impl ScheduleGraph {
+     pub fn systems_in_set(
+         &self,
+         system_set: InternedSystemSet,
+-    ) -> Result<&HashSet<SystemKey>, ScheduleError> {
++    ) -> Result<&IndexSet<SystemKey, FixedHasher>, ScheduleError> {
+         if self.changed {
+             return Err(ScheduleError::Uninitialized);
+         }
+@@ -1018,7 +1018,7 @@ impl ScheduleGraph {
+         }
+     }
+ 
+-    fn remove_systems_by_keys(&mut self, keys: &HashSet<SystemKey>) {
++    fn remove_systems_by_keys(&mut self, keys: &IndexSet<SystemKey, FixedHasher>) {
+         for &key in keys {
+             self.systems.remove(key);
+ 
+@@ -2604,7 +2604,10 @@ mod tests {
+             fn collapse_set(
+                 &mut self,
+                 _set: crate::schedule::SystemSetKey,
+-                _systems: &bevy_platform::collections::HashSet<crate::schedule::SystemKey>,
++                _systems: &indexmap::IndexSet<
++                    crate::schedule::SystemKey,
++                    bevy_platform::hash::FixedHasher,
++                >,
+                 _dependency_flattening: &crate::schedule::graph::DiGraph<crate::schedule::NodeId>,
+             ) -> impl Iterator<Item = (crate::schedule::NodeId, crate::schedule::NodeId)>
+             {
