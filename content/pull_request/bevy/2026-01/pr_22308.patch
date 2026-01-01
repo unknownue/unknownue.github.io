@@ -1,0 +1,236 @@
+diff --git a/crates/bevy_sprite/src/text2d.rs b/crates/bevy_sprite/src/text2d.rs
+index b68bf92a55f66..657c5f5301bed 100644
+--- a/crates/bevy_sprite/src/text2d.rs
++++ b/crates/bevy_sprite/src/text2d.rs
+@@ -20,9 +20,9 @@ use bevy_image::prelude::*;
+ use bevy_math::{FloatOrd, Vec2, Vec3};
+ use bevy_reflect::{prelude::ReflectDefault, Reflect};
+ use bevy_text::{
+-    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, LineBreak, LineHeight, SwashCache,
+-    TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextPipeline,
+-    TextReader, TextRoot, TextSpanAccess, TextWriter,
++    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, FontHinting, LineBreak, LineHeight,
++    SwashCache, TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo,
++    TextPipeline, TextReader, TextRoot, TextSpanAccess, TextWriter,
+ };
+ use bevy_transform::components::Transform;
+ use core::any::TypeId;
+@@ -88,7 +88,9 @@ use core::any::TypeId;
+     Anchor,
+     Visibility,
+     VisibilityClass,
+-    Transform
++    Transform,
++    // Disable hinting as `Text2d` text is not always pixel-aligned
++    FontHinting::Disabled
+ )]
+ #[component(on_add = visibility::add_visibility_class::<Sprite>)]
+ pub struct Text2d(pub String);
+@@ -175,6 +177,7 @@ pub fn update_text2d_layout(
+         Ref<TextBounds>,
+         &mut TextLayoutInfo,
+         &mut ComputedTextBlock,
++        Ref<FontHinting>,
+     )>,
+     text_font_query: Query<&TextFont>,
+     mut text_reader: Text2dReader,
+@@ -198,7 +201,7 @@ pub fn update_text2d_layout(
+     let mut previous_scale_factor = 0.;
+     let mut previous_mask = &RenderLayers::none();
+ 
+-    for (entity, maybe_entity_mask, block, bounds, mut text_layout_info, mut computed) in
++    for (entity, maybe_entity_mask, block, bounds, mut text_layout_info, mut computed, hinting) in
+         &mut text_query
+     {
+         let entity_mask = maybe_entity_mask.unwrap_or_default();
+@@ -222,6 +225,7 @@ pub fn update_text2d_layout(
+ 
+         let text_changed = scale_factor != text_layout_info.scale_factor
+             || block.is_changed()
++            || hinting.is_changed()
+             || computed.needs_rerender()
+             || (!reprocess_queue.is_empty() && reprocess_queue.remove(&entity));
+ 
+@@ -248,6 +252,7 @@ pub fn update_text2d_layout(
+                 scale_factor as f64,
+                 &mut computed,
+                 &mut font_system,
++                *hinting,
+             ) {
+                 Err(TextError::NoSuchFont) => {
+                     // There was an error processing the text layout.
+diff --git a/crates/bevy_text/Cargo.toml b/crates/bevy_text/Cargo.toml
+index 9e153138b989b..0778edc3fdff5 100644
+--- a/crates/bevy_text/Cargo.toml
++++ b/crates/bevy_text/Cargo.toml
+@@ -30,7 +30,7 @@ bevy_platform = { path = "../bevy_platform", version = "0.18.0-dev", default-fea
+ 
+ # other
+ wgpu-types = { version = "27", default-features = false }
+-cosmic-text = { version = "0.15", features = ["shape-run-cache"] }
++cosmic-text = { version = "0.16", features = ["shape-run-cache"] }
+ thiserror = { version = "2", default-features = false }
+ serde = { version = "1", features = ["derive"] }
+ smallvec = { version = "1", default-features = false }
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 4f9fbfdb79823..4fdb64c41804d 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -59,8 +59,8 @@ pub use text_access::*;
+ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+-        Font, FontWeight, Justify, LineBreak, Strikethrough, StrikethroughColor, TextColor,
+-        TextError, TextFont, TextLayout, TextSpan, Underline, UnderlineColor,
++        Font, FontHinting, FontWeight, Justify, LineBreak, Strikethrough, StrikethroughColor,
++        TextColor, TextError, TextFont, TextLayout, TextSpan, Underline, UnderlineColor,
+     };
+ }
+ 
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index 665c8bd1e14b6..b40cf7ef7598a 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -16,13 +16,12 @@ use bevy_math::{Rect, UVec2, Vec2};
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ 
+-use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Wrap};
+-
+ use crate::{
+     add_glyph_to_atlas, error::TextError, get_glyph_atlas_info, ComputedTextBlock, Font,
+-    FontAtlasKey, FontAtlasSet, FontSmoothing, Justify, LineBreak, LineHeight, PositionedGlyph,
+-    TextBounds, TextEntity, TextFont, TextLayout,
++    FontAtlasKey, FontAtlasSet, FontHinting, FontSmoothing, Justify, LineBreak, LineHeight,
++    PositionedGlyph, TextBounds, TextEntity, TextFont, TextLayout,
+ };
++use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Wrap};
+ 
+ /// A wrapper resource around a [`cosmic_text::FontSystem`]
+ ///
+@@ -101,6 +100,7 @@ impl TextPipeline {
+         scale_factor: f64,
+         computed: &mut ComputedTextBlock,
+         font_system: &mut CosmicFontSystem,
++        hinting: FontHinting,
+     ) -> Result<(), TextError> {
+         computed.needs_rerender = false;
+ 
+@@ -192,6 +192,9 @@ impl TextPipeline {
+         // Update the buffer.
+         let buffer = &mut computed.buffer;
+ 
++        // Set the metrics hinting strategy
++        buffer.set_hinting(font_system, hinting.into());
++
+         buffer.set_wrap(
+             font_system,
+             match linebreak {
+@@ -248,6 +251,7 @@ impl TextPipeline {
+         layout: &TextLayout,
+         computed: &mut ComputedTextBlock,
+         font_system: &mut CosmicFontSystem,
++        hinting: FontHinting,
+     ) -> Result<TextMeasureInfo, TextError> {
+         const MIN_WIDTH_CONTENT_BOUNDS: TextBounds = TextBounds::new_horizontal(0.0);
+ 
+@@ -264,6 +268,7 @@ impl TextPipeline {
+             scale_factor,
+             computed,
+             font_system,
++            hinting,
+         )?;
+ 
+         let buffer = &mut computed.buffer;
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index 07214a3c86071..de4d57bb7cc30 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -847,3 +847,25 @@ pub fn detect_text_needs_rerender<Root: Component>(
+         }
+     }
+ }
++
++#[derive(Component, Debug, Copy, Clone, Default, Reflect, PartialEq)]
++#[reflect(Component, Default, Debug, Clone, PartialEq)]
++/// Font hinting strategy.
++///
++/// <https://docs.rs/cosmic-text/latest/cosmic_text/enum.Hinting.html>
++pub enum FontHinting {
++    #[default]
++    /// Glyphs will have subpixel coordinates.
++    Disabled,
++    /// Glyphs will be snapped to integral coordinates in the X-axis during layout.
++    Enabled,
++}
++
++impl From<FontHinting> for cosmic_text::Hinting {
++    fn from(value: FontHinting) -> Self {
++        match value {
++            FontHinting::Disabled => cosmic_text::Hinting::Disabled,
++            FontHinting::Enabled => cosmic_text::Hinting::Enabled,
++        }
++    }
++}
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index f10f485342e59..3cf8fbf18de66 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -18,9 +18,9 @@ use bevy_image::prelude::*;
+ use bevy_math::Vec2;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_text::{
+-    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, LineBreak, LineHeight, SwashCache,
+-    TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextMeasureInfo,
+-    TextPipeline, TextReader, TextRoot, TextSpanAccess, TextWriter,
++    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, FontHinting, LineBreak, LineHeight,
++    SwashCache, TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo,
++    TextMeasureInfo, TextPipeline, TextReader, TextRoot, TextSpanAccess, TextWriter,
+ };
+ use taffy::style::AvailableSpace;
+ use tracing::error;
+@@ -102,7 +102,9 @@ impl Default for TextNodeFlags {
+     TextColor,
+     LineHeight,
+     TextNodeFlags,
+-    ContentSize
++    ContentSize,
++    // Enable hinting as UI text is normally pixel-aligned.
++    FontHinting::Enabled
+ )]
+ pub struct Text(pub String);
+ 
+@@ -244,6 +246,7 @@ pub fn measure_text_system(
+             &mut ComputedTextBlock,
+             Ref<ComputedUiRenderTargetInfo>,
+             &ComputedNode,
++            Ref<FontHinting>,
+         ),
+         With<Node>,
+     >,
+@@ -259,6 +262,7 @@ pub fn measure_text_system(
+         mut computed,
+         computed_target,
+         computed_node,
++        hinting,
+     ) in &mut text_query
+     {
+         // Note: the ComputedTextBlock::needs_rerender bool is cleared in create_text_measure().
+@@ -267,7 +271,8 @@ pub fn measure_text_system(
+             < (computed_target.scale_factor() - computed_node.inverse_scale_factor.recip()).abs()
+             || computed.needs_rerender()
+             || text_flags.needs_measure_fn
+-            || content_size.is_added())
++            || content_size.is_added()
++            || hinting.is_changed())
+         {
+             continue;
+         }
+@@ -280,6 +285,7 @@ pub fn measure_text_system(
+             &block,
+             computed.as_mut(),
+             &mut font_system,
++            *hinting,
+         ) {
+             Ok(measure) => {
+                 if block.linebreak == LineBreak::NoWrap {
