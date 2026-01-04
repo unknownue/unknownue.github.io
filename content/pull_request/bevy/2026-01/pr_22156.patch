@@ -1,0 +1,2687 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d5145a9347685..af7fbfe9a2157 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3688,6 +3688,17 @@ description = "Demonstrates dragging and dropping UI nodes"
+ category = "UI (User Interface)"
+ wasm = true
+ 
++[[example]]
++name = "font_query"
++path = "examples/ui/font_query.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.font_query]
++name = "Font Queries"
++description = "Demonstrates font querying"
++category = "UI (User Interface)"
++wasm = true
++
+ [[example]]
+ name = "display_and_visibility"
+ path = "examples/ui/display_and_visibility.rs"
+diff --git a/crates/bevy_feathers/src/font_styles.rs b/crates/bevy_feathers/src/font_styles.rs
+index 9ea7783db5752..bbe8d7762d775 100644
+--- a/crates/bevy_feathers/src/font_styles.rs
++++ b/crates/bevy_feathers/src/font_styles.rs
+@@ -58,7 +58,7 @@ pub(crate) fn on_changed_font(
+         }
+     {
+         commands.entity(insert.entity).insert(Propagate(TextFont {
+-            font,
++            font: font.into(),
+             font_size: style.font_size,
+             ..Default::default()
+         }));
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index 5c6e9fa755021..11d719bed6070 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -84,12 +84,11 @@ impl Plugin for SpritePlugin {
+             PostUpdate,
+             (
+                 bevy_text::detect_text_needs_rerender::<Text2d>,
+-                update_text2d_layout
+-                    .after(bevy_camera::CameraUpdateSystems)
+-                    .after(bevy_text::free_unused_font_atlases_system),
++                update_text2d_layout.after(bevy_camera::CameraUpdateSystems),
+                 calculate_bounds_text2d.in_set(VisibilitySystems::CalculateBounds),
+             )
+                 .chain()
++                .after(bevy_text::load_font_assets_into_fontdb_system)
+                 .in_set(bevy_text::Text2dUpdateSystems)
+                 .after(bevy_app::AnimationSystems),
+         );
+diff --git a/crates/bevy_sprite/src/text2d.rs b/crates/bevy_sprite/src/text2d.rs
+index 657c5f5301bed..3f8d604656679 100644
+--- a/crates/bevy_sprite/src/text2d.rs
++++ b/crates/bevy_sprite/src/text2d.rs
+@@ -179,7 +179,6 @@ pub fn update_text2d_layout(
+         &mut ComputedTextBlock,
+         Ref<FontHinting>,
+     )>,
+-    text_font_query: Query<&TextFont>,
+     mut text_reader: Text2dReader,
+     mut font_system: ResMut<CosmicFontSystem>,
+     mut swash_cache: ResMut<SwashCache>,
+@@ -275,8 +274,6 @@ pub fn update_text2d_layout(
+ 
+         match text_pipeline.update_text_layout_info(
+             &mut text_layout_info,
+-            text_font_query,
+-            scale_factor as f64,
+             &mut font_atlas_set,
+             &mut texture_atlases,
+             &mut textures,
+diff --git a/crates/bevy_text/Cargo.toml b/crates/bevy_text/Cargo.toml
+index 0778edc3fdff5..07261b736cbf8 100644
+--- a/crates/bevy_text/Cargo.toml
++++ b/crates/bevy_text/Cargo.toml
+@@ -34,6 +34,7 @@ cosmic-text = { version = "0.16", features = ["shape-run-cache"] }
+ thiserror = { version = "2", default-features = false }
+ serde = { version = "1", features = ["derive"] }
+ smallvec = { version = "1", default-features = false }
++smol_str = { version = "0.2", default-features = false }
+ sys-locale = "0.3.0"
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
+ 
+diff --git a/crates/bevy_text/src/font.rs b/crates/bevy_text/src/font.rs
+index 8830f7158baef..de60aec1f2c7b 100644
+--- a/crates/bevy_text/src/font.rs
++++ b/crates/bevy_text/src/font.rs
+@@ -1,9 +1,19 @@
+ use alloc::sync::Arc;
+ 
+ use bevy_asset::Asset;
++use bevy_asset::AssetEvent;
++use bevy_asset::Assets;
++use bevy_ecs::message::MessageReader;
++use bevy_ecs::system::Query;
++use bevy_ecs::system::ResMut;
+ use bevy_reflect::TypePath;
++use cosmic_text::fontdb::ID;
+ use cosmic_text::skrifa::raw::ReadError;
+ use cosmic_text::skrifa::FontRef;
++use smallvec::SmallVec;
++
++use crate::ComputedTextBlock;
++use crate::CosmicFontSystem;
+ 
+ /// An [`Asset`] that contains the data for a loaded font, if loaded as an asset.
+ ///
+@@ -21,6 +31,8 @@ use cosmic_text::skrifa::FontRef;
+ pub struct Font {
+     /// Content of a font file as bytes
+     pub data: Arc<Vec<u8>>,
++    /// Ids for fonts in font file
++    pub ids: SmallVec<[ID; 8]>,
+ }
+ 
+ impl Font {
+@@ -29,6 +41,38 @@ impl Font {
+         let _ = FontRef::from_index(&font_data, 0)?;
+         Ok(Self {
+             data: Arc::new(font_data),
++            ids: SmallVec::new(),
+         })
+     }
+ }
++
++/// Add new font assets to the font system's database.
++pub fn load_font_assets_into_fontdb_system(
++    mut fonts: ResMut<Assets<Font>>,
++    mut events: MessageReader<AssetEvent<Font>>,
++    mut cosmic_font_system: ResMut<CosmicFontSystem>,
++    mut text_block_query: Query<&mut ComputedTextBlock>,
++) {
++    let mut new_fonts_added = false;
++    let font_system = &mut cosmic_font_system.0;
++    for event in events.read() {
++        if let AssetEvent::Added { id } = event
++            && let Some(font) = fonts.get_mut(*id)
++        {
++            let data = Arc::clone(&font.data);
++            font.ids = font_system
++                .db_mut()
++                .load_font_source(cosmic_text::fontdb::Source::Binary(data))
++                .into_iter()
++                .collect();
++            new_fonts_added = true;
++        }
++    }
++
++    // Whenever new fonts are added, update all text blocks so they use the new fonts.
++    if new_fonts_added {
++        for mut block in text_block_query.iter_mut() {
++            block.needs_rerender = true;
++        }
++    }
++}
+diff --git a/crates/bevy_text/src/font_atlas_set.rs b/crates/bevy_text/src/font_atlas_set.rs
+index f189b40733fd6..ddbef4c44dd08 100644
+--- a/crates/bevy_text/src/font_atlas_set.rs
++++ b/crates/bevy_text/src/font_atlas_set.rs
+@@ -1,8 +1,8 @@
+-use crate::{Font, FontAtlas, FontSmoothing, TextFont};
+-use bevy_asset::{AssetEvent, AssetId};
++use crate::{FontAtlas, FontSmoothing};
+ use bevy_derive::{Deref, DerefMut};
+-use bevy_ecs::{message::MessageReader, resource::Resource, system::ResMut};
++use bevy_ecs::resource::Resource;
+ use bevy_platform::collections::HashMap;
++use cosmic_text::fontdb::ID;
+ 
+ /// Identifies the font atlases for a particular font in [`FontAtlasSet`]
+ ///
+@@ -10,23 +10,13 @@ use bevy_platform::collections::HashMap;
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+ pub struct FontAtlasKey {
+     /// Font asset id
+-    pub id: AssetId<Font>,
++    pub id: ID,
+     /// Font size via `f32::to_bits`
+     pub font_size_bits: u32,
+     /// Antialiasing method
+     pub font_smoothing: FontSmoothing,
+ }
+ 
+-impl From<&TextFont> for FontAtlasKey {
+-    fn from(font: &TextFont) -> Self {
+-        Self {
+-            id: font.font.id(),
+-            font_size_bits: font.font_size.to_bits(),
+-            font_smoothing: font.font_smoothing,
+-        }
+-    }
+-}
+-
+ /// Set of rasterized fonts stored in [`FontAtlas`]es.
+ #[derive(Debug, Default, Resource, Deref, DerefMut)]
+ pub struct FontAtlasSet(HashMap<FontAtlasKey, Vec<FontAtlas>>);
+@@ -38,15 +28,3 @@ impl FontAtlasSet {
+             .is_some_and(|font_atlas| font_atlas.iter().any(|atlas| atlas.has_glyph(cache_key)))
+     }
+ }
+-
+-/// A system that automatically frees unused texture atlases when a font asset is removed.
+-pub fn free_unused_font_atlases_system(
+-    mut font_atlas_sets: ResMut<FontAtlasSet>,
+-    mut font_events: MessageReader<AssetEvent<Font>>,
+-) {
+-    for event in font_events.read() {
+-        if let AssetEvent::Removed { id } = event {
+-            font_atlas_sets.retain(|key, _| key.id != *id);
+-        }
+-    }
+-}
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 4fdb64c41804d..0444e6c48fa99 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -42,6 +42,7 @@ mod pipeline;
+ mod text;
+ mod text_access;
+ 
++use bevy_asset::AssetEventSystems;
+ pub use bounds::*;
+ pub use error::*;
+ pub use font::*;
+@@ -59,13 +60,14 @@ pub use text_access::*;
+ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+-        Font, FontHinting, FontWeight, Justify, LineBreak, Strikethrough, StrikethroughColor,
+-        TextColor, TextError, TextFont, TextLayout, TextSpan, Underline, UnderlineColor,
++        Font, FontHinting, FontSource, FontStyle, FontWeight, FontWidth, Justify, LineBreak,
++        Strikethrough, StrikethroughColor, TextColor, TextError, TextFont, TextLayout, TextSpan,
++        Underline, UnderlineColor,
+     };
+ }
+ 
+ use bevy_app::prelude::*;
+-use bevy_asset::{AssetApp, AssetEventSystems};
++use bevy_asset::AssetApp;
+ use bevy_ecs::prelude::*;
+ 
+ /// The raw data for the default font used by `bevy_text`
+@@ -94,7 +96,7 @@ impl Plugin for TextPlugin {
+             .init_resource::<TextIterScratch>()
+             .add_systems(
+                 PostUpdate,
+-                free_unused_font_atlases_system.before(AssetEventSystems),
++                load_font_assets_into_fontdb_system.after(AssetEventSystems),
+             )
+             .add_systems(Last, trim_cosmic_cache);
+ 
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index b40cf7ef7598a..1f448f43ec931 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -4,24 +4,22 @@ use bevy_asset::{AssetId, Assets};
+ use bevy_color::Color;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+-    component::Component,
+-    entity::Entity,
+-    reflect::ReflectComponent,
+-    resource::Resource,
+-    system::{Query, ResMut},
++    component::Component, entity::Entity, reflect::ReflectComponent, resource::Resource,
++    system::ResMut,
+ };
+ use bevy_image::prelude::*;
+ use bevy_log::{once, warn};
+ use bevy_math::{Rect, UVec2, Vec2};
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
++use smol_str::SmolStr;
+ 
+ use crate::{
+     add_glyph_to_atlas, error::TextError, get_glyph_atlas_info, ComputedTextBlock, Font,
+-    FontAtlasKey, FontAtlasSet, FontHinting, FontSmoothing, Justify, LineBreak, LineHeight,
+-    PositionedGlyph, TextBounds, TextEntity, TextFont, TextLayout,
++    FontAtlasKey, FontAtlasSet, FontHinting, FontSmoothing, FontSource, Justify, LineBreak,
++    LineHeight, PositionedGlyph, TextBounds, TextEntity, TextFont, TextLayout,
+ };
+-use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Wrap};
++use cosmic_text::{fontdb::ID, Attrs, Buffer, Family, Metrics, Shaping, Wrap};
+ 
+ /// A wrapper resource around a [`cosmic_text::FontSystem`]
+ ///
+@@ -57,12 +55,8 @@ impl Default for SwashCache {
+ /// Information about a font collected as part of preparing for text layout.
+ #[derive(Clone)]
+ pub struct FontFaceInfo {
+-    /// Width class: <https://docs.microsoft.com/en-us/typography/opentype/spec/os2#uswidthclass>
+-    pub stretch: cosmic_text::fontdb::Stretch,
+-    /// Allows italic or oblique faces to be selected
+-    pub style: cosmic_text::fontdb::Style,
+     /// Font family name
+-    pub family_name: Arc<str>,
++    pub family_name: SmolStr,
+ }
+ 
+ /// The `TextPipeline` is used to layout and render text blocks (see `Text`/`Text2d`).
+@@ -70,8 +64,8 @@ pub struct FontFaceInfo {
+ /// See the [crate-level documentation](crate) for more information.
+ #[derive(Default, Resource)]
+ pub struct TextPipeline {
+-    /// Identifies a font [`ID`](cosmic_text::fontdb::ID) by its [`Font`] [`Asset`](bevy_asset::Asset).
+-    pub map_handle_to_font_id: HashMap<AssetId<Font>, (cosmic_text::fontdb::ID, Arc<str>)>,
++    /// Identifies a font [`ID`] by its [`Font`] [`Asset`](bevy_asset::Asset).
++    pub map_handle_to_font_id: HashMap<AssetId<Font>, (ID, Arc<str>)>,
+     /// Buffered vec for collecting spans.
+     ///
+     /// See [this dark magic](https://users.rust-lang.org/t/how-to-cache-a-vectors-capacity/94478/10).
+@@ -82,8 +76,6 @@ pub struct TextPipeline {
+         FontFaceInfo,
+         LineHeight,
+     )>,
+-    /// Buffered vec for collecting info for glyph assembly.
+-    glyph_info: Vec<(AssetId<Font>, FontSmoothing, f32, f32, f32, f32, u16)>,
+ }
+ 
+ impl TextPipeline {
+@@ -129,32 +121,46 @@ impl TextPipeline {
+             if span.is_empty() {
+                 continue;
+             }
+-            // Return early if a font is not loaded yet.
+-            if !fonts.contains(text_font.font.id()) {
+-                spans.clear();
+-                self.spans_buffer = spans
+-                    .into_iter()
+-                    .map(
+-                        |_| -> (
+-                            usize,
+-                            &'static str,
+-                            &'static TextFont,
+-                            FontFaceInfo,
+-                            LineHeight,
+-                        ) { unreachable!() },
+-                    )
+-                    .collect();
+-
+-                return Err(TextError::NoSuchFont);
+-            }
+ 
+-            // Load Bevy fonts into cosmic-text's font system.
+-            let face_info = load_font_to_fontdb(
+-                text_font,
+-                font_system,
+-                &mut self.map_handle_to_font_id,
+-                fonts,
+-            );
++            let family_name: SmolStr = match &text_font.font {
++                FontSource::Handle(handle) => {
++                    if let Some(font) = fonts.get(handle.id()) {
++                        let data = Arc::clone(&font.data);
++                        let ids = font_system
++                            .db_mut()
++                            .load_font_source(cosmic_text::fontdb::Source::Binary(data));
++
++                        // TODO: it is assumed this is the right font face
++                        font_system
++                            .db()
++                            .face(*ids.last().unwrap())
++                            .unwrap()
++                            .families[0]
++                            .0
++                            .as_str()
++                            .into()
++                    } else {
++                        // Return early if a font is not loaded yet.
++                        spans.clear();
++                        self.spans_buffer = spans
++                            .into_iter()
++                            .map(
++                                |_| -> (
++                                    usize,
++                                    &'static str,
++                                    &'static TextFont,
++                                    FontFaceInfo,
++                                    LineHeight,
++                                ) { unreachable!() },
++                            )
++                            .collect();
++                        return Err(TextError::NoSuchFont);
++                    }
++                }
++                FontSource::Family(family) => family.clone(),
++            };
++
++            let face_info = FontFaceInfo { family_name };
+ 
+             // Save spans that aren't zero-sized.
+             if scale_factor <= 0.0 || text_font.font_size <= 0.0 {
+@@ -288,7 +294,7 @@ impl TextPipeline {
+     }
+ 
+     /// Returns the [`cosmic_text::fontdb::ID`] for a given [`Font`] asset.
+-    pub fn get_font_id(&self, asset_id: AssetId<Font>) -> Option<cosmic_text::fontdb::ID> {
++    pub fn get_font_id(&self, asset_id: AssetId<Font>) -> Option<ID> {
+         self.map_handle_to_font_id
+             .get(&asset_id)
+             .cloned()
+@@ -296,11 +302,9 @@ impl TextPipeline {
+     }
+ 
+     /// Update [`TextLayoutInfo`] with the new [`PositionedGlyph`] layout.
+-    pub fn update_text_layout_info<'a>(
++    pub fn update_text_layout_info(
+         &mut self,
+         layout_info: &mut TextLayoutInfo,
+-        text_font_query: Query<&'a TextFont>,
+-        scale_factor: f64,
+         font_atlas_set: &mut FontAtlasSet,
+         texture_atlases: &mut Assets<TextureAtlasLayout>,
+         textures: &mut Assets<Image>,
+@@ -312,36 +316,7 @@ impl TextPipeline {
+     ) -> Result<(), TextError> {
+         computed.needs_rerender = false;
+ 
+-        layout_info.glyphs.clear();
+-        layout_info.run_geometry.clear();
+-        layout_info.size = Default::default();
+-
+-        self.glyph_info.clear();
+-
+-        for text_font in text_font_query.iter_many(computed.entities.iter().map(|e| e.entity)) {
+-            let mut section_info = (
+-                text_font.font.id(),
+-                text_font.font_smoothing,
+-                text_font.font_size,
+-                0.0,
+-                0.0,
+-                0.0,
+-                text_font.weight.clamp().0,
+-            );
+-
+-            if let Some((id, _)) = self.map_handle_to_font_id.get(&section_info.0)
+-                && let Some(font) = font_system.get_font(*id, cosmic_text::Weight(section_info.6))
+-            {
+-                let swash = font.as_swash();
+-                let metrics = swash.metrics(&[]);
+-                let upem = metrics.units_per_em as f32;
+-                let scalar = section_info.2 * scale_factor as f32 / upem;
+-                section_info.3 = (metrics.strikeout_offset * scalar).round();
+-                section_info.4 = (metrics.stroke_size * scalar).round().max(1.);
+-                section_info.5 = (metrics.underline_offset * scalar).round();
+-            }
+-            self.glyph_info.push(section_info);
+-        }
++        layout_info.clear();
+ 
+         let buffer = &mut computed.buffer;
+ 
+@@ -353,133 +328,125 @@ impl TextPipeline {
+         buffer.set_size(font_system, width, bounds.height);
+         let mut box_size = Vec2::ZERO;
+ 
+-        let result = buffer.layout_runs().try_for_each(|run| {
++        for run in buffer.layout_runs() {
+             box_size.x = box_size.x.max(run.line_w);
+             box_size.y += run.line_height;
+-            let mut current_section: Option<usize> = None;
+-            let mut start = 0.;
+-            let mut end = 0.;
+-            let result = run
+-                .glyphs
+-                .iter()
+-                .map(move |layout_glyph| (layout_glyph, run.line_y, run.line_i))
+-                .try_for_each(|(layout_glyph, line_y, line_i)| {
+-                    match current_section {
+-                        Some(section) => {
+-                            if section != layout_glyph.metadata {
+-                                layout_info.run_geometry.push(RunGeometry {
+-                                    span_index: section,
+-                                    bounds: Rect::new(
+-                                        start,
+-                                        run.line_top,
+-                                        end,
+-                                        run.line_top + run.line_height,
+-                                    ),
+-                                    strikethrough_y: (run.line_y - self.glyph_info[section].3)
+-                                        .round(),
+-                                    strikethrough_thickness: self.glyph_info[section].4,
+-                                    underline_y: (run.line_y - self.glyph_info[section].5).round(),
+-                                    underline_thickness: self.glyph_info[section].4,
+-                                });
+-                                start = end.max(layout_glyph.x);
+-                                current_section = Some(layout_glyph.metadata);
+-                            }
+-                            end = layout_glyph.x + layout_glyph.w;
+-                        }
+-                        None => {
+-                            current_section = Some(layout_glyph.metadata);
+-                            start = layout_glyph.x;
+-                            end = start + layout_glyph.w;
+-                        }
+-                    }
+-
+-                    let mut temp_glyph;
+-                    let span_index = layout_glyph.metadata;
+-                    let font_id = self.glyph_info[span_index].0;
+-                    let font_smoothing = self.glyph_info[span_index].1;
+-
+-                    let layout_glyph = if font_smoothing == FontSmoothing::None {
+-                        // If font smoothing is disabled, round the glyph positions and sizes,
+-                        // effectively discarding all subpixel layout.
+-                        temp_glyph = layout_glyph.clone();
+-                        temp_glyph.x = temp_glyph.x.round();
+-                        temp_glyph.y = temp_glyph.y.round();
+-                        temp_glyph.w = temp_glyph.w.round();
+-                        temp_glyph.x_offset = temp_glyph.x_offset.round();
+-                        temp_glyph.y_offset = temp_glyph.y_offset.round();
+-                        temp_glyph.line_height_opt = temp_glyph.line_height_opt.map(f32::round);
+-
+-                        &temp_glyph
+-                    } else {
+-                        layout_glyph
+-                    };
+-
+-                    let physical_glyph = layout_glyph.physical((0., 0.), 1.);
+-
+-                    let font_atlases = font_atlas_set
+-                        .entry(FontAtlasKey {
+-                            id: font_id,
+-                            font_size_bits: physical_glyph.cache_key.font_size_bits,
++            let mut maybe_run_geometry: Option<RunGeometry> = None;
++            let mut end: f32 = 0.;
++
++            for layout_glyph in run.glyphs {
++                if maybe_run_geometry
++                    .as_ref()
++                    .is_some_and(|run_geometry| run_geometry.span_index != layout_glyph.metadata)
++                {
++                    layout_info
++                        .run_geometry
++                        .push(maybe_run_geometry.take().unwrap());
++                }
++
++                if maybe_run_geometry.is_none() {
++                    let metrics = font_system
++                        .get_font(layout_glyph.font_id, layout_glyph.font_weight)
++                        .ok_or(TextError::NoSuchFont)?
++                        .as_swash()
++                        .metrics(&[]);
++
++                    let scalar = layout_glyph.font_size / metrics.units_per_em as f32;
++                    let stroke_size = (metrics.stroke_size * scalar).round().max(1.);
++                    let start = end.max(layout_glyph.x);
++
++                    maybe_run_geometry = Some(RunGeometry {
++                        span_index: layout_glyph.metadata,
++                        bounds: Rect::new(
++                            start,
++                            run.line_top,
++                            start,
++                            run.line_top + run.line_height,
++                        ),
++                        strikethrough_y: (run.line_y - metrics.strikeout_offset * scalar).round(),
++                        strikethrough_thickness: stroke_size,
++                        underline_y: (run.line_y - metrics.underline_offset * scalar).round(),
++                        underline_thickness: stroke_size,
++                    });
++                }
++
++                end = layout_glyph.x + layout_glyph.w;
++                maybe_run_geometry.as_mut().unwrap().bounds.max.x = end;
++
++                let mut temp_glyph;
++                let span_index = layout_glyph.metadata;
++                let font_smoothing = FontSmoothing::AntiAliased;
++
++                let layout_glyph = if font_smoothing == FontSmoothing::None {
++                    // If font smoothing is disabled, round the glyph positions and sizes,
++                    // effectively discarding all subpixel layout.
++                    temp_glyph = layout_glyph.clone();
++                    temp_glyph.x = temp_glyph.x.round();
++                    temp_glyph.y = temp_glyph.y.round();
++                    temp_glyph.w = temp_glyph.w.round();
++                    temp_glyph.x_offset = temp_glyph.x_offset.round();
++                    temp_glyph.y_offset = temp_glyph.y_offset.round();
++                    temp_glyph.line_height_opt = temp_glyph.line_height_opt.map(f32::round);
++
++                    &temp_glyph
++                } else {
++                    layout_glyph
++                };
++
++                let physical_glyph = layout_glyph.physical((0., 0.), 1.);
++
++                let font_atlases = font_atlas_set
++                    .entry(FontAtlasKey {
++                        id: physical_glyph.cache_key.font_id,
++                        font_size_bits: physical_glyph.cache_key.font_size_bits,
++                        font_smoothing,
++                    })
++                    .or_default();
++
++                let atlas_info = get_glyph_atlas_info(font_atlases, physical_glyph.cache_key)
++                    .map(Ok)
++                    .unwrap_or_else(|| {
++                        add_glyph_to_atlas(
++                            font_atlases,
++                            texture_atlases,
++                            textures,
++                            &mut font_system.0,
++                            &mut swash_cache.0,
++                            layout_glyph,
+                             font_smoothing,
+-                        })
+-                        .or_default();
+-
+-                    let atlas_info = get_glyph_atlas_info(font_atlases, physical_glyph.cache_key)
+-                        .map(Ok)
+-                        .unwrap_or_else(|| {
+-                            add_glyph_to_atlas(
+-                                font_atlases,
+-                                texture_atlases,
+-                                textures,
+-                                &mut font_system.0,
+-                                &mut swash_cache.0,
+-                                layout_glyph,
+-                                font_smoothing,
+-                            )
+-                        })?;
+-
+-                    let texture_atlas = texture_atlases.get(atlas_info.texture_atlas).unwrap();
+-                    let location = atlas_info.location;
+-                    let glyph_rect = texture_atlas.textures[location.glyph_index];
+-                    let left = location.offset.x as f32;
+-                    let top = location.offset.y as f32;
+-                    let glyph_size = UVec2::new(glyph_rect.width(), glyph_rect.height());
+-
+-                    // offset by half the size because the origin is center
+-                    let x = glyph_size.x as f32 / 2.0 + left + physical_glyph.x as f32;
+-                    let y =
+-                        line_y.round() + physical_glyph.y as f32 - top + glyph_size.y as f32 / 2.0;
+-
+-                    let position = Vec2::new(x, y);
+-
+-                    let pos_glyph = PositionedGlyph {
+-                        position,
+-                        size: glyph_size.as_vec2(),
+-                        atlas_info,
+-                        span_index,
+-                        byte_index: layout_glyph.start,
+-                        byte_length: layout_glyph.end - layout_glyph.start,
+-                        line_index: line_i,
+-                    };
+-                    layout_info.glyphs.push(pos_glyph);
+-                    Ok(())
+-                });
+-            if let Some(section) = current_section {
+-                layout_info.run_geometry.push(RunGeometry {
+-                    span_index: section,
+-                    bounds: Rect::new(start, run.line_top, end, run.line_top + run.line_height),
+-                    strikethrough_y: (run.line_y - self.glyph_info[section].3).round(),
+-                    strikethrough_thickness: self.glyph_info[section].4,
+-                    underline_y: (run.line_y - self.glyph_info[section].5).round(),
+-                    underline_thickness: self.glyph_info[section].4,
+-                });
++                        )
++                    })?;
++
++                let texture_atlas = texture_atlases.get(atlas_info.texture_atlas).unwrap();
++                let location = atlas_info.location;
++                let glyph_rect = texture_atlas.textures[location.glyph_index];
++                let left = location.offset.x as f32;
++                let top = location.offset.y as f32;
++                let glyph_size = UVec2::new(glyph_rect.width(), glyph_rect.height());
++
++                // offset by half the size because the origin is center
++                let x = glyph_size.x as f32 / 2.0 + left + physical_glyph.x as f32;
++                let y =
++                    run.line_y.round() + physical_glyph.y as f32 - top + glyph_size.y as f32 / 2.0;
++
++                let position = Vec2::new(x, y);
++
++                let pos_glyph = PositionedGlyph {
++                    position,
++                    size: glyph_size.as_vec2(),
++                    atlas_info,
++                    span_index,
++                    byte_index: layout_glyph.start,
++                    byte_length: layout_glyph.end - layout_glyph.start,
++                    line_index: run.line_i,
++                };
++                layout_info.glyphs.push(pos_glyph);
+             }
+ 
+-            result
+-        });
+-
+-        // Check result.
+-        result?;
++            if let Some(run_geometry) = maybe_run_geometry.take() {
++                layout_info.run_geometry.push(run_geometry);
++            }
++        }
+ 
+         layout_info.size = box_size.ceil();
+         Ok(())
+@@ -594,40 +561,6 @@ impl TextMeasureInfo {
+     }
+ }
+ 
+-/// Add the font to the cosmic text's `FontSystem`'s in-memory font database
+-pub fn load_font_to_fontdb(
+-    text_font: &TextFont,
+-    font_system: &mut cosmic_text::FontSystem,
+-    map_handle_to_font_id: &mut HashMap<AssetId<Font>, (cosmic_text::fontdb::ID, Arc<str>)>,
+-    fonts: &Assets<Font>,
+-) -> FontFaceInfo {
+-    let font_id = text_font.font.id();
+-    let (face_id, family_name) = map_handle_to_font_id.entry(font_id).or_insert_with(|| {
+-        let font = fonts.get(font_id).expect(
+-            "Tried getting a font that was not available, probably due to not being loaded yet",
+-        );
+-        let data = Arc::clone(&font.data);
+-        let ids = font_system
+-            .db_mut()
+-            .load_font_source(cosmic_text::fontdb::Source::Binary(data));
+-
+-        // TODO: it is assumed this is the right font face
+-        let face_id = *ids.last().unwrap();
+-        let face = font_system.db().face(face_id).unwrap();
+-
+-        let family_name = Arc::from(face.families[0].0.as_str());
+-        (face_id, family_name)
+-    });
+-
+-    let face = font_system.db().face(*face_id).unwrap();
+-
+-    FontFaceInfo {
+-        stretch: face.stretch,
+-        style: face.style,
+-        family_name: family_name.clone(),
+-    }
+-}
+-
+ /// Translates [`TextFont`] to [`Attrs`].
+ fn get_attrs<'a>(
+     span_index: usize,
+@@ -640,8 +573,8 @@ fn get_attrs<'a>(
+     Attrs::new()
+         .metadata(span_index)
+         .family(Family::Name(&face_info.family_name))
+-        .stretch(face_info.stretch)
+-        .style(face_info.style)
++        .stretch(text_font.width.into())
++        .style(text_font.style.into())
+         .weight(text_font.weight.into())
+         .metrics(
+             Metrics {
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index de4d57bb7cc30..0ec97b0a00d79 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -7,9 +7,10 @@ use bevy_reflect::prelude::*;
+ use bevy_utils::{default, once};
+ use core::fmt::{Debug, Formatter};
+ use core::str::from_utf8;
+-use cosmic_text::{Buffer, Metrics};
++use cosmic_text::{Buffer, Metrics, Stretch};
+ use serde::{Deserialize, Serialize};
+ use smallvec::SmallVec;
++use smol_str::SmolStr;
+ use tracing::warn;
+ 
+ /// Wrapper for [`cosmic_text::Buffer`]
+@@ -245,19 +246,64 @@ impl From<Justify> for cosmic_text::Align {
+     }
+ }
+ 
+-/// `TextFont` determines the style of a text span within a [`ComputedTextBlock`], specifically
+-/// the font face, the font size, the line height, and the antialiasing method.
+ #[derive(Component, Clone, Debug, Reflect, PartialEq)]
+-#[reflect(Component, Default, Debug, Clone)]
+-pub struct TextFont {
+-    /// The specific font face to use, as a `Handle` to a [`Font`] asset.
++/// Specifies how the font face for a text span is sourced.
++///
++/// A `FontSource` can either reference a font asset or identify a font by family name to be
++/// resolved by the font systems.
++pub enum FontSource {
++    /// Use a specific font face referenced by a [`Font`] asset handle.
+     ///
+-    /// If the `font` is not specified, then
++    /// If the default font handle is used, then
+     /// * if `default_font` feature is enabled (enabled by default in `bevy` crate),
+     ///   `FiraMono-subset.ttf` compiled into the library is used.
+     /// * otherwise no text will be rendered, unless a custom font is loaded into the default font
+     ///   handle.
+-    pub font: Handle<Font>,
++    Handle(Handle<Font>),
++    /// Resolve the font by family name using the font database.
++    Family(SmolStr),
++}
++
++impl Default for FontSource {
++    fn default() -> Self {
++        Self::Handle(Handle::default())
++    }
++}
++
++impl From<Handle<Font>> for FontSource {
++    fn from(handle: Handle<Font>) -> Self {
++        Self::Handle(handle)
++    }
++}
++
++impl From<&Handle<Font>> for FontSource {
++    fn from(handle: &Handle<Font>) -> Self {
++        Self::Handle(handle.clone())
++    }
++}
++
++impl From<SmolStr> for FontSource {
++    fn from(family: SmolStr) -> Self {
++        FontSource::Family(family)
++    }
++}
++
++impl From<&str> for FontSource {
++    fn from(family: &str) -> Self {
++        FontSource::Family(family.into())
++    }
++}
++
++/// `TextFont` determines the style of a text span within a [`ComputedTextBlock`], specifically
++/// the font face, the font size, the line height, and the antialiasing method.
++#[derive(Component, Clone, Debug, Reflect, PartialEq)]
++#[reflect(Component, Default, Debug, Clone)]
++pub struct TextFont {
++    /// Specifies how the font face for a text span is sourced.
++    ///
++    /// A `FontSource` can either reference a font asset or identify a font by family name to be
++    /// resolved by the text systems.
++    pub font: FontSource,
+     /// The vertical height of rasterized glyphs in the font atlas in pixels.
+     ///
+     /// This is multiplied by the window scale factor and `UiScale`, but not the text entity
+@@ -272,6 +318,10 @@ pub struct TextFont {
+     ///
+     /// Only supports variable weight fonts.
+     pub weight: FontWeight,
++    /// How condensed or expanded the glyphs appear horizontally.
++    pub width: FontWidth,
++    /// The slant style of a font face: normal, italic, or oblique.
++    pub style: FontStyle,
+     /// The antialiasing method to use when rendering text.
+     pub font_smoothing: FontSmoothing,
+     /// OpenType features for .otf fonts that support them.
+@@ -286,7 +336,13 @@ impl TextFont {
+ 
+     /// Returns this [`TextFont`] with the specified font face handle.
+     pub fn with_font(mut self, font: Handle<Font>) -> Self {
+-        self.font = font;
++        self.font = FontSource::Handle(font);
++        self
++    }
++
++    /// Returns this [`TextFont`] with the specified font family.
++    pub fn with_family(mut self, family: impl Into<SmolStr>) -> Self {
++        self.font = FontSource::Family(family.into());
+         self
+     }
+ 
+@@ -303,9 +359,12 @@ impl TextFont {
+     }
+ }
+ 
+-impl From<Handle<Font>> for TextFont {
+-    fn from(font: Handle<Font>) -> Self {
+-        Self { font, ..default() }
++impl<T: Into<FontSource>> From<T> for TextFont {
++    fn from(source: T) -> Self {
++        Self {
++            font: source.into(),
++            ..default()
++        }
+     }
+ }
+ 
+@@ -314,7 +373,9 @@ impl Default for TextFont {
+         Self {
+             font: Default::default(),
+             font_size: 20.0,
++            style: FontStyle::Normal,
+             weight: FontWeight::NORMAL,
++            width: FontWidth::NORMAL,
+             font_features: FontFeatures::default(),
+             font_smoothing: Default::default(),
+         }
+@@ -389,6 +450,83 @@ impl From<FontWeight> for cosmic_text::Weight {
+     }
+ }
+ 
++/// `<https://docs.microsoft.com/en-us/typography/opentype/spec/os2#uswidthclass>`
++#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash, Reflect)]
++pub struct FontWidth(u16);
++
++impl FontWidth {
++    /// 50% of normal width.
++    pub const ULTRA_CONDENSED: Self = Self(1);
++
++    /// 62.5% of normal width.
++    pub const EXTRA_CONDENSED: Self = Self(2);
++
++    /// 75% of normal width.
++    pub const CONDENSED: Self = Self(3);
++
++    /// 87.5% of normal width.
++    pub const SEMI_CONDENSED: Self = Self(4);
++
++    /// 100% of normal width. This is the default.
++    pub const NORMAL: Self = Self(5);
++
++    /// 112.5% of normal width.
++    pub const SEMI_EXPANDED: Self = Self(6);
++
++    /// 125% of normal width.
++    pub const EXPANDED: Self = Self(7);
++
++    /// 150% of normal width.
++    pub const EXTRA_EXPANDED: Self = Self(8);
++
++    /// 200% of normal width.
++    pub const ULTRA_EXPANDED: Self = Self(9);
++}
++
++impl Default for FontWidth {
++    fn default() -> Self {
++        Self::NORMAL
++    }
++}
++
++impl From<FontWidth> for Stretch {
++    fn from(value: FontWidth) -> Self {
++        match value.0 {
++            1 => Stretch::UltraCondensed,
++            2 => Stretch::ExtraCondensed,
++            3 => Stretch::Condensed,
++            4 => Stretch::SemiCondensed,
++            6 => Stretch::SemiExpanded,
++            7 => Stretch::Expanded,
++            8 => Stretch::ExtraExpanded,
++            9 => Stretch::UltraExpanded,
++            _ => Stretch::Normal,
++        }
++    }
++}
++
++/// The slant style of a font face: normal, italic, or oblique.
++#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Hash, Reflect)]
++pub enum FontStyle {
++    /// A face that is neither italic nor obliqued.
++    #[default]
++    Normal,
++    /// A form that is generally cursive in nature.
++    Italic,
++    /// A typically sloped version of the regular face.
++    Oblique,
++}
++
++impl From<FontStyle> for cosmic_text::Style {
++    fn from(value: FontStyle) -> Self {
++        match value {
++            FontStyle::Normal => cosmic_text::Style::Normal,
++            FontStyle::Italic => cosmic_text::Style::Italic,
++            FontStyle::Oblique => cosmic_text::Style::Oblique,
++        }
++    }
++}
++
+ /// An OpenType font feature tag.
+ #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Reflect)]
+ pub struct FontFeatureTag([u8; 4]);
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index 4b698a3de4a0c..01cbb0aa107d8 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -230,6 +230,7 @@ fn build_text_interop(app: &mut App) {
+                 widget::measure_text_system,
+             )
+                 .chain()
++                .after(bevy_text::load_font_assets_into_fontdb_system)
+                 .in_set(UiSystems::Content)
+                 // Text and Text2d are independent.
+                 .ambiguous_with(bevy_text::detect_text_needs_rerender::<bevy_sprite::Text2d>)
+@@ -242,8 +243,8 @@ fn build_text_interop(app: &mut App) {
+                 .ambiguous_with(widget::update_image_content_size_system),
+             widget::text_system
+                 .in_set(UiSystems::PostLayout)
+-                .after(bevy_text::free_unused_font_atlases_system)
+-                .before(bevy_asset::AssetEventSystems)
++                .after(bevy_text::load_font_assets_into_fontdb_system)
++                .after(bevy_asset::AssetEventSystems)
+                 // Text2d and bevy_ui text are entirely on separate entities
+                 .ambiguous_with(bevy_text::detect_text_needs_rerender::<bevy_sprite::Text2d>)
+                 .ambiguous_with(bevy_sprite::update_text2d_layout)
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index 3cf8fbf18de66..cfb10b16118ba 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -335,7 +335,6 @@ pub fn text_system(
+         &mut TextNodeFlags,
+         &mut ComputedTextBlock,
+     )>,
+-    text_font_query: Query<&TextFont>,
+     mut font_system: ResMut<CosmicFontSystem>,
+     mut swash_cache: ResMut<SwashCache>,
+ ) {
+@@ -346,7 +345,6 @@ pub fn text_system(
+                 continue;
+             }
+ 
+-            let scale_factor = node.inverse_scale_factor().recip().into();
+             let physical_node_size = if block.linebreak == LineBreak::NoWrap {
+                 // With `NoWrap` set, no constraints are placed on the width of the text.
+                 TextBounds::UNBOUNDED
+@@ -357,8 +355,6 @@ pub fn text_system(
+ 
+             match text_pipeline.update_text_layout_info(
+                 &mut text_layout_info,
+-                text_font_query,
+-                scale_factor,
+                 &mut font_atlas_set,
+                 &mut texture_atlases,
+                 &mut textures,
+@@ -382,7 +378,7 @@ pub fn text_system(
+                     panic!("Fatal error when processing text: {e}.");
+                 }
+                 Ok(()) => {
+-                    text_layout_info.scale_factor = scale_factor as f32;
++                    text_layout_info.scale_factor = node.inverse_scale_factor().recip();
+                     text_layout_info.size *= node.inverse_scale_factor();
+                     text_flags.needs_recompute = false;
+                 }
+diff --git a/examples/2d/dynamic_mip_generation.rs b/examples/2d/dynamic_mip_generation.rs
+index 07107ecf1f8b4..d5e11bcdced74 100644
+--- a/examples/2d/dynamic_mip_generation.rs
++++ b/examples/2d/dynamic_mip_generation.rs
+@@ -285,7 +285,7 @@ impl FromWorld for AppAssets {
+         let asset_server = world.resource::<AssetServer>();
+         let font = asset_server.load("fonts/FiraSans-Bold.ttf");
+         let text_font = TextFont {
+-            font: font.clone(),
++            font: font.into(),
+             font_size: FONT_SIZE,
+             ..default()
+         };
+diff --git a/examples/2d/sprite_slice.rs b/examples/2d/sprite_slice.rs
+index 91918b1d66091..21d99e291eb7a 100644
+--- a/examples/2d/sprite_slice.rs
++++ b/examples/2d/sprite_slice.rs
+@@ -108,7 +108,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+ 
+     let font = asset_server.load("fonts/FiraSans-Bold.ttf");
+     let style = TextFont {
+-        font: font.clone(),
++        font: font.into(),
+         ..default()
+     };
+ 
+diff --git a/examples/2d/text2d.rs b/examples/2d/text2d.rs
+index 6a961a43df9d3..b0869f0dd607b 100644
+--- a/examples/2d/text2d.rs
++++ b/examples/2d/text2d.rs
+@@ -36,7 +36,7 @@ struct AnimateScale;
+ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     let font = asset_server.load("fonts/FiraSans-Bold.ttf");
+     let text_font = TextFont {
+-        font: font.clone(),
++        font: font.clone().into(),
+         font_size: 50.0,
+         ..default()
+     };
+@@ -72,7 +72,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     ));
+     // Demonstrate text wrapping
+     let slightly_smaller_text_font = TextFont {
+-        font,
++        font: font.into(),
+         font_size: 35.0,
+         ..default()
+     };
+diff --git a/examples/2d/texture_atlas.rs b/examples/2d/texture_atlas.rs
+index 5380fc393b875..456ed9107ff70 100644
+--- a/examples/2d/texture_atlas.rs
++++ b/examples/2d/texture_atlas.rs
+@@ -121,7 +121,7 @@ fn setup(
+ 
+     // Padding label text style
+     let text_style: TextFont = TextFont {
+-        font: font.clone(),
++        font: font.clone().into(),
+         font_size: 42.0,
+         ..default()
+     };
+@@ -184,7 +184,7 @@ fn setup(
+ 
+     // Label text style
+     let sampling_label_style = TextFont {
+-        font,
++        font: font.into(),
+         font_size: 25.0,
+         ..default()
+     };
+diff --git a/examples/3d/blend_modes.rs b/examples/3d/blend_modes.rs
+index e144b05db8212..9a5fc5212b527 100644
+--- a/examples/3d/blend_modes.rs
++++ b/examples/3d/blend_modes.rs
+@@ -161,7 +161,7 @@ fn setup(
+ 
+     // We need the full version of this font so we can use box drawing characters.
+     let text_style = TextFont {
+-        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+         ..default()
+     };
+ 
+diff --git a/examples/3d/color_grading.rs b/examples/3d/color_grading.rs
+index 14237c2432629..8e6f49a08156a 100644
+--- a/examples/3d/color_grading.rs
++++ b/examples/3d/color_grading.rs
+@@ -292,7 +292,7 @@ fn add_help_text(
+     commands.spawn((
+         Text::new(create_help_text(currently_selected_option)),
+         TextFont {
+-            font: font.clone(),
++            font: FontSource::from(font),
+             ..default()
+         },
+         Node {
+@@ -310,7 +310,7 @@ fn text(label: &str, font: &Handle<Font>, color: Color) -> impl Bundle + use<> {
+     (
+         Text::new(label),
+         TextFont {
+-            font: font.clone(),
++            font: font.into(),
+             font_size: 15.0,
+             ..default()
+         },
+diff --git a/examples/README.md b/examples/README.md
+index dad6734835211..24d9044530632 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -577,6 +577,7 @@ Example | Description
+ [Feathers Widgets](../examples/ui/feathers.rs) | Gallery of Feathers Widgets
+ [Flex Layout](../examples/ui/flex_layout.rs) | Demonstrates how the AlignItems and JustifyContent properties can be composed to layout nodes and position text
+ [Font Atlas Debug](../examples/ui/font_atlas_debug.rs) | Illustrates how FontAtlases are populated (used to optimize text rendering internally)
++[Font Queries](../examples/ui/font_query.rs) | Demonstrates font querying
+ [Font Weights](../examples/ui/font_weights.rs) | Demonstrates how to use font weights.
+ [Ghost Nodes](../examples/ui/ghost_nodes.rs) | Demonstrates the use of Ghost Nodes to skip entities in the UI layout hierarchy
+ [Gradients](../examples/ui/gradients.rs) | An example demonstrating gradients
+diff --git a/examples/animation/animated_ui.rs b/examples/animation/animated_ui.rs
+index 8243592034abc..bb9bfce2690c4 100644
+--- a/examples/animation/animated_ui.rs
++++ b/examples/animation/animated_ui.rs
+@@ -142,7 +142,7 @@ fn setup(
+     entity.insert(children![(
+         Text::new("Bevy"),
+         TextFont {
+-            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+             font_size: 24.0,
+             ..default()
+         },
+diff --git a/examples/games/contributors.rs b/examples/games/contributors.rs
+index 24dc1445628d3..482219730f6df 100644
+--- a/examples/games/contributors.rs
++++ b/examples/games/contributors.rs
+@@ -139,7 +139,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     commands.spawn(Camera2d);
+ 
+     let text_style = TextFont {
+-        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+         font_size: 60.0,
+         ..default()
+     };
+diff --git a/examples/games/desk_toy.rs b/examples/games/desk_toy.rs
+index 8c066d2575ba3..db6dcb61aca2e 100644
+--- a/examples/games/desk_toy.rs
++++ b/examples/games/desk_toy.rs
+@@ -108,7 +108,7 @@ fn setup(
+     // Spawn the text instructions
+     let font = asset_server.load("fonts/FiraSans-Bold.ttf");
+     let text_style = TextFont {
+-        font: font.clone(),
++        font: font.clone().into(),
+         font_size: 25.0,
+         ..default()
+     };
+diff --git a/examples/games/stepping.rs b/examples/games/stepping.rs
+index f1e71bcedbc9a..4cf82b53daff3 100644
+--- a/examples/games/stepping.rs
++++ b/examples/games/stepping.rs
+@@ -120,7 +120,7 @@ fn build_ui(
+         text_spans.push((
+             TextSpan(format!("{label:?}\n")),
+             TextFont {
+-                font: asset_server.load(FONT_BOLD),
++                font: asset_server.load(FONT_BOLD).into(),
+                 ..default()
+             },
+             TextColor(FONT_COLOR),
+diff --git a/examples/input/text_input.rs b/examples/input/text_input.rs
+index b5f04241c750e..c1733b44d157e 100644
+--- a/examples/input/text_input.rs
++++ b/examples/input/text_input.rs
+@@ -49,20 +49,14 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
+             TextSpan::new("IME Active:  "),
+             TextSpan::new("false\n"),
+             TextSpan::new("IME Buffer:  "),
+-            (
+-                TextSpan::new("\n"),
+-                TextFont {
+-                    font: font.clone(),
+-                    ..default()
+-                },
+-            ),
++            (TextSpan::new("\n"), TextFont::from(font.clone()),),
+         ],
+     ));
+ 
+     commands.spawn((
+         Text2d::new(""),
+         TextFont {
+-            font,
++            font: font.clone().into(),
+             font_size: 100.0,
+             ..default()
+         },
+diff --git a/examples/stress_tests/many_text2d.rs b/examples/stress_tests/many_text2d.rs
+index 83c091738053a..6302bc85f45ab 100644
+--- a/examples/stress_tests/many_text2d.rs
++++ b/examples/stress_tests/many_text2d.rs
+@@ -171,17 +171,16 @@ fn print_counts(
+     mut timer: Local<PrintingTimer>,
+     texts: Query<&ViewVisibility, With<Text2d>>,
+     font_atlas_set: Res<FontAtlasSet>,
+-    font: Res<FontHandle>,
+ ) {
+     timer.tick(time.delta());
+     if !timer.just_finished() {
+         return;
+     }
+ 
+-    let font_id = font.0.id();
+     let num_atlases = font_atlas_set
+         .iter()
+-        .filter(|(key, _)| key.id == font_id)
++        // Removed this filter for now as the keys no longer include the AssetIds
++        //        .filter(|(key, _)| key.0 == font_id)
+         .map(|(_, atlases)| atlases.len())
+         .sum::<usize>();
+ 
+@@ -204,7 +203,7 @@ fn random_text_font(rng: &mut ChaCha8Rng, args: &Args, font: Handle<Font>) -> Te
+ 
+     TextFont {
+         font_size,
+-        font,
++        font: font.into(),
+         ..default()
+     }
+ }
+diff --git a/examples/stress_tests/text_pipeline.rs b/examples/stress_tests/text_pipeline.rs
+index f2c43cb162978..538f42384f747 100644
+--- a/examples/stress_tests/text_pipeline.rs
++++ b/examples/stress_tests/text_pipeline.rs
+@@ -41,7 +41,7 @@ fn spawn(mut commands: Commands, asset_server: Res<AssetServer>) {
+             (
+                 TextSpan("text".repeat(i)),
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                    font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                     font_size: (4 + i % 10) as f32,
+                     ..Default::default()
+                 },
+@@ -50,7 +50,7 @@ fn spawn(mut commands: Commands, asset_server: Res<AssetServer>) {
+             (
+                 TextSpan("pipeline".repeat(i)),
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                     font_size: (4 + i % 11) as f32,
+                     ..default()
+                 },
+diff --git a/examples/testbed/2d.rs b/examples/testbed/2d.rs
+index 6ee73f2a0c36a..9da5d642183ad 100644
+--- a/examples/testbed/2d.rs
++++ b/examples/testbed/2d.rs
+@@ -352,7 +352,7 @@ mod sprite_slicing {
+         commands.spawn((
+             Text2d::new("Original"),
+             TextFont {
+-                font: font.clone(),
++                font: FontSource::from(font.clone()),
+                 font_size: 20.0,
+                 ..default()
+             },
+@@ -363,7 +363,7 @@ mod sprite_slicing {
+         commands.spawn((
+             Text2d::new("Sliced"),
+             TextFont {
+-                font,
++                font: FontSource::from(font.clone()),
+                 font_size: 20.0,
+                 ..default()
+             },
+diff --git a/examples/testbed/full_ui.rs b/examples/testbed/full_ui.rs
+index 8565271da3e0b..392c747af42e4 100644
+--- a/examples/testbed/full_ui.rs
++++ b/examples/testbed/full_ui.rs
+@@ -71,7 +71,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                             parent.spawn((
+                                 Text::new("Text Example"),
+                                 TextFont {
+-                                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                                     font_size: 25.0,
+                                     ..default()
+                                 },
+@@ -87,7 +87,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                                 parent.spawn((
+                                     Text::new("Press Space to toggle debug outlines."),
+                                     TextFont {
+-                                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                                         ..default()
+                                     },
+                                     Label,
+@@ -96,7 +96,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                                 parent.spawn((
+                                     Text::new("V: toggle UI root's visibility"),
+                                     TextFont {
+-                                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                                         font_size: 12.,
+                                         ..default()
+                                     },
+@@ -106,7 +106,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                                 parent.spawn((
+                                     Text::new("S: toggle outlines for hidden nodes"),
+                                     TextFont {
+-                                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                                         font_size: 12.,
+                                         ..default()
+                                     },
+@@ -115,7 +115,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                                 parent.spawn((
+                                     Text::new("C: toggle outlines for clipped nodes"),
+                                     TextFont {
+-                                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                                         font_size: 12.,
+                                         ..default()
+                                     },
+@@ -126,7 +126,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                             parent.spawn((
+                                 Text::new("Try enabling feature \"bevy_ui_debug\"."),
+                                 TextFont {
+-                                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                                     ..default()
+                                 },
+                                 Label,
+@@ -147,7 +147,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                     parent.spawn((
+                         Text::new("Scrolling list"),
+                         TextFont {
+-                            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                             font_size: 21.,
+                             ..default()
+                         },
+@@ -189,7 +189,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                                                 Text(format!("Item {i}")),
+                                                 TextFont {
+                                                     font: asset_server
+-                                                        .load("fonts/FiraSans-Bold.ttf"),
++                                                        .load("fonts/FiraSans-Bold.ttf")
++                                                        .into(),
+                                                     ..default()
+                                                 },
+                                                 Label,
+diff --git a/examples/testbed/ui.rs b/examples/testbed/ui.rs
+index 32bec7dc55c07..7433269bd090e 100644
+--- a/examples/testbed/ui.rs
++++ b/examples/testbed/ui.rs
+@@ -156,7 +156,7 @@ mod text {
+         commands.spawn((
+             Text::new("Hello World."),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 200.,
+                 ..default()
+             },
+@@ -171,7 +171,7 @@ mod text {
+             },
+             Text::new("white "),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 ..default()
+             },
+             DespawnOnExit(super::Scene::Text),
+@@ -183,7 +183,7 @@ mod text {
+                     TextSpan::new("black"),
+                     TextColor(Color::BLACK),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         ..default()
+                     },
+                     TextBackgroundColor(Color::WHITE)
+@@ -199,7 +199,7 @@ mod text {
+             },
+             Text::new(""),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 ..default()
+             },
+             DespawnOnExit(super::Scene::Text),
+@@ -207,7 +207,7 @@ mod text {
+                 (
+                     TextSpan::new("white "),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         ..default()
+                     }
+                 ),
+@@ -218,7 +218,7 @@ mod text {
+                     TextSpan::new("black"),
+                     TextColor(Color::BLACK),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         ..default()
+                     },
+                     TextBackgroundColor(Color::WHITE)
+@@ -235,7 +235,7 @@ mod text {
+             },
+             Text::new(""),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 ..default()
+             },
+             DespawnOnExit(super::Scene::Text),
+@@ -245,7 +245,7 @@ mod text {
+                 (
+                     TextSpan::new("white "),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         ..default()
+                     }
+                 ),
+@@ -262,7 +262,7 @@ mod text {
+                     TextSpan::new("black"),
+                     TextColor(Color::BLACK),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         ..default()
+                     },
+                     TextBackgroundColor(Color::WHITE)
+@@ -280,7 +280,7 @@ mod text {
+             },
+             Text::new("FiraSans_"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 25.,
+                 ..default()
+             },
+@@ -289,7 +289,7 @@ mod text {
+                 (
+                     TextSpan::new("MonaSans_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     }
+@@ -297,7 +297,7 @@ mod text {
+                 (
+                     TextSpan::new("EBGaramond_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/EBGaramond12-Regular.otf"),
++                        font: asset_server.load("fonts/EBGaramond12-Regular.otf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -305,7 +305,7 @@ mod text {
+                 (
+                     TextSpan::new("FiraMono"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -321,7 +321,7 @@ mod text {
+             },
+             Text::new("FiraSans "),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 25.,
+                 ..default()
+             },
+@@ -330,7 +330,7 @@ mod text {
+                 (
+                     TextSpan::new("MonaSans "),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     }
+@@ -338,7 +338,7 @@ mod text {
+                 (
+                     TextSpan::new("EBGaramond "),
+                     TextFont {
+-                        font: asset_server.load("fonts/EBGaramond12-Regular.otf"),
++                        font: asset_server.load("fonts/EBGaramond12-Regular.otf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -346,7 +346,7 @@ mod text {
+                 (
+                     TextSpan::new("FiraMono"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -363,7 +363,7 @@ mod text {
+             },
+             Text::new("FiraSans "),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 25.,
+                 ..default()
+             },
+@@ -372,7 +372,7 @@ mod text {
+                 (
+                     TextSpan::new("MonaSans_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     }
+@@ -380,7 +380,7 @@ mod text {
+                 (
+                     TextSpan::new("EBGaramond "),
+                     TextFont {
+-                        font: asset_server.load("fonts/EBGaramond12-Regular.otf"),
++                        font: asset_server.load("fonts/EBGaramond12-Regular.otf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -388,7 +388,7 @@ mod text {
+                 (
+                     TextSpan::new("FiraMono"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -405,7 +405,7 @@ mod text {
+             },
+             Text::new("FiraSans"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 25.,
+                 ..default()
+             },
+@@ -415,7 +415,7 @@ mod text {
+                 (
+                     TextSpan::new("MonaSans"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     }
+@@ -424,7 +424,7 @@ mod text {
+                 (
+                     TextSpan::new("EBGaramond"),
+                     TextFont {
+-                        font: asset_server.load("fonts/EBGaramond12-Regular.otf"),
++                        font: asset_server.load("fonts/EBGaramond12-Regular.otf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -433,7 +433,7 @@ mod text {
+                 (
+                     TextSpan::new("FiraMono"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -450,7 +450,7 @@ mod text {
+             },
+             Text::new("Fira Sans_"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 25.,
+                 ..default()
+             },
+@@ -459,7 +459,7 @@ mod text {
+                 (
+                     TextSpan::new("Mona Sans_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     }
+@@ -467,7 +467,7 @@ mod text {
+                 (
+                     TextSpan::new("EB Garamond_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/EBGaramond12-Regular.otf"),
++                        font: asset_server.load("fonts/EBGaramond12-Regular.otf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -475,7 +475,7 @@ mod text {
+                 (
+                     TextSpan::new("Fira Mono"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -492,7 +492,7 @@ mod text {
+             },
+             Text::new("FontWeight(100)_"),
+             TextFont {
+-                font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                 font_size: 25.,
+                 weight: FontWeight(100),
+                 ..default()
+@@ -502,7 +502,7 @@ mod text {
+                 (
+                     TextSpan::new("FontWeight(500)_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         weight: FontWeight(500),
+                         ..default()
+@@ -511,7 +511,7 @@ mod text {
+                 (
+                     TextSpan::new("FontWeight(900)"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         weight: FontWeight(900),
+                         ..default()
+@@ -529,7 +529,7 @@ mod text {
+             },
+             Text::new("FiraSans_"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 25.,
+                 weight: FontWeight(900),
+                 ..default()
+@@ -539,7 +539,7 @@ mod text {
+                 (
+                     TextSpan::new("MonaSans_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         weight: FontWeight(700),
+                         ..default()
+@@ -548,7 +548,7 @@ mod text {
+                 (
+                     TextSpan::new("EBGaramond_"),
+                     TextFont {
+-                        font: asset_server.load("fonts/EBGaramond12-Regular.otf"),
++                        font: asset_server.load("fonts/EBGaramond12-Regular.otf").into(),
+                         font_size: 25.,
+                         weight: FontWeight(500),
+                         ..default()
+@@ -557,7 +557,7 @@ mod text {
+                 (
+                     TextSpan::new("FiraMono"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                         font_size: 25.,
+                         weight: FontWeight(300),
+                         ..default()
+@@ -575,7 +575,7 @@ mod text {
+             },
+             Text::new("FiraSans\t"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 25.,
+                 ..default()
+             },
+@@ -584,7 +584,7 @@ mod text {
+                 (
+                     TextSpan::new("MonaSans\t"),
+                     TextFont {
+-                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf"),
++                        font: asset_server.load("fonts/MonaSans-VariableFont.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     }
+@@ -592,7 +592,7 @@ mod text {
+                 (
+                     TextSpan::new("EBGaramond\t"),
+                     TextFont {
+-                        font: asset_server.load("fonts/EBGaramond12-Regular.otf"),
++                        font: asset_server.load("fonts/EBGaramond12-Regular.otf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+@@ -600,7 +600,7 @@ mod text {
+                 (
+                     TextSpan::new("FiraMono"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                         font_size: 25.,
+                         ..default()
+                     },
+diff --git a/examples/ui/anchor_layout.rs b/examples/ui/anchor_layout.rs
+index 6509a7790a854..5f0c6f9cc1050 100644
+--- a/examples/ui/anchor_layout.rs
++++ b/examples/ui/anchor_layout.rs
+@@ -135,11 +135,7 @@ fn anchored_node(font: Handle<Font>, node: Node, label: &str) -> impl Bundle {
+                     ..node
+                 },
+                 BackgroundColor(Color::srgb(1., 0.066, 0.349)),
+-                children![(
+-                    Text::new(label),
+-                    TextFont { font, ..default() },
+-                    TextColor::BLACK,
+-                )],
++                children![(Text::new(label), TextFont::from(font), TextColor::BLACK,)],
+             )
+         ],
+     )
+diff --git a/examples/ui/box_shadow.rs b/examples/ui/box_shadow.rs
+index 46dc09851660c..9080a5c56e858 100644
+--- a/examples/ui/box_shadow.rs
++++ b/examples/ui/box_shadow.rs
+@@ -274,7 +274,7 @@ fn setup(
+                     children![(
+                         Text::new("Reset"),
+                         TextFont {
+-                            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                             font_size: 16.0,
+                             ..default()
+                         },
+@@ -319,7 +319,7 @@ fn build_setting_row(
+                 children![(
+                     Text::new(setting_type.label()),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         font_size: 16.0,
+                         ..default()
+                     },
+@@ -345,7 +345,7 @@ fn build_setting_row(
+                         "-"
+                     }),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         font_size: 18.0,
+                         ..default()
+                     },
+@@ -365,7 +365,7 @@ fn build_setting_row(
+                     (
+                         Text::new(value_text),
+                         TextFont {
+-                            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                             font_size: 16.0,
+                             ..default()
+                         },
+@@ -392,7 +392,7 @@ fn build_setting_row(
+                         "+"
+                     }),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         font_size: 18.0,
+                         ..default()
+                     },
+diff --git a/examples/ui/button.rs b/examples/ui/button.rs
+index 811a986122d33..59d8cc6b294b0 100644
+--- a/examples/ui/button.rs
++++ b/examples/ui/button.rs
+@@ -97,7 +97,7 @@ fn button(asset_server: &AssetServer) -> impl Bundle {
+             children![(
+                 Text::new("Button"),
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                     font_size: 33.0,
+                     ..default()
+                 },
+diff --git a/examples/ui/display_and_visibility.rs b/examples/ui/display_and_visibility.rs
+index ce96648c88636..cff407f9b0ec0 100644
+--- a/examples/ui/display_and_visibility.rs
++++ b/examples/ui/display_and_visibility.rs
+@@ -75,7 +75,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     let palette: [Color; 4] = PALETTE.map(|hex| Srgba::hex(hex).unwrap().into());
+ 
+     let text_font = TextFont {
+-        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+         ..default()
+     };
+ 
+@@ -142,7 +142,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                 })
+                 .with_children(|builder| {
+                     let text_font = TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         ..default()
+                     };
+ 
+diff --git a/examples/ui/flex_layout.rs b/examples/ui/flex_layout.rs
+index be23790d5cb22..e30af1827f079 100644
+--- a/examples/ui/flex_layout.rs
++++ b/examples/ui/flex_layout.rs
+@@ -161,10 +161,6 @@ fn spawn_nested_text_bundle(
+             BackgroundColor(background_color),
+         ))
+         .with_children(|builder| {
+-            builder.spawn((
+-                Text::new(text),
+-                TextFont { font, ..default() },
+-                TextColor::BLACK,
+-            ));
++            builder.spawn((Text::new(text), TextFont::from(font), TextColor::BLACK));
+         });
+ }
+diff --git a/examples/ui/font_atlas_debug.rs b/examples/ui/font_atlas_debug.rs
+index dcc8a392e3cfd..0dc9bc5176b13 100644
+--- a/examples/ui/font_atlas_debug.rs
++++ b/examples/ui/font_atlas_debug.rs
+@@ -81,8 +81,8 @@ fn text_update_system(
+ }
+ 
+ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, mut state: ResMut<State>) {
+-    let font_handle = asset_server.load("fonts/FiraSans-Bold.ttf");
+-    state.handle = font_handle.clone();
++    state.handle = asset_server.load("fonts/FiraSans-Bold.ttf");
++    let font = FontSource::from(state.handle.clone());
+     commands.spawn(Camera2d);
+     commands
+         .spawn((
+@@ -97,7 +97,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, mut state: ResM
+             parent.spawn((
+                 Text::new("a"),
+                 TextFont {
+-                    font: font_handle,
++                    font,
+                     font_size: 50.0,
+                     ..default()
+                 },
+diff --git a/examples/ui/font_query.rs b/examples/ui/font_query.rs
+new file mode 100644
+index 0000000000000..1886078f1625c
+--- /dev/null
++++ b/examples/ui/font_query.rs
+@@ -0,0 +1,251 @@
++//! This example demonstrates how to use font weights, widths and styles.
++
++use bevy::prelude::*;
++use bevy::text::FontSource;
++
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins)
++        .add_systems(Startup, setup)
++        .run();
++}
++
++fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
++    let family = FontSource::from(asset_server.load("fonts/MonaSans-VariableFont.ttf"));
++
++    commands.spawn(Camera2d);
++
++    commands.spawn((
++        Node {
++            flex_direction: FlexDirection::Column,
++            align_self: AlignSelf::Center,
++            justify_self: JustifySelf::Center,
++            align_items: AlignItems::Center,
++            padding: px(16.).all(),
++            row_gap: px(16.),
++            ..default()
++        },
++        children![
++            (
++                Text::new("Font Weights, Widths & Styles"),
++                TextFont {
++                    font: family.clone(),
++                    font_size: 32.0,
++                    ..default()
++                },
++                Underline,
++            ),
++            (
++                // Two columns side-by-side
++                Node {
++                    flex_direction: FlexDirection::Row,
++                    column_gap: px(32.),
++                    ..default()
++                },
++                children![
++                    (
++                        // Left column: Weights
++                        Node {
++                            flex_direction: FlexDirection::Column,
++                            padding: px(8.).all(),
++                            row_gap: px(8.),
++                            ..default()
++                        },
++                        children![
++                            (
++                                Text::new("Weight 100 (Thin)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::THIN,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 200 (Extra Light)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::EXTRA_LIGHT,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 300 (Light)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::LIGHT,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 400 (Normal)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::NORMAL,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 500 (Medium)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::MEDIUM,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 600 (Semibold)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::SEMIBOLD,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 700 (Bold)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::BOLD,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 800 (Extra Bold)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::EXTRA_BOLD,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("Weight 900 (Black)"),
++                                TextFont {
++                                    font: family.clone(),
++                                    weight: FontWeight::BLACK,
++                                    ..default()
++                                },
++                            ),
++                        ]
++                    ),
++                    (
++                        // Right column: Widths
++                        Node {
++                            flex_direction: FlexDirection::Column,
++                            padding: px(8.).all(),
++                            row_gap: px(8.),
++                            ..default()
++                        },
++                        children![
++                            (
++                                Text::new("FontWidth::ULTRA_CONDENSED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::ULTRA_CONDENSED,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::EXTRA_CONDENSED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::EXTRA_CONDENSED,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::CONDENSED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::CONDENSED,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::SEMI_CONDENSED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::SEMI_CONDENSED,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::NORMAL"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::NORMAL,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::SEMI_EXPANDED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::SEMI_EXPANDED,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::EXPANDED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::EXPANDED,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::EXTRA_EXPANDED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::EXTRA_EXPANDED,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontWidth::ULTRA_EXPANDED"),
++                                TextFont {
++                                    font: family.clone(),
++                                    width: FontWidth::ULTRA_EXPANDED,
++                                    ..default()
++                                },
++                            ),
++                        ],
++                    ),
++                    (
++                        // Right column: Style
++                        Node {
++                            flex_direction: FlexDirection::Column,
++                            padding: px(8.).all(),
++                            row_gap: px(8.),
++                            ..default()
++                        },
++                        children![
++                            (
++                                Text::new("FontStyle::Normal"),
++                                TextFont {
++                                    font: family.clone(),
++                                    style: FontStyle::Normal,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontStyle::Oblique"),
++                                TextFont {
++                                    font: family.clone(),
++                                    style: FontStyle::Oblique,
++                                    ..default()
++                                },
++                            ),
++                            (
++                                Text::new("FontStyle::Italic"),
++                                TextFont {
++                                    font: family.clone(),
++                                    style: FontStyle::Italic,
++                                    ..default()
++                                },
++                            ),
++                        ]
++                    ),
++                ]
++            ),
++        ],
++    ));
++}
+diff --git a/examples/ui/font_weights.rs b/examples/ui/font_weights.rs
+index 1391e404ebc39..19c54da1ea433 100644
+--- a/examples/ui/font_weights.rs
++++ b/examples/ui/font_weights.rs
+@@ -10,7 +10,7 @@ fn main() {
+ }
+ 
+ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+-    let font = asset_server.load("fonts/MonaSans-VariableFont.ttf");
++    let font: FontSource = asset_server.load("fonts/MonaSans-VariableFont.ttf").into();
+ 
+     commands.spawn(Camera2d);
+ 
+diff --git a/examples/ui/ghost_nodes.rs b/examples/ui/ghost_nodes.rs
+index f2d8c0930f09d..f5f1198877e32 100644
+--- a/examples/ui/ghost_nodes.rs
++++ b/examples/ui/ghost_nodes.rs
+@@ -92,7 +92,7 @@ fn create_label(text: &str, font: Handle<Font>) -> (Text, TextFont, TextColor) {
+     (
+         Text::new(text),
+         TextFont {
+-            font,
++            font: font.into(),
+             font_size: 33.0,
+             ..default()
+         },
+diff --git a/examples/ui/grid.rs b/examples/ui/grid.rs
+index 63b2b525be3a0..2b8a95f9e7339 100644
+--- a/examples/ui/grid.rs
++++ b/examples/ui/grid.rs
+@@ -133,14 +133,11 @@ fn spawn_layout(mut commands: Commands, asset_server: Res<AssetServer>) {
+                 ))
+                 .with_children(|builder| {
+                     builder.spawn((Text::new("Sidebar"),
+-                        TextFont {
+-                            font: font.clone(),
+-                            ..default()
+-                        },
++                        TextFont::from(font.clone()),
+                     ));
+                     builder.spawn((Text::new("A paragraph of text which ought to wrap nicely. A paragraph of text which ought to wrap nicely. A paragraph of text which ought to wrap nicely. A paragraph of text which ought to wrap nicely. A paragraph of text which ought to wrap nicely. A paragraph of text which ought to wrap nicely. A paragraph of text which ought to wrap nicely."),
+                         TextFont {
+-                            font: font.clone(),
++                            font: font.clone().into(),
+                             font_size: 13.0,
+                             ..default()
+                         },
+@@ -200,7 +197,7 @@ fn item_rect(builder: &mut ChildSpawnerCommands, color: Srgba) {
+ fn spawn_nested_text_bundle(builder: &mut ChildSpawnerCommands, font: Handle<Font>, text: &str) {
+     builder.spawn((
+         Text::new(text),
+-        TextFont { font, ..default() },
++        TextFont::from(font.clone()),
+         TextColor::BLACK,
+     ));
+ }
+diff --git a/examples/ui/overflow_debug.rs b/examples/ui/overflow_debug.rs
+index 1f0bde0eb5364..eda7a6d6653cf 100644
+--- a/examples/ui/overflow_debug.rs
++++ b/examples/ui/overflow_debug.rs
+@@ -160,7 +160,7 @@ fn spawn_text(
+         parent.spawn((
+             Text::new("Bevy"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 100.0,
+                 ..default()
+             },
+diff --git a/examples/ui/relative_cursor_position.rs b/examples/ui/relative_cursor_position.rs
+index 67932d69ef3d3..ed0558637ab61 100644
+--- a/examples/ui/relative_cursor_position.rs
++++ b/examples/ui/relative_cursor_position.rs
+@@ -49,7 +49,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+             parent.spawn((
+                 Text::new("(0.0, 0.0)"),
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                     font_size: 33.0,
+                     ..default()
+                 },
+diff --git a/examples/ui/scroll.rs b/examples/ui/scroll.rs
+index c087dfc6bdfee..1833f42f1301a 100644
+--- a/examples/ui/scroll.rs
++++ b/examples/ui/scroll.rs
+@@ -136,7 +136,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                     parent.spawn((
+                         Text::new("Horizontally Scrolling list (Ctrl + MouseWheel)"),
+                         TextFont {
+-                            font: font_handle.clone(),
++                            font: font_handle.clone().into(),
+                             font_size: FONT_SIZE,
+                             ..default()
+                         },
+@@ -161,7 +161,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                                     .spawn((
+                                         Text(format!("Item {i}")),
+                                         TextFont {
+-                                            font: font_handle.clone(),
++                                            font: font_handle.clone().into(),
+                                             ..default()
+                                         },
+                                         Label,
+@@ -218,7 +218,7 @@ fn vertically_scrolling_list(font_handle: Handle<Font>) -> impl Bundle {
+                 // Title
+                 Text::new("Vertically Scrolling List"),
+                 TextFont {
+-                    font: font_handle.clone(),
++                    font: font_handle.clone().into(),
+                     font_size: FONT_SIZE,
+                     ..default()
+                 },
+@@ -258,7 +258,7 @@ fn vertically_scrolling_list(font_handle: Handle<Font>) -> impl Bundle {
+                         children![(
+                             Text(format!("Item {i}")),
+                             TextFont {
+-                                font: font_handle.clone(),
++                                font: font_handle.clone().into(),
+                                 ..default()
+                             },
+                             Label,
+@@ -284,7 +284,7 @@ fn bidirectional_scrolling_list(font_handle: Handle<Font>) -> impl Bundle {
+             (
+                 Text::new("Bidirectionally Scrolling List"),
+                 TextFont {
+-                    font: font_handle.clone(),
++                    font: font_handle.clone().into(),
+                     font_size: FONT_SIZE,
+                     ..default()
+                 },
+@@ -310,10 +310,7 @@ fn bidirectional_scrolling_list(font_handle: Handle<Font>) -> impl Bundle {
+                             move |i| {
+                                 (
+                                     Text(format!("Item {}", (oi * 10) + i)),
+-                                    TextFont {
+-                                        font: value.clone(),
+-                                        ..default()
+-                                    },
++                                    TextFont::from(value.clone()),
+                                     Label,
+                                     AccessibilityNode(Accessible::new(Role::ListItem)),
+                                 )
+@@ -339,7 +336,7 @@ fn bidirectional_scrolling_list_with_sticky(font_handle: Handle<Font>) -> impl B
+             (
+                 Text::new("Bidirectionally Scrolling List With Sticky Nodes"),
+                 TextFont {
+-                    font: font_handle.clone(),
++                    font: font_handle.clone().into(),
+                     font_size: FONT_SIZE,
+                     ..default()
+                 },
+@@ -374,10 +371,7 @@ fn bidirectional_scrolling_list_with_sticky(font_handle: Handle<Font>) -> impl B
+                             };
+                             (
+                                 Text(format!("|{},{}|", y, x)),
+-                                TextFont {
+-                                    font: value.clone(),
+-                                    ..default()
+-                                },
++                                TextFont::from(value.clone()),
+                                 TextLayout {
+                                     linebreak: LineBreak::NoWrap,
+                                     ..default()
+@@ -409,7 +403,7 @@ fn nested_scrolling_list(font_handle: Handle<Font>) -> impl Bundle {
+                 // Title
+                 Text::new("Nested Scrolling Lists"),
+                 TextFont {
+-                    font: font_handle.clone(),
++                    font: font_handle.clone().into(),
+                     font_size: FONT_SIZE,
+                     ..default()
+                 },
+@@ -442,10 +436,7 @@ fn nested_scrolling_list(font_handle: Handle<Font>) -> impl Bundle {
+                             move |i| {
+                                 (
+                                     Text(format!("Item {}", (oi * 20) + i)),
+-                                    TextFont {
+-                                        font: value.clone(),
+-                                        ..default()
+-                                    },
++                                    TextFont::from(value.clone()),
+                                     Label,
+                                     AccessibilityNode(Accessible::new(Role::ListItem)),
+                                 )
+diff --git a/examples/ui/size_constraints.rs b/examples/ui/size_constraints.rs
+index 585ed321912c2..7491f0eb154c4 100644
+--- a/examples/ui/size_constraints.rs
++++ b/examples/ui/size_constraints.rs
+@@ -44,7 +44,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+ 
+     let text_font = (
+         TextFont {
+-            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+             font_size: 33.0,
+             ..Default::default()
+         },
+diff --git a/examples/ui/standard_widgets.rs b/examples/ui/standard_widgets.rs
+index 99149bc6065fa..af28cc3b4351c 100644
+--- a/examples/ui/standard_widgets.rs
++++ b/examples/ui/standard_widgets.rs
+@@ -214,7 +214,7 @@ fn button(asset_server: &AssetServer) -> impl Bundle {
+         children![(
+             Text::new("Button"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 33.0,
+                 ..default()
+             },
+@@ -251,7 +251,7 @@ fn menu_button(asset_server: &AssetServer) -> impl Bundle {
+                 (
+                     Text::new("Menu"),
+                     TextFont {
+-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                         font_size: 33.0,
+                         ..default()
+                     },
+@@ -570,7 +570,7 @@ fn checkbox(asset_server: &AssetServer, caption: &str) -> impl Bundle {
+             Spawn((
+                 Text::new(caption),
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                     font_size: 20.0,
+                     ..default()
+                 },
+@@ -783,7 +783,7 @@ fn radio(asset_server: &AssetServer, value: TrackClick, caption: &str) -> impl B
+             Spawn((
+                 Text::new(caption),
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                     font_size: 20.0,
+                     ..default()
+                 },
+@@ -891,7 +891,7 @@ fn menu_item(asset_server: &AssetServer) -> impl Bundle {
+         children![(
+             Text::new("Menu Item"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 33.0,
+                 ..default()
+             },
+diff --git a/examples/ui/standard_widgets_observers.rs b/examples/ui/standard_widgets_observers.rs
+index 4bed7b5c5b257..50f16c9645f0f 100644
+--- a/examples/ui/standard_widgets_observers.rs
++++ b/examples/ui/standard_widgets_observers.rs
+@@ -148,7 +148,7 @@ fn button(asset_server: &AssetServer) -> impl Bundle {
+         children![(
+             Text::new("Button"),
+             TextFont {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 33.0,
+                 ..default()
+             },
+@@ -379,7 +379,7 @@ fn checkbox(asset_server: &AssetServer, caption: &str) -> impl Bundle {
+             Spawn((
+                 Text::new(caption),
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                     font_size: 20.0,
+                     ..default()
+                 },
+diff --git a/examples/ui/strikethrough_and_underline.rs b/examples/ui/strikethrough_and_underline.rs
+index 2995350ab8f9c..3a7933e05b66a 100644
+--- a/examples/ui/strikethrough_and_underline.rs
++++ b/examples/ui/strikethrough_and_underline.rs
+@@ -19,7 +19,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+         // Just add the `Strikethrough` component to any `Text`, `Text2d` or `TextSpan` and its text will be struck through
+         Strikethrough,
+         TextFont {
+-            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+             font_size: 67.0,
+             ..default()
+         },
+@@ -72,7 +72,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                 Text::new("2struck\nstruck"),
+                 Strikethrough,
+                 TextFont {
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                     font_size: 67.0,
+                     ..default()
+                 },
+diff --git a/examples/ui/text.rs b/examples/ui/text.rs
+index 1d3941a34b3bc..87f235b5eb588 100644
+--- a/examples/ui/text.rs
++++ b/examples/ui/text.rs
+@@ -7,15 +7,19 @@ use bevy::{
+     color::palettes::css::GOLD,
+     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
+     prelude::*,
+-    text::{FontFeatureTag, FontFeatures, Underline},
++    text::{CosmicFontSystem, FontFeatureTag, FontFeatures, Underline},
+ };
+ 
+ fn main() {
+-    App::new()
+-        .add_plugins((DefaultPlugins, FrameTimeDiagnosticsPlugin::default()))
++    let mut app = App::new();
++    app.add_plugins((DefaultPlugins, FrameTimeDiagnosticsPlugin::default()))
+         .add_systems(Startup, setup)
+-        .add_systems(Update, (text_update_system, text_color_system))
+-        .run();
++        .add_systems(Update, (text_update_system, text_color_system));
++
++    let mut f = app.world_mut().resource_mut::<CosmicFontSystem>();
++    f.db_mut().load_system_fonts();
++
++    app.run();
+ }
+ 
+ // Marker struct to help identify the FPS UI component, since there may be many Text components
+@@ -36,10 +40,11 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+         Underline,
+         TextFont {
+             // This font is loaded and will be used instead of the default font.
+-            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++            font: "Comic Sans MS".into(),
+             font_size: 67.0,
+             ..default()
+         },
++        Strikethrough,
+         TextShadow::default(),
+         // Set the justification of the Text
+         TextLayout::new_with_justify(Justify::Center),
+@@ -60,7 +65,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+             Text::new("FPS: "),
+             TextFont {
+                 // This font is loaded and will be used instead of the default font.
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                 font_size: 42.0,
+                 ..default()
+             },
+@@ -71,7 +76,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                 TextFont {
+                     // If the "default_font" feature is unavailable, load a font to use instead.
+                     #[cfg(not(feature = "default_font"))]
+-                    font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                    font: asset_server.load("fonts/FiraMono-Medium.ttf").into(),
+                     font_size: 33.0,
+                     ..Default::default()
+                 },
+@@ -81,7 +86,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+         ));
+ 
+     // Text with OpenType features
+-    let opentype_font_handle = asset_server.load("fonts/EBGaramond12-Regular.otf");
++    let opentype_font_handle: FontSource =
++        asset_server.load("fonts/EBGaramond12-Regular.otf").into();
+     commands
+         .spawn((
+             Node {
+diff --git a/examples/ui/text_debug.rs b/examples/ui/text_debug.rs
+index 84e4db4e52b43..c80f93d22a9c0 100644
+--- a/examples/ui/text_debug.rs
++++ b/examples/ui/text_debug.rs
+@@ -31,7 +31,7 @@ fn main() {
+ struct TextChanges;
+ 
+ fn infotext_system(mut commands: Commands, asset_server: Res<AssetServer>) {
+-    let font = asset_server.load("fonts/FiraSans-Bold.ttf");
++    let font = FontSource::from(asset_server.load("fonts/FiraSans-Bold.ttf"));
+     let background_color = MAROON.into();
+     commands.spawn(Camera2d);
+ 
+diff --git a/examples/ui/text_wrap_debug.rs b/examples/ui/text_wrap_debug.rs
+index 212a820abca75..78e36c6212551 100644
+--- a/examples/ui/text_wrap_debug.rs
++++ b/examples/ui/text_wrap_debug.rs
+@@ -45,7 +45,7 @@ fn spawn(mut commands: Commands, asset_server: Res<AssetServer>) {
+     commands.spawn(Camera2d);
+ 
+     let text_font = TextFont {
+-        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++        font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+         font_size: 12.0,
+         ..default()
+     };
+diff --git a/examples/ui/transparency_ui.rs b/examples/ui/transparency_ui.rs
+index d3884483f463f..c8537f27f49fd 100644
+--- a/examples/ui/transparency_ui.rs
++++ b/examples/ui/transparency_ui.rs
+@@ -14,7 +14,7 @@ fn main() {
+ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     commands.spawn(Camera2d);
+ 
+-    let font_handle = asset_server.load("fonts/FiraSans-Bold.ttf");
++    let font_handle = FontSource::from(asset_server.load("fonts/FiraSans-Bold.ttf"));
+ 
+     commands
+         .spawn(Node {
+diff --git a/examples/ui/ui_texture_atlas_slice.rs b/examples/ui/ui_texture_atlas_slice.rs
+index b651630094ea8..2f66313455d46 100644
+--- a/examples/ui/ui_texture_atlas_slice.rs
++++ b/examples/ui/ui_texture_atlas_slice.rs
+@@ -102,7 +102,7 @@ fn setup(
+                         parent.spawn((
+                             Text::new("Button"),
+                             TextFont {
+-                                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                                 font_size: 33.0,
+                                 ..default()
+                             },
+diff --git a/examples/ui/ui_texture_slice.rs b/examples/ui/ui_texture_slice.rs
+index 464bdfd41bce9..067835d26cca6 100644
+--- a/examples/ui/ui_texture_slice.rs
++++ b/examples/ui/ui_texture_slice.rs
+@@ -84,7 +84,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+                     .with_child((
+                         Text::new("Button"),
+                         TextFont {
+-                            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+                             font_size: 33.0,
+                             ..default()
+                         },
+diff --git a/examples/ui/vertical_slider.rs b/examples/ui/vertical_slider.rs
+index 66dcccbad229c..170cc98267cdb 100644
+--- a/examples/ui/vertical_slider.rs
++++ b/examples/ui/vertical_slider.rs
+@@ -72,7 +72,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+                     parent.spawn((
+                         Text::new("Vertical"),
+                         TextFont {
+-                            font: assets.load("fonts/FiraSans-Bold.ttf"),
++                            font: assets.load("fonts/FiraSans-Bold.ttf").into(),
+                             font_size: 20.0,
+                             ..default()
+                         },
+@@ -83,7 +83,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+                         .spawn((
+                             Text::new("50"),
+                             TextFont {
+-                                font: assets.load("fonts/FiraSans-Bold.ttf"),
++                                font: assets.load("fonts/FiraSans-Bold.ttf").into(),
+                                 font_size: 24.0,
+                                 ..default()
+                             },
+@@ -111,7 +111,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+                     parent.spawn((
+                         Text::new("Horizontal"),
+                         TextFont {
+-                            font: assets.load("fonts/FiraSans-Bold.ttf"),
++                            font: assets.load("fonts/FiraSans-Bold.ttf").into(),
+                             font_size: 20.0,
+                             ..default()
+                         },
+@@ -122,7 +122,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+                         .spawn((
+                             Text::new("50"),
+                             TextFont {
+-                                font: assets.load("fonts/FiraSans-Bold.ttf"),
++                                font: assets.load("fonts/FiraSans-Bold.ttf").into(),
+                                 font_size: 24.0,
+                                 ..default()
+                             },
+diff --git a/examples/ui/window_fallthrough.rs b/examples/ui/window_fallthrough.rs
+index 275514662717c..89094cce8fd92 100644
+--- a/examples/ui/window_fallthrough.rs
++++ b/examples/ui/window_fallthrough.rs
+@@ -30,7 +30,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+         // Accepts a `String` or any type that converts into a `String`, such as `&str`
+         Text::new("Hit 'P' then scroll/click around!"),
+         TextFont {
+-            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++            font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
+             font_size: 83.0, // Nice and big so you can see it!
+             ..default()
+         },
+diff --git a/release-content/migration-guides/TextFont_font_is_now_a_FontSource.md b/release-content/migration-guides/TextFont_font_is_now_a_FontSource.md
+new file mode 100644
+index 0000000000000..1fc8a1a4ee8fa
+--- /dev/null
++++ b/release-content/migration-guides/TextFont_font_is_now_a_FontSource.md
+@@ -0,0 +1,10 @@
++---
++title: "TextFont's `font` field is now a `FontSource`"
++pull_requests: [22156]
++---
++
++The type of `TextFont`'s `font` field has been changed from a `Handle<Font>` to a `FontSource`. `FontSource` has two variants: `Handle`, which identifies a font by asset handle, and `Family`, which selects a font by its family name.
++
++`FontSource` implements `From<Handle<Font>>`, migration of existing code should only require calling `into()` on the handle.
++
++Font texture atlases are no longer automatically cleared when the font asset they were generated from is removed. This is because there is no way to remove individual fonts from cosmic text's `FontSystem`. So even after the asset is removed, the font is still accessible using the family name with `FontSource::family` and removing the text atlases naively could cause a panic as rendering expects them to be present.
+diff --git a/release-content/release-notes/new_font_features.md b/release-content/release-notes/new_font_features.md
+new file mode 100644
+index 0000000000000..569e1ec824100
+--- /dev/null
++++ b/release-content/release-notes/new_font_features.md
+@@ -0,0 +1,33 @@
++---
++title: "New Font features"
++authors: ["@ickshonpe"]
++pull_requests: [22156]
++---
++
++`TextFont` has been expanded to include new fields:
++
++```rust
++pub struct TextFont {
++    pub font: FontSource,
++    pub font_size: f32,
++    pub weight: FontWeight,
++    pub width: FontWidth,
++    pub style: FontStyle,
++    pub font_smoothing: FontSmoothing,
++    pub font_features: FontFeatures,
++}
++```
++
++FontSource has two variants: Handle, which identifies a font by asset handle, and Family, which selects a font by its family name.
++
++`FontWidth` is a newtype struct representing OpenType font stretch classifications ranging from `ULTRA_CONDENSED` (50%) to `ULTRA_EXPANDED` (200%).
++
++`FontStyle` is an enum used to set the slant style of a font, with variants `Normal`, `Italic`, or `Oblique`.
++
++The system font support is very basic for now. You load them using the `CosmicFontSystem` resource:
++
++```rust
++font_system.db_mut().load_system_fonts()
++```
++
++Then they are available to be selected by family name using `FontSource::Family`.
