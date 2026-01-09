@@ -1,0 +1,941 @@
+diff --git a/crates/bevy_camera/src/camera.rs b/crates/bevy_camera/src/camera.rs
+index dd5f1019abe6e..073e6a06b2f35 100644
+--- a/crates/bevy_camera/src/camera.rs
++++ b/crates/bevy_camera/src/camera.rs
+@@ -343,7 +343,8 @@ pub enum ViewportConversionError {
+     CameraMainTextureUsages,
+     VisibleEntities,
+     Transform,
+-    Visibility
++    Visibility,
++    RenderTarget
+ )]
+ pub struct Camera {
+     /// If set, this camera will render to the given [`Viewport`] rectangle within the configured [`RenderTarget`].
+@@ -356,8 +357,7 @@ pub struct Camera {
+     /// Computed values for this camera, such as the projection matrix and the render target size.
+     #[reflect(ignore, clone)]
+     pub computed: ComputedCameraValues,
+-    /// The "target" that this camera will render to.
+-    pub target: RenderTarget,
++    // todo: reflect this when #6042 lands
+     /// The [`CameraOutputMode`] for this camera.
+     pub output_mode: CameraOutputMode,
+     /// Controls when MSAA writeback occurs for this camera.
+@@ -385,7 +385,6 @@ impl Default for Camera {
+             order: 0,
+             viewport: None,
+             computed: Default::default(),
+-            target: Default::default(),
+             output_mode: Default::default(),
+             msaa_writeback: MsaaWriteback::default(),
+             clear_color: Default::default(),
+@@ -811,7 +810,7 @@ impl Default for CameraOutputMode {
+ 
+ /// The "target" that a [`Camera`] will render to. For example, this could be a `Window`
+ /// swapchain or an [`Image`].
+-#[derive(Debug, Clone, Reflect, From)]
++#[derive(Component, Debug, Clone, Reflect, From)]
+ #[reflect(Clone)]
+ pub enum RenderTarget {
+     /// Window to which the camera's view is rendered.
+diff --git a/crates/bevy_core_pipeline/src/oit/mod.rs b/crates/bevy_core_pipeline/src/oit/mod.rs
+index 80763ee37bf3f..51c07dff717c6 100644
+--- a/crates/bevy_core_pipeline/src/oit/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/mod.rs
+@@ -1,7 +1,7 @@
+ //! Order Independent Transparency (OIT) for 3d rendering. See [`OrderIndependentTransparencyPlugin`] for more details.
+ 
+ use bevy_app::prelude::*;
+-use bevy_camera::{Camera, Camera3d};
++use bevy_camera::{Camera3d, RenderTarget};
+ use bevy_ecs::{component::*, lifecycle::ComponentHook, prelude::*};
+ use bevy_math::UVec2;
+ use bevy_platform::collections::HashSet;
+@@ -135,8 +135,8 @@ impl Plugin for OrderIndependentTransparencyPlugin {
+ // bevy reuses the same depth texture so we need to set this on all cameras with the same render target.
+ fn configure_depth_texture_usages(
+     p: Query<Entity, With<PrimaryWindow>>,
+-    cameras: Query<(&Camera, Has<OrderIndependentTransparencySettings>)>,
+-    mut new_cameras: Query<(&mut Camera3d, &Camera), Added<Camera3d>>,
++    cameras: Query<(&RenderTarget, Has<OrderIndependentTransparencySettings>)>,
++    mut new_cameras: Query<(&mut Camera3d, &RenderTarget), Added<Camera3d>>,
+ ) {
+     if new_cameras.is_empty() {
+         return;
+@@ -145,15 +145,15 @@ fn configure_depth_texture_usages(
+     // Find all the render target that potentially uses OIT
+     let primary_window = p.single().ok();
+     let mut render_target_has_oit = <HashSet<_>>::default();
+-    for (camera, has_oit) in &cameras {
++    for (render_target, has_oit) in &cameras {
+         if has_oit {
+-            render_target_has_oit.insert(camera.target.normalize(primary_window));
++            render_target_has_oit.insert(render_target.normalize(primary_window));
+         }
+     }
+ 
+     // Update the depth texture usage for cameras with a render target that has OIT
+-    for (mut camera_3d, camera) in &mut new_cameras {
+-        if render_target_has_oit.contains(&camera.target.normalize(primary_window)) {
++    for (mut camera_3d, render_target) in &mut new_cameras {
++        if render_target_has_oit.contains(&render_target.normalize(primary_window)) {
+             let mut usages = TextureUsages::from(camera_3d.depth_texture_usages);
+             usages |= TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
+             camera_3d.depth_texture_usages = usages.into();
+diff --git a/crates/bevy_dev_tools/src/picking_debug.rs b/crates/bevy_dev_tools/src/picking_debug.rs
+index 40c98d2537e35..515dbfc222946 100644
+--- a/crates/bevy_dev_tools/src/picking_debug.rs
++++ b/crates/bevy_dev_tools/src/picking_debug.rs
+@@ -2,7 +2,7 @@
+ 
+ use bevy_app::prelude::*;
+ use bevy_camera::visibility::Visibility;
+-use bevy_camera::Camera;
++use bevy_camera::{Camera, RenderTarget};
+ use bevy_color::prelude::*;
+ use bevy_ecs::prelude::*;
+ use bevy_picking::backend::HitData;
+@@ -243,7 +243,7 @@ pub fn update_debug_data(
+ /// Draw text on each cursor with debug info
+ pub fn debug_draw(
+     mut commands: Commands,
+-    camera_query: Query<(Entity, &Camera)>,
++    camera_query: Query<(Entity, &Camera, &RenderTarget)>,
+     primary_window: Query<Entity, With<bevy_window::PrimaryWindow>>,
+     pointers: Query<(Entity, &PointerId, &PointerDebug)>,
+     scale: Res<UiScale>,
+@@ -254,9 +254,8 @@ pub fn debug_draw(
+         };
+         let text = format!("{id:?}\n{debug}");
+ 
+-        for (camera, _) in camera_query.iter().filter(|(_, camera)| {
+-            camera
+-                .target
++        for (camera, _, _) in camera_query.iter().filter(|(_, _, render_target)| {
++            render_target
+                 .normalize(primary_window.single().ok())
+                 .is_some_and(|target| target == pointer_location.target)
+         }) {
+@@ -264,7 +263,7 @@ pub fn debug_draw(
+             if let Some(viewport) = camera_query
+                 .get(camera)
+                 .ok()
+-                .and_then(|(_, camera)| camera.logical_viewport_rect())
++                .and_then(|(_, camera, _)| camera.logical_viewport_rect())
+             {
+                 pointer_pos -= viewport.min;
+             }
+diff --git a/crates/bevy_picking/src/backend.rs b/crates/bevy_picking/src/backend.rs
+index 1e5fe64b2f97f..83ba7fc010e96 100644
+--- a/crates/bevy_picking/src/backend.rs
++++ b/crates/bevy_picking/src/backend.rs
+@@ -129,7 +129,7 @@ pub mod ray {
+     //! Types and systems for constructing rays from cameras and pointers.
+ 
+     use crate::backend::prelude::{PointerId, PointerLocation};
+-    use bevy_camera::Camera;
++    use bevy_camera::{Camera, RenderTarget};
+     use bevy_ecs::prelude::*;
+     use bevy_math::Ray3d;
+     use bevy_platform::collections::{hash_map::Iter, HashMap};
+@@ -196,20 +196,24 @@ pub mod ray {
+         pub fn repopulate(
+             mut ray_map: ResMut<Self>,
+             primary_window_entity: Query<Entity, With<PrimaryWindow>>,
+-            cameras: Query<(Entity, &Camera, &GlobalTransform)>,
++            cameras: Query<(Entity, &Camera, &RenderTarget, &GlobalTransform)>,
+             pointers: Query<(&PointerId, &PointerLocation)>,
+         ) {
+             ray_map.map.clear();
+ 
+-            for (camera_entity, camera, camera_tfm) in &cameras {
++            for (camera_entity, camera, render_target, camera_tfm) in &cameras {
+                 if !camera.is_active {
+                     continue;
+                 }
+ 
+                 for (&pointer_id, pointer_loc) in &pointers {
+-                    if let Some(ray) =
+-                        make_ray(&primary_window_entity, camera, camera_tfm, pointer_loc)
+-                    {
++                    if let Some(ray) = make_ray(
++                        &primary_window_entity,
++                        camera,
++                        render_target,
++                        camera_tfm,
++                        pointer_loc,
++                    ) {
+                         ray_map
+                             .map
+                             .insert(RayId::new(camera_entity, pointer_id), ray);
+@@ -222,11 +226,12 @@ pub mod ray {
+     fn make_ray(
+         primary_window_entity: &Query<Entity, With<PrimaryWindow>>,
+         camera: &Camera,
++        render_target: &RenderTarget,
+         camera_tfm: &GlobalTransform,
+         pointer_loc: &PointerLocation,
+     ) -> Option<Ray3d> {
+         let pointer_loc = pointer_loc.location()?;
+-        if !pointer_loc.is_in_viewport(camera, primary_window_entity) {
++        if !pointer_loc.is_in_viewport(camera, render_target, primary_window_entity) {
+             return None;
+         }
+         camera
+diff --git a/crates/bevy_picking/src/pointer.rs b/crates/bevy_picking/src/pointer.rs
+index 3320817c4249a..1ef36a323346c 100644
+--- a/crates/bevy_picking/src/pointer.rs
++++ b/crates/bevy_picking/src/pointer.rs
+@@ -8,8 +8,8 @@
+ //! The purpose of this module is primarily to provide a common interface that can be
+ //! driven by lower-level input devices and consumed by higher-level interaction systems.
+ 
+-use bevy_camera::Camera;
+ use bevy_camera::NormalizedRenderTarget;
++use bevy_camera::{Camera, RenderTarget};
+ use bevy_ecs::prelude::*;
+ use bevy_input::mouse::MouseScrollUnit;
+ use bevy_math::Vec2;
+@@ -223,10 +223,10 @@ impl Location {
+     pub fn is_in_viewport(
+         &self,
+         camera: &Camera,
++        render_target: &RenderTarget,
+         primary_window: &Query<Entity, With<PrimaryWindow>>,
+     ) -> bool {
+-        if camera
+-            .target
++        if render_target
+             .normalize(Some(match primary_window.single() {
+                 Ok(w) => w,
+                 Err(_) => return false,
+diff --git a/crates/bevy_render/src/camera.rs b/crates/bevy_render/src/camera.rs
+index 84988a2fc6534..4ff8e6d456021 100644
+--- a/crates/bevy_render/src/camera.rs
++++ b/crates/bevy_render/src/camera.rs
+@@ -21,7 +21,7 @@ use bevy_camera::{
+     visibility::{self, RenderLayers, VisibleEntities},
+     Camera, Camera2d, Camera3d, CameraMainTextureUsages, CameraOutputMode, CameraUpdateSystems,
+     ClearColor, ClearColorConfig, Exposure, ManualTextureViewHandle, MsaaWriteback,
+-    NormalizedRenderTarget, Projection, RenderTargetInfo, Viewport,
++    NormalizedRenderTarget, Projection, RenderTarget, RenderTargetInfo, Viewport,
+ };
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+@@ -312,7 +312,7 @@ pub fn camera_system(
+     windows: Query<(Entity, &Window)>,
+     images: Res<Assets<Image>>,
+     manual_texture_views: Res<ManualTextureViews>,
+-    mut cameras: Query<(&mut Camera, &mut Projection)>,
++    mut cameras: Query<(&mut Camera, &RenderTarget, &mut Projection)>,
+ ) -> Result<(), BevyError> {
+     let primary_window = primary_window.iter().next();
+ 
+@@ -333,13 +333,13 @@ pub fn camera_system(
+         })
+         .collect();
+ 
+-    for (mut camera, mut camera_projection) in &mut cameras {
++    for (mut camera, render_target, mut camera_projection) in &mut cameras {
+         let mut viewport_size = camera
+             .viewport
+             .as_ref()
+             .map(|viewport| viewport.physical_size);
+ 
+-        if let Some(normalized_target) = &camera.target.normalize(primary_window)
++        if let Some(normalized_target) = render_target.normalize(primary_window)
+             && (normalized_target.is_changed(&changed_window_ids, &changed_image_handles)
+                 || camera.is_added()
+                 || camera_projection.is_changed()
+@@ -423,18 +423,21 @@ pub fn extract_cameras(
+             Entity,
+             RenderEntity,
+             &Camera,
++            &RenderTarget,
+             &CameraRenderGraph,
+             &GlobalTransform,
+             &VisibleEntities,
+             &Frustum,
+-            Has<Hdr>,
+-            Option<&ColorGrading>,
+-            Option<&Exposure>,
+-            Option<&TemporalJitter>,
+-            Option<&MipBias>,
+-            Option<&RenderLayers>,
+-            Option<&Projection>,
+-            Has<NoIndirectDrawing>,
++            (
++                Has<Hdr>,
++                Option<&ColorGrading>,
++                Option<&Exposure>,
++                Option<&TemporalJitter>,
++                Option<&MipBias>,
++                Option<&RenderLayers>,
++                Option<&Projection>,
++                Has<NoIndirectDrawing>,
++            ),
+         )>,
+     >,
+     primary_window: Extract<Query<Entity, With<PrimaryWindow>>>,
+@@ -457,18 +460,21 @@ pub fn extract_cameras(
+         main_entity,
+         render_entity,
+         camera,
++        render_target,
+         camera_render_graph,
+         transform,
+         visible_entities,
+         frustum,
+-        hdr,
+-        color_grading,
+-        exposure,
+-        temporal_jitter,
+-        mip_bias,
+-        render_layers,
+-        projection,
+-        no_indirect_drawing,
++        (
++            hdr,
++            color_grading,
++            exposure,
++            temporal_jitter,
++            mip_bias,
++            render_layers,
++            projection,
++            no_indirect_drawing,
++        ),
+     ) in query.iter()
+     {
+         if !camera.is_active {
+@@ -523,7 +529,7 @@ pub fn extract_cameras(
+             let mut commands = commands.entity(render_entity);
+             commands.insert((
+                 ExtractedCamera {
+-                    target: camera.target.normalize(primary_window),
++                    target: render_target.normalize(primary_window),
+                     viewport: camera.viewport.clone(),
+                     physical_viewport_size: Some(viewport_size),
+                     physical_target_size: Some(target_size),
+diff --git a/crates/bevy_sprite/src/picking_backend.rs b/crates/bevy_sprite/src/picking_backend.rs
+index 9dbd3ac2d413a..1ad650c1a1fdd 100644
+--- a/crates/bevy_sprite/src/picking_backend.rs
++++ b/crates/bevy_sprite/src/picking_backend.rs
+@@ -15,7 +15,7 @@ use bevy_app::prelude::*;
+ use bevy_asset::prelude::*;
+ use bevy_camera::{
+     visibility::{RenderLayers, ViewVisibility},
+-    Camera, Projection,
++    Camera, Projection, RenderTarget,
+ };
+ use bevy_color::Alpha;
+ use bevy_ecs::prelude::*;
+@@ -88,6 +88,7 @@ fn sprite_picking(
+     cameras: Query<(
+         Entity,
+         &Camera,
++        &RenderTarget,
+         &GlobalTransform,
+         &Projection,
+         Has<SpritePickingCamera>,
+@@ -135,6 +136,7 @@ fn sprite_picking(
+         let Ok((
+             cam_entity,
+             camera,
++            render_target,
+             cam_transform,
+             Projection::Orthographic(cam_ortho),
+             cam_can_pick,
+@@ -156,8 +158,7 @@ fn sprite_picking(
+             None
+         })?;
+ 
+-        if camera
+-            .target
++        if render_target
+             .normalize(primary_window)
+             .is_none_or(|x| x != location.target)
+         {
+diff --git a/crates/bevy_ui/src/focus.rs b/crates/bevy_ui/src/focus.rs
+index 41c133697f590..0f3f0e029a887 100644
+--- a/crates/bevy_ui/src/focus.rs
++++ b/crates/bevy_ui/src/focus.rs
+@@ -2,7 +2,7 @@ use crate::{
+     ui_transform::UiGlobalTransform, ComputedNode, ComputedUiTargetCamera, Node, OverrideClip,
+     UiStack,
+ };
+-use bevy_camera::{visibility::InheritedVisibility, Camera, NormalizedRenderTarget};
++use bevy_camera::{visibility::InheritedVisibility, Camera, NormalizedRenderTarget, RenderTarget};
+ use bevy_ecs::{
+     change_detection::DetectChangesMut,
+     entity::{ContainsEntity, Entity},
+@@ -149,7 +149,7 @@ pub struct NodeQuery {
+ pub fn ui_focus_system(
+     mut hovered_nodes: Local<Vec<Entity>>,
+     mut state: Local<State>,
+-    camera_query: Query<(Entity, &Camera)>,
++    camera_query: Query<(Entity, &Camera, &RenderTarget)>,
+     primary_window: Query<Entity, With<PrimaryWindow>>,
+     windows: Query<&Window>,
+     mouse_button_input: Res<ButtonInput<MouseButton>>,
+@@ -189,10 +189,10 @@ pub fn ui_focus_system(
+ 
+     let camera_cursor_positions: HashMap<Entity, Vec2> = camera_query
+         .iter()
+-        .filter_map(|(entity, camera)| {
++        .filter_map(|(entity, camera, render_target)| {
+             // Interactions are only supported for cameras rendering to a window.
+             let Some(NormalizedRenderTarget::Window(window_ref)) =
+-                camera.target.normalize(primary_window)
++                render_target.normalize(primary_window)
+             else {
+                 return None;
+             };
+diff --git a/crates/bevy_ui/src/picking_backend.rs b/crates/bevy_ui/src/picking_backend.rs
+index 46d29e7f1a4b2..1028cfb6b0e5a 100644
+--- a/crates/bevy_ui/src/picking_backend.rs
++++ b/crates/bevy_ui/src/picking_backend.rs
+@@ -25,7 +25,7 @@
+ 
+ use crate::{clip_check_recursive, prelude::*, ui_transform::UiGlobalTransform, UiStack};
+ use bevy_app::prelude::*;
+-use bevy_camera::{visibility::InheritedVisibility, Camera};
++use bevy_camera::{visibility::InheritedVisibility, Camera, RenderTarget};
+ use bevy_ecs::{prelude::*, query::QueryData};
+ use bevy_math::Vec2;
+ use bevy_platform::collections::HashMap;
+@@ -102,7 +102,7 @@ pub struct NodeQuery {
+ /// we need for determining picking.
+ pub fn ui_picking(
+     pointers: Query<(&PointerId, &PointerLocation)>,
+-    camera_query: Query<(Entity, &Camera, Has<UiPickingCamera>)>,
++    camera_query: Query<(Entity, &Camera, &RenderTarget, Has<UiPickingCamera>)>,
+     primary_window: Query<Entity, With<PrimaryWindow>>,
+     settings: Res<UiPickingSettings>,
+     ui_stack: Res<UiStack>,
+@@ -122,13 +122,16 @@ pub fn ui_picking(
+     {
+         // This pointer is associated with a render target, which could be used by multiple
+         // cameras. We want to ensure we return all cameras with a matching target.
+-        for (entity, camera, _) in camera_query.iter().filter(|(_, camera, cam_can_pick)| {
+-            (!settings.require_markers || *cam_can_pick)
+-                && camera
+-                    .target
+-                    .normalize(primary_window.single().ok())
+-                    .is_some_and(|target| target == pointer_location.target)
+-        }) {
++        for (entity, camera, _, _) in
++            camera_query
++                .iter()
++                .filter(|(_, _, render_target, cam_can_pick)| {
++                    (!settings.require_markers || *cam_can_pick)
++                        && render_target
++                            .normalize(primary_window.single().ok())
++                            .is_some_and(|target| target == pointer_location.target)
++                })
++        {
+             let mut pointer_pos =
+                 pointer_location.position * camera.target_scaling_factor().unwrap_or(1.);
+             if let Some(viewport) = camera.physical_viewport_rect() {
+@@ -272,7 +275,7 @@ pub fn ui_picking(
+ 
+         let order = camera_query
+             .get(*camera)
+-            .map(|(_, cam, _)| cam.order)
++            .map(|(_, cam, _, _)| cam.order)
+             .unwrap_or_default() as f32
+             + 0.5; // bevy ui can run on any camera, it's a special case
+ 
+diff --git a/crates/bevy_ui/src/ui_node.rs b/crates/bevy_ui/src/ui_node.rs
+index ac086d02a5556..d65a86427492d 100644
+--- a/crates/bevy_ui/src/ui_node.rs
++++ b/crates/bevy_ui/src/ui_node.rs
+@@ -2814,9 +2814,9 @@ impl UiTargetCamera {
+ ///     commands.spawn((
+ ///         Camera2d,
+ ///         Camera {
+-///             target: RenderTarget::Window(WindowRef::Entity(another_window)),
+ ///             ..Default::default()
+ ///         },
++///         RenderTarget::Window(WindowRef::Entity(another_window)),
+ ///         // We add the Marker here so all Ui will spawn in
+ ///         // another window if no UiTargetCamera is specified
+ ///         IsDefaultUiCamera
+@@ -2828,7 +2828,7 @@ pub struct IsDefaultUiCamera;
+ 
+ #[derive(SystemParam)]
+ pub struct DefaultUiCamera<'w, 's> {
+-    cameras: Query<'w, 's, (Entity, &'static Camera)>,
++    cameras: Query<'w, 's, (Entity, &'static Camera, &'static RenderTarget)>,
+     default_cameras: Query<'w, 's, Entity, (With<Camera>, With<IsDefaultUiCamera>)>,
+     primary_window: Query<'w, 's, Entity, With<PrimaryWindow>>,
+ }
+@@ -2842,15 +2842,15 @@ impl<'w, 's> DefaultUiCamera<'w, 's> {
+             }
+             self.cameras
+                 .iter()
+-                .filter(|(_, c)| match c.target {
++                .filter(|(_, _, render_target)| match render_target {
+                     RenderTarget::Window(WindowRef::Primary) => true,
+                     RenderTarget::Window(WindowRef::Entity(w)) => {
+-                        self.primary_window.get(w).is_ok()
++                        self.primary_window.get(*w).is_ok()
+                     }
+                     _ => false,
+                 })
+-                .max_by_key(|(e, c)| (c.order, *e))
+-                .map(|(e, _)| e)
++                .max_by_key(|(e, c, _)| (c.order, *e))
++                .map(|(e, _, _)| e)
+         })
+     }
+ }
+diff --git a/crates/bevy_ui/src/update.rs b/crates/bevy_ui/src/update.rs
+index 77659effabcf1..e1e789577c53f 100644
+--- a/crates/bevy_ui/src/update.rs
++++ b/crates/bevy_ui/src/update.rs
+@@ -181,11 +181,11 @@ pub fn propagate_ui_target_cameras(
+ pub(crate) fn update_cameras_test_system(
+     primary_window: Query<Entity, bevy_ecs::query::With<bevy_window::PrimaryWindow>>,
+     window_query: Query<&bevy_window::Window>,
+-    mut camera_query: Query<&mut Camera>,
++    mut camera_query: Query<(&mut Camera, &bevy_camera::RenderTarget)>,
+ ) {
+     let primary_window = primary_window.single().ok();
+-    for mut camera in camera_query.iter_mut() {
+-        let Some(camera_target) = camera.target.normalize(primary_window) else {
++    for (mut camera, render_target) in camera_query.iter_mut() {
++        let Some(camera_target) = render_target.normalize(primary_window) else {
+             continue;
+         };
+         let bevy_camera::NormalizedRenderTarget::Window(window_ref) = camera_target else {
+@@ -217,13 +217,11 @@ mod tests {
+     use bevy_app::HierarchyPropagatePlugin;
+     use bevy_app::PostUpdate;
+     use bevy_app::PropagateSet;
+-    use bevy_camera::Camera;
+     use bevy_camera::Camera2d;
+     use bevy_camera::RenderTarget;
+     use bevy_ecs::hierarchy::ChildOf;
+     use bevy_ecs::schedule::IntoScheduleConfigs;
+     use bevy_math::UVec2;
+-    use bevy_utils::default;
+     use bevy_window::PrimaryWindow;
+     use bevy_window::Window;
+     use bevy_window::WindowRef;
+@@ -326,13 +324,7 @@ mod tests {
+ 
+         let camera1 = world.spawn((Camera2d, IsDefaultUiCamera)).id();
+         let camera2 = world
+-            .spawn((
+-                Camera2d,
+-                Camera {
+-                    target: RenderTarget::Window(WindowRef::Entity(window_2)),
+-                    ..default()
+-                },
+-            ))
++            .spawn((Camera2d, RenderTarget::Window(WindowRef::Entity(window_2))))
+             .id();
+ 
+         let uinode1a = world.spawn(Node::default()).id();
+@@ -393,13 +385,7 @@ mod tests {
+ 
+         let camera1 = world.spawn((Camera2d, IsDefaultUiCamera)).id();
+         let camera2 = world
+-            .spawn((
+-                Camera2d,
+-                Camera {
+-                    target: RenderTarget::Window(WindowRef::Entity(window_2)),
+-                    ..default()
+-                },
+-            ))
++            .spawn((Camera2d, RenderTarget::Window(WindowRef::Entity(window_2))))
+             .id();
+ 
+         let uinode = world.spawn(Node::default()).id();
+@@ -490,13 +476,7 @@ mod tests {
+ 
+         let camera1 = world.spawn((Camera2d, IsDefaultUiCamera)).id();
+         let camera2 = world
+-            .spawn((
+-                Camera2d,
+-                Camera {
+-                    target: RenderTarget::Window(WindowRef::Entity(window_2)),
+-                    ..default()
+-                },
+-            ))
++            .spawn((Camera2d, RenderTarget::Window(WindowRef::Entity(window_2))))
+             .id();
+ 
+         // `UiTargetCamera` is ignored on non-root UI nodes
+diff --git a/crates/bevy_ui/src/widget/viewport.rs b/crates/bevy_ui/src/widget/viewport.rs
+index 5f4efb3f4f33d..3b02e1748d84a 100644
+--- a/crates/bevy_ui/src/widget/viewport.rs
++++ b/crates/bevy_ui/src/widget/viewport.rs
+@@ -1,5 +1,5 @@
+ use bevy_asset::Assets;
+-use bevy_camera::Camera;
++use bevy_camera::{Camera, RenderTarget};
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -26,7 +26,7 @@ use bevy_reflect::Reflect;
+ use crate::UiGlobalTransform;
+ use crate::{ComputedNode, Node};
+ 
+-/// Component used to render a [`Camera::target`]  to a node.
++/// Component used to render a [`RenderTarget`]  to a node.
+ ///
+ /// # See Also
+ ///
+@@ -67,7 +67,7 @@ pub fn viewport_picking(
+         &ComputedNode,
+         &UiGlobalTransform,
+     )>,
+-    camera_query: Query<&Camera>,
++    camera_query: Query<(&Camera, &RenderTarget)>,
+     hover_map: Res<HoverMap>,
+     pointer_state: Res<PointerState>,
+     mut pointer_inputs: MessageReader<PointerInput>,
+@@ -110,7 +110,7 @@ pub fn viewport_picking(
+             viewport_pointer_location.location = None;
+             continue;
+         };
+-        let Ok(camera) = camera_query.get(viewport.camera) else {
++        let Ok((camera, render_target)) = camera_query.get(viewport.camera) else {
+             continue;
+         };
+         let Some(cam_viewport_size) = camera.logical_viewport_size() else {
+@@ -124,7 +124,7 @@ pub fn viewport_picking(
+         let top_left = node_rect.min * computed_node.inverse_scale_factor();
+         let logical_size = computed_node.size() * computed_node.inverse_scale_factor();
+ 
+-        let Some(target) = camera.target.as_image() else {
++        let Some(target) = render_target.as_image() else {
+             continue;
+         };
+ 
+@@ -156,14 +156,14 @@ pub fn update_viewport_render_target_size(
+         (&ViewportNode, &ComputedNode),
+         Or<(Changed<ComputedNode>, Changed<ViewportNode>)>,
+     >,
+-    camera_query: Query<&Camera>,
++    camera_query: Query<&RenderTarget>,
+     mut images: ResMut<Assets<Image>>,
+ ) {
+     for (viewport, computed_node) in &viewport_query {
+-        let camera = camera_query.get(viewport.camera).unwrap();
++        let render_target = camera_query.get(viewport.camera).unwrap();
+         let size = computed_node.size();
+ 
+-        let Some(image_handle) = camera.target.as_image() else {
++        let Some(image_handle) = render_target.as_image() else {
+             continue;
+         };
+         let size = size.as_uvec2().max(UVec2::ONE).to_extents();
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index c79c8c43e405d..fb8b5c9b51af5 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -20,7 +20,7 @@ pub mod ui_texture_slice_pipeline;
+ mod debug_overlay;
+ 
+ use bevy_camera::visibility::InheritedVisibility;
+-use bevy_camera::{Camera, Camera2d, Camera3d};
++use bevy_camera::{Camera, Camera2d, Camera3d, RenderTarget};
+ use bevy_reflect::prelude::ReflectDefault;
+ use bevy_reflect::Reflect;
+ use bevy_shader::load_shader_library;
+@@ -839,7 +839,7 @@ pub fn extract_ui_camera_view(
+ pub fn extract_viewport_nodes(
+     mut commands: Commands,
+     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
+-    camera_query: Extract<Query<&Camera>>,
++    camera_query: Extract<Query<(&Camera, &RenderTarget)>>,
+     uinode_query: Extract<
+         Query<(
+             Entity,
+@@ -869,7 +869,7 @@ pub fn extract_viewport_nodes(
+         let Some(image) = camera_query
+             .get(viewport_node.camera)
+             .ok()
+-            .and_then(|camera| camera.target.as_image())
++            .and_then(|(_, render_target)| render_target.as_image())
+         else {
+             continue;
+         };
+diff --git a/examples/2d/pixel_grid_snap.rs b/examples/2d/pixel_grid_snap.rs
+index 08d1436ecb359..607dcdf568877 100644
+--- a/examples/2d/pixel_grid_snap.rs
++++ b/examples/2d/pixel_grid_snap.rs
+@@ -116,10 +116,10 @@ fn setup_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+         Camera {
+             // Render before the "main pass" camera
+             order: -1,
+-            target: RenderTarget::Image(image_handle.clone().into()),
+             clear_color: ClearColorConfig::Custom(GRAY.into()),
+             ..default()
+         },
++        RenderTarget::Image(image_handle.clone().into()),
+         Msaa::Off,
+         InGameCamera,
+         PIXEL_PERFECT_LAYERS,
+diff --git a/examples/3d/mirror.rs b/examples/3d/mirror.rs
+index b6d0cf8cebadf..6b5b9d71cc9ba 100644
+--- a/examples/3d/mirror.rs
++++ b/examples/3d/mirror.rs
+@@ -2,6 +2,8 @@
+ 
+ use std::f32::consts::FRAC_PI_2;
+ 
++use crate::widgets::{RadioButton, WidgetClickEvent, WidgetClickSender};
++use bevy::camera::RenderTarget;
+ use bevy::{
+     asset::RenderAssetUsages,
+     color::palettes::css::GREEN,
+@@ -16,8 +18,6 @@ use bevy::{
+     window::{PrimaryWindow, WindowResized},
+ };
+ 
+-use crate::widgets::{RadioButton, WidgetClickEvent, WidgetClickSender};
+-
+ #[path = "../helpers/widgets.rs"]
+ mod widgets;
+ 
+@@ -263,13 +263,13 @@ fn spawn_mirror_camera(
+         Camera3d::default(),
+         Camera {
+             order: -1,
+-            target: mirror_render_target.clone().into(),
+             // Reflecting the model across the mirror will flip the winding of
+             // all the polygons. Therefore, in order to properly backface cull,
+             // we need to turn on `invert_culling`.
+             invert_culling: true,
+             ..default()
+         },
++        RenderTarget::Image(mirror_render_target.clone().into()),
+         mirror_camera_transform,
+         Projection::Perspective(mirror_camera_projection),
+         MirrorCamera,
+@@ -387,7 +387,7 @@ fn calculate_mirror_camera_transform_and_projection(
+ /// material whenever the window size changes.
+ fn handle_window_resize_messages(
+     windows_query: Query<&Window>,
+-    mut mirror_cameras_query: Query<&mut Camera, With<MirrorCamera>>,
++    mut mirror_cameras_query: Query<&mut RenderTarget, With<MirrorCamera>>,
+     mut images: ResMut<Assets<Image>>,
+     mut mirror_image: ResMut<MirrorImage>,
+     mut screen_space_texture_materials: ResMut<
+@@ -410,8 +410,8 @@ fn handle_window_resize_messages(
+ 
+     mirror_image.0 = image.clone();
+ 
+-    for mut mirror_camera in mirror_cameras_query.iter_mut() {
+-        mirror_camera.target = image.clone().into();
++    for mut target in mirror_cameras_query.iter_mut() {
++        *target = image.clone().into();
+     }
+ 
+     for (_, material) in screen_space_texture_materials.iter_mut() {
+diff --git a/examples/3d/render_to_texture.rs b/examples/3d/render_to_texture.rs
+index f6b02ff98300d..26cae98f38c25 100644
+--- a/examples/3d/render_to_texture.rs
++++ b/examples/3d/render_to_texture.rs
+@@ -2,6 +2,7 @@
+ 
+ use std::f32::consts::PI;
+ 
++use bevy::camera::RenderTarget;
+ use bevy::{camera::visibility::RenderLayers, prelude::*, render::render_resource::TextureFormat};
+ 
+ fn main() {
+@@ -66,10 +67,10 @@ fn setup(
+         Camera {
+             // render before the "main pass" camera
+             order: -1,
+-            target: image_handle.clone().into(),
+             clear_color: Color::WHITE.into(),
+             ..default()
+         },
++        RenderTarget::Image(image_handle.clone().into()),
+         Transform::from_translation(Vec3::new(0.0, 0.0, 15.0)).looking_at(Vec3::ZERO, Vec3::Y),
+         first_pass_layer,
+     ));
+diff --git a/examples/app/headless_renderer.rs b/examples/app/headless_renderer.rs
+index b6aa5bf674636..7dc9639ed9539 100644
+--- a/examples/app/headless_renderer.rs
++++ b/examples/app/headless_renderer.rs
+@@ -194,11 +194,7 @@ fn setup(
+ 
+     commands.spawn((
+         Camera3d::default(),
+-        Camera {
+-            // render to image
+-            target: render_target,
+-            ..default()
+-        },
++        render_target,
+         Tonemapping::None,
+         Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
+     ));
+diff --git a/examples/shader_advanced/render_depth_to_texture.rs b/examples/shader_advanced/render_depth_to_texture.rs
+index babeebb28c5a0..6cb1d82aa4d8f 100644
+--- a/examples/shader_advanced/render_depth_to_texture.rs
++++ b/examples/shader_advanced/render_depth_to_texture.rs
+@@ -221,18 +221,18 @@ fn spawn_depth_only_camera(commands: &mut Commands) {
+         Camera3d::default(),
+         Transform::from_xyz(-4.0, -5.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+         Camera {
+-            // We specify no color render target, for maximum efficiency.
+-            target: RenderTarget::None {
+-                // When specifying no render target, we must manually specify
+-                // the viewport size. Otherwise, Bevy won't know how big to make
+-                // the depth buffer.
+-                size: UVec2::splat(DEPTH_TEXTURE_SIZE),
+-            },
+             // Make sure that we render from this depth-only camera *before*
+             // rendering from the main camera.
+             order: -1,
+             ..Camera::default()
+         },
++        // We specify no color render target, for maximum efficiency.
++        RenderTarget::None {
++            // When specifying no render target, we must manually specify
++            // the viewport size. Otherwise, Bevy won't know how big to make
++            // the depth buffer.
++            size: UVec2::splat(DEPTH_TEXTURE_SIZE),
++        },
+         // We need to disable multisampling or the depth texture will be
+         // multisampled, which adds complexity we don't care about for this
+         // demo.
+diff --git a/examples/ui/render_ui_to_texture.rs b/examples/ui/render_ui_to_texture.rs
+index cc702dbf39a57..d2ff76bad34b4 100644
+--- a/examples/ui/render_ui_to_texture.rs
++++ b/examples/ui/render_ui_to_texture.rs
+@@ -67,9 +67,9 @@ fn setup(
+             Camera {
+                 // render before the "main pass" camera
+                 order: -1,
+-                target: RenderTarget::Image(image_handle.clone().into()),
+                 ..default()
+             },
++            RenderTarget::Image(image_handle.clone().into()),
+         ))
+         .id();
+ 
+@@ -176,7 +176,7 @@ fn drive_diegetic_pointer(
+     mut raycast: MeshRayCast,
+     rays: Res<RayMap>,
+     cubes: Query<&Mesh3d, With<Cube>>,
+-    ui_camera: Query<&Camera, With<Camera2d>>,
++    ui_camera: Query<&RenderTarget, With<Camera2d>>,
+     primary_window: Query<Entity, With<PrimaryWindow>>,
+     windows: Query<(Entity, &Window)>,
+     images: Res<Assets<Image>>,
+@@ -188,7 +188,6 @@ fn drive_diegetic_pointer(
+     // from 0 to 1, to pixel coordinates.
+     let target = ui_camera
+         .single()?
+-        .target
+         .normalize(primary_window.single().ok())
+         .unwrap();
+     let target_info = target
+diff --git a/examples/ui/viewport_node.rs b/examples/ui/viewport_node.rs
+index 913ba765f4c5e..3a8d2f4679db9 100644
+--- a/examples/ui/viewport_node.rs
++++ b/examples/ui/viewport_node.rs
+@@ -50,9 +50,9 @@ fn test(
+             Camera {
+                 // Render this camera before our UI camera
+                 order: -1,
+-                target: RenderTarget::Image(image_handle.clone().into()),
+                 ..default()
+             },
++            RenderTarget::Image(image_handle.clone().into()),
+         ))
+         .id();
+ 
+diff --git a/examples/window/monitor_info.rs b/examples/window/monitor_info.rs
+index 18500c10a1a66..c5965c3b83161 100644
+--- a/examples/window/monitor_info.rs
++++ b/examples/window/monitor_info.rs
+@@ -56,13 +56,7 @@ fn update(
+             .id();
+ 
+         let camera = commands
+-            .spawn((
+-                Camera2d,
+-                Camera {
+-                    target: RenderTarget::Window(WindowRef::Entity(window)),
+-                    ..default()
+-                },
+-            ))
++            .spawn((Camera2d, RenderTarget::Window(WindowRef::Entity(window))))
+             .id();
+ 
+         let info_text = format!(
+diff --git a/examples/window/multi_window_text.rs b/examples/window/multi_window_text.rs
+index 448b67fd12b0a..bd7af84625511 100644
+--- a/examples/window/multi_window_text.rs
++++ b/examples/window/multi_window_text.rs
+@@ -47,11 +47,8 @@ fn setup_scene(mut commands: Commands) {
+             Camera2d,
+             // This camera will only render entities belonging to render layer `1`.
+             RenderLayers::layer(1),
+-            Camera {
+-                // Without an explicit render target, this camera would also target the primary window.
+-                target: RenderTarget::Window(WindowRef::Entity(secondary_window)),
+-                ..default()
+-            },
++            // Without an explicit render target, this camera would also target the primary window.
++            RenderTarget::Window(WindowRef::Entity(secondary_window)),
+         ))
+         .id();
+ 
+diff --git a/examples/window/multiple_windows.rs b/examples/window/multiple_windows.rs
+index 46d4a708a5a04..b920b29eada06 100644
+--- a/examples/window/multiple_windows.rs
++++ b/examples/window/multiple_windows.rs
+@@ -40,10 +40,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
+         .spawn((
+             Camera3d::default(),
+             Transform::from_xyz(6.0, 0.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+-            Camera {
+-                target: RenderTarget::Window(WindowRef::Entity(second_window)),
+-                ..default()
+-            },
++            RenderTarget::Window(WindowRef::Entity(second_window)),
+         ))
+         .id();
+ 
+diff --git a/release-content/migration-guides/render_target_component.md b/release-content/migration-guides/render_target_component.md
+new file mode 100644
+index 0000000000000..9896cebbb5e4c
+--- /dev/null
++++ b/release-content/migration-guides/render_target_component.md
+@@ -0,0 +1,25 @@
++---
++title: "`RenderTarget` is now a component"
++pull_requests: [20917]
++---
++
++`RenderTarget` has been moved from a field on `Camera` to a separate required component.
++
++When spawning a camera, specify `RenderTarget` as a component instead of setting `camera.target`:
++
++```rust
++// before
++commands.spawn((
++    Camera3d::default(),
++    Camera {
++        target: RenderTarget::Image(image_handle.into()),
++        ..default()
++    },
++));
++
++// after
++commands.spawn((
++    Camera3d::default(),
++    RenderTarget::Image(image_handle.into()),
++));
++```

@@ -1,0 +1,430 @@
+diff --git a/crates/bevy_pbr/src/render/pbr_functions.wgsl b/crates/bevy_pbr/src/render/pbr_functions.wgsl
+index 33e550c01c768..f62d85c155b33 100644
+--- a/crates/bevy_pbr/src/render/pbr_functions.wgsl
++++ b/crates/bevy_pbr/src/render/pbr_functions.wgsl
+@@ -420,7 +420,7 @@ fn apply_pbr_lighting(
+         var shadow: f32 = 1.0;
+         if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+                 && (view_bindings::clusterable_objects.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+-            shadow = shadows::fetch_point_shadow(light_id, in.world_position, in.world_normal);
++            shadow = shadows::fetch_point_shadow(light_id, in.world_position, in.world_normal, in.frag_coord.xy);
+         }
+ 
+         let light_contrib = lighting::point_light(light_id, &lighting_input, enable_diffuse, true);
+@@ -439,7 +439,7 @@ fn apply_pbr_lighting(
+         var transmitted_shadow: f32 = 1.0;
+         if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
+                 && (view_bindings::clusterable_objects.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+-            transmitted_shadow = shadows::fetch_point_shadow(light_id, diffuse_transmissive_lobe_world_position, -in.world_normal);
++            transmitted_shadow = shadows::fetch_point_shadow(light_id, diffuse_transmissive_lobe_world_position, -in.world_normal, in.frag_coord.xy);
+         }
+ 
+         let transmitted_light_contrib =
+@@ -473,6 +473,7 @@ fn apply_pbr_lighting(
+                 in.world_position,
+                 in.world_normal,
+                 view_bindings::clusterable_objects.data[light_id].shadow_map_near_z,
++                in.frag_coord.xy,
+             );
+         }
+ 
+@@ -497,6 +498,7 @@ fn apply_pbr_lighting(
+                 diffuse_transmissive_lobe_world_position,
+                 -in.world_normal,
+                 view_bindings::clusterable_objects.data[light_id].shadow_map_near_z,
++                in.frag_coord.xy,
+             );
+         }
+ 
+@@ -527,7 +529,7 @@ fn apply_pbr_lighting(
+         var shadow: f32 = 1.0;
+         if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+                 && (view_bindings::lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+-            shadow = shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z);
++            shadow = shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.frag_coord.xy);
+         }
+ 
+         var light_contrib = lighting::directional_light(i, &lighting_input, enable_diffuse);
+@@ -550,7 +552,7 @@ fn apply_pbr_lighting(
+         var transmitted_shadow: f32 = 1.0;
+         if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
+                 && (view_bindings::lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+-            transmitted_shadow = shadows::fetch_directional_shadow(i, diffuse_transmissive_lobe_world_position, -in.world_normal, view_z);
++            transmitted_shadow = shadows::fetch_directional_shadow(i, diffuse_transmissive_lobe_world_position, -in.world_normal, view_z, in.frag_coord.xy);
+         }
+ 
+         let transmitted_light_contrib =
+@@ -613,7 +615,7 @@ fn apply_pbr_lighting(
+ #else   // SCREEN_SPACE_REFLECTIONS
+     let use_ssr = false;
+ #endif  // SCREEN_SPACE_REFLECTIONS
+-    
++
+     if (!use_ssr) {
+ #ifdef STANDARD_MATERIAL_ANISOTROPY
+         var bent_normal_lighting_input = lighting_input;
+@@ -781,7 +783,7 @@ fn apply_fog(fog_params: mesh_view_types::Fog, input_color: vec4<f32>, fragment_
+         let view_to_world_normalized = view_to_world / distance;
+         let n_directional_lights = view_bindings::lights.n_directional_lights;
+         for (var i: u32 = 0u; i < n_directional_lights; i = i + 1u) {
+-            let light = view_bindings::lights.directional_lights[i];            
++            let light = view_bindings::lights.directional_lights[i];
+             let scattering_contribution = pow(
+                 max(
+                     dot(view_to_world_normalized, light.direction_to_light),
+@@ -793,7 +795,7 @@ fn apply_fog(fog_params: mesh_view_types::Fog, input_color: vec4<f32>, fragment_
+             // Sample shadow map to attenuate inscattering in shadowed areas
+             var shadow: f32 = 1.0;
+             if ((light.flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+-                shadow = shadows::fetch_directional_shadow(i, fragment_world_position_vec4, view_direction_normal, view_z);
++                shadow = shadows::fetch_directional_shadow(i, fragment_world_position_vec4, view_direction_normal, view_z, in.frag_coord.xy);
+             }
+             scattering += scattering_contribution * shadow;
+         }
+diff --git a/crates/bevy_pbr/src/render/shadow_sampling.wgsl b/crates/bevy_pbr/src/render/shadow_sampling.wgsl
+index 2b35e57037408..d4f0751e17e68 100644
+--- a/crates/bevy_pbr/src/render/shadow_sampling.wgsl
++++ b/crates/bevy_pbr/src/render/shadow_sampling.wgsl
+@@ -178,12 +178,12 @@ fn sample_shadow_map_jimenez_fourteen(
+     light_local: vec2<f32>,
+     depth: f32,
+     array_index: i32,
++    frag_coord_xy: vec2<f32>,
+     texel_size: f32,
+     blur_size: f32,
+     temporal: bool,
+ ) -> f32 {
+-    let shadow_map_size = vec2<f32>(textureDimensions(view_bindings::directional_shadow_textures));
+-    let rotation_matrix = random_rotation_matrix(light_local * shadow_map_size, temporal);
++    let rotation_matrix = random_rotation_matrix(frag_coord_xy, temporal);
+     let uv_offset_scale = calculate_uv_offset_scale_jimenez_fourteen(texel_size, blur_size);
+ 
+     // https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare (slides 120-135)
+@@ -253,12 +253,18 @@ fn search_for_blockers_in_shadow_map(
+     return sum.x / sum.y;
+ }
+ 
+-fn sample_shadow_map(light_local: vec2<f32>, depth: f32, array_index: i32, texel_size: f32) -> f32 {
++fn sample_shadow_map(
++    light_local: vec2<f32>,
++    depth: f32,
++    array_index: i32,
++    frag_coord_xy: vec2<f32>,
++    texel_size: f32,
++) -> f32 {
+ #ifdef SHADOW_FILTER_METHOD_GAUSSIAN
+     return sample_shadow_map_castano_thirteen(light_local, depth, array_index);
+ #else ifdef SHADOW_FILTER_METHOD_TEMPORAL
+     return sample_shadow_map_jimenez_fourteen(
+-        light_local, depth, array_index, texel_size, 1.0, true);
++        light_local, depth, array_index, frag_coord_xy, texel_size, 1.0, true);
+ #else ifdef SHADOW_FILTER_METHOD_HARDWARE_2X2
+     return sample_shadow_map_hardware(light_local, depth, array_index);
+ #else
+@@ -285,6 +291,7 @@ fn sample_shadow_map_pcss(
+     light_local: vec2<f32>,
+     depth: f32,
+     array_index: i32,
++    frag_coord_xy: vec2<f32>,
+     texel_size: f32,
+     light_size: f32,
+ ) -> f32 {
+@@ -302,10 +309,10 @@ fn sample_shadow_map_pcss(
+     // provide better blurs.
+ #ifdef SHADOW_FILTER_METHOD_TEMPORAL
+     return sample_shadow_map_jimenez_fourteen(
+-        light_local, depth, array_index, texel_size, blur_size, true);
++        light_local, depth, array_index, frag_coord_xy, texel_size, blur_size, true);
+ #else   // SHADOW_FILTER_METHOD_TEMPORAL
+     return sample_shadow_map_jimenez_fourteen(
+-        light_local, depth, array_index, texel_size, blur_size, false);
++        light_local, depth, array_index, frag_coord_xy, texel_size, blur_size, false);
+ #endif  // SHADOW_FILTER_METHOD_TEMPORAL
+ }
+ 
+@@ -458,16 +465,13 @@ fn sample_shadow_cubemap_gaussian(
+ fn sample_shadow_cubemap_jittered(
+     light_local: vec3<f32>,
+     depth: f32,
++    frag_coord_xy: vec2<f32>,
+     scale: f32,
+     distance_to_light: f32,
+     light_id: u32,
+     temporal: bool,
+ ) -> f32 {
+-    // Create an orthonormal basis so we can apply a 2D sampling pattern to a
+-    // cubemap.
+-    let basis = orthonormalize(normalize(light_local)) * scale * distance_to_light;
+-
+-    let rotation_matrix = random_rotation_matrix(vec2(1.0), temporal);
++    let rotation_matrix = random_rotation_matrix(frag_coord_xy, temporal);
+ 
+     let sample_offset0 = rotation_matrix * utils::SPIRAL_OFFSET_0_ *
+         POINT_SHADOW_TEMPORAL_OFFSET_SCALE;
+@@ -486,6 +490,10 @@ fn sample_shadow_cubemap_jittered(
+     let sample_offset7 = rotation_matrix * utils::SPIRAL_OFFSET_7_ *
+         POINT_SHADOW_TEMPORAL_OFFSET_SCALE;
+ 
++    // Create an orthonormal basis so we can apply a 2D sampling pattern to a
++    // cubemap.
++    let basis = orthonormalize(normalize(light_local)) * scale * distance_to_light;
++
+     var sum: f32 = 0.0;
+     sum += sample_shadow_cubemap_at_offset(
+         sample_offset0, 0.125, basis[0], basis[1], light_local, depth, light_id);
+@@ -511,13 +519,14 @@ fn sample_shadow_cubemap(
+     distance_to_light: f32,
+     depth: f32,
+     light_id: u32,
++    frag_coord_xy: vec2<f32>,
+ ) -> f32 {
+ #ifdef SHADOW_FILTER_METHOD_GAUSSIAN
+     return sample_shadow_cubemap_gaussian(
+         light_local, depth, POINT_SHADOW_SCALE, distance_to_light, light_id);
+ #else ifdef SHADOW_FILTER_METHOD_TEMPORAL
+     return sample_shadow_cubemap_jittered(
+-        light_local, depth, POINT_SHADOW_SCALE, distance_to_light, light_id, true);
++        light_local, depth, frag_coord_xy, POINT_SHADOW_SCALE, distance_to_light, light_id, true);
+ #else ifdef SHADOW_FILTER_METHOD_HARDWARE_2X2
+     return sample_shadow_cubemap_hardware(light_local, depth, light_id);
+ #else
+@@ -582,6 +591,7 @@ fn sample_shadow_cubemap_pcss(
+     depth: f32,
+     light_id: u32,
+     light_size: f32,
++    frag_coord_xy: vec2<f32>,
+ ) -> f32 {
+     let z_blocker = search_for_blockers_in_shadow_cubemap(
+         light_local, depth, light_size, distance_to_light, light_id);
+@@ -591,9 +601,9 @@ fn sample_shadow_cubemap_pcss(
+ 
+ #ifdef SHADOW_FILTER_METHOD_TEMPORAL
+     return sample_shadow_cubemap_jittered(
+-        light_local, depth, POINT_SHADOW_SCALE * blur_size, distance_to_light, light_id, true);
++        light_local, depth, frag_coord_xy, POINT_SHADOW_SCALE * blur_size, distance_to_light, light_id, true);
+ #else
+     return sample_shadow_cubemap_jittered(
+-        light_local, depth, POINT_SHADOW_SCALE * blur_size, distance_to_light, light_id, false);
++        light_local, depth, frag_coord_xy, POINT_SHADOW_SCALE * blur_size, distance_to_light, light_id, false);
+ #endif
+ }
+diff --git a/crates/bevy_pbr/src/render/shadows.wgsl b/crates/bevy_pbr/src/render/shadows.wgsl
+index a3727b45af526..c7b8287f3f9b8 100644
+--- a/crates/bevy_pbr/src/render/shadows.wgsl
++++ b/crates/bevy_pbr/src/render/shadows.wgsl
+@@ -16,7 +16,12 @@
+ 
+ const flip_z: vec3<f32> = vec3<f32>(1.0, 1.0, -1.0);
+ 
+-fn fetch_point_shadow(light_id: u32, frag_position: vec4<f32>, surface_normal: vec3<f32>) -> f32 {
++fn fetch_point_shadow(
++    light_id: u32,
++    frag_position: vec4<f32>,
++    surface_normal: vec3<f32>,
++    frag_coord_xy: vec2<f32>,
++) -> f32 {
+     let light = &view_bindings::clusterable_objects.data[light_id];
+ 
+     // because the shadow maps align with the axes and the frustum planes are at 45 degrees
+@@ -54,12 +59,13 @@ fn fetch_point_shadow(light_id: u32, frag_position: vec4<f32>, surface_normal: v
+             depth,
+             light_id,
+             (*light).soft_shadow_size,
++            frag_coord_xy,
+         );
+     }
+ 
+     // Do the lookup, using HW PCF and comparison. Cubemaps assume a left-handed
+     // coordinate space, so we have to flip the z-axis when sampling.
+-    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id);
++    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id, frag_coord_xy);
+ }
+ 
+ fn fetch_spot_shadow(
+@@ -67,6 +73,7 @@ fn fetch_spot_shadow(
+     frag_position: vec4<f32>,
+     surface_normal: vec3<f32>,
+     near_z: f32,
++    frag_coord_xy: vec2<f32>,
+ ) -> f32 {
+     let light = &view_bindings::clusterable_objects.data[light_id];
+ 
+@@ -108,10 +115,22 @@ fn fetch_spot_shadow(
+     let array_index = i32(light_id) + view_bindings::lights.spot_light_shadowmap_offset;
+     if ((*light).soft_shadow_size > 0.0) {
+         return sample_shadow_map_pcss(
+-            shadow_uv, depth, array_index, SPOT_SHADOW_TEXEL_SIZE, (*light).soft_shadow_size);
++            shadow_uv,
++            depth,
++            array_index,
++            frag_coord_xy,
++            SPOT_SHADOW_TEXEL_SIZE,
++            (*light).soft_shadow_size,
++        );
+     }
+ 
+-    return sample_shadow_map(shadow_uv, depth, array_index, SPOT_SHADOW_TEXEL_SIZE);
++    return sample_shadow_map(
++        shadow_uv,
++        depth,
++        array_index,
++        frag_coord_xy,
++        SPOT_SHADOW_TEXEL_SIZE,
++    );
+ }
+ 
+ fn get_cascade_index(light_id: u32, view_z: f32) -> u32 {
+@@ -163,6 +182,7 @@ fn sample_directional_cascade(
+     cascade_index: u32,
+     frag_position: vec4<f32>,
+     surface_normal: vec3<f32>,
++    frag_coord_xy: vec2<f32>,
+ ) -> f32 {
+     let light = &view_bindings::lights.directional_lights[light_id];
+     let cascade = &(*light).cascades[cascade_index];
+@@ -183,13 +203,31 @@ fn sample_directional_cascade(
+     // If soft shadows are enabled, use the PCSS path.
+     if ((*light).soft_shadow_size > 0.0) {
+         return sample_shadow_map_pcss(
+-            light_local.xy, light_local.z, array_index, texel_size, (*light).soft_shadow_size);
++            light_local.xy,
++            light_local.z,
++            array_index,
++            frag_coord_xy,
++            texel_size,
++            (*light).soft_shadow_size,
++        );
+     }
+ 
+-    return sample_shadow_map(light_local.xy, light_local.z, array_index, texel_size);
++    return sample_shadow_map(
++        light_local.xy,
++        light_local.z,
++        array_index,
++        frag_coord_xy,
++        texel_size,
++    );
+ }
+ 
+-fn fetch_directional_shadow(light_id: u32, frag_position: vec4<f32>, surface_normal: vec3<f32>, view_z: f32) -> f32 {
++fn fetch_directional_shadow(
++    light_id: u32,
++    frag_position: vec4<f32>,
++    surface_normal: vec3<f32>,
++    view_z: f32,
++    frag_coord_xy: vec2<f32>,
++) -> f32 {
+     let light = &view_bindings::lights.directional_lights[light_id];
+     let cascade_index = get_cascade_index(light_id, view_z);
+ 
+@@ -197,7 +235,13 @@ fn fetch_directional_shadow(light_id: u32, frag_position: vec4<f32>, surface_nor
+         return 1.0;
+     }
+ 
+-    var shadow = sample_directional_cascade(light_id, cascade_index, frag_position, surface_normal);
++    var shadow = sample_directional_cascade(
++        light_id,
++        cascade_index,
++        frag_position,
++        surface_normal,
++        frag_coord_xy,
++    );
+ 
+     // Blend with the next cascade, if there is one.
+     let next_cascade_index = cascade_index + 1u;
+@@ -205,7 +249,13 @@ fn fetch_directional_shadow(light_id: u32, frag_position: vec4<f32>, surface_nor
+         let this_far_bound = (*light).cascades[cascade_index].far_bound;
+         let next_near_bound = (1.0 - (*light).cascades_overlap_proportion) * this_far_bound;
+         if (-view_z >= next_near_bound) {
+-            let next_shadow = sample_directional_cascade(light_id, next_cascade_index, frag_position, surface_normal);
++            let next_shadow = sample_directional_cascade(
++                light_id,
++                next_cascade_index,
++                frag_position,
++                surface_normal,
++                frag_coord_xy,
++            );
+             shadow = mix(shadow, next_shadow, (-view_z - next_near_bound) / (this_far_bound - next_near_bound));
+         }
+     }
+diff --git a/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl b/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl
+index 12294cd088b1a..aa96a832c6b24 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl
++++ b/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl
+@@ -20,7 +20,7 @@
+ }
+ #import bevy_pbr::mesh_functions::{get_world_from_local, mesh_position_local_to_clip}
+ #import bevy_pbr::mesh_view_bindings::{
+-    globals, lights, view, clusterable_objects, 
++    globals, lights, view, clusterable_objects,
+     atmosphere_data, atmosphere_transmittance_texture, atmosphere_transmittance_sampler
+ }
+ #import bevy_pbr::mesh_view_types::{
+@@ -312,7 +312,7 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+                 let r = length(P_as);
+                 let local_up = normalize(P_as);
+                 let mu_light = dot(L, local_up);
+-                
++
+                 let transmittance = sample_transmittance_lut(r, mu_light);
+                 let sun_visibility = calculate_visible_sun_ratio(atmosphere_data.atmosphere, r, mu_light, (*light).sun_disk_angular_size);
+                 light_factors_per_step *= transmittance * sun_visibility;
+@@ -369,7 +369,7 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+             if (i < clusterable_object_index_ranges.first_spot_light_index_offset) {
+                 var shadow: f32 = 1.0;
+                 if (((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+-                    shadow = fetch_point_shadow_without_normal(light_id, vec4(P_world, 1.0));
++                    shadow = fetch_point_shadow_without_normal(light_id, vec4(P_world, 1.0), position.xy);
+                 }
+                 local_light_attenuation *= shadow;
+             } else {
+@@ -391,7 +391,7 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+ 
+                 var shadow: f32 = 1.0;
+                 if (((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+-                    shadow = fetch_spot_shadow_without_normal(light_id, vec4(P_world, 1.0));
++                    shadow = fetch_spot_shadow_without_normal(light_id, vec4(P_world, 1.0), position.xy);
+                 }
+                 local_light_attenuation *= spot_attenuation * shadow;
+             }
+@@ -422,7 +422,7 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+     return vec4(accumulated_color, 1.0 - background_alpha);
+ }
+ 
+-fn fetch_point_shadow_without_normal(light_id: u32, frag_position: vec4<f32>) -> f32 {
++fn fetch_point_shadow_without_normal(light_id: u32, frag_position: vec4<f32>, frag_coord_xy: vec2<f32>) -> f32 {
+     let light = &clusterable_objects.data[light_id];
+ 
+     // because the shadow maps align with the axes and the frustum planes are at 45 degrees
+@@ -452,10 +452,10 @@ fn fetch_point_shadow_without_normal(light_id: u32, frag_position: vec4<f32>) ->
+     // Do the lookup, using HW PCF and comparison. Cubemaps assume a left-handed coordinate space,
+     // so we have to flip the z-axis when sampling.
+     let flip_z = vec3(1.0, 1.0, -1.0);
+-    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id);
++    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id, frag_coord_xy);
+ }
+ 
+-fn fetch_spot_shadow_without_normal(light_id: u32, frag_position: vec4<f32>) -> f32 {
++fn fetch_spot_shadow_without_normal(light_id: u32, frag_position: vec4<f32>, frag_coord_xy: vec2<f32>) -> f32 {
+     let light = &clusterable_objects.data[light_id];
+ 
+     let surface_to_light = (*light).position_radius.xyz - frag_position.xyz;
+@@ -505,6 +505,7 @@ fn fetch_spot_shadow_without_normal(light_id: u32, frag_position: vec4<f32>) ->
+         shadow_uv,
+         depth,
+         i32(light_id) + lights.spot_light_shadowmap_offset,
++        frag_coord_xy,
+         SPOT_SHADOW_TEXEL_SIZE
+     );
+ }
+@@ -513,7 +514,7 @@ fn fetch_spot_shadow_without_normal(light_id: u32, frag_position: vec4<f32>) ->
+ fn sample_transmittance_lut(r: f32, mu: f32) -> vec3<f32> {
+     let uv = transmittance_lut_r_mu_to_uv(atmosphere_data.atmosphere, r, mu);
+     return textureSampleLevel(
+-        atmosphere_transmittance_texture, 
++        atmosphere_transmittance_texture,
+         atmosphere_transmittance_sampler, uv, 0.0).rgb;
+ }
+-#endif  // ATMOSPHERE
+\ No newline at end of file
++#endif  // ATMOSPHERE

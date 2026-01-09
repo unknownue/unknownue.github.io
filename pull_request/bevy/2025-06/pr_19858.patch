@@ -1,0 +1,123 @@
+diff --git a/crates/bevy_ui/src/focus.rs b/crates/bevy_ui/src/focus.rs
+index f55cbb92b8f50..549d26a262463 100644
+--- a/crates/bevy_ui/src/focus.rs
++++ b/crates/bevy_ui/src/focus.rs
+@@ -1,7 +1,4 @@
+-use crate::{
+-    picking_backend::clip_check_recursive, ui_transform::UiGlobalTransform, ComputedNode,
+-    ComputedNodeTarget, Node, UiStack,
+-};
++use crate::{ui_transform::UiGlobalTransform, ComputedNode, ComputedNodeTarget, Node, UiStack};
+ use bevy_ecs::{
+     change_detection::DetectChangesMut,
+     entity::{ContainsEntity, Entity},
+@@ -322,3 +319,27 @@ pub fn ui_focus_system(
+         }
+     }
+ }
++
++/// Walk up the tree child-to-parent checking that `point` is not clipped by any ancestor node.
++pub fn clip_check_recursive(
++    point: Vec2,
++    entity: Entity,
++    clipping_query: &Query<'_, '_, (&ComputedNode, &UiGlobalTransform, &Node)>,
++    child_of_query: &Query<&ChildOf>,
++) -> bool {
++    if let Ok(child_of) = child_of_query.get(entity) {
++        let parent = child_of.0;
++        if let Ok((computed_node, transform, node)) = clipping_query.get(parent) {
++            if !computed_node
++                .resolve_clip_rect(node.overflow, node.overflow_clip_margin)
++                .contains(transform.inverse().transform_point2(point))
++            {
++                // The point is clipped and should be ignored by picking
++                return false;
++            }
++        }
++        return clip_check_recursive(point, parent, clipping_query, child_of_query);
++    }
++    // Reached root, point unclipped by all ancestors
++    true
++}
+diff --git a/crates/bevy_ui/src/picking_backend.rs b/crates/bevy_ui/src/picking_backend.rs
+index 5647baee12a8c..5ca59ceeafb59 100644
+--- a/crates/bevy_ui/src/picking_backend.rs
++++ b/crates/bevy_ui/src/picking_backend.rs
+@@ -24,7 +24,7 @@
+ 
+ #![deny(missing_docs)]
+ 
+-use crate::{prelude::*, ui_transform::UiGlobalTransform, UiStack};
++use crate::{clip_check_recursive, prelude::*, ui_transform::UiGlobalTransform, UiStack};
+ use bevy_app::prelude::*;
+ use bevy_ecs::{prelude::*, query::QueryData};
+ use bevy_math::Vec2;
+@@ -252,27 +252,3 @@ pub fn ui_picking(
+         output.write(PointerHits::new(*pointer, picks, order));
+     }
+ }
+-
+-/// Walk up the tree child-to-parent checking that `point` is not clipped by any ancestor node.
+-pub fn clip_check_recursive(
+-    point: Vec2,
+-    entity: Entity,
+-    clipping_query: &Query<'_, '_, (&ComputedNode, &UiGlobalTransform, &Node)>,
+-    child_of_query: &Query<&ChildOf>,
+-) -> bool {
+-    if let Ok(child_of) = child_of_query.get(entity) {
+-        let parent = child_of.0;
+-        if let Ok((computed_node, transform, node)) = clipping_query.get(parent) {
+-            if !computed_node
+-                .resolve_clip_rect(node.overflow, node.overflow_clip_margin)
+-                .contains(transform.inverse().transform_point2(point))
+-            {
+-                // The point is clipped and should be ignored by picking
+-                return false;
+-            }
+-        }
+-        return clip_check_recursive(point, parent, clipping_query, child_of_query);
+-    }
+-    // Reached root, point unclipped by all ancestors
+-    true
+-}
+diff --git a/crates/bevy_ui/src/widget/viewport.rs b/crates/bevy_ui/src/widget/viewport.rs
+index fe5b6eeb6d339..120c3335c2a21 100644
+--- a/crates/bevy_ui/src/widget/viewport.rs
++++ b/crates/bevy_ui/src/widget/viewport.rs
+@@ -2,22 +2,32 @@ use bevy_asset::Assets;
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+-    event::EventReader,
+     query::{Changed, Or},
+     reflect::ReflectComponent,
+-    system::{Commands, Query, Res, ResMut},
++    system::{Query, ResMut},
++};
++#[cfg(feature = "bevy_ui_picking_backend")]
++use bevy_ecs::{
++    event::EventReader,
++    system::{Commands, Res},
+ };
+ use bevy_image::{Image, ToExtents};
+-use bevy_math::{Rect, UVec2};
++#[cfg(feature = "bevy_ui_picking_backend")]
++use bevy_math::Rect;
++use bevy_math::UVec2;
+ #[cfg(feature = "bevy_ui_picking_backend")]
+ use bevy_picking::{
+     events::PointerState,
+     hover::HoverMap,
+     pointer::{Location, PointerId, PointerInput, PointerLocation},
+ };
++#[cfg(feature = "bevy_ui_picking_backend")]
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::Reflect;
+-use bevy_render::camera::{Camera, NormalizedRenderTarget};
++use bevy_render::camera::Camera;
++#[cfg(feature = "bevy_ui_picking_backend")]
++use bevy_render::camera::NormalizedRenderTarget;
++#[cfg(feature = "bevy_ui_picking_backend")]
+ use bevy_transform::components::GlobalTransform;
+ #[cfg(feature = "bevy_ui_picking_backend")]
+ use uuid::Uuid;
