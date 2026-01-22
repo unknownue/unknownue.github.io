@@ -45,14 +45,3 @@ A static website built with Zola framework. This project serves as a personal bl
 
 ### Documentation
 - Zola documentation is available locally at `submodules/zola/docs`.
-
-### Theme Design Philosophy
-
-This theme follows the "designed to last" principle, implementing best practices to ensure websites continue working correctly indefinitely with minimal maintenance.
-
-Key principles:
-- Keep CSS and JavaScript minimal - only use when necessary for core functionality
-- Prioritize plain HTML/CSS over complex solutions
-- Maintain code simplicity and long-term maintainability
-- Chosen Zola for its Rust-based architecture, simplicity, and single-binary design
-- Focus on future-proofing with minimal dependencies
