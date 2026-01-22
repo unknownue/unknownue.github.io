@@ -43,6 +43,9 @@ A static website built with Zola framework. This project serves as a personal bl
 
 ## Project Specific Context
 
+### Documentation
+- Zola documentation is available locally at `submodules/zola/docs`.
+
 ### Theme Design Philosophy
 
 This theme follows the "designed to last" principle, implementing best practices to ensure websites continue working correctly indefinitely with minimal maintenance.
