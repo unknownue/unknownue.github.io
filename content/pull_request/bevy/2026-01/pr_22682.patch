@@ -1,0 +1,434 @@
+diff --git a/crates/bevy_core_pipeline/Cargo.toml b/crates/bevy_core_pipeline/Cargo.toml
+index f80799228fcd0..185a5e8f86fcd 100644
+--- a/crates/bevy_core_pipeline/Cargo.toml
++++ b/crates/bevy_core_pipeline/Cargo.toml
+@@ -24,6 +24,7 @@ bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.19.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.19.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.19.0-dev" }
+ bevy_log = { path = "../bevy_log", version = "0.19.0-dev" }
++bevy_light = { path = "../bevy_light", version = "0.19.0-dev" }
+ bevy_camera = { path = "../bevy_camera", version = "0.19.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.19.0-dev" }
+ bevy_shader = { path = "../bevy_shader", version = "0.19.0-dev" }
+diff --git a/crates/bevy_core_pipeline/src/lib.rs b/crates/bevy_core_pipeline/src/lib.rs
+index 15ac93c775345..f82e02fbe8558 100644
+--- a/crates/bevy_core_pipeline/src/lib.rs
++++ b/crates/bevy_core_pipeline/src/lib.rs
+@@ -18,7 +18,6 @@ pub mod tonemapping;
+ pub mod upscaling;
+ 
+ pub use fullscreen_vertex_shader::FullscreenShader;
+-pub use skybox::Skybox;
+ 
+ mod fullscreen_vertex_shader;
+ mod skybox;
+diff --git a/crates/bevy_core_pipeline/src/skybox/mod.rs b/crates/bevy_core_pipeline/src/skybox/mod.rs
+index 20cf97726b082..53213964b4d16 100644
+--- a/crates/bevy_core_pipeline/src/skybox/mod.rs
++++ b/crates/bevy_core_pipeline/src/skybox/mod.rs
+@@ -3,29 +3,26 @@ use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+ use bevy_camera::Exposure;
+ use bevy_ecs::{
+     prelude::{Component, Entity},
+-    query::{QueryItem, With},
+-    reflect::ReflectComponent,
++    query::With,
+     resource::Resource,
+     schedule::IntoScheduleConfigs,
+-    system::{Commands, Query, Res, ResMut},
++    system::{Commands, Local, Query, Res, ResMut},
+ };
+-use bevy_image::{BevyDefault, Image};
+-use bevy_math::{Mat4, Quat};
+-use bevy_reflect::{std_traits::ReflectDefault, Reflect};
++use bevy_image::BevyDefault;
++use bevy_light::Skybox;
++use bevy_math::Mat4;
+ use bevy_render::{
+-    extract_component::{
+-        ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
+-        UniformComponentPlugin,
+-    },
++    extract_component::{ComponentUniforms, DynamicUniformIndex, UniformComponentPlugin},
+     render_asset::RenderAssets,
+     render_resource::{
+         binding_types::{sampler, texture_cube, uniform_buffer},
+         *,
+     },
+     renderer::RenderDevice,
++    sync_world::RenderEntity,
+     texture::GpuImage,
+     view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniforms},
+-    Render, RenderApp, RenderStartup, RenderSystems,
++    Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_shader::Shader;
+ use bevy_transform::components::Transform;
+@@ -46,10 +43,7 @@ impl Plugin for SkyboxPlugin {
+         embedded_asset!(app, "skybox.wgsl");
+         embedded_asset!(app, "skybox_prepass.wgsl");
+ 
+-        app.add_plugins((
+-            ExtractComponentPlugin::<Skybox>::default(),
+-            UniformComponentPlugin::<SkyboxUniforms>::default(),
+-        ));
++        app.add_plugins(UniformComponentPlugin::<SkyboxUniforms>::default());
+ 
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+@@ -58,6 +52,7 @@ impl Plugin for SkyboxPlugin {
+             .init_resource::<SpecializedRenderPipelines<SkyboxPipeline>>()
+             .init_resource::<SpecializedRenderPipelines<SkyboxPrepassPipeline>>()
+             .init_resource::<PreviousViewUniforms>()
++            .add_systems(ExtractSchedule, extract_skybox)
+             .add_systems(
+                 RenderStartup,
+                 (init_skybox_pipeline, init_skybox_prepass_pipeline),
+@@ -75,63 +70,32 @@ impl Plugin for SkyboxPlugin {
+     }
+ }
+ 
+-/// Adds a skybox to a 3D camera, based on a cubemap texture.
+-///
+-/// Note that this component does not (currently) affect the scene's lighting.
+-/// To do so, use `EnvironmentMapLight` alongside this component.
+-///
+-/// See also <https://en.wikipedia.org/wiki/Skybox_(video_games)>.
+-#[derive(Component, Clone, Reflect)]
+-#[reflect(Component, Default, Clone)]
+-pub struct Skybox {
+-    pub image: Handle<Image>,
+-    /// Scale factor applied to the skybox image.
+-    /// After applying this multiplier to the image samples, the resulting values should
+-    /// be in units of [cd/m^2](https://en.wikipedia.org/wiki/Candela_per_square_metre).
+-    pub brightness: f32,
+-
+-    /// View space rotation applied to the skybox cubemap.
+-    /// This is useful for users who require a different axis, such as the Z-axis, to serve
+-    /// as the vertical axis.
+-    pub rotation: Quat,
+-}
+-
+-impl Default for Skybox {
+-    fn default() -> Self {
+-        Skybox {
+-            image: Handle::default(),
+-            brightness: 0.0,
+-            rotation: Quat::IDENTITY,
+-        }
+-    }
+-}
+-
+-impl ExtractComponent for Skybox {
+-    type QueryData = (&'static Self, Option<&'static Exposure>);
+-    type QueryFilter = ();
+-    type Out = (Self, SkyboxUniforms);
+-
+-    fn extract_component(
+-        (skybox, exposure): QueryItem<'_, '_, Self::QueryData>,
+-    ) -> Option<Self::Out> {
++// This is needed because of the orphan rule not allowing implementing
++// foreign trait ExtractComponent on foreign type Skybox
++pub fn extract_skybox(
++    mut commands: Commands,
++    mut previous_len: Local<usize>,
++    query: Extract<Query<(RenderEntity, &Skybox, Option<&Exposure>)>>,
++) {
++    let mut values = Vec::with_capacity(*previous_len);
++    for (entity, skybox, exposure) in &query {
+         let exposure = exposure
+             .map(Exposure::exposure)
+             .unwrap_or_else(|| Exposure::default().exposure());
+-
+-        Some((
+-            skybox.clone(),
+-            SkyboxUniforms {
+-                brightness: skybox.brightness * exposure,
+-                transform: Transform::from_rotation(skybox.rotation.inverse()).to_matrix(),
+-                #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+-                _webgl2_padding_8b: 0,
+-                #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+-                _webgl2_padding_12b: 0,
+-                #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+-                _webgl2_padding_16b: 0,
+-            },
+-        ))
++        let uniforms = SkyboxUniforms {
++            brightness: skybox.brightness * exposure,
++            transform: Transform::from_rotation(skybox.rotation.inverse()).to_matrix(),
++            #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
++            _webgl2_padding_8b: 0,
++            #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
++            _webgl2_padding_12b: 0,
++            #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
++            _webgl2_padding_16b: 0,
++        };
++        values.push((entity, (skybox.clone(), uniforms)));
+     }
++    *previous_len = values.len();
++    commands.try_insert_batch(values);
+ }
+ 
+ // TODO: Replace with a push constant once WebGPU gets support for that
+diff --git a/crates/bevy_core_pipeline/src/skybox/prepass.rs b/crates/bevy_core_pipeline/src/skybox/prepass.rs
+index 8eb51c10e2067..8bb455a1d255f 100644
+--- a/crates/bevy_core_pipeline/src/skybox/prepass.rs
++++ b/crates/bevy_core_pipeline/src/skybox/prepass.rs
+@@ -8,6 +8,7 @@ use bevy_ecs::{
+     resource::Resource,
+     system::{Commands, Query, Res, ResMut},
+ };
++use bevy_light::Skybox;
+ use bevy_render::{
+     render_resource::{
+         binding_types::uniform_buffer, BindGroup, BindGroupEntries, BindGroupLayoutDescriptor,
+@@ -27,7 +28,7 @@ use crate::{
+         prepass_target_descriptors, MotionVectorPrepass, NormalPrepass, PreviousViewData,
+         PreviousViewUniforms,
+     },
+-    FullscreenShader, Skybox,
++    FullscreenShader,
+ };
+ 
+ /// This pipeline writes motion vectors to the prepass for all [`Skybox`]es.
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index 44396b48a3a64..f55fdd0196a5d 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -31,7 +31,7 @@ use bevy_camera::visibility::SetViewVisibility;
+ mod probe;
+ pub use probe::{
+     AtmosphereEnvironmentMapLight, EnvironmentMapLight, GeneratedEnvironmentMapLight,
+-    IrradianceVolume, LightProbe, NoParallaxCorrection,
++    IrradianceVolume, LightProbe, NoParallaxCorrection, Skybox,
+ };
+ mod volumetric;
+ pub use volumetric::{FogVolume, VolumetricFog, VolumetricLight};
+diff --git a/crates/bevy_light/src/probe.rs b/crates/bevy_light/src/probe.rs
+index 9430857c21678..27771ada2109f 100644
+--- a/crates/bevy_light/src/probe.rs
++++ b/crates/bevy_light/src/probe.rs
+@@ -179,6 +179,37 @@ impl Default for EnvironmentMapLight {
+     }
+ }
+ 
++/// Adds a skybox to a 3D camera, based on a cubemap texture.
++///
++/// Note that this component does not (currently) affect the scene's lighting.
++/// To do so, use `EnvironmentMapLight` alongside this component.
++///
++/// See also <https://en.wikipedia.org/wiki/Skybox_(video_games)>.
++#[derive(Component, Clone, Reflect)]
++#[reflect(Component, Default, Clone)]
++pub struct Skybox {
++    pub image: Handle<Image>,
++    /// Scale factor applied to the skybox image.
++    /// After applying this multiplier to the image samples, the resulting values should
++    /// be in units of [cd/m^2](https://en.wikipedia.org/wiki/Candela_per_square_metre).
++    pub brightness: f32,
++
++    /// View space rotation applied to the skybox cubemap.
++    /// This is useful for users who require a different axis, such as the Z-axis, to serve
++    /// as the vertical axis.
++    pub rotation: Quat,
++}
++
++impl Default for Skybox {
++    fn default() -> Self {
++        Skybox {
++            image: Handle::default(),
++            brightness: 0.0,
++            rotation: Quat::IDENTITY,
++        }
++    }
++}
++
+ /// A generated environment map that is filtered at runtime.
+ ///
+ /// See `bevy_pbr::light_probe::generate` for detailed information.
+diff --git a/examples/3d/anisotropy.rs b/examples/3d/anisotropy.rs
+index 9804e3ea931e2..443d2a2dc12a2 100644
+--- a/examples/3d/anisotropy.rs
++++ b/examples/3d/anisotropy.rs
+@@ -4,7 +4,7 @@ use std::fmt::Display;
+ 
+ use bevy::{
+     color::palettes::{self, css::WHITE},
+-    core_pipeline::Skybox,
++    light::Skybox,
+     math::vec3,
+     prelude::*,
+     time::Stopwatch,
+diff --git a/examples/3d/auto_exposure.rs b/examples/3d/auto_exposure.rs
+index c5e0bf783262f..6b92b124fe0a1 100644
+--- a/examples/3d/auto_exposure.rs
++++ b/examples/3d/auto_exposure.rs
+@@ -12,7 +12,7 @@
+ //! | `V`                | Visualize Metering Mask                |
+ 
+ use bevy::{
+-    core_pipeline::Skybox,
++    light::Skybox,
+     math::{cubic_splines::LinearSpline, primitives::Plane3d, vec2},
+     post_process::auto_exposure::{
+         AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin,
+diff --git a/examples/3d/clearcoat.rs b/examples/3d/clearcoat.rs
+index 97f23e02eb9ef..3e7c17433b89c 100644
+--- a/examples/3d/clearcoat.rs
++++ b/examples/3d/clearcoat.rs
+@@ -22,8 +22,9 @@ use std::f32::consts::PI;
+ use bevy::{
+     camera::Hdr,
+     color::palettes::css::{BLUE, GOLD, WHITE},
+-    core_pipeline::{tonemapping::Tonemapping::AcesFitted, Skybox},
++    core_pipeline::tonemapping::Tonemapping::AcesFitted,
+     image::ImageLoaderSettings,
++    light::Skybox,
+     math::vec3,
+     prelude::*,
+ };
+diff --git a/examples/3d/contact_shadows.rs b/examples/3d/contact_shadows.rs
+index 06d759f65ab01..62fbd4a5de14f 100644
+--- a/examples/3d/contact_shadows.rs
++++ b/examples/3d/contact_shadows.rs
+@@ -3,7 +3,7 @@
+ use crate::widgets::{RadioButton, RadioButtonText, WidgetClickEvent, WidgetClickSender};
+ use bevy::anti_alias::taa::TemporalAntiAliasing;
+ use bevy::core_pipeline::tonemapping::Tonemapping;
+-use bevy::core_pipeline::Skybox;
++use bevy::light::Skybox;
+ use bevy::pbr::ScreenSpaceAmbientOcclusion;
+ use bevy::post_process::motion_blur::MotionBlur;
+ use bevy::window::{CursorIcon, PrimaryWindow, SystemCursorIcon};
+diff --git a/examples/3d/irradiance_volumes.rs b/examples/3d/irradiance_volumes.rs
+index bb45ae6bfac4b..1b48c40f653b1 100644
+--- a/examples/3d/irradiance_volumes.rs
++++ b/examples/3d/irradiance_volumes.rs
+@@ -15,7 +15,7 @@
+ 
+ use bevy::{
+     color::palettes::css::*,
+-    core_pipeline::Skybox,
++    light::Skybox,
+     light::{IrradianceVolume, NotShadowCaster},
+     math::{uvec3, vec3},
+     pbr::{ExtendedMaterial, MaterialExtension},
+diff --git a/examples/3d/pcss.rs b/examples/3d/pcss.rs
+index 281acf75a4504..fc6e447d2ea7a 100644
+--- a/examples/3d/pcss.rs
++++ b/examples/3d/pcss.rs
+@@ -10,11 +10,8 @@ use bevy::{
+         primitives::{CubemapFrusta, Frustum},
+         visibility::{CubemapVisibleEntities, VisibleMeshEntities},
+     },
+-    core_pipeline::{
+-        prepass::{DepthPrepass, MotionVectorPrepass},
+-        Skybox,
+-    },
+-    light::ShadowFilteringMethod,
++    core_pipeline::prepass::{DepthPrepass, MotionVectorPrepass},
++    light::{ShadowFilteringMethod, Skybox},
+     math::vec3,
+     prelude::*,
+     render::camera::TemporalJitter,
+diff --git a/examples/3d/reflection_probes.rs b/examples/3d/reflection_probes.rs
+index 0344e84c7d8ca..0844de0ee9fb5 100644
+--- a/examples/3d/reflection_probes.rs
++++ b/examples/3d/reflection_probes.rs
+@@ -12,8 +12,8 @@
+ 
+ use bevy::{
+     camera::{Exposure, Hdr},
+-    core_pipeline::{tonemapping::Tonemapping, Skybox},
+-    light::NoParallaxCorrection,
++    core_pipeline::tonemapping::Tonemapping,
++    light::{NoParallaxCorrection, Skybox},
+     pbr::generate::generate_environment_map_light,
+     prelude::*,
+     render::render_resource::TextureUsages,
+diff --git a/examples/3d/rotate_environment_map.rs b/examples/3d/rotate_environment_map.rs
+index 9f401ae0685af..9bbf8092ae31a 100644
+--- a/examples/3d/rotate_environment_map.rs
++++ b/examples/3d/rotate_environment_map.rs
+@@ -5,8 +5,9 @@ use std::f32::consts::PI;
+ use bevy::{
+     camera::Hdr,
+     color::palettes::css::{GOLD, WHITE},
+-    core_pipeline::{tonemapping::Tonemapping::AcesFitted, Skybox},
++    core_pipeline::tonemapping::Tonemapping::AcesFitted,
+     image::ImageLoaderSettings,
++    light::Skybox,
+     prelude::*,
+ };
+ 
+diff --git a/examples/3d/skybox.rs b/examples/3d/skybox.rs
+index 0cfe1cec93607..313f3ef2f26ef 100644
+--- a/examples/3d/skybox.rs
++++ b/examples/3d/skybox.rs
+@@ -5,8 +5,8 @@ use bevy::anti_alias::taa::TemporalAntiAliasing;
+ 
+ use bevy::{
+     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+-    core_pipeline::Skybox,
+     image::CompressedImageFormats,
++    light::Skybox,
+     pbr::ScreenSpaceAmbientOcclusion,
+     prelude::*,
+     render::{
+diff --git a/examples/3d/specular_tint.rs b/examples/3d/specular_tint.rs
+index 3e182e845bfce..1d9d6143c8cb1 100644
+--- a/examples/3d/specular_tint.rs
++++ b/examples/3d/specular_tint.rs
+@@ -2,7 +2,7 @@
+ 
+ use std::f32::consts::PI;
+ 
+-use bevy::{camera::Hdr, color::palettes::css::WHITE, core_pipeline::Skybox, prelude::*};
++use bevy::{camera::Hdr, color::palettes::css::WHITE, light::Skybox, prelude::*};
+ 
+ /// The camera rotation speed in radians per frame.
+ const ROTATION_SPEED: f32 = 0.005;
+diff --git a/examples/3d/ssr.rs b/examples/3d/ssr.rs
+index b5aaa2e3ad9a9..276e0b97cdc5d 100644
+--- a/examples/3d/ssr.rs
++++ b/examples/3d/ssr.rs
+@@ -7,12 +7,12 @@ use bevy::{
+     anti_alias::taa::TemporalAntiAliasing,
+     camera::Hdr,
+     color::palettes::css::{BLACK, WHITE},
+-    core_pipeline::Skybox,
+     image::{
+         ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler,
+         ImageSamplerDescriptor,
+     },
+     input::mouse::MouseWheel,
++    light::Skybox,
+     math::{vec3, vec4},
+     pbr::{
+         DefaultOpaqueRendererMethod, ExtendedMaterial, MaterialExtension,
+diff --git a/examples/3d/volumetric_fog.rs b/examples/3d/volumetric_fog.rs
+index 2f0d5e085c129..f403de2fe7929 100644
+--- a/examples/3d/volumetric_fog.rs
++++ b/examples/3d/volumetric_fog.rs
+@@ -3,7 +3,8 @@
+ 
+ use bevy::{
+     color::palettes::css::RED,
+-    core_pipeline::{tonemapping::Tonemapping, Skybox},
++    core_pipeline::tonemapping::Tonemapping,
++    light::Skybox,
+     light::{FogVolume, VolumetricFog, VolumetricLight},
+     math::vec3,
+     post_process::bloom::Bloom,
+diff --git a/release-content/migration-guides/skybox.md b/release-content/migration-guides/skybox.md
+new file mode 100644
+index 0000000000000..719a6f6d4a39b
+--- /dev/null
++++ b/release-content/migration-guides/skybox.md
+@@ -0,0 +1,6 @@
++---
++title: "`Skybox` moved to `bevy_light`"
++pull_requests: [22682]
++---
++
++`Skybox` has been moved from `bevy_core_pipelines` to `bevy_light`.
