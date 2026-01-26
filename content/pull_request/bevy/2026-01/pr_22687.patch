@@ -1,0 +1,875 @@
+diff --git a/crates/bevy_camera/src/components.rs b/crates/bevy_camera/src/components.rs
+index a91246cb258a9..ffc38f68b71d3 100644
+--- a/crates/bevy_camera/src/components.rs
++++ b/crates/bevy_camera/src/components.rs
+@@ -27,31 +27,6 @@ pub struct Camera3d {
+     pub depth_load_op: Camera3dDepthLoadOp,
+     /// The texture usages for the depth texture created for the main 3d pass.
+     pub depth_texture_usages: Camera3dDepthTextureUsage,
+-    /// How many individual steps should be performed in the `Transmissive3d` pass.
+-    ///
+-    /// Roughly corresponds to how many “layers of transparency” are rendered for screen space
+-    /// specular transmissive objects. Each step requires making one additional
+-    /// texture copy, so it's recommended to keep this number to a reasonably low value. Defaults to `1`.
+-    ///
+-    /// ### Notes
+-    ///
+-    /// - No copies will be performed if there are no transmissive materials currently being rendered,
+-    ///   regardless of this setting.
+-    /// - Setting this to `0` disables the screen-space refraction effect entirely, and falls
+-    ///   back to refracting only the environment map light's texture.
+-    /// - If set to more than `0`, any opaque [`clear_color`](Camera::clear_color) will obscure the environment
+-    ///   map light's texture, preventing it from being visible “through” transmissive materials. If you'd like
+-    ///   to still have the environment map show up in your refractions, you can set the clear color's alpha to `0.0`.
+-    ///   Keep in mind that depending on the platform and your window settings, this may cause the window to become
+-    ///   transparent.
+-    pub screen_space_specular_transmission_steps: usize,
+-    /// The quality of the screen space specular transmission blur effect, applied to whatever's “behind” transmissive
+-    /// objects when their `roughness` is greater than `0.0`.
+-    ///
+-    /// Higher qualities are more GPU-intensive.
+-    ///
+-    /// **Note:** You can get better-looking results at any quality level by enabling TAA. See: `TemporalAntiAliasPlugin`
+-    pub screen_space_specular_transmission_quality: ScreenSpaceTransmissionQuality,
+ }
+ 
+ impl Default for Camera3d {
+@@ -59,8 +34,6 @@ impl Default for Camera3d {
+         Self {
+             depth_load_op: Default::default(),
+             depth_texture_usages: TextureUsages::RENDER_ATTACHMENT.into(),
+-            screen_space_specular_transmission_steps: 1,
+-            screen_space_specular_transmission_quality: Default::default(),
+         }
+     }
+ }
+@@ -114,34 +87,3 @@ impl From<Camera3dDepthLoadOp> for LoadOp<f32> {
+ #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
+ #[reflect(Component, Default, PartialEq, Hash, Debug)]
+ pub struct Hdr;
+-
+-/// The quality of the screen space transmission blur effect, applied to whatever's “behind” transmissive
+-/// objects when their `roughness` is greater than `0.0`.
+-///
+-/// Higher qualities are more GPU-intensive.
+-///
+-/// **Note:** You can get better-looking results at any quality level by enabling TAA. See: `TemporalAntiAliasPlugin`
+-#[derive(Resource, Default, Clone, Copy, Reflect, PartialEq, PartialOrd, Debug)]
+-#[reflect(Resource, Default, Clone, Debug, PartialEq)]
+-pub enum ScreenSpaceTransmissionQuality {
+-    /// Best performance at the cost of quality. Suitable for lower end GPUs. (e.g. Mobile)
+-    ///
+-    /// `num_taps` = 4
+-    Low,
+-
+-    /// A balanced option between quality and performance.
+-    ///
+-    /// `num_taps` = 8
+-    #[default]
+-    Medium,
+-
+-    /// Better quality. Suitable for high end GPUs. (e.g. Desktop)
+-    ///
+-    /// `num_taps` = 16
+-    High,
+-
+-    /// The highest quality, suitable for non-realtime rendering. (e.g. Pre-rendered cinematics and photo mode)
+-    ///
+-    /// `num_taps` = 32
+-    Ultra,
+-}
+diff --git a/crates/bevy_core_pipeline/src/core_3d/mod.rs b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+index feeef1701487e..5321a330d113c 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/mod.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+@@ -1,5 +1,4 @@
+ mod main_opaque_pass_3d_node;
+-mod main_transmissive_pass_3d_node;
+ mod main_transparent_pass_3d_node;
+ 
+ pub mod graph {
+@@ -90,7 +89,7 @@ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_asset::UntypedAssetId;
+ use bevy_color::LinearRgba;
+ use bevy_ecs::prelude::*;
+-use bevy_image::{BevyDefault, ToExtents};
++use bevy_image::ToExtents;
+ use bevy_math::FloatOrd;
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_render::{
+@@ -104,20 +103,18 @@ use bevy_render::{
+         ViewSortedRenderPhases,
+     },
+     render_resource::{
+-        CachedRenderPipelineId, FilterMode, Sampler, SamplerDescriptor, Texture, TextureDescriptor,
+-        TextureDimension, TextureFormat, TextureUsages, TextureView,
++        CachedRenderPipelineId, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+     },
+     renderer::RenderDevice,
+     sync_world::{MainEntity, RenderEntity},
+     texture::{ColorAttachment, TextureCache},
+-    view::{ExtractedView, ViewDepthTexture, ViewTarget},
++    view::{ExtractedView, ViewDepthTexture},
+     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+ use nonmax::NonMaxU32;
+ use tracing::warn;
+ 
+ use crate::{
+-    core_3d::main_transmissive_pass_3d_node::MainTransmissivePass3dNode,
+     deferred::{
+         copy_lighting_id::CopyDeferredLightingIdNode,
+         node::{EarlyDeferredGBufferPrepassNode, LateDeferredGBufferPrepassNode},
+@@ -181,7 +178,6 @@ impl Plugin for Core3dPlugin {
+                         .after(prepare_view_targets)
+                         .in_set(RenderSystems::ManageViews),
+                     prepare_core_3d_depth_textures.in_set(RenderSystems::PrepareResources),
+-                    prepare_core_3d_transmission_textures.in_set(RenderSystems::PrepareResources),
+                     prepare_prepass_textures.in_set(RenderSystems::PrepareResources),
+                 ),
+             );
+@@ -208,10 +204,6 @@ impl Plugin for Core3dPlugin {
+                 Core3d,
+                 Node3d::MainOpaquePass,
+             )
+-            .add_render_graph_node::<ViewNodeRunner<MainTransmissivePass3dNode>>(
+-                Core3d,
+-                Node3d::MainTransmissivePass,
+-            )
+             .add_render_graph_node::<ViewNodeRunner<MainTransparentPass3dNode>>(
+                 Core3d,
+                 Node3d::MainTransparentPass,
+@@ -232,7 +224,6 @@ impl Plugin for Core3dPlugin {
+                     Node3d::EndPrepasses,
+                     Node3d::StartMainPass,
+                     Node3d::MainOpaquePass,
+-                    Node3d::MainTransmissivePass,
+                     Node3d::MainTransparentPass,
+                     Node3d::EndMainPass,
+                     Node3d::StartMainPassPostProcessing,
+@@ -471,7 +462,7 @@ pub struct Transmissive3d {
+ 
+ impl PhaseItem for Transmissive3d {
+     /// For now, automatic batching is disabled for transmissive items because their rendering is
+-    /// split into multiple steps depending on [`Camera3d::screen_space_specular_transmission_steps`],
++    /// split into multiple steps depending on `ScreenSpaceTransmission::screen_space_specular_transmission_steps`,
+     /// which the batching system doesn't currently know about.
+     ///
+     /// Having batching enabled would cause the same item to be drawn multiple times across different
+@@ -866,93 +857,6 @@ pub fn prepare_core_3d_depth_textures(
+     }
+ }
+ 
+-#[derive(Component)]
+-pub struct ViewTransmissionTexture {
+-    pub texture: Texture,
+-    pub view: TextureView,
+-    pub sampler: Sampler,
+-}
+-
+-pub fn prepare_core_3d_transmission_textures(
+-    mut commands: Commands,
+-    mut texture_cache: ResMut<TextureCache>,
+-    render_device: Res<RenderDevice>,
+-    opaque_3d_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
+-    alpha_mask_3d_phases: Res<ViewBinnedRenderPhases<AlphaMask3d>>,
+-    transmissive_3d_phases: Res<ViewSortedRenderPhases<Transmissive3d>>,
+-    transparent_3d_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
+-    views_3d: Query<(Entity, &ExtractedCamera, &Camera3d, &ExtractedView)>,
+-) {
+-    let mut textures = <HashMap<_, _>>::default();
+-    for (entity, camera, camera_3d, view) in &views_3d {
+-        if !opaque_3d_phases.contains_key(&view.retained_view_entity)
+-            || !alpha_mask_3d_phases.contains_key(&view.retained_view_entity)
+-            || !transparent_3d_phases.contains_key(&view.retained_view_entity)
+-        {
+-            continue;
+-        };
+-
+-        let Some(transmissive_3d_phase) = transmissive_3d_phases.get(&view.retained_view_entity)
+-        else {
+-            continue;
+-        };
+-
+-        let Some(physical_target_size) = camera.physical_target_size else {
+-            continue;
+-        };
+-
+-        // Don't prepare a transmission texture if the number of steps is set to 0
+-        if camera_3d.screen_space_specular_transmission_steps == 0 {
+-            continue;
+-        }
+-
+-        // Don't prepare a transmission texture if there are no transmissive items to render
+-        if transmissive_3d_phase.items.is_empty() {
+-            continue;
+-        }
+-
+-        let cached_texture = textures
+-            .entry(camera.target.clone())
+-            .or_insert_with(|| {
+-                let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+-
+-                let format = if view.hdr {
+-                    ViewTarget::TEXTURE_FORMAT_HDR
+-                } else {
+-                    TextureFormat::bevy_default()
+-                };
+-
+-                let descriptor = TextureDescriptor {
+-                    label: Some("view_transmission_texture"),
+-                    // The size of the transmission texture
+-                    size: physical_target_size.to_extents(),
+-                    mip_level_count: 1,
+-                    sample_count: 1, // No need for MSAA, as we'll only copy the main texture here
+-                    dimension: TextureDimension::D2,
+-                    format,
+-                    usage,
+-                    view_formats: &[],
+-                };
+-
+-                texture_cache.get(&render_device, descriptor)
+-            })
+-            .clone();
+-
+-        let sampler = render_device.create_sampler(&SamplerDescriptor {
+-            label: Some("view_transmission_sampler"),
+-            mag_filter: FilterMode::Linear,
+-            min_filter: FilterMode::Linear,
+-            ..Default::default()
+-        });
+-
+-        commands.entity(entity).insert(ViewTransmissionTexture {
+-            texture: cached_texture.texture,
+-            view: cached_texture.default_view,
+-            sampler,
+-        });
+-    }
+-}
+-
+ /// Sets the `TEXTURE_BINDING` flag on the depth texture if necessary for
+ /// occlusion culling.
+ ///
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index 255595c406bdf..e1ddb7fc60b53 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -49,6 +49,7 @@ mod prepass;
+ mod render;
+ mod ssao;
+ mod ssr;
++mod transmission;
+ mod volumetric_fog;
+ 
+ use bevy_color::{Color, LinearRgba};
+@@ -76,6 +77,7 @@ pub use prepass::*;
+ pub use render::*;
+ pub use ssao::*;
+ pub use ssr::*;
++pub use transmission::*;
+ pub use volumetric_fog::VolumetricFogPlugin;
+ 
+ /// The PBR prelude.
+@@ -203,7 +205,6 @@ impl Plugin for PbrPlugin {
+         load_shader_library!(app, "render/utils.wgsl");
+         load_shader_library!(app, "render/clustered_forward.wgsl");
+         load_shader_library!(app, "render/pbr_lighting.wgsl");
+-        load_shader_library!(app, "render/pbr_transmission.wgsl");
+         load_shader_library!(app, "render/shadows.wgsl");
+         load_shader_library!(app, "deferred/pbr_deferred_types.wgsl");
+         load_shader_library!(app, "deferred/pbr_deferred_functions.wgsl");
+@@ -246,6 +247,7 @@ impl Plugin for PbrPlugin {
+                 },
+                 VolumetricFogPlugin,
+                 ScreenSpaceReflectionsPlugin,
++                ScreenSpaceTransmissionPlugin,
+                 ClusteredDecalPlugin,
+                 ContactShadowsPlugin,
+             ))
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 5c61c59a9a0f6..a400e349f373f 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -6,7 +6,6 @@ use alloc::sync::Arc;
+ use bevy_asset::prelude::AssetChanged;
+ use bevy_asset::{Asset, AssetEventSystems, AssetId, AssetServer, UntypedAssetId};
+ use bevy_camera::visibility::ViewVisibility;
+-use bevy_camera::ScreenSpaceTransmissionQuality;
+ use bevy_core_pipeline::deferred::{AlphaMask3dDeferred, Opaque3dDeferred};
+ use bevy_core_pipeline::prepass::{AlphaMask3dPrepass, Opaque3dPrepass};
+ use bevy_core_pipeline::{
+@@ -178,7 +177,7 @@ pub trait Material: Asset + AsBindGroup + Clone + Sized {
+     }
+ 
+     #[inline]
+-    /// Returns whether the material would like to read from [`ViewTransmissionTexture`](bevy_core_pipeline::core_3d::ViewTransmissionTexture).
++    /// Returns whether the material would like to read from [`ViewTransmissionTexture`].
+     ///
+     /// This allows taking color output from the [`Opaque3d`] pass as an input, (for screen-space transmission) but requires
+     /// rendering to take place in a separate [`Transmissive3d`] pass.
+diff --git a/crates/bevy_pbr/src/pbr_material.rs b/crates/bevy_pbr/src/pbr_material.rs
+index 83fafa6d4e1d1..08557a73f1723 100644
+--- a/crates/bevy_pbr/src/pbr_material.rs
++++ b/crates/bevy_pbr/src/pbr_material.rs
+@@ -258,10 +258,10 @@ pub struct StandardMaterial {
+     /// Specular transmission is implemented as a relatively expensive screen-space effect that allows occluded objects to be seen through the material,
+     /// with distortion and blur effects.
+     ///
+-    /// - [`Camera3d::screen_space_specular_transmission_steps`](bevy_camera::Camera3d::screen_space_specular_transmission_steps) can be used to enable transmissive objects
++    /// - [`crate::ScreenSpaceTransmission::screen_space_specular_transmission_steps`] can be used to enable transmissive objects
+     ///   to be seen through other transmissive objects, at the cost of additional draw calls and texture copies; (Use with caution!)
+     ///   - If a simplified approximation of specular transmission using only environment map lighting is sufficient, consider setting
+-    ///     [`Camera3d::screen_space_specular_transmission_steps`](bevy_camera::Camera3d::screen_space_specular_transmission_steps) to `0`.
++    ///     [`crate::ScreenSpaceTransmission::screen_space_specular_transmission_steps`] to `0`.
+     /// - If purely diffuse light transmission is needed, (i.e. “translucency”) consider using [`StandardMaterial::diffuse_transmission`] instead,
+     ///   for a much less expensive effect.
+     /// - Specular transmission is rendered before alpha blending, so any material with [`AlphaMode::Blend`], [`AlphaMode::Premultiplied`], [`AlphaMode::Add`] or [`AlphaMode::Multiply`]
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 96ddaa7123b1e..4a79e1373984b 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -8,7 +8,7 @@ use bevy_asset::{embedded_asset, load_embedded_asset, AssetId};
+ use bevy_camera::{
+     primitives::Aabb,
+     visibility::{NoFrustumCulling, RenderLayers, ViewVisibility, VisibilityRange},
+-    Camera, Camera3d, Projection,
++    Camera, Projection,
+ };
+ use bevy_core_pipeline::{
+     core_3d::{AlphaMask3d, Opaque3d, Transmissive3d, Transparent3d, CORE_3D_DEPTH_FORMAT},
+@@ -325,7 +325,7 @@ pub fn check_views_need_specialization(
+             Has<MotionVectorPrepass>,
+             Has<DeferredPrepass>,
+         ),
+-        Option<&Camera3d>,
++        Option<&ScreenSpaceTransmission>,
+         Has<TemporalJitter>,
+         Option<&Projection>,
+         Has<DistanceFog>,
+@@ -347,7 +347,7 @@ pub fn check_views_need_specialization(
+         shadow_filter_method,
+         ssao,
+         (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass),
+-        camera_3d,
++        transmission,
+         temporal_jitter,
+         projection,
+         distance_fog,
+@@ -439,9 +439,9 @@ pub fn check_views_need_specialization(
+         if distance_fog {
+             view_key |= MeshPipelineKey::DISTANCE_FOG;
+         }
+-        if let Some(camera_3d) = camera_3d {
++        if let Some(transmission) = transmission {
+             view_key |= screen_space_specular_transmission_pipeline_key(
+-                camera_3d.screen_space_specular_transmission_quality,
++                transmission.screen_space_specular_transmission_quality,
+             );
+         }
+         if !view_key_cache
+diff --git a/crates/bevy_pbr/src/render/mesh_view_bindings.rs b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+index 77fdc3d45525d..5f67ce1d7b71f 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_bindings.rs
++++ b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+@@ -1,6 +1,5 @@
+ use alloc::sync::Arc;
+ use bevy_core_pipeline::{
+-    core_3d::ViewTransmissionTexture,
+     oit::{resolve::is_oit_supported, OitBuffers, OrderIndependentTransparencySettings},
+     prepass::ViewPrepassTextures,
+     tonemapping::{
+@@ -53,7 +52,7 @@ use crate::{
+     LightProbesBuffer, LightProbesUniform, MeshPipeline, MeshPipelineKey, RenderViewLightProbes,
+     ScreenSpaceAmbientOcclusionResources, ScreenSpaceReflectionsBuffer,
+     ScreenSpaceReflectionsUniform, ShadowSamplers, ViewClusterBindings, ViewShadowBindings,
+-    CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT,
++    ViewTransmissionTexture, CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT,
+ };
+ 
+ #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+diff --git a/crates/bevy_pbr/src/transmission/mod.rs b/crates/bevy_pbr/src/transmission/mod.rs
+new file mode 100644
+index 0000000000000..b7c42dc475a81
+--- /dev/null
++++ b/crates/bevy_pbr/src/transmission/mod.rs
+@@ -0,0 +1,123 @@
++mod node;
++mod texture;
++
++use bevy_app::{App, Plugin};
++use bevy_camera::Camera3d;
++use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
++use bevy_ecs::prelude::*;
++use bevy_reflect::prelude::*;
++use bevy_render::{
++    extract_component::{ExtractComponent, ExtractComponentPlugin},
++    render_graph::{RenderGraphExt, ViewNodeRunner},
++    Render, RenderApp, RenderSystems,
++};
++use bevy_shader::load_shader_library;
++pub use node::MainTransmissivePass3dNode;
++pub use texture::ViewTransmissionTexture;
++
++use texture::prepare_core_3d_transmission_textures;
++
++/// Enables screen-space transmission for cameras.
++pub struct ScreenSpaceTransmissionPlugin;
++
++impl Plugin for ScreenSpaceTransmissionPlugin {
++    fn build(&self, app: &mut App) {
++        load_shader_library!(app, "transmission.wgsl");
++
++        app.add_plugins(ExtractComponentPlugin::<ScreenSpaceTransmission>::default())
++            .register_required_components::<Camera3d, ScreenSpaceTransmission>();
++
++        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
++            return;
++        };
++
++        render_app
++            .add_systems(
++                Render,
++                prepare_core_3d_transmission_textures.in_set(RenderSystems::PrepareResources),
++            )
++            .add_render_graph_node::<ViewNodeRunner<MainTransmissivePass3dNode>>(
++                Core3d,
++                Node3d::MainTransmissivePass,
++            )
++            .add_render_graph_edges(
++                Core3d,
++                (
++                    Node3d::MainOpaquePass,
++                    Node3d::MainTransmissivePass,
++                    Node3d::MainTransparentPass,
++                ),
++            );
++    }
++}
++
++/// Configures transmission behavior, offering a trade-off between performance and visual fidelity.
++#[derive(Component, Reflect, Clone, ExtractComponent)]
++#[reflect(Component, Default, Clone)]
++pub struct ScreenSpaceTransmission {
++    /// How many individual steps should be performed in the `Transmissive3d` pass.
++    ///
++    /// Roughly corresponds to how many layers of transparency are rendered for screen space
++    /// specular transmissive objects. Each step requires making one additional
++    /// texture copy, so it's recommended to keep this number to a reasonably low value. Defaults to `1`.
++    ///
++    /// ### Notes
++    ///
++    /// - No copies will be performed if there are no transmissive materials currently being rendered,
++    ///   regardless of this setting.
++    /// - Setting this to `0` disables the screen-space refraction effect entirely, and falls
++    ///   back to refracting only the environment map light's texture.
++    /// - If set to more than `0`, any opaque [`clear_color`](bevy_camera::Camera::clear_color) will obscure the environment
++    ///   map light's texture, preventing it from being visible through transmissive materials. If you'd like
++    ///   to still have the environment map show up in your refractions, you can set the clear color's alpha to `0.0`.
++    ///   Keep in mind that depending on the platform and your window settings, this may cause the window to become
++    ///   transparent.
++    pub screen_space_specular_transmission_steps: usize,
++    /// The quality of the screen space specular transmission blur effect, applied to whatever's behind transmissive
++    /// objects when their `roughness` is greater than `0.0`.
++    ///
++    /// Higher qualities are more GPU-intensive.
++    ///
++    /// **Note:** You can get better-looking results at any quality level by enabling TAA. See: `TemporalAntiAliasPlugin`
++    pub screen_space_specular_transmission_quality: ScreenSpaceTransmissionQuality,
++}
++
++impl Default for ScreenSpaceTransmission {
++    fn default() -> Self {
++        Self {
++            screen_space_specular_transmission_steps: 1,
++            screen_space_specular_transmission_quality: Default::default(),
++        }
++    }
++}
++
++/// The quality of the screen space transmission blur effect, applied to whatever's behind transmissive
++/// objects when their `roughness` is greater than `0.0`.
++///
++/// Higher qualities are more GPU-intensive.
++///
++/// **Note:** You can get better-looking results at any quality level by enabling TAA. See: `TemporalAntiAliasPlugin`
++#[derive(Default, Clone, Copy, Reflect, PartialEq, PartialOrd, Debug)]
++#[reflect(Default, Clone, Debug, PartialEq)]
++pub enum ScreenSpaceTransmissionQuality {
++    /// Best performance at the cost of quality. Suitable for lower end GPUs. (e.g. Mobile)
++    ///
++    /// `num_taps` = 4
++    Low,
++
++    /// A balanced option between quality and performance.
++    ///
++    /// `num_taps` = 8
++    #[default]
++    Medium,
++
++    /// Better quality. Suitable for high end GPUs. (e.g. Desktop)
++    ///
++    /// `num_taps` = 16
++    High,
++
++    /// The highest quality, suitable for non-realtime rendering. (e.g. Pre-rendered cinematics and photo mode)
++    ///
++    /// `num_taps` = 32
++    Ultra,
++}
+diff --git a/crates/bevy_core_pipeline/src/core_3d/main_transmissive_pass_3d_node.rs b/crates/bevy_pbr/src/transmission/node.rs
+similarity index 91%
+rename from crates/bevy_core_pipeline/src/core_3d/main_transmissive_pass_3d_node.rs
+rename to crates/bevy_pbr/src/transmission/node.rs
+index 27dd5f7730bcd..a8d5d962df78b 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/main_transmissive_pass_3d_node.rs
++++ b/crates/bevy_pbr/src/transmission/node.rs
+@@ -1,6 +1,7 @@
+-use super::ViewTransmissionTexture;
+-use crate::core_3d::Transmissive3d;
+-use bevy_camera::{Camera3d, MainPassResolutionOverride, Viewport};
++use crate::{ScreenSpaceTransmission, ViewTransmissionTexture};
++
++use bevy_camera::{MainPassResolutionOverride, Viewport};
++use bevy_core_pipeline::core_3d::Transmissive3d;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_image::ToExtents;
+ use bevy_render::{
+@@ -26,7 +27,7 @@ impl ViewNode for MainTransmissivePass3dNode {
+     type ViewQuery = (
+         &'static ExtractedCamera,
+         &'static ExtractedView,
+-        &'static Camera3d,
++        &'static ScreenSpaceTransmission,
+         &'static ViewTarget,
+         Option<&'static ViewTransmissionTexture>,
+         &'static ViewDepthTexture,
+@@ -37,7 +38,7 @@ impl ViewNode for MainTransmissivePass3dNode {
+         &self,
+         graph: &mut RenderGraphContext,
+         render_context: &mut RenderContext,
+-        (camera, view, camera_3d, target, transmission, depth, resolution_override): QueryItem<
++        (camera, view, transmission, target, texture, depth, resolution_override): QueryItem<
+             Self::ViewQuery,
+         >,
+         world: &World,
+@@ -74,10 +75,10 @@ impl ViewNode for MainTransmissivePass3dNode {
+ 
+         if !transmissive_phase.items.is_empty() {
+             let screen_space_specular_transmission_steps =
+-                camera_3d.screen_space_specular_transmission_steps;
++                transmission.screen_space_specular_transmission_steps;
+             if screen_space_specular_transmission_steps > 0 {
+-                let transmission =
+-                    transmission.expect("`ViewTransmissionTexture` should exist at this point");
++                let texture =
++                    texture.expect("`ViewTransmissionTexture` should exist at this point");
+ 
+                 // `transmissive_phase.items` are depth sorted, so we split them into N = `screen_space_specular_transmission_steps`
+                 // ranges, rendering them back-to-front in multiple steps, allowing multiple levels of transparency.
+@@ -93,7 +94,7 @@ impl ViewNode for MainTransmissivePass3dNode {
+                     // previous step (or of the `Opaque3d` phase, for the first step) as a transmissive color input
+                     render_context.command_encoder().copy_texture_to_texture(
+                         target.main_texture().as_image_copy(),
+-                        transmission.texture.as_image_copy(),
++                        texture.texture.as_image_copy(),
+                         physical_target_size.to_extents(),
+                     );
+ 
+diff --git a/crates/bevy_pbr/src/transmission/texture.rs b/crates/bevy_pbr/src/transmission/texture.rs
+new file mode 100644
+index 0000000000000..5e15b906bd33c
+--- /dev/null
++++ b/crates/bevy_pbr/src/transmission/texture.rs
+@@ -0,0 +1,113 @@
++use bevy_core_pipeline::core_3d::{AlphaMask3d, Opaque3d, Transmissive3d, Transparent3d};
++use bevy_ecs::{
++    component::Component,
++    entity::Entity,
++    system::{Commands, Query, Res, ResMut},
++};
++use bevy_image::{BevyDefault, ToExtents};
++use bevy_platform::collections::HashMap;
++use bevy_render::{
++    camera::ExtractedCamera,
++    render_phase::{ViewBinnedRenderPhases, ViewSortedRenderPhases},
++    render_resource::{
++        FilterMode, Sampler, SamplerDescriptor, Texture, TextureDescriptor, TextureDimension,
++        TextureFormat, TextureUsages, TextureView,
++    },
++    renderer::RenderDevice,
++    texture::TextureCache,
++    view::{ExtractedView, ViewTarget},
++};
++
++use crate::ScreenSpaceTransmission;
++
++#[derive(Component)]
++pub struct ViewTransmissionTexture {
++    pub texture: Texture,
++    pub view: TextureView,
++    pub sampler: Sampler,
++}
++
++pub fn prepare_core_3d_transmission_textures(
++    mut commands: Commands,
++    mut texture_cache: ResMut<TextureCache>,
++    render_device: Res<RenderDevice>,
++    opaque_3d_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
++    alpha_mask_3d_phases: Res<ViewBinnedRenderPhases<AlphaMask3d>>,
++    transmissive_3d_phases: Res<ViewSortedRenderPhases<Transmissive3d>>,
++    transparent_3d_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
++    views_3d: Query<(
++        Entity,
++        &ExtractedCamera,
++        &ScreenSpaceTransmission,
++        &ExtractedView,
++    )>,
++) {
++    let mut textures = <HashMap<_, _>>::default();
++    for (entity, camera, transmission, view) in &views_3d {
++        if !opaque_3d_phases.contains_key(&view.retained_view_entity)
++            || !alpha_mask_3d_phases.contains_key(&view.retained_view_entity)
++            || !transparent_3d_phases.contains_key(&view.retained_view_entity)
++        {
++            continue;
++        };
++
++        let Some(transmissive_3d_phase) = transmissive_3d_phases.get(&view.retained_view_entity)
++        else {
++            continue;
++        };
++
++        let Some(physical_target_size) = camera.physical_target_size else {
++            continue;
++        };
++
++        // Don't prepare a transmission texture if the number of steps is set to 0
++        if transmission.screen_space_specular_transmission_steps == 0 {
++            continue;
++        }
++
++        // Don't prepare a transmission texture if there are no transmissive items to render
++        if transmissive_3d_phase.items.is_empty() {
++            continue;
++        }
++
++        let cached_texture = textures
++            .entry(camera.target.clone())
++            .or_insert_with(|| {
++                let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
++
++                let format = if view.hdr {
++                    ViewTarget::TEXTURE_FORMAT_HDR
++                } else {
++                    TextureFormat::bevy_default()
++                };
++
++                let descriptor = TextureDescriptor {
++                    label: Some("view_transmission_texture"),
++                    // The size of the transmission texture
++                    size: physical_target_size.to_extents(),
++                    mip_level_count: 1,
++                    sample_count: 1, // No need for MSAA, as we'll only copy the main texture here
++                    dimension: TextureDimension::D2,
++                    format,
++                    usage,
++                    view_formats: &[],
++                };
++
++                texture_cache.get(&render_device, descriptor)
++            })
++            .clone();
++
++        let sampler = render_device.create_sampler(&SamplerDescriptor {
++            label: Some("view_transmission_sampler"),
++            mag_filter: FilterMode::Linear,
++            min_filter: FilterMode::Linear,
++            ..Default::default()
++        });
++
++        commands.entity(entity).insert(ViewTransmissionTexture {
++            texture: cached_texture.texture,
++            view: cached_texture.default_view,
++            sampler,
++        });
++    }
++}
+diff --git a/crates/bevy_pbr/src/render/pbr_transmission.wgsl b/crates/bevy_pbr/src/transmission/transmission.wgsl
+similarity index 100%
+rename from crates/bevy_pbr/src/render/pbr_transmission.wgsl
+rename to crates/bevy_pbr/src/transmission/transmission.wgsl
+diff --git a/crates/bevy_remote/src/lib.rs b/crates/bevy_remote/src/lib.rs
+index 91a9a81d11409..921ab1ff148dd 100644
+--- a/crates/bevy_remote/src/lib.rs
++++ b/crates/bevy_remote/src/lib.rs
+@@ -208,8 +208,6 @@
+ //!            "Clear": 0.0
+ //!          },
+ //!          "depth_texture_usages": 16,
+-//!          "screen_space_specular_transmission_quality": "Medium",
+-//!          "screen_space_specular_transmission_steps": 1
+ //!        },
+ //!        "bevy_core_pipeline::tonemapping::DebandDither": "Enabled",
+ //!        "bevy_core_pipeline::tonemapping::Tonemapping": "TonyMcMapface",
+diff --git a/examples/3d/transmission.rs b/examples/3d/transmission.rs
+index 4b3971db5f565..e7400c544eccc 100644
+--- a/examples/3d/transmission.rs
++++ b/examples/3d/transmission.rs
+@@ -21,11 +21,12 @@
+ use std::f32::consts::PI;
+ 
+ use bevy::{
+-    camera::{Exposure, Hdr, ScreenSpaceTransmissionQuality},
++    camera::{Exposure, Hdr},
+     color::palettes::css::*,
+     core_pipeline::{prepass::DepthPrepass, tonemapping::Tonemapping},
+     light::{NotShadowCaster, PointLightShadowMap, TransmittedShadowReceiver},
+     math::ops,
++    pbr::{ScreenSpaceTransmission, ScreenSpaceTransmissionQuality},
+     post_process::bloom::Bloom,
+     prelude::*,
+     render::{
+@@ -378,7 +379,7 @@ fn example_control_system(
+     camera: Single<
+         (
+             Entity,
+-            &mut Camera3d,
++            &mut ScreenSpaceTransmission,
+             &mut Transform,
+             Option<&DepthPrepass>,
+             Option<&TemporalJitter>,
+@@ -449,8 +450,14 @@ fn example_control_system(
+         }
+     }
+ 
+-    let (camera_entity, mut camera_3d, mut camera_transform, depth_prepass, temporal_jitter, hdr) =
+-        camera.into_inner();
++    let (
++        camera_entity,
++        mut transmission,
++        mut camera_transform,
++        depth_prepass,
++        temporal_jitter,
++        hdr,
++    ) = camera.into_inner();
+ 
+     if input.just_pressed(KeyCode::KeyH) {
+         if hdr {
+@@ -482,29 +489,35 @@ fn example_control_system(
+         }
+     }
+ 
+-    if input.just_pressed(KeyCode::KeyO) && camera_3d.screen_space_specular_transmission_steps > 0 {
+-        camera_3d.screen_space_specular_transmission_steps -= 1;
++    if input.just_pressed(KeyCode::KeyO)
++        && transmission.screen_space_specular_transmission_steps > 0
++    {
++        transmission.screen_space_specular_transmission_steps -= 1;
+     }
+ 
+-    if input.just_pressed(KeyCode::KeyP) && camera_3d.screen_space_specular_transmission_steps < 4 {
+-        camera_3d.screen_space_specular_transmission_steps += 1;
++    if input.just_pressed(KeyCode::KeyP)
++        && transmission.screen_space_specular_transmission_steps < 4
++    {
++        transmission.screen_space_specular_transmission_steps += 1;
+     }
+ 
+     if input.just_pressed(KeyCode::KeyJ) {
+-        camera_3d.screen_space_specular_transmission_quality = ScreenSpaceTransmissionQuality::Low;
++        transmission.screen_space_specular_transmission_quality =
++            ScreenSpaceTransmissionQuality::Low;
+     }
+ 
+     if input.just_pressed(KeyCode::KeyK) {
+-        camera_3d.screen_space_specular_transmission_quality =
++        transmission.screen_space_specular_transmission_quality =
+             ScreenSpaceTransmissionQuality::Medium;
+     }
+ 
+     if input.just_pressed(KeyCode::KeyL) {
+-        camera_3d.screen_space_specular_transmission_quality = ScreenSpaceTransmissionQuality::High;
++        transmission.screen_space_specular_transmission_quality =
++            ScreenSpaceTransmissionQuality::High;
+     }
+ 
+     if input.just_pressed(KeyCode::Semicolon) {
+-        camera_3d.screen_space_specular_transmission_quality =
++        transmission.screen_space_specular_transmission_quality =
+             ScreenSpaceTransmissionQuality::Ultra;
+     }
+ 
+@@ -552,8 +565,8 @@ fn example_control_system(
+             "             D  Depth Prepass: {}\n",
+             "             T  TAA: {}\n",
+         ),
+-        camera_3d.screen_space_specular_transmission_quality,
+-        camera_3d.screen_space_specular_transmission_steps,
++        transmission.screen_space_specular_transmission_quality,
++        transmission.screen_space_specular_transmission_steps,
+         state.diffuse_transmission,
+         state.specular_transmission,
+         state.thickness,
+diff --git a/examples/large_scenes/bistro/src/main.rs b/examples/large_scenes/bistro/src/main.rs
+index 9a69bcdfe9648..3e79a8d8693dc 100644
+--- a/examples/large_scenes/bistro/src/main.rs
++++ b/examples/large_scenes/bistro/src/main.rs
+@@ -17,7 +17,10 @@ use bevy::{
+     core_pipeline::prepass::{DeferredPrepass, DepthPrepass},
+     diagnostic::DiagnosticsStore,
+     light::TransmittedShadowReceiver,
+-    pbr::{DefaultOpaqueRendererMethod, ScreenSpaceAmbientOcclusion},
++    pbr::{
++        DefaultOpaqueRendererMethod, ScreenSpaceAmbientOcclusion, ScreenSpaceTransmission,
++        ScreenSpaceTransmissionQuality,
++    },
+     post_process::bloom::Bloom,
+     render::{
+         batching::NoAutomaticBatching, occlusion_culling::OcclusionCulling, render_resource::Face,
+@@ -26,11 +29,9 @@ use bevy::{
+     scene::SceneInstanceReady,
+ };
+ use bevy::{
+-    camera::{Hdr, ScreenSpaceTransmissionQuality},
+-    light::CascadeShadowConfigBuilder,
+-};
+-use bevy::{
++    camera::Hdr,
+     diagnostic::FrameTimeDiagnosticsPlugin,
++    light::CascadeShadowConfigBuilder,
+     prelude::*,
+     window::{PresentMode, WindowResolution},
+     winit::WinitSettings,
+@@ -260,10 +261,10 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
+     // Camera
+     let mut cam = commands.spawn((
+         Msaa::Off,
+-        Camera3d {
++        Camera3d::default(),
++        ScreenSpaceTransmission {
+             screen_space_specular_transmission_steps: 0,
+             screen_space_specular_transmission_quality: ScreenSpaceTransmissionQuality::Low,
+-            ..default()
+         },
+         Hdr,
+         Transform::from_xyz(-10.5, 1.7, -1.0).looking_at(Vec3::new(0.0, 3.5, 0.0), Vec3::Y),
+diff --git a/release-content/migration-guides/transmission.md b/release-content/migration-guides/transmission.md
+new file mode 100644
+index 0000000000000..60287ea1e1d39
+--- /dev/null
++++ b/release-content/migration-guides/transmission.md
+@@ -0,0 +1,14 @@
++---
++title: "Transmission has been moved to `bevy_pbr`"
++pull_requests: [22687]
++---
++
++`Camera3d::screen_space_specular_transmission_steps` and `Camera3d::screen_space_specular_transmission_quality` have been pulled out into a separate component, `ScreenSpaceTransmission`, and put in `bevy_pbr`.
++
++`ScreenSpaceTransmissionQuality` has been moved from `bevy_camera` to `bevy_pbr`.
++
++`ScreenSpaceTransmissionQuality` is no longer a `Resource`.
++
++`ViewTransmissionTexture` has been moved from `bevy_core_pipelines` to `bevy_pbr`.
++
++`Node3d::MainTransmissivePass` is now initialized by `PbrPlugin`.
