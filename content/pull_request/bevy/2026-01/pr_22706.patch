@@ -1,0 +1,441 @@
+diff --git a/crates/bevy_core_pipeline/src/core_3d/mod.rs b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+index 5321a330d113c..64db62dec5ea4 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/mod.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+@@ -153,7 +153,6 @@ impl Plugin for Core3dPlugin {
+         render_app
+             .init_resource::<DrawFunctions<Opaque3d>>()
+             .init_resource::<DrawFunctions<AlphaMask3d>>()
+-            .init_resource::<DrawFunctions<Transmissive3d>>()
+             .init_resource::<DrawFunctions<Transparent3d>>()
+             .init_resource::<DrawFunctions<Opaque3dPrepass>>()
+             .init_resource::<DrawFunctions<AlphaMask3dPrepass>>()
+@@ -165,14 +164,12 @@ impl Plugin for Core3dPlugin {
+             .init_resource::<ViewBinnedRenderPhases<AlphaMask3dPrepass>>()
+             .init_resource::<ViewBinnedRenderPhases<Opaque3dDeferred>>()
+             .init_resource::<ViewBinnedRenderPhases<AlphaMask3dDeferred>>()
+-            .init_resource::<ViewSortedRenderPhases<Transmissive3d>>()
+             .init_resource::<ViewSortedRenderPhases<Transparent3d>>()
+             .add_systems(ExtractSchedule, extract_core_3d_camera_phases)
+             .add_systems(ExtractSchedule, extract_camera_prepass_phase)
+             .add_systems(
+                 Render,
+                 (
+-                    sort_phase_system::<Transmissive3d>.in_set(RenderSystems::PhaseSort),
+                     sort_phase_system::<Transparent3d>.in_set(RenderSystems::PhaseSort),
+                     configure_occlusion_culling_view_targets
+                         .after(prepare_view_targets)
+@@ -448,93 +445,6 @@ impl CachedRenderPipelinePhaseItem for AlphaMask3d {
+     }
+ }
+ 
+-pub struct Transmissive3d {
+-    pub distance: f32,
+-    pub pipeline: CachedRenderPipelineId,
+-    pub entity: (Entity, MainEntity),
+-    pub draw_function: DrawFunctionId,
+-    pub batch_range: Range<u32>,
+-    pub extra_index: PhaseItemExtraIndex,
+-    /// Whether the mesh in question is indexed (uses an index buffer in
+-    /// addition to its vertex buffer).
+-    pub indexed: bool,
+-}
+-
+-impl PhaseItem for Transmissive3d {
+-    /// For now, automatic batching is disabled for transmissive items because their rendering is
+-    /// split into multiple steps depending on `ScreenSpaceTransmission::screen_space_specular_transmission_steps`,
+-    /// which the batching system doesn't currently know about.
+-    ///
+-    /// Having batching enabled would cause the same item to be drawn multiple times across different
+-    /// steps, whenever the batching range crossed a step boundary.
+-    ///
+-    /// Eventually, we could add support for this by having the batching system break up the batch ranges
+-    /// using the same logic as the transmissive pass, but for now it's simpler to just disable batching.
+-    const AUTOMATIC_BATCHING: bool = false;
+-
+-    #[inline]
+-    fn entity(&self) -> Entity {
+-        self.entity.0
+-    }
+-
+-    #[inline]
+-    fn main_entity(&self) -> MainEntity {
+-        self.entity.1
+-    }
+-
+-    #[inline]
+-    fn draw_function(&self) -> DrawFunctionId {
+-        self.draw_function
+-    }
+-
+-    #[inline]
+-    fn batch_range(&self) -> &Range<u32> {
+-        &self.batch_range
+-    }
+-
+-    #[inline]
+-    fn batch_range_mut(&mut self) -> &mut Range<u32> {
+-        &mut self.batch_range
+-    }
+-
+-    #[inline]
+-    fn extra_index(&self) -> PhaseItemExtraIndex {
+-        self.extra_index.clone()
+-    }
+-
+-    #[inline]
+-    fn batch_range_and_extra_index_mut(&mut self) -> (&mut Range<u32>, &mut PhaseItemExtraIndex) {
+-        (&mut self.batch_range, &mut self.extra_index)
+-    }
+-}
+-
+-impl SortedPhaseItem for Transmissive3d {
+-    // NOTE: Values increase towards the camera. Back-to-front ordering for transmissive means we need an ascending sort.
+-    type SortKey = FloatOrd;
+-
+-    #[inline]
+-    fn sort_key(&self) -> Self::SortKey {
+-        FloatOrd(self.distance)
+-    }
+-
+-    #[inline]
+-    fn sort(items: &mut [Self]) {
+-        radsort::sort_by_key(items, |item| item.distance);
+-    }
+-
+-    #[inline]
+-    fn indexed(&self) -> bool {
+-        self.indexed
+-    }
+-}
+-
+-impl CachedRenderPipelinePhaseItem for Transmissive3d {
+-    #[inline]
+-    fn cached_pipeline(&self) -> CachedRenderPipelineId {
+-        self.pipeline
+-    }
+-}
+-
+ pub struct Transparent3d {
+     pub distance: f32,
+     pub pipeline: CachedRenderPipelineId,
+@@ -613,7 +523,6 @@ impl CachedRenderPipelinePhaseItem for Transparent3d {
+ pub fn extract_core_3d_camera_phases(
+     mut opaque_3d_phases: ResMut<ViewBinnedRenderPhases<Opaque3d>>,
+     mut alpha_mask_3d_phases: ResMut<ViewBinnedRenderPhases<AlphaMask3d>>,
+-    mut transmissive_3d_phases: ResMut<ViewSortedRenderPhases<Transmissive3d>>,
+     mut transparent_3d_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+     cameras_3d: Extract<Query<(Entity, &Camera, Has<NoIndirectDrawing>), With<Camera3d>>>,
+     mut live_entities: Local<HashSet<RetainedViewEntity>>,
+@@ -639,7 +548,6 @@ pub fn extract_core_3d_camera_phases(
+ 
+         opaque_3d_phases.prepare_for_new_frame(retained_view_entity, gpu_preprocessing_mode);
+         alpha_mask_3d_phases.prepare_for_new_frame(retained_view_entity, gpu_preprocessing_mode);
+-        transmissive_3d_phases.insert_or_clear(retained_view_entity);
+         transparent_3d_phases.insert_or_clear(retained_view_entity);
+ 
+         live_entities.insert(retained_view_entity);
+@@ -647,7 +555,6 @@ pub fn extract_core_3d_camera_phases(
+ 
+     opaque_3d_phases.retain(|view_entity, _| live_entities.contains(view_entity));
+     alpha_mask_3d_phases.retain(|view_entity, _| live_entities.contains(view_entity));
+-    transmissive_3d_phases.retain(|view_entity, _| live_entities.contains(view_entity));
+     transparent_3d_phases.retain(|view_entity, _| live_entities.contains(view_entity));
+ }
+ 
+@@ -785,7 +692,6 @@ pub fn prepare_core_3d_depth_textures(
+     render_device: Res<RenderDevice>,
+     opaque_3d_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
+     alpha_mask_3d_phases: Res<ViewBinnedRenderPhases<AlphaMask3d>>,
+-    transmissive_3d_phases: Res<ViewSortedRenderPhases<Transmissive3d>>,
+     transparent_3d_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
+     views_3d: Query<(
+         Entity,
+@@ -800,7 +706,6 @@ pub fn prepare_core_3d_depth_textures(
+     for (_, camera, extracted_view, depth_prepass, camera_3d, _msaa) in &views_3d {
+         if !opaque_3d_phases.contains_key(&extracted_view.retained_view_entity)
+             || !alpha_mask_3d_phases.contains_key(&extracted_view.retained_view_entity)
+-            || !transmissive_3d_phases.contains_key(&extracted_view.retained_view_entity)
+             || !transparent_3d_phases.contains_key(&extracted_view.retained_view_entity)
+         {
+             continue;
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index 1666c03c1043b..397d7e4aa1dd3 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -79,6 +79,7 @@ itertools = { version = "0.14", optional = true }
+ bitvec = { version = "1", optional = true }
+ # direct dependency required for derive macro
+ bytemuck = { version = "1", features = ["derive", "must_cast"] }
++radsort = "0.1"
+ smallvec = { version = "1", default-features = false }
+ nonmax = "0.5"
+ static_assertions = "1"
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index a400e349f373f..34c5cc509bb95 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -9,9 +9,7 @@ use bevy_camera::visibility::ViewVisibility;
+ use bevy_core_pipeline::deferred::{AlphaMask3dDeferred, Opaque3dDeferred};
+ use bevy_core_pipeline::prepass::{AlphaMask3dPrepass, Opaque3dPrepass};
+ use bevy_core_pipeline::{
+-    core_3d::{
+-        AlphaMask3d, Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, Transmissive3d, Transparent3d,
+-    },
++    core_3d::{AlphaMask3d, Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, Transparent3d},
+     prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
+     tonemapping::Tonemapping,
+ };
+@@ -299,7 +297,6 @@ impl Plugin for MaterialsPlugin {
+                 .init_resource::<RenderMaterialInstances>()
+                 .init_resource::<MaterialBindGroupAllocators>()
+                 .add_render_command::<Shadow, DrawPrepass>()
+-                .add_render_command::<Transmissive3d, DrawMaterial>()
+                 .add_render_command::<Transparent3d, DrawMaterial>()
+                 .add_render_command::<Opaque3d, DrawMaterial>()
+                 .add_render_command::<AlphaMask3d, DrawMaterial>()
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index e320def183063..baa5d4fa077cc 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -11,7 +11,7 @@ use bevy_camera::{
+     Camera, Projection,
+ };
+ use bevy_core_pipeline::{
+-    core_3d::{AlphaMask3d, Opaque3d, Transmissive3d, Transparent3d, CORE_3D_DEPTH_FORMAT},
++    core_3d::{AlphaMask3d, Opaque3d, Transparent3d, CORE_3D_DEPTH_FORMAT},
+     deferred::{AlphaMask3dDeferred, Opaque3dDeferred},
+     oit::{prepare_oit_buffers, OrderIndependentTransparencySettingsOffset},
+     prepass::MotionVectorPrepass,
+diff --git a/crates/bevy_pbr/src/transmission/mod.rs b/crates/bevy_pbr/src/transmission/mod.rs
+index b7c42dc475a81..c096a69a3cb17 100644
+--- a/crates/bevy_pbr/src/transmission/mod.rs
++++ b/crates/bevy_pbr/src/transmission/mod.rs
+@@ -1,4 +1,5 @@
+ mod node;
++mod phase;
+ mod texture;
+ 
+ use bevy_app::{App, Plugin};
+@@ -9,14 +10,18 @@ use bevy_reflect::prelude::*;
+ use bevy_render::{
+     extract_component::{ExtractComponent, ExtractComponentPlugin},
+     render_graph::{RenderGraphExt, ViewNodeRunner},
+-    Render, RenderApp, RenderSystems,
++    render_phase::{sort_phase_system, AddRenderCommand, DrawFunctions, ViewSortedRenderPhases},
++    ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+ use bevy_shader::load_shader_library;
+ pub use node::MainTransmissivePass3dNode;
++pub use phase::Transmissive3d;
+ pub use texture::ViewTransmissionTexture;
+ 
+ use texture::prepare_core_3d_transmission_textures;
+ 
++use crate::DrawMaterial;
++
+ /// Enables screen-space transmission for cameras.
+ pub struct ScreenSpaceTransmissionPlugin;
+ 
+@@ -32,6 +37,14 @@ impl Plugin for ScreenSpaceTransmissionPlugin {
+         };
+ 
+         render_app
++            .init_resource::<DrawFunctions<Transmissive3d>>()
++            .init_resource::<ViewSortedRenderPhases<Transmissive3d>>()
++            .add_render_command::<Transmissive3d, DrawMaterial>()
++            .add_systems(
++                Render,
++                sort_phase_system::<Transmissive3d>.in_set(RenderSystems::PhaseSort),
++            )
++            .add_systems(ExtractSchedule, phase::extract_transmissive_camera_phases)
+             .add_systems(
+                 Render,
+                 prepare_core_3d_transmission_textures.in_set(RenderSystems::PrepareResources),
+diff --git a/crates/bevy_pbr/src/transmission/node.rs b/crates/bevy_pbr/src/transmission/node.rs
+index a8d5d962df78b..6dd0bc1a6dc38 100644
+--- a/crates/bevy_pbr/src/transmission/node.rs
++++ b/crates/bevy_pbr/src/transmission/node.rs
+@@ -1,7 +1,6 @@
+-use crate::{ScreenSpaceTransmission, ViewTransmissionTexture};
++use crate::{ScreenSpaceTransmission, Transmissive3d, ViewTransmissionTexture};
+ 
+ use bevy_camera::{MainPassResolutionOverride, Viewport};
+-use bevy_core_pipeline::core_3d::Transmissive3d;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_image::ToExtents;
+ use bevy_render::{
+diff --git a/crates/bevy_pbr/src/transmission/phase.rs b/crates/bevy_pbr/src/transmission/phase.rs
+new file mode 100644
+index 0000000000000..913efa4426d98
+--- /dev/null
++++ b/crates/bevy_pbr/src/transmission/phase.rs
+@@ -0,0 +1,129 @@
++use core::ops::Range;
++
++use bevy_camera::{Camera, Camera3d};
++use bevy_ecs::{
++    entity::Entity,
++    query::With,
++    system::{Local, Query, ResMut},
++};
++use bevy_material::{descriptor::CachedRenderPipelineId, labels::DrawFunctionId};
++use bevy_math::FloatOrd;
++use bevy_platform::collections::HashSet;
++use bevy_render::{
++    render_phase::{
++        CachedRenderPipelinePhaseItem, PhaseItem, PhaseItemExtraIndex, SortedPhaseItem,
++        ViewSortedRenderPhases,
++    },
++    sync_world::MainEntity,
++    view::RetainedViewEntity,
++    Extract,
++};
++
++pub struct Transmissive3d {
++    pub distance: f32,
++    pub pipeline: CachedRenderPipelineId,
++    pub entity: (Entity, MainEntity),
++    pub draw_function: DrawFunctionId,
++    pub batch_range: Range<u32>,
++    pub extra_index: PhaseItemExtraIndex,
++    /// Whether the mesh in question is indexed (uses an index buffer in
++    /// addition to its vertex buffer).
++    pub indexed: bool,
++}
++
++impl PhaseItem for Transmissive3d {
++    /// For now, automatic batching is disabled for transmissive items because their rendering is
++    /// split into multiple steps depending on [`crate::ScreenSpaceTransmission::screen_space_specular_transmission_steps`],
++    /// which the batching system doesn't currently know about.
++    ///
++    /// Having batching enabled would cause the same item to be drawn multiple times across different
++    /// steps, whenever the batching range crossed a step boundary.
++    ///
++    /// Eventually, we could add support for this by having the batching system break up the batch ranges
++    /// using the same logic as the transmissive pass, but for now it's simpler to just disable batching.
++    const AUTOMATIC_BATCHING: bool = false;
++
++    #[inline]
++    fn entity(&self) -> Entity {
++        self.entity.0
++    }
++
++    #[inline]
++    fn main_entity(&self) -> MainEntity {
++        self.entity.1
++    }
++
++    #[inline]
++    fn draw_function(&self) -> DrawFunctionId {
++        self.draw_function
++    }
++
++    #[inline]
++    fn batch_range(&self) -> &Range<u32> {
++        &self.batch_range
++    }
++
++    #[inline]
++    fn batch_range_mut(&mut self) -> &mut Range<u32> {
++        &mut self.batch_range
++    }
++
++    #[inline]
++    fn extra_index(&self) -> PhaseItemExtraIndex {
++        self.extra_index.clone()
++    }
++
++    #[inline]
++    fn batch_range_and_extra_index_mut(&mut self) -> (&mut Range<u32>, &mut PhaseItemExtraIndex) {
++        (&mut self.batch_range, &mut self.extra_index)
++    }
++}
++
++impl SortedPhaseItem for Transmissive3d {
++    // NOTE: Values increase towards the camera. Back-to-front ordering for transmissive means we need an ascending sort.
++    type SortKey = FloatOrd;
++
++    #[inline]
++    fn sort_key(&self) -> Self::SortKey {
++        FloatOrd(self.distance)
++    }
++
++    #[inline]
++    fn sort(items: &mut [Self]) {
++        radsort::sort_by_key(items, |item| item.distance);
++    }
++
++    #[inline]
++    fn indexed(&self) -> bool {
++        self.indexed
++    }
++}
++
++impl CachedRenderPipelinePhaseItem for Transmissive3d {
++    #[inline]
++    fn cached_pipeline(&self) -> CachedRenderPipelineId {
++        self.pipeline
++    }
++}
++
++pub fn extract_transmissive_camera_phases(
++    mut transmissive_3d_phases: ResMut<ViewSortedRenderPhases<Transmissive3d>>,
++    cameras: Extract<Query<(Entity, &Camera), With<Camera3d>>>,
++    mut live_entities: Local<HashSet<RetainedViewEntity>>,
++) {
++    live_entities.clear();
++
++    for (main_entity, camera) in &cameras {
++        if !camera.is_active {
++            continue;
++        }
++
++        // This is the main camera, so use the first subview index (0).
++        let retained_view_entity = RetainedViewEntity::new(main_entity.into(), None, 0);
++
++        transmissive_3d_phases.insert_or_clear(retained_view_entity);
++        live_entities.insert(retained_view_entity);
++    }
++
++    transmissive_3d_phases.retain(|view_entity, _| live_entities.contains(view_entity));
++}
+diff --git a/crates/bevy_pbr/src/transmission/texture.rs b/crates/bevy_pbr/src/transmission/texture.rs
+index 5e15b906bd33c..7df1cd53f1a74 100644
+--- a/crates/bevy_pbr/src/transmission/texture.rs
++++ b/crates/bevy_pbr/src/transmission/texture.rs
+@@ -1,4 +1,4 @@
+-use bevy_core_pipeline::core_3d::{AlphaMask3d, Opaque3d, Transmissive3d, Transparent3d};
++use bevy_core_pipeline::core_3d::{AlphaMask3d, Opaque3d, Transparent3d};
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -18,7 +18,7 @@ use bevy_render::{
+     view::{ExtractedView, ViewTarget},
+ };
+ 
+-use crate::ScreenSpaceTransmission;
++use crate::{ScreenSpaceTransmission, Transmissive3d};
+ 
+ #[derive(Component)]
+ pub struct ViewTransmissionTexture {
+diff --git a/release-content/migration-guides/transmission.md b/release-content/migration-guides/transmission.md
+index 60287ea1e1d39..57d19d674fe28 100644
+--- a/release-content/migration-guides/transmission.md
++++ b/release-content/migration-guides/transmission.md
+@@ -1,6 +1,6 @@
+ ---
+ title: "Transmission has been moved to `bevy_pbr`"
+-pull_requests: [22687]
++pull_requests: [22687, 22706]
+ ---
+ 
+ `Camera3d::screen_space_specular_transmission_steps` and `Camera3d::screen_space_specular_transmission_quality` have been pulled out into a separate component, `ScreenSpaceTransmission`, and put in `bevy_pbr`.
+@@ -9,6 +9,6 @@ pull_requests: [22687]
+ 
+ `ScreenSpaceTransmissionQuality` is no longer a `Resource`.
+ 
+-`ViewTransmissionTexture` has been moved from `bevy_core_pipelines` to `bevy_pbr`.
++`ViewTransmissionTexture` and `Transmissive3d` has been moved from `bevy_core_pipelines` to `bevy_pbr`.
+ 
+ `Node3d::MainTransmissivePass` is now initialized by `PbrPlugin`.
