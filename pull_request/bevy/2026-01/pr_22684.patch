@@ -1,0 +1,634 @@
+diff --git a/crates/bevy_camera/src/primitives.rs b/crates/bevy_camera/src/primitives.rs
+index e03c07ce99bc3..c5d547accc3b1 100644
+--- a/crates/bevy_camera/src/primitives.rs
++++ b/crates/bevy_camera/src/primitives.rs
+@@ -1,9 +1,11 @@
+ use core::borrow::Borrow;
+ 
++use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{component::Component, entity::EntityHashMap, reflect::ReflectComponent};
+ use bevy_math::{
+     bounding::{Aabb3d, BoundingVolume},
+-    Affine3A, Mat3A, Mat4, Vec3, Vec3A, Vec4, Vec4Swizzles,
++    primitives::{HalfSpace, ViewFrustum},
++    Affine3A, Mat3A, Vec3, Vec3A,
+ };
+ use bevy_mesh::{Mesh, VertexAttributeValues};
+ use bevy_reflect::prelude::*;
+@@ -195,74 +197,6 @@ impl Sphere {
+     }
+ }
+ 
+-/// A region of 3D space, specifically an open set whose border is a bisecting 2D plane.
+-///
+-/// This bisecting plane partitions 3D space into two infinite regions,
+-/// the half-space is one of those regions and excludes the bisecting plane.
+-///
+-/// Each instance of this type is characterized by:
+-/// - the bisecting plane's unit normal, normalized and pointing "inside" the half-space,
+-/// - the signed distance along the normal from the bisecting plane to the origin of 3D space.
+-///
+-/// The distance can also be seen as:
+-/// - the distance along the inverse of the normal from the origin of 3D space to the bisecting plane,
+-/// - the opposite of the distance along the normal from the origin of 3D space to the bisecting plane.
+-///
+-/// Any point `p` is considered to be within the `HalfSpace` when the length of the projection
+-/// of p on the normal is greater or equal than the opposite of the distance,
+-/// meaning: if the equation `normal.dot(p) + distance > 0.` is satisfied.
+-///
+-/// For example, the half-space containing all the points with a z-coordinate lesser
+-/// or equal than `8.0` would be defined by: `HalfSpace::new(Vec3::NEG_Z.extend(-8.0))`.
+-/// It includes all the points from the bisecting plane towards `NEG_Z`, and the distance
+-/// from the plane to the origin is `-8.0` along `NEG_Z`.
+-///
+-/// It is used to define a [`Frustum`], but is also a useful mathematical primitive for rendering tasks such as  light computation.
+-#[derive(Clone, Copy, Reflect, Debug, Default)]
+-pub struct HalfSpace {
+-    normal_d: Vec4,
+-}
+-
+-impl HalfSpace {
+-    /// Constructs a `HalfSpace` from a 4D vector whose first 3 components
+-    /// represent the bisecting plane's unit normal, and the last component is
+-    /// the signed distance along the normal from the plane to the origin.
+-    /// The constructor ensures the normal vector is normalized and the distance is appropriately scaled.
+-    #[inline]
+-    pub fn new(normal_d: Vec4) -> Self {
+-        Self {
+-            normal_d: normal_d * normal_d.xyz().length_recip(),
+-        }
+-    }
+-
+-    /// Returns the unit normal vector of the bisecting plane that characterizes the `HalfSpace`.
+-    #[inline]
+-    pub fn normal(&self) -> Vec3A {
+-        Vec3A::from_vec4(self.normal_d)
+-    }
+-
+-    /// Returns the signed distance from the bisecting plane to the origin along
+-    /// the plane's unit normal vector.
+-    #[inline]
+-    pub fn d(&self) -> f32 {
+-        self.normal_d.w
+-    }
+-
+-    /// Returns the bisecting plane's unit normal vector and the signed distance
+-    /// from the plane to the origin.
+-    #[inline]
+-    pub fn normal_d(&self) -> Vec4 {
+-        self.normal_d
+-    }
+-}
+-
+-/// A region of 3D space defined by the intersection of 6 [`HalfSpace`]s.
+-///
+-/// Frustums are typically an apex-truncated square pyramid (a pyramid without the top) or a cuboid.
+-///
+-/// Half spaces are ordered left, right, top, bottom, near, far. The normal vectors
+-/// of the half-spaces point towards the interior of the frustum.
+-///
+ /// A frustum component is used on an entity with a [`Camera`] component to
+ /// determine which entities will be considered for rendering by this camera.
+ /// All entities with an [`Aabb`] component that are not contained by (or crossing
+@@ -282,72 +216,19 @@ impl HalfSpace {
+ /// [`GlobalTransform`]: bevy_transform::components::GlobalTransform
+ /// [`Camera2d`]: crate::Camera2d
+ /// [`Camera3d`]: crate::Camera3d
+-#[derive(Component, Clone, Copy, Debug, Default, Reflect)]
++#[derive(Component, Clone, Copy, Debug, Default, Deref, DerefMut, Reflect)]
+ #[reflect(Component, Default, Debug, Clone)]
+-pub struct Frustum {
+-    pub half_spaces: [HalfSpace; 6],
+-}
++pub struct Frustum(pub ViewFrustum);
+ 
+ impl Frustum {
+-    pub const NEAR_PLANE_IDX: usize = 4;
+-    const FAR_PLANE_IDX: usize = 5;
+-    const INACTIVE_HALF_SPACE: Vec4 = Vec4::new(0.0, 0.0, 0.0, f32::INFINITY);
+-
+-    /// Returns a frustum derived from `clip_from_world`.
+-    #[inline]
+-    pub fn from_clip_from_world(clip_from_world: &Mat4) -> Self {
+-        let mut frustum = Frustum::from_clip_from_world_no_far(clip_from_world);
+-        frustum.half_spaces[Self::FAR_PLANE_IDX] = HalfSpace::new(clip_from_world.row(2));
+-        frustum
+-    }
+-
+-    /// Returns a frustum derived from `clip_from_world`,
+-    /// but with a custom far plane.
+-    #[inline]
+-    pub fn from_clip_from_world_custom_far(
+-        clip_from_world: &Mat4,
+-        view_translation: &Vec3,
+-        view_backward: &Vec3,
+-        far: f32,
+-    ) -> Self {
+-        let mut frustum = Frustum::from_clip_from_world_no_far(clip_from_world);
+-        let far_center = *view_translation - far * *view_backward;
+-        frustum.half_spaces[Self::FAR_PLANE_IDX] =
+-            HalfSpace::new(view_backward.extend(-view_backward.dot(far_center)));
+-        frustum
+-    }
+-
+-    // NOTE: This approach of extracting the frustum half-space from the view
+-    // projection matrix is from Foundations of Game Engine Development 2
+-    // Rendering by Lengyel.
+-    /// Returns a frustum derived from `view_projection`,
+-    /// without a far plane.
+-    fn from_clip_from_world_no_far(clip_from_world: &Mat4) -> Self {
+-        let row0 = clip_from_world.row(0);
+-        let row1 = clip_from_world.row(1);
+-        let row2 = clip_from_world.row(2);
+-        let row3 = clip_from_world.row(3);
+-
+-        Self {
+-            half_spaces: [
+-                HalfSpace::new(row3 + row0),
+-                HalfSpace::new(row3 - row0),
+-                HalfSpace::new(row3 + row1),
+-                HalfSpace::new(row3 - row1),
+-                HalfSpace::new(row3 + row2),
+-                HalfSpace::new(Self::INACTIVE_HALF_SPACE),
+-            ],
+-        }
+-    }
+-
+     /// Checks if a sphere intersects the frustum.
+     #[inline]
+     pub fn intersects_sphere(&self, sphere: &Sphere, intersect_far: bool) -> bool {
+         let sphere_center = sphere.center.extend(1.0);
+         let max = if intersect_far {
+-            Self::FAR_PLANE_IDX
++            ViewFrustum::FAR_PLANE_IDX
+         } else {
+-            Self::NEAR_PLANE_IDX
++            ViewFrustum::NEAR_PLANE_IDX
+         };
+         for half_space in &self.half_spaces[..=max] {
+             if half_space.normal_d().dot(sphere_center) + sphere.radius <= 0.0 {
+@@ -369,8 +250,8 @@ impl Frustum {
+         let aabb_center_world = world_from_local.transform_point3a(aabb.center).extend(1.0);
+ 
+         for (idx, half_space) in self.half_spaces.into_iter().enumerate() {
+-            if (idx == Self::NEAR_PLANE_IDX && !intersect_near)
+-                || (idx == Self::FAR_PLANE_IDX && !intersect_far)
++            if (idx == ViewFrustum::NEAR_PLANE_IDX && !intersect_near)
++                || (idx == ViewFrustum::FAR_PLANE_IDX && !intersect_far)
+             {
+                 continue;
+             }
+@@ -541,7 +422,7 @@ pub struct CascadesFrusta {
+ mod tests {
+     use core::f32::consts::PI;
+ 
+-    use bevy_math::{ops, Quat};
++    use bevy_math::{ops, Quat, Vec4};
+     use bevy_transform::components::GlobalTransform;
+ 
+     use crate::{CameraProjection, PerspectiveProjection};
+@@ -550,7 +431,7 @@ mod tests {
+ 
+     // A big, offset frustum
+     fn big_frustum() -> Frustum {
+-        Frustum {
++        Frustum(ViewFrustum {
+             half_spaces: [
+                 HalfSpace::new(Vec4::new(-0.9701, -0.2425, -0.0000, 7.7611)),
+                 HalfSpace::new(Vec4::new(-0.0000, 1.0000, -0.0000, 4.0000)),
+@@ -559,7 +440,7 @@ mod tests {
+                 HalfSpace::new(Vec4::new(-0.0000, -0.2425, 0.9701, 2.9104)),
+                 HalfSpace::new(Vec4::new(0.9701, -0.2425, -0.0000, -1.9403)),
+             ],
+-        }
++        })
+     }
+ 
+     #[test]
+@@ -586,7 +467,7 @@ mod tests {
+ 
+     // A frustum
+     fn frustum() -> Frustum {
+-        Frustum {
++        Frustum(ViewFrustum {
+             half_spaces: [
+                 HalfSpace::new(Vec4::new(-0.9701, -0.2425, -0.0000, 0.7276)),
+                 HalfSpace::new(Vec4::new(-0.0000, 1.0000, -0.0000, 1.0000)),
+@@ -595,7 +476,7 @@ mod tests {
+                 HalfSpace::new(Vec4::new(-0.0000, -0.2425, 0.9701, 0.7276)),
+                 HalfSpace::new(Vec4::new(0.9701, -0.2425, -0.0000, 0.7276)),
+             ],
+-        }
++        })
+     }
+ 
+     #[test]
+@@ -666,7 +547,7 @@ mod tests {
+ 
+     // A long frustum.
+     fn long_frustum() -> Frustum {
+-        Frustum {
++        Frustum(ViewFrustum {
+             half_spaces: [
+                 HalfSpace::new(Vec4::new(-0.9998, -0.0222, -0.0000, -1.9543)),
+                 HalfSpace::new(Vec4::new(-0.0000, 1.0000, -0.0000, 45.1249)),
+@@ -675,7 +556,7 @@ mod tests {
+                 HalfSpace::new(Vec4::new(-0.0000, -0.0168, 0.9999, 2.2718)),
+                 HalfSpace::new(Vec4::new(0.9998, -0.0222, -0.0000, 7.9528)),
+             ],
+-        }
++        })
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_camera/src/projection.rs b/crates/bevy_camera/src/projection.rs
+index 7fcbb6930b37e..0953db98880dd 100644
+--- a/crates/bevy_camera/src/projection.rs
++++ b/crates/bevy_camera/src/projection.rs
+@@ -4,7 +4,7 @@ use core::ops::{Deref, DerefMut};
+ use crate::{primitives::Frustum, visibility::VisibilitySystems};
+ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_ecs::prelude::*;
+-use bevy_math::{ops, vec4, AspectRatio, Mat4, Rect, Vec2, Vec3A, Vec4};
++use bevy_math::{ops, primitives::ViewFrustum, vec4, AspectRatio, Mat4, Rect, Vec2, Vec3A, Vec4};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect, ReflectDeserialize, ReflectSerialize};
+ use bevy_transform::{components::GlobalTransform, TransformSystems};
+ use derive_more::derive::From;
+@@ -69,12 +69,12 @@ pub trait CameraProjection {
+     /// for each camera to update its frustum.
+     fn compute_frustum(&self, camera_transform: &GlobalTransform) -> Frustum {
+         let clip_from_world = self.get_clip_from_view() * camera_transform.affine().inverse();
+-        Frustum::from_clip_from_world_custom_far(
++        Frustum(ViewFrustum::from_clip_from_world_custom_far(
+             &clip_from_world,
+             &camera_transform.translation(),
+             &camera_transform.back(),
+             self.far(),
+-        )
++        ))
+     }
+ }
+ 
+diff --git a/crates/bevy_light/src/cluster/assign.rs b/crates/bevy_light/src/cluster/assign.rs
+index bc3112eddd5d0..4c65a02c9bbd6 100644
+--- a/crates/bevy_light/src/cluster/assign.rs
++++ b/crates/bevy_light/src/cluster/assign.rs
+@@ -1,7 +1,7 @@
+ //! Assigning objects to clusters.
+ 
+ use bevy_camera::{
+-    primitives::{Aabb, Frustum, HalfSpace, Sphere},
++    primitives::{Aabb, Frustum, Sphere},
+     visibility::{RenderLayers, ViewVisibility},
+     Camera,
+ };
+@@ -12,6 +12,7 @@ use bevy_ecs::{
+ };
+ use bevy_math::{
+     ops::{self, sin_cos},
++    primitives::HalfSpace,
+     Mat4, UVec3, Vec2, Vec3, Vec3A, Vec3Swizzles as _, Vec4, Vec4Swizzles as _,
+ };
+ use bevy_transform::components::GlobalTransform;
+diff --git a/crates/bevy_light/src/directional_light.rs b/crates/bevy_light/src/directional_light.rs
+index adc085525ff87..dfa155144ee01 100644
+--- a/crates/bevy_light/src/directional_light.rs
++++ b/crates/bevy_light/src/directional_light.rs
+@@ -7,6 +7,7 @@ use bevy_camera::{
+ use bevy_color::Color;
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
++use bevy_math::primitives::ViewFrustum;
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::Transform;
+ use tracing::warn;
+@@ -237,7 +238,7 @@ pub fn update_directional_light_frusta(
+                     *view,
+                     cascades
+                         .iter()
+-                        .map(|c| Frustum::from_clip_from_world(&c.clip_from_world))
++                        .map(|c| Frustum(ViewFrustum::from_clip_from_world(&c.clip_from_world)))
+                         .collect::<Vec<_>>(),
+                 )
+             })
+diff --git a/crates/bevy_light/src/point_light.rs b/crates/bevy_light/src/point_light.rs
+index 16760f7a252f8..1470633c1a3fd 100644
+--- a/crates/bevy_light/src/point_light.rs
++++ b/crates/bevy_light/src/point_light.rs
+@@ -6,7 +6,7 @@ use bevy_camera::{
+ use bevy_color::Color;
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
+-use bevy_math::Mat4;
++use bevy_math::{primitives::ViewFrustum, Mat4};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::{GlobalTransform, Transform};
+ 
+@@ -238,12 +238,12 @@ pub fn update_point_light_frusta(
+             let world_from_view = view_translation * *view_rotation;
+             let clip_from_world = clip_from_view * world_from_view.compute_affine().inverse();
+ 
+-            *frustum = Frustum::from_clip_from_world_custom_far(
++            *frustum = Frustum(ViewFrustum::from_clip_from_world_custom_far(
+                 &clip_from_world,
+                 &transform.translation(),
+                 &view_backward,
+                 point_light.range,
+-            );
++            ));
+         }
+     }
+ }
+diff --git a/crates/bevy_light/src/spot_light.rs b/crates/bevy_light/src/spot_light.rs
+index d8000d2fb3940..e4f47532c00f5 100644
+--- a/crates/bevy_light/src/spot_light.rs
++++ b/crates/bevy_light/src/spot_light.rs
+@@ -6,7 +6,7 @@ use bevy_camera::{
+ use bevy_color::Color;
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
+-use bevy_math::{Affine3A, Dir3, Mat3, Mat4, Vec3};
++use bevy_math::{primitives::ViewFrustum, Affine3A, Dir3, Mat3, Mat4, Vec3};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::{GlobalTransform, Transform};
+ 
+@@ -232,11 +232,11 @@ pub fn update_spot_light_frusta(
+             spot_light_clip_from_view(spot_light.outer_angle, spot_light.shadow_map_near_z);
+         let clip_from_world = spot_clip_from_view * spot_world_from_view.inverse();
+ 
+-        *frustum = Frustum::from_clip_from_world_custom_far(
++        *frustum = Frustum(ViewFrustum::from_clip_from_world_custom_far(
+             &clip_from_world,
+             &transform.translation(),
+             &view_backward,
+             spot_light.range,
+-        );
++        ));
+     }
+ }
+diff --git a/crates/bevy_math/src/primitives/half_space.rs b/crates/bevy_math/src/primitives/half_space.rs
+new file mode 100644
+index 0000000000000..3bf9a945ee053
+--- /dev/null
++++ b/crates/bevy_math/src/primitives/half_space.rs
+@@ -0,0 +1,78 @@
++use crate::{Vec3A, Vec4, Vec4Swizzles};
++
++#[cfg(feature = "bevy_reflect")]
++use bevy_reflect::{std_traits::ReflectDefault, Reflect};
++#[cfg(all(feature = "serialize", feature = "bevy_reflect"))]
++use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
++
++/// A region of 3D space, specifically an open set whose border is a bisecting 2D plane.
++///
++/// This bisecting plane partitions 3D space into two infinite regions,
++/// the half-space is one of those regions and excludes the bisecting plane.
++///
++/// Each instance of this type is characterized by:
++/// - the bisecting plane's unit normal, normalized and pointing "inside" the half-space,
++/// - the signed distance along the normal from the bisecting plane to the origin of 3D space.
++///
++/// The distance can also be seen as:
++/// - the distance along the inverse of the normal from the origin of 3D space to the bisecting plane,
++/// - the opposite of the distance along the normal from the origin of 3D space to the bisecting plane.
++///
++/// Any point `p` is considered to be within the `HalfSpace` when the length of the projection
++/// of p on the normal is greater or equal than the opposite of the distance,
++/// meaning: if the equation `normal.dot(p) + distance > 0.` is satisfied.
++///
++/// For example, the half-space containing all the points with a z-coordinate lesser
++/// or equal than `8.0` would be defined by: `HalfSpace::new(Vec3::NEG_Z.extend(-8.0))`.
++/// It includes all the points from the bisecting plane towards `NEG_Z`, and the distance
++/// from the plane to the origin is `-8.0` along `NEG_Z`.
++///
++/// It is used to define a [`ViewFrustum`](crate::primitives::ViewFrustum),
++/// but is also a useful mathematical primitive for rendering tasks such as  light computation.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(
++    feature = "bevy_reflect",
++    derive(Reflect),
++    reflect(Clone, Debug, Default, PartialEq)
++)]
++#[cfg_attr(
++    all(feature = "serialize", feature = "bevy_reflect"),
++    reflect(Serialize, Deserialize)
++)]
++pub struct HalfSpace {
++    normal_d: Vec4,
++}
++
++impl HalfSpace {
++    /// Constructs a `HalfSpace` from a 4D vector whose first 3 components
++    /// represent the bisecting plane's unit normal, and the last component is
++    /// the signed distance along the normal from the plane to the origin.
++    /// The constructor ensures the normal vector is normalized and the distance is appropriately scaled.
++    #[inline]
++    pub fn new(normal_d: Vec4) -> Self {
++        Self {
++            normal_d: normal_d * normal_d.xyz().length_recip(),
++        }
++    }
++
++    /// Returns the unit normal vector of the bisecting plane that characterizes the `HalfSpace`.
++    #[inline]
++    pub fn normal(&self) -> Vec3A {
++        Vec3A::from_vec4(self.normal_d)
++    }
++
++    /// Returns the signed distance from the bisecting plane to the origin along
++    /// the plane's unit normal vector.
++    #[inline]
++    pub fn d(&self) -> f32 {
++        self.normal_d.w
++    }
++
++    /// Returns the bisecting plane's unit normal vector and the signed distance
++    /// from the plane to the origin.
++    #[inline]
++    pub fn normal_d(&self) -> Vec4 {
++        self.normal_d
++    }
++}
+diff --git a/crates/bevy_math/src/primitives/mod.rs b/crates/bevy_math/src/primitives/mod.rs
+index 1e95105a0f29a..c2cb17f963123 100644
+--- a/crates/bevy_math/src/primitives/mod.rs
++++ b/crates/bevy_math/src/primitives/mod.rs
+@@ -8,7 +8,11 @@ mod dim3;
+ pub use dim3::*;
+ mod inset;
+ pub use inset::*;
++mod half_space;
+ mod polygon;
++pub use half_space::*;
++mod view_frustum;
++pub use view_frustum::*;
+ 
+ /// A marker trait for 2D primitives
+ pub trait Primitive2d {}
+diff --git a/crates/bevy_math/src/primitives/view_frustum.rs b/crates/bevy_math/src/primitives/view_frustum.rs
+new file mode 100644
+index 0000000000000..d0048c385e833
+--- /dev/null
++++ b/crates/bevy_math/src/primitives/view_frustum.rs
+@@ -0,0 +1,86 @@
++use crate::{primitives::HalfSpace, Mat4, Vec3, Vec4};
++
++#[cfg(feature = "bevy_reflect")]
++use bevy_reflect::{std_traits::ReflectDefault, Reflect};
++#[cfg(all(feature = "serialize", feature = "bevy_reflect"))]
++use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
++
++/// A region of 3D space defined by the intersection of 6 [`HalfSpace`]s.
++///
++/// View Frustums are typically an apex-truncated square pyramid (a pyramid without the top) or a cuboid.
++///
++/// Half spaces are ordered left, right, top, bottom, near, far. The normal vectors
++/// of the half-spaces point towards the interior of the frustum.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(
++    feature = "bevy_reflect",
++    derive(Reflect),
++    reflect(Clone, Debug, Default, PartialEq)
++)]
++#[cfg_attr(
++    all(feature = "serialize", feature = "bevy_reflect"),
++    reflect(Serialize, Deserialize)
++)]
++pub struct ViewFrustum {
++    /// The six half-spaces making up the frustum
++    pub half_spaces: [HalfSpace; 6],
++}
++
++impl ViewFrustum {
++    /// The index for the near plane in `half_spaces`
++    pub const NEAR_PLANE_IDX: usize = 4;
++    /// The index for the far plane in `half_spaces`
++    pub const FAR_PLANE_IDX: usize = 5;
++    /// Vec4 representing an inactive half space.
++    /// The bisecting plane's unit normal is set to (0, 0, 0).
++    /// The signed distance along the normal from the plane to the origin is set to `f32::INFINITY`.
++    const INACTIVE_HALF_SPACE: Vec4 = Vec4::new(0.0, 0.0, 0.0, f32::INFINITY);
++
++    /// Returns a view frustum derived from `clip_from_world`.
++    #[inline]
++    pub fn from_clip_from_world(clip_from_world: &Mat4) -> Self {
++        let mut frustum = ViewFrustum::from_clip_from_world_no_far(clip_from_world);
++        frustum.half_spaces[Self::FAR_PLANE_IDX] = HalfSpace::new(clip_from_world.row(2));
++        frustum
++    }
++
++    /// Returns a view frustum derived from `clip_from_world`,
++    /// but with a custom far plane.
++    #[inline]
++    pub fn from_clip_from_world_custom_far(
++        clip_from_world: &Mat4,
++        view_translation: &Vec3,
++        view_backward: &Vec3,
++        far: f32,
++    ) -> Self {
++        let mut frustum = ViewFrustum::from_clip_from_world_no_far(clip_from_world);
++        let far_center = *view_translation - far * *view_backward;
++        frustum.half_spaces[Self::FAR_PLANE_IDX] =
++            HalfSpace::new(view_backward.extend(-view_backward.dot(far_center)));
++        frustum
++    }
++
++    // NOTE: This approach of extracting the frustum half-space from the view
++    // projection matrix is from Foundations of Game Engine Development 2
++    // Rendering by Lengyel.
++    /// Returns a view frustum derived from `view_projection`,
++    /// without a far plane.
++    fn from_clip_from_world_no_far(clip_from_world: &Mat4) -> Self {
++        let row0 = clip_from_world.row(0);
++        let row1 = clip_from_world.row(1);
++        let row2 = clip_from_world.row(2);
++        let row3 = clip_from_world.row(3);
++
++        Self {
++            half_spaces: [
++                HalfSpace::new(row3 + row0),
++                HalfSpace::new(row3 - row0),
++                HalfSpace::new(row3 + row1),
++                HalfSpace::new(row3 - row1),
++                HalfSpace::new(row3 + row2),
++                HalfSpace::new(Self::INACTIVE_HALF_SPACE),
++            ],
++        }
++    }
++}
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 9040d219a0b05..a2768d179e042 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -2,8 +2,7 @@ use crate::*;
+ use alloc::sync::Arc;
+ use bevy_asset::UntypedAssetId;
+ use bevy_camera::primitives::{
+-    face_index_to_name, CascadesFrusta, CubeMapFace, CubemapFrusta, Frustum, HalfSpace,
+-    CUBE_MAP_FACES,
++    face_index_to_name, CascadesFrusta, CubeMapFace, CubemapFrusta, Frustum, CUBE_MAP_FACES,
+ };
+ use bevy_camera::visibility::{
+     CascadesVisibleEntities, CubemapVisibleEntities, RenderLayers, ViewVisibility,
+@@ -33,7 +32,11 @@ use bevy_material::{
+     key::{ErasedMaterialPipelineKey, ErasedMeshPipelineKey},
+     MaterialProperties,
+ };
+-use bevy_math::{ops, Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles};
++use bevy_math::{
++    ops,
++    primitives::{HalfSpace, ViewFrustum},
++    Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles,
++};
+ use bevy_mesh::MeshVertexBufferLayoutRef;
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_platform::hash::FixedHasher;
+@@ -1592,8 +1595,8 @@ pub fn prepare_lights(
+ 
+                 let mut frustum = *frustum;
+                 // Push the near clip plane out to infinity for directional lights
+-                frustum.half_spaces[Frustum::NEAR_PLANE_IDX] = HalfSpace::new(
+-                    frustum.half_spaces[Frustum::NEAR_PLANE_IDX]
++                frustum.half_spaces[ViewFrustum::NEAR_PLANE_IDX] = HalfSpace::new(
++                    frustum.half_spaces[ViewFrustum::NEAR_PLANE_IDX]
+                         .normal()
+                         .extend(f32::INFINITY),
+                 );
+diff --git a/release-content/migration-guides/camera_primitives_moved.md b/release-content/migration-guides/camera_primitives_moved.md
+new file mode 100644
+index 0000000000000..5cc902fcbcde7
+--- /dev/null
++++ b/release-content/migration-guides/camera_primitives_moved.md
+@@ -0,0 +1,30 @@
++---
++title: "Some bevy_camera primitives moved to bevy_math"
++pull_requests: [22684]
++---
++
++`bevy_camera::primitives::HalfSpace` has moved to `bevy_math::primitives::HalfSpace`.
++Some parts of `bevy_camera::primitives::Frustum` have moved to `bevy_math::primitives::ViewFrustum`.
++
++`bevy_camera` has some rendering primitives that can be extracted to be more generally useful.
++To expose them for others to use, some of these primitives and/or functionality have moved to `bevy_math`.
++
++```rust
++// 0.18
++use bevy_camera::primitives::{Frustum, HalfSpace}
++let half_spaces: [HalfSpace; 6] = ...;
++let frustum_one: Frustum = Frustum {
++  half_spaces
++};
++let frustum_two: Frustum = Frustum::from_clip_from_world(...);
++
++// 0.19
++use bevy_math::primitives::{HalfSpace, ViewFrustum}
++use bevy_camera::primitives::Frustum
++let half_spaces: [HalfSpace; 6] = ...;
++let frustum_one: Frustum = Frustum(
++  ViewFrustum {
++    half_spaces
++});
++let frustum_two: Frustum = Frustum(ViewFrustum::from_clip_from_world(...));
++```

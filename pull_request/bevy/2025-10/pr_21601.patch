@@ -1,0 +1,383 @@
+diff --git a/crates/bevy_ecs/macros/src/component.rs b/crates/bevy_ecs/macros/src/component.rs
+index 576ce15a5f4f9..3ba48175d6f90 100644
+--- a/crates/bevy_ecs/macros/src/component.rs
++++ b/crates/bevy_ecs/macros/src/component.rs
+@@ -216,6 +216,35 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
+         )
+     };
+ 
++    let relationship_accessor = if (relationship.is_some() || relationship_target.is_some())
++        && let Data::Struct(DataStruct {
++            fields,
++            struct_token,
++            ..
++        }) = &ast.data
++        && let Ok(field) = relationship_field(fields, "Relationship", struct_token.span())
++    {
++        let relationship_member = field.ident.clone().map_or(Member::from(0), Member::Named);
++        if relationship.is_some() {
++            quote! {
++                Some(
++                    // Safety: we pass valid offset of a field containing Entity (obtained via offset_off!)
++                    unsafe {
++                        #bevy_ecs_path::relationship::ComponentRelationshipAccessor::<Self>::relationship(
++                            core::mem::offset_of!(Self, #relationship_member)
++                        )
++                    }
++                )
++            }
++        } else {
++            quote! {
++                Some(#bevy_ecs_path::relationship::ComponentRelationshipAccessor::<Self>::relationship_target())
++            }
++        }
++    } else {
++        quote! {None}
++    };
++
+     // This puts `register_required` before `register_recursive_requires` to ensure that the constructors of _all_ top
+     // level components are initialized first, giving them precedence over recursively defined constructors for the same component type
+     TokenStream::from(quote! {
+@@ -241,6 +270,10 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
+             }
+ 
+             #map_entities
++
++            fn relationship_accessor() -> Option<#bevy_ecs_path::relationship::ComponentRelationshipAccessor<Self>> {
++                #relationship_accessor
++            }
+         }
+ 
+         #relationship
+diff --git a/crates/bevy_ecs/src/component/info.rs b/crates/bevy_ecs/src/component/info.rs
+index 0e222692d7fb1..50691d990d282 100644
+--- a/crates/bevy_ecs/src/component/info.rs
++++ b/crates/bevy_ecs/src/component/info.rs
+@@ -20,6 +20,7 @@ use crate::{
+     },
+     lifecycle::ComponentHooks,
+     query::DebugCheckedUnwrap as _,
++    relationship::RelationshipAccessor,
+     resource::Resource,
+     storage::SparseSetIndex,
+ };
+@@ -140,6 +141,11 @@ impl ComponentInfo {
+     pub fn required_components(&self) -> &RequiredComponents {
+         &self.required_components
+     }
++
++    /// Returns [`RelationshipAccessor`] for this component if it is a [`Relationship`](crate::relationship::Relationship) or [`RelationshipTarget`](crate::relationship::RelationshipTarget) , `None` otherwise.
++    pub fn relationship_accessor(&self) -> Option<&RelationshipAccessor> {
++        self.descriptor.relationship_accessor.as_ref()
++    }
+ }
+ 
+ /// A value which uniquely identifies the type of a [`Component`] or [`Resource`] within a
+@@ -219,6 +225,7 @@ pub struct ComponentDescriptor {
+     drop: Option<for<'a> unsafe fn(OwningPtr<'a>)>,
+     mutable: bool,
+     clone_behavior: ComponentCloneBehavior,
++    relationship_accessor: Option<RelationshipAccessor>,
+ }
+ 
+ // We need to ignore the `drop` field in our `Debug` impl
+@@ -232,6 +239,7 @@ impl Debug for ComponentDescriptor {
+             .field("layout", &self.layout)
+             .field("mutable", &self.mutable)
+             .field("clone_behavior", &self.clone_behavior)
++            .field("relationship_accessor", &self.relationship_accessor)
+             .finish()
+     }
+ }
+@@ -258,6 +266,7 @@ impl ComponentDescriptor {
+             drop: needs_drop::<T>().then_some(Self::drop_ptr::<T> as _),
+             mutable: T::Mutability::MUTABLE,
+             clone_behavior: T::clone_behavior(),
++            relationship_accessor: T::relationship_accessor().map(|v| v.accessor),
+         }
+     }
+ 
+@@ -266,6 +275,7 @@ impl ComponentDescriptor {
+     /// # Safety
+     /// - the `drop` fn must be usable on a pointer with a value of the layout `layout`
+     /// - the component type must be safe to access from any thread (Send + Sync in rust terms)
++    /// - `relationship_accessor` must be valid for this component type if not `None`
+     pub unsafe fn new_with_layout(
+         name: impl Into<Cow<'static, str>>,
+         storage_type: StorageType,
+@@ -273,6 +283,7 @@ impl ComponentDescriptor {
+         drop: Option<for<'a> unsafe fn(OwningPtr<'a>)>,
+         mutable: bool,
+         clone_behavior: ComponentCloneBehavior,
++        relationship_accessor: Option<RelationshipAccessor>,
+     ) -> Self {
+         Self {
+             name: name.into().into(),
+@@ -283,6 +294,7 @@ impl ComponentDescriptor {
+             drop,
+             mutable,
+             clone_behavior,
++            relationship_accessor,
+         }
+     }
+ 
+@@ -301,6 +313,7 @@ impl ComponentDescriptor {
+             drop: needs_drop::<T>().then_some(Self::drop_ptr::<T> as _),
+             mutable: true,
+             clone_behavior: ComponentCloneBehavior::Default,
++            relationship_accessor: None,
+         }
+     }
+ 
+@@ -314,6 +327,7 @@ impl ComponentDescriptor {
+             drop: needs_drop::<T>().then_some(Self::drop_ptr::<T> as _),
+             mutable: true,
+             clone_behavior: ComponentCloneBehavior::Default,
++            relationship_accessor: None,
+         }
+     }
+ 
+diff --git a/crates/bevy_ecs/src/component/mod.rs b/crates/bevy_ecs/src/component/mod.rs
+index 1d808f0e1d1ee..3286e7a1eebf3 100644
+--- a/crates/bevy_ecs/src/component/mod.rs
++++ b/crates/bevy_ecs/src/component/mod.rs
+@@ -15,6 +15,7 @@ pub use tick::*;
+ use crate::{
+     entity::EntityMapper,
+     lifecycle::ComponentHook,
++    relationship::ComponentRelationshipAccessor,
+     system::{Local, SystemParam},
+     world::{FromWorld, World},
+ };
+@@ -625,6 +626,13 @@ pub trait Component: Send + Sync + 'static {
+     /// You can use the turbofish (`::<A,B,C>`) to specify parameters when a function is generic, using either M or _ for the type of the mapper parameter.
+     #[inline]
+     fn map_entities<E: EntityMapper>(_this: &mut Self, _mapper: &mut E) {}
++
++    /// Returns [`ComponentRelationshipAccessor`] required for working with relationships in dynamic contexts.
++    ///
++    /// If component is not a [`Relationship`](crate::relationship::Relationship) or [`RelationshipTarget`](crate::relationship::RelationshipTarget), this should return `None`.
++    fn relationship_accessor() -> Option<ComponentRelationshipAccessor<Self>> {
++        None
++    }
+ }
+ 
+ mod private {
+diff --git a/crates/bevy_ecs/src/entity/clone_entities.rs b/crates/bevy_ecs/src/entity/clone_entities.rs
+index 4c110d0057c9a..3b68f854beb96 100644
+--- a/crates/bevy_ecs/src/entity/clone_entities.rs
++++ b/crates/bevy_ecs/src/entity/clone_entities.rs
+@@ -2099,6 +2099,7 @@ mod tests {
+                 None,
+                 true,
+                 ComponentCloneBehavior::Custom(test_handler),
++                None,
+             )
+         };
+         let component_id = world.register_component_with_descriptor(descriptor);
+diff --git a/crates/bevy_ecs/src/relationship/mod.rs b/crates/bevy_ecs/src/relationship/mod.rs
+index b234318ea8947..2778568dead6e 100644
+--- a/crates/bevy_ecs/src/relationship/mod.rs
++++ b/crates/bevy_ecs/src/relationship/mod.rs
+@@ -4,6 +4,8 @@ mod related_methods;
+ mod relationship_query;
+ mod relationship_source_collection;
+ 
++use alloc::boxed::Box;
++use bevy_ptr::Ptr;
+ use core::marker::PhantomData;
+ 
+ use alloc::format;
+@@ -478,11 +480,78 @@ impl RelationshipTargetCloneBehaviorHierarchy
+     }
+ }
+ 
++/// This enum describes a way to access the entities of [`Relationship`] and [`RelationshipTarget`] components
++/// in a type-erased context.
++#[derive(Debug, Clone, Copy)]
++pub enum RelationshipAccessor {
++    /// This component is a [`Relationship`].
++    Relationship {
++        /// Offset of the field containing [`Entity`] from the base of the component.
++        ///
++        /// Dynamic equivalent of [`Relationship::get`].
++        entity_field_offset: usize,
++        /// Value of [`RelationshipTarget::LINKED_SPAWN`] for the [`Relationship::RelationshipTarget`] of this [`Relationship`].
++        linked_spawn: bool,
++    },
++    /// This component is a [`RelationshipTarget`].
++    RelationshipTarget {
++        /// Function that returns an iterator over all [`Entity`]s of this [`RelationshipTarget`]'s collection.
++        ///
++        /// Dynamic equivalent of [`RelationshipTarget::iter`].
++        /// # Safety
++        /// Passed pointer must point to the value of the same component as the one that this accessor was registered to.
++        iter: for<'a> unsafe fn(Ptr<'a>) -> Box<dyn Iterator<Item = Entity> + 'a>,
++        /// Value of [`RelationshipTarget::LINKED_SPAWN`] of this [`RelationshipTarget`].
++        linked_spawn: bool,
++    },
++}
++
++/// A type-safe convenience wrapper over [`RelationshipAccessor`].
++pub struct ComponentRelationshipAccessor<C: ?Sized> {
++    pub(crate) accessor: RelationshipAccessor,
++    phantom: PhantomData<C>,
++}
++
++impl<C> ComponentRelationshipAccessor<C> {
++    /// Create a new [`ComponentRelationshipAccessor`] for a [`Relationship`] component.
++    /// # Safety
++    /// `entity_field_offset` should be the offset from the base of this component and point to a field that stores value of type [`Entity`].
++    /// This value can be obtained using the [`core::mem::offset_of`] macro.
++    pub unsafe fn relationship(entity_field_offset: usize) -> Self
++    where
++        C: Relationship,
++    {
++        Self {
++            accessor: RelationshipAccessor::Relationship {
++                entity_field_offset,
++                linked_spawn: C::RelationshipTarget::LINKED_SPAWN,
++            },
++            phantom: Default::default(),
++        }
++    }
++
++    /// Create a new [`ComponentRelationshipAccessor`] for a [`RelationshipTarget`] component.
++    pub fn relationship_target() -> Self
++    where
++        C: RelationshipTarget,
++    {
++        Self {
++            accessor: RelationshipAccessor::RelationshipTarget {
++                // Safety: caller ensures that `ptr` is of type `C`.
++                iter: |ptr| unsafe { Box::new(RelationshipTarget::iter(ptr.deref::<C>())) },
++                linked_spawn: C::LINKED_SPAWN,
++            },
++            phantom: Default::default(),
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use core::marker::PhantomData;
+ 
+     use crate::prelude::{ChildOf, Children};
++    use crate::relationship::RelationshipAccessor;
+     use crate::world::World;
+     use crate::{component::Component, entity::Entity};
+     use alloc::vec::Vec;
+@@ -697,4 +766,50 @@ mod tests {
+         assert!(world.get::<ChildOf>(child).is_some());
+         assert!(world.get::<Children>(parent).is_some());
+     }
++
++    #[test]
++    fn dynamically_traverse_hierarchy() {
++        let mut world = World::new();
++        let child_of_id = world.register_component::<ChildOf>();
++        let children_id = world.register_component::<Children>();
++
++        let parent = world.spawn_empty().id();
++        let child = world.spawn_empty().id();
++        world.entity_mut(child).insert(ChildOf(parent));
++        world.flush();
++
++        let children_ptr = world.get_by_id(parent, children_id).unwrap();
++        let RelationshipAccessor::RelationshipTarget { iter, .. } = world
++            .components()
++            .get_info(children_id)
++            .unwrap()
++            .relationship_accessor()
++            .unwrap()
++        else {
++            unreachable!()
++        };
++        // Safety: `children_ptr` contains value of the same type as the one this accessor was registered for.
++        let children: Vec<_> = unsafe { iter(children_ptr).collect() };
++        assert_eq!(children, alloc::vec![child]);
++
++        let child_of_ptr = world.get_by_id(child, child_of_id).unwrap();
++        let RelationshipAccessor::Relationship {
++            entity_field_offset,
++            ..
++        } = world
++            .components()
++            .get_info(child_of_id)
++            .unwrap()
++            .relationship_accessor()
++            .unwrap()
++        else {
++            unreachable!()
++        };
++        // Safety:
++        // - offset is in bounds, aligned and has the same lifetime as the original pointer.
++        // - value at offset is guaranteed to be a valid Entity
++        let child_of_entity: Entity =
++            unsafe { *child_of_ptr.byte_add(*entity_field_offset).deref() };
++        assert_eq!(child_of_entity, parent);
++    }
+ }
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 024c127aab8b2..55b47c56def8f 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -4001,6 +4001,7 @@ mod tests {
+                 }),
+                 true,
+                 ComponentCloneBehavior::Default,
++                None,
+             )
+         };
+ 
+diff --git a/examples/ecs/dynamic.rs b/examples/ecs/dynamic.rs
+index 35eb8a8ea6c00..e5dd3c40b50a2 100644
+--- a/examples/ecs/dynamic.rs
++++ b/examples/ecs/dynamic.rs
+@@ -97,6 +97,7 @@ fn main() {
+                             None,
+                             true,
+                             ComponentCloneBehavior::Default,
++                            None,
+                         )
+                     });
+                     let Some(info) = world.components().get_info(id) else {
+diff --git a/examples/ecs/immutable_components.rs b/examples/ecs/immutable_components.rs
+index c0ee241923931..a4e282af61967 100644
+--- a/examples/ecs/immutable_components.rs
++++ b/examples/ecs/immutable_components.rs
+@@ -154,6 +154,7 @@ fn demo_3(world: &mut World) {
+                     None,
+                     false,
+                     ComponentCloneBehavior::Default,
++                    None,
+                 )
+             };
+ 
+diff --git a/examples/stress_tests/many_components.rs b/examples/stress_tests/many_components.rs
+index 0250f6e3c1fc2..60ace001f5333 100644
+--- a/examples/stress_tests/many_components.rs
++++ b/examples/stress_tests/many_components.rs
+@@ -97,6 +97,7 @@ fn stress_test(num_entities: u32, num_components: u32, num_systems: u32) {
+                         None,
+                         true, // is mutable
+                         ComponentCloneBehavior::Default,
++                        None,
+                     )
+                 },
+             )
+diff --git a/release-content/migration-guides/dynamic_relationships_api.md b/release-content/migration-guides/dynamic_relationships_api.md
+new file mode 100644
+index 0000000000000..9317ad8a32d4f
+--- /dev/null
++++ b/release-content/migration-guides/dynamic_relationships_api.md
+@@ -0,0 +1,9 @@
++---
++title: API for working with `Relationships` and `RelationshipTargets` in type-erased contexts
++pull_requests: [21601]
++---
++
++`ComponentDescriptor` now stores additional data for working with relationships in dynamic contexts.
++This resulted in changes to `ComponentDescriptor::new_with_layout`:
++
++- Now requires additional parameter `relationship_accessor`, which should be set to `None` for all existing code creating `ComponentDescriptors`.

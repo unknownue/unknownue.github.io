@@ -1,0 +1,3127 @@
+diff --git a/benches/Cargo.toml b/benches/Cargo.toml
+index bea4c3f0c857b..0579f61c76282 100644
+--- a/benches/Cargo.toml
++++ b/benches/Cargo.toml
+@@ -31,7 +31,10 @@ bevy_platform = { path = "../crates/bevy_platform", default-features = false, fe
+ ] }
+ 
+ # Other crates
+-glam = { version = "0.30.7", default-features = false, features = ["std"] }
++glam = { version = "0.30.7", default-features = false, features = [
++  "std",
++  "rand",
++] }
+ rand = "0.9"
+ rand_chacha = "0.9"
+ nonmax = { version = "0.5", default-features = false }
+diff --git a/benches/benches/bevy_math/bounding.rs b/benches/benches/bevy_math/bounding.rs
+new file mode 100644
+index 0000000000000..e13772d7b5f8a
+--- /dev/null
++++ b/benches/benches/bevy_math/bounding.rs
+@@ -0,0 +1,67 @@
++use benches::bench;
++use bevy_math::{
++    bounding::{Aabb3d, BoundingSphere, BoundingVolume},
++    prelude::*,
++};
++use core::hint::black_box;
++use criterion::{criterion_group, Criterion};
++use rand::{
++    distr::{Distribution, StandardUniform, Uniform},
++    rngs::StdRng,
++    Rng, SeedableRng,
++};
++
++criterion_group!(benches, bounding);
++
++struct PointCloud {
++    points: Vec<Vec3A>,
++    isometry: Isometry3d,
++}
++
++impl PointCloud {
++    fn aabb(&self) -> Aabb3d {
++        Aabb3d::from_point_cloud(self.isometry, self.points.iter().copied())
++    }
++
++    fn sphere(&self) -> BoundingSphere {
++        BoundingSphere::from_point_cloud(self.isometry, &self.points)
++    }
++}
++
++fn bounding(c: &mut Criterion) {
++    // Create point clouds of various sizes, then benchmark two different ways
++    // of finding the bounds of each cloud and merging them together.
++
++    let mut rng1 = StdRng::seed_from_u64(123);
++    let mut rng2 = StdRng::seed_from_u64(456);
++
++    let point_clouds = Uniform::<usize>::new(black_box(3), black_box(30))
++        .unwrap()
++        .sample_iter(&mut rng1)
++        .take(black_box(1000))
++        .map(|num_points| PointCloud {
++            points: StandardUniform
++                .sample_iter(&mut rng2)
++                .take(num_points)
++                .collect::<Vec<Vec3A>>(),
++            isometry: Isometry3d::new(rng2.random::<Vec3>(), rng2.random::<Quat>()),
++        })
++        .collect::<Vec<_>>();
++
++    c.bench_function(bench!("bounding"), |b| {
++        b.iter(|| {
++            let aabb = point_clouds
++                .iter()
++                .map(PointCloud::aabb)
++                .reduce(|l, r| l.merge(&r));
++
++            let sphere = point_clouds
++                .iter()
++                .map(PointCloud::sphere)
++                .reduce(|l, r| l.merge(&r));
++
++            black_box(aabb);
++            black_box(sphere);
++        });
++    });
++}
+diff --git a/benches/benches/bevy_math/main.rs b/benches/benches/bevy_math/main.rs
+index 7b84b6d60f41b..33a2d113ac94a 100644
+--- a/benches/benches/bevy_math/main.rs
++++ b/benches/benches/bevy_math/main.rs
+@@ -1,5 +1,6 @@
+ use criterion::criterion_main;
+ 
+ mod bezier;
++mod bounding;
+ 
+-criterion_main!(bezier::benches);
++criterion_main!(bezier::benches, bounding::benches);
+diff --git a/crates/bevy_math/src/bounding/bounded2d/mod.rs b/crates/bevy_math/src/bounding/bounded2d/mod.rs
+index 3a8f9a742edfc..79def679f9ad3 100644
+--- a/crates/bevy_math/src/bounding/bounded2d/mod.rs
++++ b/crates/bevy_math/src/bounding/bounded2d/mod.rs
+@@ -15,7 +15,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
+ use serde::{Deserialize, Serialize};
+ 
+ /// Computes the geometric center of the given set of points.
+-#[inline(always)]
++#[inline]
+ fn point_cloud_2d_center(points: &[Vec2]) -> Vec2 {
+     assert!(
+         !points.is_empty(),
+@@ -56,7 +56,7 @@ pub struct Aabb2d {
+ 
+ impl Aabb2d {
+     /// Constructs an AABB from its center and half-size.
+-    #[inline(always)]
++    #[inline]
+     pub fn new(center: Vec2, half_size: Vec2) -> Self {
+         debug_assert!(half_size.x >= 0.0 && half_size.y >= 0.0);
+         Self {
+@@ -71,7 +71,7 @@ impl Aabb2d {
+     /// # Panics
+     ///
+     /// Panics if the given set of points is empty.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_point_cloud(isometry: impl Into<Isometry2d>, points: &[Vec2]) -> Aabb2d {
+         let isometry = isometry.into();
+ 
+@@ -93,7 +93,7 @@ impl Aabb2d {
+     }
+ 
+     /// Computes the smallest [`BoundingCircle`] containing this [`Aabb2d`].
+-    #[inline(always)]
++    #[inline]
+     pub fn bounding_circle(&self) -> BoundingCircle {
+         let radius = self.min.distance(self.max) / 2.0;
+         BoundingCircle::new(self.center(), radius)
+@@ -103,7 +103,7 @@ impl Aabb2d {
+     ///
+     /// If the point is outside the AABB, the returned point will be on the perimeter of the AABB.
+     /// Otherwise, it will be inside the AABB and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec2) -> Vec2 {
+         // Clamp point coordinates to the AABB
+         point.clamp(self.min, self.max)
+@@ -115,23 +115,23 @@ impl BoundingVolume for Aabb2d {
+     type Rotation = Rot2;
+     type HalfSize = Vec2;
+ 
+-    #[inline(always)]
++    #[inline]
+     fn center(&self) -> Self::Translation {
+         (self.min + self.max) / 2.
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn half_size(&self) -> Self::HalfSize {
+         (self.max - self.min) / 2.
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn visible_area(&self) -> f32 {
+         let b = (self.max - self.min).max(Vec2::ZERO);
+         b.x * b.y
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn contains(&self, other: &Self) -> bool {
+         other.min.x >= self.min.x
+             && other.min.y >= self.min.y
+@@ -139,7 +139,7 @@ impl BoundingVolume for Aabb2d {
+             && other.max.y <= self.max.y
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn merge(&self, other: &Self) -> Self {
+         Self {
+             min: self.min.min(other.min),
+@@ -147,7 +147,7 @@ impl BoundingVolume for Aabb2d {
+         }
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn grow(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         let b = Self {
+@@ -158,7 +158,7 @@ impl BoundingVolume for Aabb2d {
+         b
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn shrink(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         let b = Self {
+@@ -169,7 +169,7 @@ impl BoundingVolume for Aabb2d {
+         b
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn scale_around_center(&self, scale: impl Into<Self::HalfSize>) -> Self {
+         let scale = scale.into();
+         let b = Self {
+@@ -187,7 +187,7 @@ impl BoundingVolume for Aabb2d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn transformed_by(
+         mut self,
+         translation: impl Into<Self::Translation>,
+@@ -204,7 +204,7 @@ impl BoundingVolume for Aabb2d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn transform_by(
+         &mut self,
+         translation: impl Into<Self::Translation>,
+@@ -214,7 +214,7 @@ impl BoundingVolume for Aabb2d {
+         self.translate_by(translation);
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn translate_by(&mut self, translation: impl Into<Self::Translation>) {
+         let translation = translation.into();
+         self.min += translation;
+@@ -228,7 +228,7 @@ impl BoundingVolume for Aabb2d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn rotated_by(mut self, rotation: impl Into<Self::Rotation>) -> Self {
+         self.rotate_by(rotation);
+         self
+@@ -241,7 +241,7 @@ impl BoundingVolume for Aabb2d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn rotate_by(&mut self, rotation: impl Into<Self::Rotation>) {
+         let rot_mat = Mat2::from(rotation.into());
+         let half_size = rot_mat.abs() * self.half_size();
+@@ -250,7 +250,7 @@ impl BoundingVolume for Aabb2d {
+ }
+ 
+ impl IntersectsVolume<Self> for Aabb2d {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, other: &Self) -> bool {
+         let x_overlaps = self.min.x <= other.max.x && self.max.x >= other.min.x;
+         let y_overlaps = self.min.y <= other.max.y && self.max.y >= other.min.y;
+@@ -259,7 +259,7 @@ impl IntersectsVolume<Self> for Aabb2d {
+ }
+ 
+ impl IntersectsVolume<BoundingCircle> for Aabb2d {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, circle: &BoundingCircle) -> bool {
+         let closest_point = self.closest_point(circle.center);
+         let distance_squared = circle.center.distance_squared(closest_point);
+@@ -492,7 +492,7 @@ pub struct BoundingCircle {
+ 
+ impl BoundingCircle {
+     /// Constructs a bounding circle from its center and radius.
+-    #[inline(always)]
++    #[inline]
+     pub fn new(center: Vec2, radius: f32) -> Self {
+         debug_assert!(radius >= 0.);
+         Self {
+@@ -505,7 +505,7 @@ impl BoundingCircle {
+     /// transformed by the rotation and translation of the given isometry.
+     ///
+     /// The bounding circle is not guaranteed to be the smallest possible.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_point_cloud(isometry: impl Into<Isometry2d>, points: &[Vec2]) -> BoundingCircle {
+         let isometry = isometry.into();
+ 
+@@ -524,13 +524,13 @@ impl BoundingCircle {
+     }
+ 
+     /// Get the radius of the bounding circle
+-    #[inline(always)]
++    #[inline]
+     pub fn radius(&self) -> f32 {
+         self.circle.radius
+     }
+ 
+     /// Computes the smallest [`Aabb2d`] containing this [`BoundingCircle`].
+-    #[inline(always)]
++    #[inline]
+     pub fn aabb_2d(&self) -> Aabb2d {
+         Aabb2d {
+             min: self.center - Vec2::splat(self.radius()),
+@@ -542,7 +542,7 @@ impl BoundingCircle {
+     ///
+     /// If the point is outside the circle, the returned point will be on the perimeter of the circle.
+     /// Otherwise, it will be inside the circle and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec2) -> Vec2 {
+         self.circle.closest_point(point - self.center) + self.center
+     }
+@@ -553,28 +553,28 @@ impl BoundingVolume for BoundingCircle {
+     type Rotation = Rot2;
+     type HalfSize = f32;
+ 
+-    #[inline(always)]
++    #[inline]
+     fn center(&self) -> Self::Translation {
+         self.center
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn half_size(&self) -> Self::HalfSize {
+         self.radius()
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn visible_area(&self) -> f32 {
+         core::f32::consts::PI * self.radius() * self.radius()
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn contains(&self, other: &Self) -> bool {
+         let diff = self.radius() - other.radius();
+         self.center.distance_squared(other.center) <= ops::copysign(diff.squared(), diff)
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn merge(&self, other: &Self) -> Self {
+         let diff = other.center - self.center;
+         let length = diff.length();
+@@ -591,14 +591,14 @@ impl BoundingVolume for BoundingCircle {
+         )
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn grow(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         debug_assert!(amount >= 0.);
+         Self::new(self.center, self.radius() + amount)
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn shrink(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         debug_assert!(amount >= 0.);
+@@ -606,19 +606,19 @@ impl BoundingVolume for BoundingCircle {
+         Self::new(self.center, self.radius() - amount)
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn scale_around_center(&self, scale: impl Into<Self::HalfSize>) -> Self {
+         let scale = scale.into();
+         debug_assert!(scale >= 0.);
+         Self::new(self.center, self.radius() * scale)
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn translate_by(&mut self, translation: impl Into<Self::Translation>) {
+         self.center += translation.into();
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn rotate_by(&mut self, rotation: impl Into<Self::Rotation>) {
+         let rotation: Rot2 = rotation.into();
+         self.center = rotation * self.center;
+@@ -626,7 +626,7 @@ impl BoundingVolume for BoundingCircle {
+ }
+ 
+ impl IntersectsVolume<Self> for BoundingCircle {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, other: &Self) -> bool {
+         let center_distance_squared = self.center.distance_squared(other.center);
+         let radius_sum_squared = (self.radius() + other.radius()).squared();
+@@ -635,7 +635,7 @@ impl IntersectsVolume<Self> for BoundingCircle {
+ }
+ 
+ impl IntersectsVolume<Aabb2d> for BoundingCircle {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, aabb: &Aabb2d) -> bool {
+         aabb.intersects(self)
+     }
+diff --git a/crates/bevy_math/src/bounding/bounded3d/mod.rs b/crates/bevy_math/src/bounding/bounded3d/mod.rs
+index 6769d61dab383..c131da0572cf1 100644
+--- a/crates/bevy_math/src/bounding/bounded3d/mod.rs
++++ b/crates/bevy_math/src/bounding/bounded3d/mod.rs
+@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
+ pub use extrusion::BoundedExtrusion;
+ 
+ /// Computes the geometric center of the given set of points.
+-#[inline(always)]
++#[inline]
+ fn point_cloud_3d_center(points: impl Iterator<Item = impl Into<Vec3A>>) -> Vec3A {
+     let (acc, len) = points.fold((Vec3A::ZERO, 0), |(acc, len), point| {
+         (acc + point.into(), len + 1)
+@@ -61,7 +61,7 @@ pub struct Aabb3d {
+ 
+ impl Aabb3d {
+     /// Constructs an AABB from its center and half-size.
+-    #[inline(always)]
++    #[inline]
+     pub fn new(center: impl Into<Vec3A>, half_size: impl Into<Vec3A>) -> Self {
+         let (center, half_size) = (center.into(), half_size.into());
+         debug_assert!(half_size.x >= 0.0 && half_size.y >= 0.0 && half_size.z >= 0.0);
+@@ -77,7 +77,7 @@ impl Aabb3d {
+     /// # Panics
+     ///
+     /// Panics if the given set of points is empty.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_point_cloud(
+         isometry: impl Into<Isometry3d>,
+         points: impl Iterator<Item = impl Into<Vec3A>>,
+@@ -102,7 +102,7 @@ impl Aabb3d {
+     }
+ 
+     /// Computes the smallest [`BoundingSphere`] containing this [`Aabb3d`].
+-    #[inline(always)]
++    #[inline]
+     pub fn bounding_sphere(&self) -> BoundingSphere {
+         let radius = self.min.distance(self.max) / 2.0;
+         BoundingSphere::new(self.center(), radius)
+@@ -112,7 +112,7 @@ impl Aabb3d {
+     ///
+     /// If the point is outside the AABB, the returned point will be on the surface of the AABB.
+     /// Otherwise, it will be inside the AABB and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: impl Into<Vec3A>) -> Vec3A {
+         // Clamp point coordinates to the AABB
+         point.into().clamp(self.min, self.max)
+@@ -124,28 +124,28 @@ impl BoundingVolume for Aabb3d {
+     type Rotation = Quat;
+     type HalfSize = Vec3A;
+ 
+-    #[inline(always)]
++    #[inline]
+     fn center(&self) -> Self::Translation {
+         (self.min + self.max) / 2.
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn half_size(&self) -> Self::HalfSize {
+         (self.max - self.min) / 2.
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn visible_area(&self) -> f32 {
+         let b = (self.max - self.min).max(Vec3A::ZERO);
+         b.x * (b.y + b.z) + b.y * b.z
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn contains(&self, other: &Self) -> bool {
+         other.min.cmpge(self.min).all() && other.max.cmple(self.max).all()
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn merge(&self, other: &Self) -> Self {
+         Self {
+             min: self.min.min(other.min),
+@@ -153,7 +153,7 @@ impl BoundingVolume for Aabb3d {
+         }
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn grow(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         let b = Self {
+@@ -164,7 +164,7 @@ impl BoundingVolume for Aabb3d {
+         b
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn shrink(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         let b = Self {
+@@ -175,7 +175,7 @@ impl BoundingVolume for Aabb3d {
+         b
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn scale_around_center(&self, scale: impl Into<Self::HalfSize>) -> Self {
+         let scale = scale.into();
+         let b = Self {
+@@ -193,7 +193,7 @@ impl BoundingVolume for Aabb3d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn transformed_by(
+         mut self,
+         translation: impl Into<Self::Translation>,
+@@ -210,7 +210,7 @@ impl BoundingVolume for Aabb3d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn transform_by(
+         &mut self,
+         translation: impl Into<Self::Translation>,
+@@ -220,7 +220,7 @@ impl BoundingVolume for Aabb3d {
+         self.translate_by(translation);
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn translate_by(&mut self, translation: impl Into<Self::Translation>) {
+         let translation = translation.into();
+         self.min += translation;
+@@ -234,7 +234,7 @@ impl BoundingVolume for Aabb3d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn rotated_by(mut self, rotation: impl Into<Self::Rotation>) -> Self {
+         self.rotate_by(rotation);
+         self
+@@ -247,7 +247,7 @@ impl BoundingVolume for Aabb3d {
+     /// Note that the result may not be as tightly fitting as the original, and repeated rotations
+     /// can cause the AABB to grow indefinitely. Avoid applying multiple rotations to the same AABB,
+     /// and consider storing the original AABB and rotating that every time instead.
+-    #[inline(always)]
++    #[inline]
+     fn rotate_by(&mut self, rotation: impl Into<Self::Rotation>) {
+         let rot_mat = Mat3::from_quat(rotation.into());
+         let half_size = rot_mat.abs() * self.half_size();
+@@ -256,14 +256,14 @@ impl BoundingVolume for Aabb3d {
+ }
+ 
+ impl IntersectsVolume<Self> for Aabb3d {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, other: &Self) -> bool {
+         self.min.cmple(other.max).all() && self.max.cmpge(other.min).all()
+     }
+ }
+ 
+ impl IntersectsVolume<BoundingSphere> for Aabb3d {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, sphere: &BoundingSphere) -> bool {
+         let closest_point = self.closest_point(sphere.center);
+         let distance_squared = sphere.center.distance_squared(closest_point);
+@@ -512,7 +512,7 @@ impl BoundingSphere {
+     /// transformed by the rotation and translation of the given isometry.
+     ///
+     /// The bounding sphere is not guaranteed to be the smallest possible.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_point_cloud(
+         isometry: impl Into<Isometry3d>,
+         points: &[impl Copy + Into<Vec3A>],
+@@ -534,13 +534,13 @@ impl BoundingSphere {
+     }
+ 
+     /// Get the radius of the bounding sphere
+-    #[inline(always)]
++    #[inline]
+     pub fn radius(&self) -> f32 {
+         self.sphere.radius
+     }
+ 
+     /// Computes the smallest [`Aabb3d`] containing this [`BoundingSphere`].
+-    #[inline(always)]
++    #[inline]
+     pub fn aabb_3d(&self) -> Aabb3d {
+         Aabb3d {
+             min: self.center - self.radius(),
+@@ -552,7 +552,7 @@ impl BoundingSphere {
+     ///
+     /// If the point is outside the sphere, the returned point will be on the surface of the sphere.
+     /// Otherwise, it will be inside the sphere and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: impl Into<Vec3A>) -> Vec3A {
+         let point = point.into();
+         let radius = self.radius();
+@@ -575,28 +575,28 @@ impl BoundingVolume for BoundingSphere {
+     type Rotation = Quat;
+     type HalfSize = f32;
+ 
+-    #[inline(always)]
++    #[inline]
+     fn center(&self) -> Self::Translation {
+         self.center
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn half_size(&self) -> Self::HalfSize {
+         self.radius()
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn visible_area(&self) -> f32 {
+         2. * core::f32::consts::PI * self.radius() * self.radius()
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn contains(&self, other: &Self) -> bool {
+         let diff = self.radius() - other.radius();
+         self.center.distance_squared(other.center) <= ops::copysign(diff.squared(), diff)
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn merge(&self, other: &Self) -> Self {
+         let diff = other.center - self.center;
+         let length = diff.length();
+@@ -613,7 +613,7 @@ impl BoundingVolume for BoundingSphere {
+         )
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn grow(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         debug_assert!(amount >= 0.);
+@@ -625,7 +625,7 @@ impl BoundingVolume for BoundingSphere {
+         }
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn shrink(&self, amount: impl Into<Self::HalfSize>) -> Self {
+         let amount = amount.into();
+         debug_assert!(amount >= 0.);
+@@ -638,19 +638,19 @@ impl BoundingVolume for BoundingSphere {
+         }
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn scale_around_center(&self, scale: impl Into<Self::HalfSize>) -> Self {
+         let scale = scale.into();
+         debug_assert!(scale >= 0.);
+         Self::new(self.center, self.radius() * scale)
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn translate_by(&mut self, translation: impl Into<Self::Translation>) {
+         self.center += translation.into();
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn rotate_by(&mut self, rotation: impl Into<Self::Rotation>) {
+         let rotation: Quat = rotation.into();
+         self.center = rotation * self.center;
+@@ -658,7 +658,7 @@ impl BoundingVolume for BoundingSphere {
+ }
+ 
+ impl IntersectsVolume<Self> for BoundingSphere {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, other: &Self) -> bool {
+         let center_distance_squared = self.center.distance_squared(other.center);
+         let radius_sum_squared = (self.radius() + other.radius()).squared();
+@@ -667,7 +667,7 @@ impl IntersectsVolume<Self> for BoundingSphere {
+ }
+ 
+ impl IntersectsVolume<Aabb3d> for BoundingSphere {
+-    #[inline(always)]
++    #[inline]
+     fn intersects(&self, aabb: &Aabb3d) -> bool {
+         aabb.intersects(self)
+     }
+diff --git a/crates/bevy_math/src/cubic_splines/mod.rs b/crates/bevy_math/src/cubic_splines/mod.rs
+index 6a45103393ffc..ebc55ac1f9eae 100644
+--- a/crates/bevy_math/src/cubic_splines/mod.rs
++++ b/crates/bevy_math/src/cubic_splines/mod.rs
+@@ -743,7 +743,7 @@ impl<P: VectorSpace<Scalar = f32>> CubicNurbs<P> {
+         )
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     const fn knots_len(control_points_len: usize) -> usize {
+         control_points_len + 4
+     }
+diff --git a/crates/bevy_math/src/ops.rs b/crates/bevy_math/src/ops.rs
+index 3a7765939da0a..3a98b4da9c4ff 100644
+--- a/crates/bevy_math/src/ops.rs
++++ b/crates/bevy_math/src/ops.rs
+@@ -29,7 +29,7 @@ mod std_ops {
+     /// Raises a number to a floating point power.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn powf(x: f32, y: f32) -> f32 {
+         f32::powf(x, y)
+     }
+@@ -37,7 +37,7 @@ mod std_ops {
+     /// Returns `e^(self)`, (the exponential function).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn exp(x: f32) -> f32 {
+         f32::exp(x)
+     }
+@@ -45,7 +45,7 @@ mod std_ops {
+     /// Returns `2^(self)`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn exp2(x: f32) -> f32 {
+         f32::exp2(x)
+     }
+@@ -53,7 +53,7 @@ mod std_ops {
+     /// Returns the natural logarithm of the number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn ln(x: f32) -> f32 {
+         f32::ln(x)
+     }
+@@ -61,7 +61,7 @@ mod std_ops {
+     /// Returns the base 2 logarithm of the number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn log2(x: f32) -> f32 {
+         f32::log2(x)
+     }
+@@ -69,7 +69,7 @@ mod std_ops {
+     /// Returns the base 10 logarithm of the number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn log10(x: f32) -> f32 {
+         f32::log10(x)
+     }
+@@ -77,7 +77,7 @@ mod std_ops {
+     /// Returns the cube root of a number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn cbrt(x: f32) -> f32 {
+         f32::cbrt(x)
+     }
+@@ -86,7 +86,7 @@ mod std_ops {
+     /// Equivalently, compute the length of the hypotenuse of a right-angle triangle with other sides having length `x.abs()` and `y.abs()`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn hypot(x: f32, y: f32) -> f32 {
+         f32::hypot(x, y)
+     }
+@@ -94,7 +94,7 @@ mod std_ops {
+     /// Computes the sine of a number (in radians).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn sin(x: f32) -> f32 {
+         f32::sin(x)
+     }
+@@ -102,7 +102,7 @@ mod std_ops {
+     /// Computes the cosine of a number (in radians).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn cos(x: f32) -> f32 {
+         f32::cos(x)
+     }
+@@ -110,7 +110,7 @@ mod std_ops {
+     /// Computes the tangent of a number (in radians).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn tan(x: f32) -> f32 {
+         f32::tan(x)
+     }
+@@ -120,7 +120,7 @@ mod std_ops {
+     /// [-1, 1].
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn asin(x: f32) -> f32 {
+         f32::asin(x)
+     }
+@@ -130,7 +130,7 @@ mod std_ops {
+     /// [-1, 1].
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn acos(x: f32) -> f32 {
+         f32::acos(x)
+     }
+@@ -139,7 +139,7 @@ mod std_ops {
+     /// range [-pi/2, pi/2];
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn atan(x: f32) -> f32 {
+         f32::atan(x)
+     }
+@@ -152,7 +152,7 @@ mod std_ops {
+     /// * `y < 0`: `arctan(y/x) - pi` -> `(-pi, -pi/2)`
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn atan2(y: f32, x: f32) -> f32 {
+         f32::atan2(y, x)
+     }
+@@ -161,7 +161,7 @@ mod std_ops {
+     /// `(sin(x), cos(x))`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn sin_cos(x: f32) -> (f32, f32) {
+         f32::sin_cos(x)
+     }
+@@ -170,7 +170,7 @@ mod std_ops {
+     /// number is close to zero.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn exp_m1(x: f32) -> f32 {
+         f32::exp_m1(x)
+     }
+@@ -179,7 +179,7 @@ mod std_ops {
+     /// the operations were performed separately.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn ln_1p(x: f32) -> f32 {
+         f32::ln_1p(x)
+     }
+@@ -187,7 +187,7 @@ mod std_ops {
+     /// Hyperbolic sine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn sinh(x: f32) -> f32 {
+         f32::sinh(x)
+     }
+@@ -195,7 +195,7 @@ mod std_ops {
+     /// Hyperbolic cosine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn cosh(x: f32) -> f32 {
+         f32::cosh(x)
+     }
+@@ -203,7 +203,7 @@ mod std_ops {
+     /// Hyperbolic tangent function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn tanh(x: f32) -> f32 {
+         f32::tanh(x)
+     }
+@@ -211,7 +211,7 @@ mod std_ops {
+     /// Inverse hyperbolic sine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn asinh(x: f32) -> f32 {
+         f32::asinh(x)
+     }
+@@ -219,7 +219,7 @@ mod std_ops {
+     /// Inverse hyperbolic cosine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn acosh(x: f32) -> f32 {
+         f32::acosh(x)
+     }
+@@ -227,7 +227,7 @@ mod std_ops {
+     /// Inverse hyperbolic tangent function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn atanh(x: f32) -> f32 {
+         f32::atanh(x)
+     }
+@@ -239,7 +239,7 @@ mod libm_ops {
+     /// Raises a number to a floating point power.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn powf(x: f32, y: f32) -> f32 {
+         libm::powf(x, y)
+     }
+@@ -247,7 +247,7 @@ mod libm_ops {
+     /// Returns `e^(self)`, (the exponential function).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn exp(x: f32) -> f32 {
+         libm::expf(x)
+     }
+@@ -255,7 +255,7 @@ mod libm_ops {
+     /// Returns `2^(self)`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn exp2(x: f32) -> f32 {
+         libm::exp2f(x)
+     }
+@@ -263,7 +263,7 @@ mod libm_ops {
+     /// Returns the natural logarithm of the number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn ln(x: f32) -> f32 {
+         // This isn't documented in `libm` but this is actually the base e logarithm.
+         libm::logf(x)
+@@ -272,7 +272,7 @@ mod libm_ops {
+     /// Returns the base 2 logarithm of the number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn log2(x: f32) -> f32 {
+         libm::log2f(x)
+     }
+@@ -280,7 +280,7 @@ mod libm_ops {
+     /// Returns the base 10 logarithm of the number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn log10(x: f32) -> f32 {
+         libm::log10f(x)
+     }
+@@ -288,7 +288,7 @@ mod libm_ops {
+     /// Returns the cube root of a number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn cbrt(x: f32) -> f32 {
+         libm::cbrtf(x)
+     }
+@@ -298,7 +298,7 @@ mod libm_ops {
+     /// Equivalently, compute the length of the hypotenuse of a right-angle triangle with other sides having length `x.abs()` and `y.abs()`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn hypot(x: f32, y: f32) -> f32 {
+         libm::hypotf(x, y)
+     }
+@@ -306,7 +306,7 @@ mod libm_ops {
+     /// Computes the sine of a number (in radians).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn sin(x: f32) -> f32 {
+         libm::sinf(x)
+     }
+@@ -314,7 +314,7 @@ mod libm_ops {
+     /// Computes the cosine of a number (in radians).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn cos(x: f32) -> f32 {
+         libm::cosf(x)
+     }
+@@ -322,7 +322,7 @@ mod libm_ops {
+     /// Computes the tangent of a number (in radians).
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn tan(x: f32) -> f32 {
+         libm::tanf(x)
+     }
+@@ -332,7 +332,7 @@ mod libm_ops {
+     /// [-1, 1].
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn asin(x: f32) -> f32 {
+         libm::asinf(x)
+     }
+@@ -345,7 +345,7 @@ mod libm_ops {
+     /// [-1, 1].
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn acos(x: f32) -> f32 {
+         libm::acosf(x)
+     }
+@@ -354,7 +354,7 @@ mod libm_ops {
+     /// range [-pi/2, pi/2];
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn atan(x: f32) -> f32 {
+         libm::atanf(x)
+     }
+@@ -367,7 +367,7 @@ mod libm_ops {
+     /// * `y < 0`: `arctan(y/x) - pi` -> `(-pi, -pi/2)`
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn atan2(y: f32, x: f32) -> f32 {
+         libm::atan2f(y, x)
+     }
+@@ -376,7 +376,7 @@ mod libm_ops {
+     /// `(sin(x), cos(x))`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn sin_cos(x: f32) -> (f32, f32) {
+         libm::sincosf(x)
+     }
+@@ -385,7 +385,7 @@ mod libm_ops {
+     /// number is close to zero.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn exp_m1(x: f32) -> f32 {
+         libm::expm1f(x)
+     }
+@@ -394,7 +394,7 @@ mod libm_ops {
+     /// the operations were performed separately.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn ln_1p(x: f32) -> f32 {
+         libm::log1pf(x)
+     }
+@@ -402,7 +402,7 @@ mod libm_ops {
+     /// Hyperbolic sine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn sinh(x: f32) -> f32 {
+         libm::sinhf(x)
+     }
+@@ -410,7 +410,7 @@ mod libm_ops {
+     /// Hyperbolic cosine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn cosh(x: f32) -> f32 {
+         libm::coshf(x)
+     }
+@@ -418,7 +418,7 @@ mod libm_ops {
+     /// Hyperbolic tangent function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn tanh(x: f32) -> f32 {
+         libm::tanhf(x)
+     }
+@@ -426,7 +426,7 @@ mod libm_ops {
+     /// Inverse hyperbolic sine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn asinh(x: f32) -> f32 {
+         libm::asinhf(x)
+     }
+@@ -434,7 +434,7 @@ mod libm_ops {
+     /// Inverse hyperbolic cosine function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn acosh(x: f32) -> f32 {
+         libm::acoshf(x)
+     }
+@@ -442,7 +442,7 @@ mod libm_ops {
+     /// Inverse hyperbolic tangent function.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn atanh(x: f32) -> f32 {
+         libm::atanhf(x)
+     }
+@@ -458,7 +458,7 @@ mod libm_ops_for_no_std {
+     /// Calculates the least nonnegative remainder of `self (mod rhs)`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn rem_euclid(x: f32, y: f32) -> f32 {
+         let result = libm::remainderf(x, y);
+ 
+@@ -473,7 +473,7 @@ mod libm_ops_for_no_std {
+     /// Computes the absolute value of x.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn abs(x: f32) -> f32 {
+         libm::fabsf(x)
+     }
+@@ -481,7 +481,7 @@ mod libm_ops_for_no_std {
+     /// Returns the square root of a number.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn sqrt(x: f32) -> f32 {
+         libm::sqrtf(x)
+     }
+@@ -489,7 +489,7 @@ mod libm_ops_for_no_std {
+     /// Returns a number composed of the magnitude of `x` and the sign of `y`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn copysign(x: f32, y: f32) -> f32 {
+         libm::copysignf(x, y)
+     }
+@@ -497,7 +497,7 @@ mod libm_ops_for_no_std {
+     /// Returns the nearest integer to `x`. If a value is half-way between two integers, round away from `0.0`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn round(x: f32) -> f32 {
+         libm::roundf(x)
+     }
+@@ -505,7 +505,7 @@ mod libm_ops_for_no_std {
+     /// Returns the largest integer less than or equal to `x`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn floor(x: f32) -> f32 {
+         libm::floorf(x)
+     }
+@@ -513,7 +513,7 @@ mod libm_ops_for_no_std {
+     /// Returns the smallest integer greater than or equal to `x`.
+     ///
+     /// Precision is specified when the `libm` feature is enabled.
+-    #[inline(always)]
++    #[inline]
+     pub fn ceil(x: f32) -> f32 {
+         libm::ceilf(x)
+     }
+@@ -521,7 +521,7 @@ mod libm_ops_for_no_std {
+     /// Returns the fractional part of `x`.
+     ///
+     /// This function always returns the precise result.
+-    #[inline(always)]
++    #[inline]
+     pub fn fract(x: f32) -> f32 {
+         libm::modff(x).0
+     }
+@@ -541,7 +541,7 @@ mod std_ops_for_no_std {
+     /// Calculates the least nonnegative remainder of `x (mod y)`.
+     ///
+     /// The result of this operation is guaranteed to be the rounded infinite-precision result.
+-    #[inline(always)]
++    #[inline]
+     pub fn rem_euclid(x: f32, y: f32) -> f32 {
+         f32::rem_euclid(x, y)
+     }
+@@ -549,7 +549,7 @@ mod std_ops_for_no_std {
+     /// Computes the absolute value of x.
+     ///
+     /// This function always returns the precise result.
+-    #[inline(always)]
++    #[inline]
+     pub fn abs(x: f32) -> f32 {
+         f32::abs(x)
+     }
+@@ -558,7 +558,7 @@ mod std_ops_for_no_std {
+     ///
+     /// The result of this operation is guaranteed to be the rounded infinite-precision result.
+     /// It is specified by IEEE 754 as `squareRoot` and guaranteed not to change.
+-    #[inline(always)]
++    #[inline]
+     pub fn sqrt(x: f32) -> f32 {
+         f32::sqrt(x)
+     }
+@@ -568,7 +568,7 @@ mod std_ops_for_no_std {
+     /// Equal to `x` if the sign of `x` and `y` are the same, otherwise equal to `-x`. If `x` is a
+     /// `NaN`, then a `NaN` with the sign bit of `y` is returned. Note, however, that conserving the
+     /// sign bit on `NaN` across arithmetical operations is not generally guaranteed.
+-    #[inline(always)]
++    #[inline]
+     pub fn copysign(x: f32, y: f32) -> f32 {
+         f32::copysign(x, y)
+     }
+@@ -576,7 +576,7 @@ mod std_ops_for_no_std {
+     /// Returns the nearest integer to `x`. If a value is half-way between two integers, round away from `0.0`.
+     ///
+     /// This function always returns the precise result.
+-    #[inline(always)]
++    #[inline]
+     pub fn round(x: f32) -> f32 {
+         f32::round(x)
+     }
+@@ -584,7 +584,7 @@ mod std_ops_for_no_std {
+     /// Returns the largest integer less than or equal to `x`.
+     ///
+     /// This function always returns the precise result.
+-    #[inline(always)]
++    #[inline]
+     pub fn floor(x: f32) -> f32 {
+         f32::floor(x)
+     }
+@@ -592,7 +592,7 @@ mod std_ops_for_no_std {
+     /// Returns the smallest integer greater than or equal to `x`.
+     ///
+     /// This function always returns the precise result.
+-    #[inline(always)]
++    #[inline]
+     pub fn ceil(x: f32) -> f32 {
+         f32::ceil(x)
+     }
+@@ -600,7 +600,7 @@ mod std_ops_for_no_std {
+     /// Returns the fractional part of `x`.
+     ///
+     /// This function always returns the precise result.
+-    #[inline(always)]
++    #[inline]
+     pub fn fract(x: f32) -> f32 {
+         f32::fract(x)
+     }
+diff --git a/crates/bevy_math/src/primitives/dim2.rs b/crates/bevy_math/src/primitives/dim2.rs
+index 0f3b4bcc26153..74fab8e43bdce 100644
+--- a/crates/bevy_math/src/primitives/dim2.rs
++++ b/crates/bevy_math/src/primitives/dim2.rs
+@@ -48,13 +48,13 @@ impl Default for Circle {
+ 
+ impl Circle {
+     /// Create a new [`Circle`] from a `radius`
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(radius: f32) -> Self {
+         Self { radius }
+     }
+ 
+     /// Get the diameter of the circle
+-    #[inline(always)]
++    #[inline]
+     pub const fn diameter(&self) -> f32 {
+         2.0 * self.radius
+     }
+@@ -63,7 +63,7 @@ impl Circle {
+     ///
+     /// If the point is outside the circle, the returned point will be on the perimeter of the circle.
+     /// Otherwise, it will be inside the circle and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec2) -> Vec2 {
+         let distance_squared = point.length_squared();
+ 
+@@ -81,13 +81,13 @@ impl Circle {
+ 
+ impl Measured2d for Circle {
+     /// Get the area of the circle
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         PI * self.radius.squared()
+     }
+ 
+     /// Get the perimeter or circumference of the circle
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "circumference")]
+     fn perimeter(&self) -> f32 {
+         2.0 * PI * self.radius
+@@ -141,13 +141,13 @@ impl Default for Arc2d {
+ 
+ impl Arc2d {
+     /// Create a new [`Arc2d`] from a `radius` and a `half_angle`
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(radius: f32, half_angle: f32) -> Self {
+         Self { radius, half_angle }
+     }
+ 
+     /// Create a new [`Arc2d`] from a `radius` and an `angle` in radians
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_radians(radius: f32, angle: f32) -> Self {
+         Self {
+             radius,
+@@ -156,7 +156,7 @@ impl Arc2d {
+     }
+ 
+     /// Create a new [`Arc2d`] from a `radius` and an `angle` in degrees.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_degrees(radius: f32, angle: f32) -> Self {
+         Self {
+             radius,
+@@ -167,7 +167,7 @@ impl Arc2d {
+     /// Create a new [`Arc2d`] from a `radius` and a `fraction` of a single turn.
+     ///
+     /// For instance, `0.5` turns is a semicircle.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_turns(radius: f32, fraction: f32) -> Self {
+         Self {
+             radius,
+@@ -176,31 +176,31 @@ impl Arc2d {
+     }
+ 
+     /// Get the angle of the arc
+-    #[inline(always)]
++    #[inline]
+     pub const fn angle(&self) -> f32 {
+         self.half_angle * 2.0
+     }
+ 
+     /// Get the length of the arc
+-    #[inline(always)]
++    #[inline]
+     pub const fn length(&self) -> f32 {
+         self.angle() * self.radius
+     }
+ 
+     /// Get the right-hand end point of the arc
+-    #[inline(always)]
++    #[inline]
+     pub fn right_endpoint(&self) -> Vec2 {
+         self.radius * Vec2::from_angle(FRAC_PI_2 - self.half_angle)
+     }
+ 
+     /// Get the left-hand end point of the arc
+-    #[inline(always)]
++    #[inline]
+     pub fn left_endpoint(&self) -> Vec2 {
+         self.radius * Vec2::from_angle(FRAC_PI_2 + self.half_angle)
+     }
+ 
+     /// Get the endpoints of the arc
+-    #[inline(always)]
++    #[inline]
+     pub fn endpoints(&self) -> [Vec2; 2] {
+         [self.left_endpoint(), self.right_endpoint()]
+     }
+@@ -212,19 +212,19 @@ impl Arc2d {
+     }
+ 
+     /// Get half the distance between the endpoints (half the length of the chord)
+-    #[inline(always)]
++    #[inline]
+     pub fn half_chord_length(&self) -> f32 {
+         self.radius * ops::sin(self.half_angle)
+     }
+ 
+     /// Get the distance between the endpoints (the length of the chord)
+-    #[inline(always)]
++    #[inline]
+     pub fn chord_length(&self) -> f32 {
+         2.0 * self.half_chord_length()
+     }
+ 
+     /// Get the midpoint of the two endpoints (the midpoint of the chord)
+-    #[inline(always)]
++    #[inline]
+     pub fn chord_midpoint(&self) -> Vec2 {
+         self.apothem() * Vec2::Y
+     }
+@@ -234,7 +234,7 @@ impl Arc2d {
+     /// Equivalently, the [`radius`](Self::radius) minus the [`sagitta`](Self::sagitta).
+     ///
+     /// Note that for a [`major`](Self::is_major) arc, the apothem will be negative.
+-    #[inline(always)]
++    #[inline]
+     // Naming note: Various sources are inconsistent as to whether the apothem is the segment between the center and the
+     // midpoint of a chord, or the length of that segment. Given this confusion, we've opted for the definition
+     // used by Wolfram MathWorld, which is the distance rather than the segment.
+@@ -255,7 +255,7 @@ impl Arc2d {
+     /// Produces true if the arc is at most half a circle.
+     ///
+     /// **Note:** This is not the negation of [`is_major`](Self::is_major): an exact semicircle is both major and minor.
+-    #[inline(always)]
++    #[inline]
+     pub const fn is_minor(&self) -> bool {
+         self.half_angle <= FRAC_PI_2
+     }
+@@ -263,7 +263,7 @@ impl Arc2d {
+     /// Produces true if the arc is at least half a circle.
+     ///
+     /// **Note:** This is not the negation of [`is_minor`](Self::is_minor): an exact semicircle is both major and minor.
+-    #[inline(always)]
++    #[inline]
+     pub const fn is_major(&self) -> bool {
+         self.half_angle >= FRAC_PI_2
+     }
+@@ -304,12 +304,12 @@ impl Default for CircularSector {
+ }
+ 
+ impl Measured2d for CircularSector {
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         self.arc.radius.squared() * self.arc.half_angle
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn perimeter(&self) -> f32 {
+         if self.half_angle() >= PI {
+             self.arc.radius * 2.0 * PI
+@@ -321,7 +321,7 @@ impl Measured2d for CircularSector {
+ 
+ impl CircularSector {
+     /// Create a new [`CircularSector`] from a `radius` and an `angle`
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(radius: f32, angle: f32) -> Self {
+         Self {
+             arc: Arc2d::new(radius, angle),
+@@ -329,7 +329,7 @@ impl CircularSector {
+     }
+ 
+     /// Create a new [`CircularSector`] from a `radius` and an `angle` in radians.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_radians(radius: f32, angle: f32) -> Self {
+         Self {
+             arc: Arc2d::from_radians(radius, angle),
+@@ -337,7 +337,7 @@ impl CircularSector {
+     }
+ 
+     /// Create a new [`CircularSector`] from a `radius` and an `angle` in degrees.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_degrees(radius: f32, angle: f32) -> Self {
+         Self {
+             arc: Arc2d::from_degrees(radius, angle),
+@@ -347,7 +347,7 @@ impl CircularSector {
+     /// Create a new [`CircularSector`] from a `radius` and a number of `turns` of a circle.
+     ///
+     /// For instance, `0.5` turns is a semicircle.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_turns(radius: f32, fraction: f32) -> Self {
+         Self {
+             arc: Arc2d::from_turns(radius, fraction),
+@@ -355,25 +355,25 @@ impl CircularSector {
+     }
+ 
+     /// Get half the angle of the sector
+-    #[inline(always)]
++    #[inline]
+     pub const fn half_angle(&self) -> f32 {
+         self.arc.half_angle
+     }
+ 
+     /// Get the angle of the sector
+-    #[inline(always)]
++    #[inline]
+     pub const fn angle(&self) -> f32 {
+         self.arc.angle()
+     }
+ 
+     /// Get the radius of the sector
+-    #[inline(always)]
++    #[inline]
+     pub const fn radius(&self) -> f32 {
+         self.arc.radius
+     }
+ 
+     /// Get the length of the arc defining the sector
+-    #[inline(always)]
++    #[inline]
+     pub const fn arc_length(&self) -> f32 {
+         self.arc.length()
+     }
+@@ -381,7 +381,7 @@ impl CircularSector {
+     /// Get half the length of the chord defined by the sector
+     ///
+     /// See [`Arc2d::half_chord_length`]
+-    #[inline(always)]
++    #[inline]
+     pub fn half_chord_length(&self) -> f32 {
+         self.arc.half_chord_length()
+     }
+@@ -389,7 +389,7 @@ impl CircularSector {
+     /// Get the length of the chord defined by the sector
+     ///
+     /// See [`Arc2d::chord_length`]
+-    #[inline(always)]
++    #[inline]
+     pub fn chord_length(&self) -> f32 {
+         self.arc.chord_length()
+     }
+@@ -397,7 +397,7 @@ impl CircularSector {
+     /// Get the midpoint of the chord defined by the sector
+     ///
+     /// See [`Arc2d::chord_midpoint`]
+-    #[inline(always)]
++    #[inline]
+     pub fn chord_midpoint(&self) -> Vec2 {
+         self.arc.chord_midpoint()
+     }
+@@ -405,7 +405,7 @@ impl CircularSector {
+     /// Get the length of the apothem of this sector
+     ///
+     /// See [`Arc2d::apothem`]
+-    #[inline(always)]
++    #[inline]
+     pub fn apothem(&self) -> f32 {
+         self.arc.apothem()
+     }
+@@ -413,7 +413,7 @@ impl CircularSector {
+     /// Get the length of the sagitta of this sector
+     ///
+     /// See [`Arc2d::sagitta`]
+-    #[inline(always)]
++    #[inline]
+     pub fn sagitta(&self) -> f32 {
+         self.arc.sagitta()
+     }
+@@ -456,12 +456,12 @@ impl Default for CircularSegment {
+ }
+ 
+ impl Measured2d for CircularSegment {
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         0.5 * self.arc.radius.squared() * (self.arc.angle() - ops::sin(self.arc.angle()))
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     fn perimeter(&self) -> f32 {
+         self.chord_length() + self.arc_length()
+     }
+@@ -469,7 +469,7 @@ impl Measured2d for CircularSegment {
+ 
+ impl CircularSegment {
+     /// Create a new [`CircularSegment`] from a `radius`, and an `angle`
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(radius: f32, angle: f32) -> Self {
+         Self {
+             arc: Arc2d::new(radius, angle),
+@@ -477,7 +477,7 @@ impl CircularSegment {
+     }
+ 
+     /// Create a new [`CircularSegment`] from a `radius` and an `angle` in radians.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_radians(radius: f32, angle: f32) -> Self {
+         Self {
+             arc: Arc2d::from_radians(radius, angle),
+@@ -485,7 +485,7 @@ impl CircularSegment {
+     }
+ 
+     /// Create a new [`CircularSegment`] from a `radius` and an `angle` in degrees.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_degrees(radius: f32, angle: f32) -> Self {
+         Self {
+             arc: Arc2d::from_degrees(radius, angle),
+@@ -495,7 +495,7 @@ impl CircularSegment {
+     /// Create a new [`CircularSegment`] from a `radius` and a number of `turns` of a circle.
+     ///
+     /// For instance, `0.5` turns is a semicircle.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_turns(radius: f32, fraction: f32) -> Self {
+         Self {
+             arc: Arc2d::from_turns(radius, fraction),
+@@ -503,38 +503,38 @@ impl CircularSegment {
+     }
+ 
+     /// Get the half-angle of the segment
+-    #[inline(always)]
++    #[inline]
+     pub const fn half_angle(&self) -> f32 {
+         self.arc.half_angle
+     }
+ 
+     /// Get the angle of the segment
+-    #[inline(always)]
++    #[inline]
+     pub const fn angle(&self) -> f32 {
+         self.arc.angle()
+     }
+ 
+     /// Get the radius of the segment
+-    #[inline(always)]
++    #[inline]
+     pub const fn radius(&self) -> f32 {
+         self.arc.radius
+     }
+ 
+     /// Get the length of the arc defining the segment
+-    #[inline(always)]
++    #[inline]
+     pub const fn arc_length(&self) -> f32 {
+         self.arc.length()
+     }
+ 
+     /// Get half the length of the segment's base, also known as its chord
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "half_base_length")]
+     pub fn half_chord_length(&self) -> f32 {
+         self.arc.half_chord_length()
+     }
+ 
+     /// Get the length of the segment's base, also known as its chord
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "base_length")]
+     #[doc(alias = "base")]
+     pub fn chord_length(&self) -> f32 {
+@@ -542,7 +542,7 @@ impl CircularSegment {
+     }
+ 
+     /// Get the midpoint of the segment's base, also known as its chord
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "base_midpoint")]
+     pub fn chord_midpoint(&self) -> Vec2 {
+         self.arc.chord_midpoint()
+@@ -552,7 +552,7 @@ impl CircularSegment {
+     /// which is the signed distance between the segment and the center of its circle
+     ///
+     /// See [`Arc2d::apothem`]
+-    #[inline(always)]
++    #[inline]
+     pub fn apothem(&self) -> f32 {
+         self.arc.apothem()
+     }
+@@ -560,7 +560,7 @@ impl CircularSegment {
+     /// Get the length of the sagitta of this segment, also known as its height
+     ///
+     /// See [`Arc2d::sagitta`]
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "height")]
+     pub fn sagitta(&self) -> f32 {
+         self.arc.sagitta()
+@@ -826,7 +826,7 @@ impl Ellipse {
+     /// Create a new `Ellipse` from half of its width and height.
+     ///
+     /// This corresponds to the two perpendicular radii defining the ellipse.
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(half_width: f32, half_height: f32) -> Self {
+         Self {
+             half_size: Vec2::new(half_width, half_height),
+@@ -836,14 +836,14 @@ impl Ellipse {
+     /// Create a new `Ellipse` from a given full size.
+     ///
+     /// `size.x` is the diameter along the X axis, and `size.y` is the diameter along the Y axis.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_size(size: Vec2) -> Self {
+         Self {
+             half_size: Vec2::new(size.x / 2.0, size.y / 2.0),
+         }
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     /// Returns the [eccentricity](https://en.wikipedia.org/wiki/Eccentricity_(mathematics)) of the ellipse.
+     /// It can be thought of as a measure of how "stretched" or elongated the ellipse is.
+     ///
+@@ -855,7 +855,7 @@ impl Ellipse {
+         ops::sqrt(a * a - b * b) / a
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     /// Get the focal length of the ellipse. This corresponds to the distance between one of the foci and the center of the ellipse.
+     ///
+     /// The focal length of an ellipse is related to its eccentricity by `eccentricity = focal_length / semi_major`
+@@ -867,13 +867,13 @@ impl Ellipse {
+     }
+ 
+     /// Returns the length of the semi-major axis. This corresponds to the longest radius of the ellipse.
+-    #[inline(always)]
++    #[inline]
+     pub fn semi_major(&self) -> f32 {
+         self.half_size.max_element()
+     }
+ 
+     /// Returns the length of the semi-minor axis. This corresponds to the shortest radius of the ellipse.
+-    #[inline(always)]
++    #[inline]
+     pub fn semi_minor(&self) -> f32 {
+         self.half_size.min_element()
+     }
+@@ -881,12 +881,12 @@ impl Ellipse {
+ 
+ impl Measured2d for Ellipse {
+     /// Get the area of the ellipse
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         PI * self.half_size.x * self.half_size.y
+     }
+ 
+-    #[inline(always)]
++    #[inline]
+     /// Get an approximation for the perimeter or circumference of the ellipse.
+     ///
+     /// The approximation is reasonably precise with a relative error less than 0.007%, getting more precise as the eccentricity of the ellipse decreases.
+@@ -977,7 +977,7 @@ impl Default for Annulus {
+ 
+ impl Annulus {
+     /// Create a new [`Annulus`] from the radii of the inner and outer circle
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(inner_radius: f32, outer_radius: f32) -> Self {
+         Self {
+             inner_circle: Circle::new(inner_radius),
+@@ -986,13 +986,13 @@ impl Annulus {
+     }
+ 
+     /// Get the diameter of the annulus
+-    #[inline(always)]
++    #[inline]
+     pub const fn diameter(&self) -> f32 {
+         self.outer_circle.diameter()
+     }
+ 
+     /// Get the thickness of the annulus
+-    #[inline(always)]
++    #[inline]
+     pub const fn thickness(&self) -> f32 {
+         self.outer_circle.radius - self.inner_circle.radius
+     }
+@@ -1002,7 +1002,7 @@ impl Annulus {
+     /// - If the point is outside of the annulus completely, the returned point will be on the outer perimeter.
+     /// - If the point is inside of the inner circle (hole) of the annulus, the returned point will be on the inner perimeter.
+     /// - Otherwise, the returned point is overlapping the annulus and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec2) -> Vec2 {
+         let distance_squared = point.length_squared();
+ 
+@@ -1027,14 +1027,14 @@ impl Annulus {
+ 
+ impl Measured2d for Annulus {
+     /// Get the area of the annulus
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         PI * (self.outer_circle.radius.squared() - self.inner_circle.radius.squared())
+     }
+ 
+     /// Get the perimeter or circumference of the annulus,
+     /// which is the sum of the perimeters of the inner and outer circles.
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "circumference")]
+     fn perimeter(&self) -> f32 {
+         2.0 * PI * (self.outer_circle.radius + self.inner_circle.radius)
+@@ -1074,7 +1074,7 @@ impl Default for Rhombus {
+ 
+ impl Rhombus {
+     /// Create a new `Rhombus` from a vertical and horizontal diagonal sizes.
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(horizontal_diagonal: f32, vertical_diagonal: f32) -> Self {
+         Self {
+             half_diagonals: Vec2::new(horizontal_diagonal / 2.0, vertical_diagonal / 2.0),
+@@ -1082,7 +1082,7 @@ impl Rhombus {
+     }
+ 
+     /// Create a new `Rhombus` from a side length with all inner angles equal.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_side(side: f32) -> Self {
+         Self {
+             half_diagonals: Vec2::splat(side * FRAC_1_SQRT_2),
+@@ -1090,7 +1090,7 @@ impl Rhombus {
+     }
+ 
+     /// Create a new `Rhombus` from a given inradius with all inner angles equal.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_inradius(inradius: f32) -> Self {
+         let half_diagonal = inradius * 2.0 / core::f32::consts::SQRT_2;
+         Self {
+@@ -1099,21 +1099,21 @@ impl Rhombus {
+     }
+ 
+     /// Get the length of each side of the rhombus
+-    #[inline(always)]
++    #[inline]
+     pub fn side(&self) -> f32 {
+         self.half_diagonals.length()
+     }
+ 
+     /// Get the radius of the circumcircle on which all vertices
+     /// of the rhombus lie
+-    #[inline(always)]
++    #[inline]
+     pub const fn circumradius(&self) -> f32 {
+         self.half_diagonals.x.max(self.half_diagonals.y)
+     }
+ 
+     /// Get the radius of the largest circle that can
+     /// be drawn within the rhombus
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "apothem")]
+     pub fn inradius(&self) -> f32 {
+         let side = self.side();
+@@ -1128,7 +1128,7 @@ impl Rhombus {
+     ///
+     /// If the point is outside the rhombus, the returned point will be on the perimeter of the rhombus.
+     /// Otherwise, it will be inside the rhombus and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec2) -> Vec2 {
+         // Fold the problem into the positive quadrant
+         let point_abs = point.abs();
+@@ -1167,13 +1167,13 @@ impl Rhombus {
+ 
+ impl Measured2d for Rhombus {
+     /// Get the area of the rhombus
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         2.0 * self.half_diagonals.x * self.half_diagonals.y
+     }
+ 
+     /// Get the perimeter of the rhombus
+-    #[inline(always)]
++    #[inline]
+     fn perimeter(&self) -> f32 {
+         4.0 * self.side()
+     }
+@@ -1212,7 +1212,7 @@ impl Plane2d {
+     /// # Panics
+     ///
+     /// Panics if the given `normal` is zero (or very close to zero), or non-finite.
+-    #[inline(always)]
++    #[inline]
+     pub fn new(normal: Vec2) -> Self {
+         Self {
+             normal: Dir2::new(normal).expect("normal must be nonzero and finite"),
+@@ -1272,7 +1272,7 @@ impl Default for Segment2d {
+ 
+ impl Segment2d {
+     /// Create a new `Segment2d` from its endpoints.
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(point1: Vec2, point2: Vec2) -> Self {
+         Self {
+             vertices: [point1, point2],
+@@ -1282,7 +1282,7 @@ impl Segment2d {
+     /// Create a new `Segment2d` centered at the origin with the given direction and length.
+     ///
+     /// The endpoints will be at `-direction * length / 2.0` and `direction * length / 2.0`.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_direction_and_length(direction: Dir2, length: f32) -> Self {
+         let endpoint = 0.5 * length * direction;
+         Self {
+@@ -1294,7 +1294,7 @@ impl Segment2d {
+     /// the direction and length of the line segment.
+     ///
+     /// The endpoints will be at `-scaled_direction / 2.0` and `scaled_direction / 2.0`.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_scaled_direction(scaled_direction: Vec2) -> Self {
+         let endpoint = 0.5 * scaled_direction;
+         Self {
+@@ -1306,7 +1306,7 @@ impl Segment2d {
+     /// going in the direction of the ray for the given `length`.
+     ///
+     /// The endpoints will be at `ray.origin` and `ray.origin + length * ray.direction`.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_ray_and_length(ray: Ray2d, length: f32) -> Self {
+         Self {
+             vertices: [ray.origin, ray.get_point(length)],
+@@ -1314,32 +1314,32 @@ impl Segment2d {
+     }
+ 
+     /// Get the position of the first endpoint of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub const fn point1(&self) -> Vec2 {
+         self.vertices[0]
+     }
+ 
+     /// Get the position of the second endpoint of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub const fn point2(&self) -> Vec2 {
+         self.vertices[1]
+     }
+ 
+     /// Compute the midpoint between the two endpoints of the line segment.
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "midpoint")]
+     pub fn center(&self) -> Vec2 {
+         self.point1().midpoint(self.point2())
+     }
+ 
+     /// Compute the length of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub fn length(&self) -> f32 {
+         self.point1().distance(self.point2())
+     }
+ 
+     /// Compute the squared length of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub fn length_squared(&self) -> f32 {
+         self.point1().distance_squared(self.point2())
+     }
+@@ -1351,7 +1351,7 @@ impl Segment2d {
+     /// # Panics
+     ///
+     /// Panics if a valid direction could not be computed, for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn direction(&self) -> Dir2 {
+         self.try_direction().unwrap_or_else(|err| {
+             panic!("Failed to compute the direction of a line segment: {err}")
+@@ -1362,13 +1362,13 @@ impl Segment2d {
+     ///
+     /// Returns [`Err(InvalidDirectionError)`](InvalidDirectionError) if a valid direction could not be computed,
+     /// for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn try_direction(&self) -> Result<Dir2, InvalidDirectionError> {
+         Dir2::new(self.scaled_direction())
+     }
+ 
+     /// Compute the vector from the first endpoint to the second endpoint.
+-    #[inline(always)]
++    #[inline]
+     pub fn scaled_direction(&self) -> Vec2 {
+         self.point2() - self.point1()
+     }
+@@ -1380,7 +1380,7 @@ impl Segment2d {
+     /// # Panics
+     ///
+     /// Panics if a valid normal could not be computed, for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn left_normal(&self) -> Dir2 {
+         self.try_left_normal().unwrap_or_else(|err| {
+             panic!("Failed to compute the left-hand side normal of a line segment: {err}")
+@@ -1391,7 +1391,7 @@ impl Segment2d {
+     ///
+     /// Returns [`Err(InvalidDirectionError)`](InvalidDirectionError) if a valid normal could not be computed,
+     /// for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn try_left_normal(&self) -> Result<Dir2, InvalidDirectionError> {
+         Dir2::new(self.scaled_left_normal())
+     }
+@@ -1399,7 +1399,7 @@ impl Segment2d {
+     /// Compute the non-normalized counterclockwise normal on the left-hand side of the line segment.
+     ///
+     /// The length of the normal is the distance between the endpoints.
+-    #[inline(always)]
++    #[inline]
+     pub fn scaled_left_normal(&self) -> Vec2 {
+         let scaled_direction = self.scaled_direction();
+         Vec2::new(-scaled_direction.y, scaled_direction.x)
+@@ -1412,7 +1412,7 @@ impl Segment2d {
+     /// # Panics
+     ///
+     /// Panics if a valid normal could not be computed, for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn right_normal(&self) -> Dir2 {
+         self.try_right_normal().unwrap_or_else(|err| {
+             panic!("Failed to compute the right-hand side normal of a line segment: {err}")
+@@ -1423,7 +1423,7 @@ impl Segment2d {
+     ///
+     /// Returns [`Err(InvalidDirectionError)`](InvalidDirectionError) if a valid normal could not be computed,
+     /// for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn try_right_normal(&self) -> Result<Dir2, InvalidDirectionError> {
+         Dir2::new(self.scaled_right_normal())
+     }
+@@ -1431,14 +1431,14 @@ impl Segment2d {
+     /// Compute the non-normalized clockwise normal on the right-hand side of the line segment.
+     ///
+     /// The length of the normal is the distance between the endpoints.
+-    #[inline(always)]
++    #[inline]
+     pub fn scaled_right_normal(&self) -> Vec2 {
+         let scaled_direction = self.scaled_direction();
+         Vec2::new(scaled_direction.y, -scaled_direction.x)
+     }
+ 
+     /// Compute the segment transformed by the given [`Isometry2d`].
+-    #[inline(always)]
++    #[inline]
+     pub fn transformed(&self, isometry: impl Into<Isometry2d>) -> Self {
+         let isometry: Isometry2d = isometry.into();
+         Self::new(
+@@ -1448,19 +1448,19 @@ impl Segment2d {
+     }
+ 
+     /// Compute the segment translated by the given vector.
+-    #[inline(always)]
++    #[inline]
+     pub fn translated(&self, translation: Vec2) -> Segment2d {
+         Self::new(self.point1() + translation, self.point2() + translation)
+     }
+ 
+     /// Compute the segment rotated around the origin by the given rotation.
+-    #[inline(always)]
++    #[inline]
+     pub fn rotated(&self, rotation: Rot2) -> Segment2d {
+         Segment2d::new(rotation * self.point1(), rotation * self.point2())
+     }
+ 
+     /// Compute the segment rotated around the given point by the given rotation.
+-    #[inline(always)]
++    #[inline]
+     pub fn rotated_around(&self, rotation: Rot2, point: Vec2) -> Segment2d {
+         // We offset our segment so that our segment is rotated as if from the origin, then we can apply the offset back
+         let offset = self.translated(-point);
+@@ -1469,20 +1469,20 @@ impl Segment2d {
+     }
+ 
+     /// Compute the segment rotated around its own center.
+-    #[inline(always)]
++    #[inline]
+     pub fn rotated_around_center(&self, rotation: Rot2) -> Segment2d {
+         self.rotated_around(rotation, self.center())
+     }
+ 
+     /// Compute the segment with its center at the origin, keeping the same direction and length.
+-    #[inline(always)]
++    #[inline]
+     pub fn centered(&self) -> Segment2d {
+         let center = self.center();
+         self.translated(-center)
+     }
+ 
+     /// Compute the segment with a new length, keeping the same direction and center.
+-    #[inline(always)]
++    #[inline]
+     pub fn resized(&self, length: f32) -> Segment2d {
+         let offset_from_origin = self.center();
+         let centered = self.translated(-offset_from_origin);
+@@ -1492,14 +1492,14 @@ impl Segment2d {
+     }
+ 
+     /// Reverses the direction of the line segment by swapping the endpoints.
+-    #[inline(always)]
++    #[inline]
+     pub fn reverse(&mut self) {
+         let [point1, point2] = &mut self.vertices;
+         core::mem::swap(point1, point2);
+     }
+ 
+     /// Returns the line segment with its direction reversed by swapping the endpoints.
+-    #[inline(always)]
++    #[inline]
+     #[must_use]
+     pub fn reversed(mut self) -> Self {
+         self.reverse();
+@@ -1507,7 +1507,7 @@ impl Segment2d {
+     }
+ 
+     /// Returns the point on the [`Segment2d`] that is closest to the specified `point`.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec2) -> Vec2 {
+         //       `point`
+         //           x
+@@ -1540,14 +1540,14 @@ impl Segment2d {
+ }
+ 
+ impl From<[Vec2; 2]> for Segment2d {
+-    #[inline(always)]
++    #[inline]
+     fn from(vertices: [Vec2; 2]) -> Self {
+         Self { vertices }
+     }
+ }
+ 
+ impl From<(Vec2, Vec2)> for Segment2d {
+-    #[inline(always)]
++    #[inline]
+     fn from((point1, point2): (Vec2, Vec2)) -> Self {
+         Self::new(point1, point2)
+     }
+@@ -1645,7 +1645,7 @@ impl Default for Triangle2d {
+ 
+ impl Triangle2d {
+     /// Create a new `Triangle2d` from points `a`, `b`, and `c`
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(a: Vec2, b: Vec2, c: Vec2) -> Self {
+         Self {
+             vertices: [a, b, c],
+@@ -1653,7 +1653,7 @@ impl Triangle2d {
+     }
+ 
+     /// Get the [`WindingOrder`] of the triangle
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "orientation")]
+     pub fn winding_order(&self) -> WindingOrder {
+         let [a, b, c] = self.vertices;
+@@ -1706,7 +1706,7 @@ impl Triangle2d {
+     ///
+     /// A triangle is degenerate if the cross product of the vectors `ab` and `ac` has a length less than `10e-7`.
+     /// This indicates that the three vertices are collinear or nearly collinear.
+-    #[inline(always)]
++    #[inline]
+     pub fn is_degenerate(&self) -> bool {
+         let [a, b, c] = self.vertices;
+         let ab = (b - a).extend(0.);
+@@ -1715,7 +1715,7 @@ impl Triangle2d {
+     }
+ 
+     /// Checks if the triangle is acute, meaning all angles are less than 90 degrees
+-    #[inline(always)]
++    #[inline]
+     pub fn is_acute(&self) -> bool {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1733,7 +1733,7 @@ impl Triangle2d {
+     }
+ 
+     /// Checks if the triangle is obtuse, meaning one angle is greater than 90 degrees
+-    #[inline(always)]
++    #[inline]
+     pub fn is_obtuse(&self) -> bool {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1752,13 +1752,13 @@ impl Triangle2d {
+ 
+     /// Reverse the [`WindingOrder`] of the triangle
+     /// by swapping the first and last vertices.
+-    #[inline(always)]
++    #[inline]
+     pub fn reverse(&mut self) {
+         self.vertices.swap(0, 2);
+     }
+ 
+     /// This triangle but reversed.
+-    #[inline(always)]
++    #[inline]
+     #[must_use]
+     pub fn reversed(mut self) -> Self {
+         self.reverse();
+@@ -1768,14 +1768,14 @@ impl Triangle2d {
+ 
+ impl Measured2d for Triangle2d {
+     /// Get the area of the triangle
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         let [a, b, c] = self.vertices;
+         ops::abs(a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y)) / 2.0
+     }
+ 
+     /// Get the perimeter of the triangle
+-    #[inline(always)]
++    #[inline]
+     fn perimeter(&self) -> f32 {
+         let [a, b, c] = self.vertices;
+ 
+@@ -1818,13 +1818,13 @@ impl Default for Rectangle {
+ 
+ impl Rectangle {
+     /// Create a new `Rectangle` from a full width and height
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(width: f32, height: f32) -> Self {
+         Self::from_size(Vec2::new(width, height))
+     }
+ 
+     /// Create a new `Rectangle` from a given full size
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_size(size: Vec2) -> Self {
+         Self {
+             half_size: Vec2::new(size.x / 2.0, size.y / 2.0),
+@@ -1832,7 +1832,7 @@ impl Rectangle {
+     }
+ 
+     /// Create a new `Rectangle` from two corner points
+-    #[inline(always)]
++    #[inline]
+     pub fn from_corners(point1: Vec2, point2: Vec2) -> Self {
+         Self {
+             half_size: (point2 - point1).abs() / 2.0,
+@@ -1841,7 +1841,7 @@ impl Rectangle {
+ 
+     /// Create a `Rectangle` from a single length.
+     /// The resulting `Rectangle` will be the same size in every direction.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_length(length: f32) -> Self {
+         Self {
+             half_size: Vec2::splat(length / 2.0),
+@@ -1849,7 +1849,7 @@ impl Rectangle {
+     }
+ 
+     /// Get the size of the rectangle
+-    #[inline(always)]
++    #[inline]
+     pub fn size(&self) -> Vec2 {
+         2.0 * self.half_size
+     }
+@@ -1858,7 +1858,7 @@ impl Rectangle {
+     ///
+     /// If the point is outside the rectangle, the returned point will be on the perimeter of the rectangle.
+     /// Otherwise, it will be inside the rectangle and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec2) -> Vec2 {
+         // Clamp point coordinates to the rectangle
+         point.clamp(-self.half_size, self.half_size)
+@@ -1867,13 +1867,13 @@ impl Rectangle {
+ 
+ impl Measured2d for Rectangle {
+     /// Get the area of the rectangle
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         4.0 * self.half_size.x * self.half_size.y
+     }
+ 
+     /// Get the perimeter of the rectangle
+-    #[inline(always)]
++    #[inline]
+     fn perimeter(&self) -> f32 {
+         4.0 * (self.half_size.x + self.half_size.y)
+     }
+@@ -1999,7 +1999,7 @@ impl ConvexPolygon {
+ 
+     /// Create a [`ConvexPolygon`] from its `vertices`, without checks.
+     /// Use this version only if you know that the `vertices` make up a convex polygon.
+-    #[inline(always)]
++    #[inline]
+     pub fn new_unchecked(vertices: impl IntoIterator<Item = Vec2>) -> Self {
+         Self {
+             vertices: vertices.into_iter().collect(),
+@@ -2007,7 +2007,7 @@ impl ConvexPolygon {
+     }
+ 
+     /// Get the vertices of this polygon
+-    #[inline(always)]
++    #[inline]
+     pub fn vertices(&self) -> &[Vec2] {
+         &self.vertices
+     }
+@@ -2060,7 +2060,7 @@ impl RegularPolygon {
+     /// # Panics
+     ///
+     /// Panics if `circumradius` is negative
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(circumradius: f32, sides: u32) -> Self {
+         assert!(
+             circumradius.is_sign_positive(),
+@@ -2078,7 +2078,7 @@ impl RegularPolygon {
+ 
+     /// Get the radius of the circumcircle on which all vertices
+     /// of the regular polygon lie
+-    #[inline(always)]
++    #[inline]
+     pub const fn circumradius(&self) -> f32 {
+         self.circumcircle.radius
+     }
+@@ -2086,14 +2086,14 @@ impl RegularPolygon {
+     /// Get the inradius or apothem of the regular polygon.
+     /// This is the radius of the largest circle that can
+     /// be drawn within the polygon
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "apothem")]
+     pub fn inradius(&self) -> f32 {
+         self.circumradius() * ops::cos(PI / self.sides as f32)
+     }
+ 
+     /// Get the length of one side of the regular polygon
+-    #[inline(always)]
++    #[inline]
+     pub fn side_length(&self) -> f32 {
+         2.0 * self.circumradius() * ops::sin(PI / self.sides as f32)
+     }
+@@ -2102,7 +2102,7 @@ impl RegularPolygon {
+     ///
+     /// This is the angle formed by two adjacent sides with points
+     /// within the angle being in the interior of the polygon
+-    #[inline(always)]
++    #[inline]
+     pub const fn internal_angle_degrees(&self) -> f32 {
+         (self.sides - 2) as f32 / self.sides as f32 * 180.0
+     }
+@@ -2111,7 +2111,7 @@ impl RegularPolygon {
+     ///
+     /// This is the angle formed by two adjacent sides with points
+     /// within the angle being in the interior of the polygon
+-    #[inline(always)]
++    #[inline]
+     pub const fn internal_angle_radians(&self) -> f32 {
+         (self.sides - 2) as f32 * PI / self.sides as f32
+     }
+@@ -2120,7 +2120,7 @@ impl RegularPolygon {
+     ///
+     /// This is the angle formed by two adjacent sides with points
+     /// within the angle being in the exterior of the polygon
+-    #[inline(always)]
++    #[inline]
+     pub const fn external_angle_degrees(&self) -> f32 {
+         360.0 / self.sides as f32
+     }
+@@ -2129,7 +2129,7 @@ impl RegularPolygon {
+     ///
+     /// This is the angle formed by two adjacent sides with points
+     /// within the angle being in the exterior of the polygon
+-    #[inline(always)]
++    #[inline]
+     pub const fn external_angle_radians(&self) -> f32 {
+         2.0 * PI / self.sides as f32
+     }
+@@ -2153,7 +2153,7 @@ impl RegularPolygon {
+ 
+ impl Measured2d for RegularPolygon {
+     /// Get the area of the regular polygon
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         let angle: f32 = 2.0 * PI / (self.sides as f32);
+         (self.sides as f32) * self.circumradius().squared() * ops::sin(angle) / 2.0
+@@ -2161,7 +2161,7 @@ impl Measured2d for RegularPolygon {
+ 
+     /// Get the perimeter of the regular polygon.
+     /// This is the sum of its sides
+-    #[inline(always)]
++    #[inline]
+     fn perimeter(&self) -> f32 {
+         self.sides as f32 * self.side_length()
+     }
+diff --git a/crates/bevy_math/src/primitives/dim3.rs b/crates/bevy_math/src/primitives/dim3.rs
+index 97ff85bcd6511..abfc778d7f947 100644
+--- a/crates/bevy_math/src/primitives/dim3.rs
++++ b/crates/bevy_math/src/primitives/dim3.rs
+@@ -43,13 +43,13 @@ impl Default for Sphere {
+ 
+ impl Sphere {
+     /// Create a new [`Sphere`] from a `radius`
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(radius: f32) -> Self {
+         Self { radius }
+     }
+ 
+     /// Get the diameter of the sphere
+-    #[inline(always)]
++    #[inline]
+     pub const fn diameter(&self) -> f32 {
+         2.0 * self.radius
+     }
+@@ -58,7 +58,7 @@ impl Sphere {
+     ///
+     /// If the point is outside the sphere, the returned point will be on the surface of the sphere.
+     /// Otherwise, it will be inside the sphere and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec3) -> Vec3 {
+         let distance_squared = point.length_squared();
+ 
+@@ -76,13 +76,13 @@ impl Sphere {
+ 
+ impl Measured3d for Sphere {
+     /// Get the surface area of the sphere
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         4.0 * PI * self.radius.squared()
+     }
+ 
+     /// Get the volume of the sphere
+-    #[inline(always)]
++    #[inline]
+     fn volume(&self) -> f32 {
+         4.0 * FRAC_PI_3 * self.radius.cubed()
+     }
+@@ -125,7 +125,7 @@ impl Plane3d {
+     /// # Panics
+     ///
+     /// Panics if the given `normal` is zero (or very close to zero), or non-finite.
+-    #[inline(always)]
++    #[inline]
+     pub fn new(normal: Vec3, half_size: Vec2) -> Self {
+         Self {
+             normal: Dir3::new(normal).expect("normal must be nonzero and finite"),
+@@ -143,7 +143,7 @@ impl Plane3d {
+     ///
+     /// Panics if a valid normal can not be computed, for example when the points
+     /// are *collinear* and lie on the same line.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_points(a: Vec3, b: Vec3, c: Vec3) -> (Self, Vec3) {
+         let normal = Dir3::new((b - a).cross(c - a)).expect(
+             "finite plane must be defined by three finite points that don't lie on the same line",
+@@ -193,7 +193,7 @@ impl InfinitePlane3d {
+     /// # Panics
+     ///
+     /// Panics if the given `normal` is zero (or very close to zero), or non-finite.
+-    #[inline(always)]
++    #[inline]
+     pub fn new<T: TryInto<Dir3>>(normal: T) -> Self
+     where
+         <T as TryInto<Dir3>>::Error: core::fmt::Debug,
+@@ -215,7 +215,7 @@ impl InfinitePlane3d {
+     ///
+     /// Panics if a valid normal can not be computed, for example when the points
+     /// are *collinear* and lie on the same line.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_points(a: Vec3, b: Vec3, c: Vec3) -> (Self, Vec3) {
+         let normal = Dir3::new((b - a).cross(c - a)).expect(
+             "infinite plane must be defined by three finite points that don't lie on the same line",
+@@ -387,7 +387,7 @@ impl Default for Segment3d {
+ 
+ impl Segment3d {
+     /// Create a new `Segment3d` from its endpoints.
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(point1: Vec3, point2: Vec3) -> Self {
+         Self {
+             vertices: [point1, point2],
+@@ -397,7 +397,7 @@ impl Segment3d {
+     /// Create a new `Segment3d` centered at the origin with the given direction and length.
+     ///
+     /// The endpoints will be at `-direction * length / 2.0` and `direction * length / 2.0`.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_direction_and_length(direction: Dir3, length: f32) -> Self {
+         let endpoint = 0.5 * length * direction;
+         Self {
+@@ -409,7 +409,7 @@ impl Segment3d {
+     /// the direction and length of the line segment.
+     ///
+     /// The endpoints will be at `-scaled_direction / 2.0` and `scaled_direction / 2.0`.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_scaled_direction(scaled_direction: Vec3) -> Self {
+         let endpoint = 0.5 * scaled_direction;
+         Self {
+@@ -421,7 +421,7 @@ impl Segment3d {
+     /// going in the direction of the ray for the given `length`.
+     ///
+     /// The endpoints will be at `ray.origin` and `ray.origin + length * ray.direction`.
+-    #[inline(always)]
++    #[inline]
+     pub fn from_ray_and_length(ray: Ray3d, length: f32) -> Self {
+         Self {
+             vertices: [ray.origin, ray.get_point(length)],
+@@ -429,32 +429,32 @@ impl Segment3d {
+     }
+ 
+     /// Get the position of the first endpoint of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub const fn point1(&self) -> Vec3 {
+         self.vertices[0]
+     }
+ 
+     /// Get the position of the second endpoint of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub const fn point2(&self) -> Vec3 {
+         self.vertices[1]
+     }
+ 
+     /// Compute the midpoint between the two endpoints of the line segment.
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "midpoint")]
+     pub fn center(&self) -> Vec3 {
+         self.point1().midpoint(self.point2())
+     }
+ 
+     /// Compute the length of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub fn length(&self) -> f32 {
+         self.point1().distance(self.point2())
+     }
+ 
+     /// Compute the squared length of the line segment.
+-    #[inline(always)]
++    #[inline]
+     pub fn length_squared(&self) -> f32 {
+         self.point1().distance_squared(self.point2())
+     }
+@@ -466,7 +466,7 @@ impl Segment3d {
+     /// # Panics
+     ///
+     /// Panics if a valid direction could not be computed, for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn direction(&self) -> Dir3 {
+         self.try_direction().unwrap_or_else(|err| {
+             panic!("Failed to compute the direction of a line segment: {err}")
+@@ -477,19 +477,19 @@ impl Segment3d {
+     ///
+     /// Returns [`Err(InvalidDirectionError)`](InvalidDirectionError) if a valid direction could not be computed,
+     /// for example when the endpoints are coincident, NaN, or infinite.
+-    #[inline(always)]
++    #[inline]
+     pub fn try_direction(&self) -> Result<Dir3, InvalidDirectionError> {
+         Dir3::new(self.scaled_direction())
+     }
+ 
+     /// Compute the vector from the first endpoint to the second endpoint.
+-    #[inline(always)]
++    #[inline]
+     pub fn scaled_direction(&self) -> Vec3 {
+         self.point2() - self.point1()
+     }
+ 
+     /// Compute the segment transformed by the given [`Isometry3d`].
+-    #[inline(always)]
++    #[inline]
+     pub fn transformed(&self, isometry: impl Into<Isometry3d>) -> Self {
+         let isometry: Isometry3d = isometry.into();
+         Self::new(
+@@ -499,19 +499,19 @@ impl Segment3d {
+     }
+ 
+     /// Compute the segment translated by the given vector.
+-    #[inline(always)]
++    #[inline]
+     pub fn translated(&self, translation: Vec3) -> Segment3d {
+         Self::new(self.point1() + translation, self.point2() + translation)
+     }
+ 
+     /// Compute the segment rotated around the origin by the given rotation.
+-    #[inline(always)]
++    #[inline]
+     pub fn rotated(&self, rotation: Quat) -> Segment3d {
+         Segment3d::new(rotation * self.point1(), rotation * self.point2())
+     }
+ 
+     /// Compute the segment rotated around the given point by the given rotation.
+-    #[inline(always)]
++    #[inline]
+     pub fn rotated_around(&self, rotation: Quat, point: Vec3) -> Segment3d {
+         // We offset our segment so that our segment is rotated as if from the origin, then we can apply the offset back
+         let offset = self.translated(-point);
+@@ -520,20 +520,20 @@ impl Segment3d {
+     }
+ 
+     /// Compute the segment rotated around its own center.
+-    #[inline(always)]
++    #[inline]
+     pub fn rotated_around_center(&self, rotation: Quat) -> Segment3d {
+         self.rotated_around(rotation, self.center())
+     }
+ 
+     /// Compute the segment with its center at the origin, keeping the same direction and length.
+-    #[inline(always)]
++    #[inline]
+     pub fn centered(&self) -> Segment3d {
+         let center = self.center();
+         self.translated(-center)
+     }
+ 
+     /// Compute the segment with a new length, keeping the same direction and center.
+-    #[inline(always)]
++    #[inline]
+     pub fn resized(&self, length: f32) -> Segment3d {
+         let offset_from_origin = self.center();
+         let centered = self.translated(-offset_from_origin);
+@@ -543,14 +543,14 @@ impl Segment3d {
+     }
+ 
+     /// Reverses the direction of the line segment by swapping the endpoints.
+-    #[inline(always)]
++    #[inline]
+     pub fn reverse(&mut self) {
+         let [point1, point2] = &mut self.vertices;
+         core::mem::swap(point1, point2);
+     }
+ 
+     /// Returns the line segment with its direction reversed by swapping the endpoints.
+-    #[inline(always)]
++    #[inline]
+     #[must_use]
+     pub fn reversed(mut self) -> Self {
+         self.reverse();
+@@ -558,7 +558,7 @@ impl Segment3d {
+     }
+ 
+     /// Returns the point on the [`Segment3d`] that is closest to the specified `point`.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec3) -> Vec3 {
+         //       `point`
+         //           x
+@@ -591,14 +591,14 @@ impl Segment3d {
+ }
+ 
+ impl From<[Vec3; 2]> for Segment3d {
+-    #[inline(always)]
++    #[inline]
+     fn from(vertices: [Vec3; 2]) -> Self {
+         Self { vertices }
+     }
+ }
+ 
+ impl From<(Vec3, Vec3)> for Segment3d {
+-    #[inline(always)]
++    #[inline]
+     fn from((point1, point2): (Vec3, Vec3)) -> Self {
+         Self::new(point1, point2)
+     }
+@@ -695,13 +695,13 @@ impl Default for Cuboid {
+ 
+ impl Cuboid {
+     /// Create a new `Cuboid` from a full x, y, and z length
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(x_length: f32, y_length: f32, z_length: f32) -> Self {
+         Self::from_size(Vec3::new(x_length, y_length, z_length))
+     }
+ 
+     /// Create a new `Cuboid` from a given full size
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_size(size: Vec3) -> Self {
+         Self {
+             half_size: Vec3::new(size.x / 2.0, size.y / 2.0, size.z / 2.0),
+@@ -709,7 +709,7 @@ impl Cuboid {
+     }
+ 
+     /// Create a new `Cuboid` from two corner points
+-    #[inline(always)]
++    #[inline]
+     pub fn from_corners(point1: Vec3, point2: Vec3) -> Self {
+         Self {
+             half_size: (point2 - point1).abs() / 2.0,
+@@ -718,7 +718,7 @@ impl Cuboid {
+ 
+     /// Create a `Cuboid` from a single length.
+     /// The resulting `Cuboid` will be the same size in every direction.
+-    #[inline(always)]
++    #[inline]
+     pub const fn from_length(length: f32) -> Self {
+         Self {
+             half_size: Vec3::splat(length / 2.0),
+@@ -726,7 +726,7 @@ impl Cuboid {
+     }
+ 
+     /// Get the size of the cuboid
+-    #[inline(always)]
++    #[inline]
+     pub fn size(&self) -> Vec3 {
+         2.0 * self.half_size
+     }
+@@ -735,7 +735,7 @@ impl Cuboid {
+     ///
+     /// If the point is outside the cuboid, the returned point will be on the surface of the cuboid.
+     /// Otherwise, it will be inside the cuboid and returned as is.
+-    #[inline(always)]
++    #[inline]
+     pub fn closest_point(&self, point: Vec3) -> Vec3 {
+         // Clamp point coordinates to the cuboid
+         point.clamp(-self.half_size, self.half_size)
+@@ -744,7 +744,7 @@ impl Cuboid {
+ 
+ impl Measured3d for Cuboid {
+     /// Get the surface area of the cuboid
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         8.0 * (self.half_size.x * self.half_size.y
+             + self.half_size.y * self.half_size.z
+@@ -752,7 +752,7 @@ impl Measured3d for Cuboid {
+     }
+ 
+     /// Get the volume of the cuboid
+-    #[inline(always)]
++    #[inline]
+     fn volume(&self) -> f32 {
+         8.0 * self.half_size.x * self.half_size.y * self.half_size.z
+     }
+@@ -791,7 +791,7 @@ impl Default for Cylinder {
+ 
+ impl Cylinder {
+     /// Create a new `Cylinder` from a radius and full height
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(radius: f32, height: f32) -> Self {
+         Self {
+             radius,
+@@ -800,7 +800,7 @@ impl Cylinder {
+     }
+ 
+     /// Get the base of the cylinder as a [`Circle`]
+-    #[inline(always)]
++    #[inline]
+     pub const fn base(&self) -> Circle {
+         Circle {
+             radius: self.radius,
+@@ -809,14 +809,14 @@ impl Cylinder {
+ 
+     /// Get the surface area of the side of the cylinder,
+     /// also known as the lateral area
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "side_area")]
+     pub const fn lateral_area(&self) -> f32 {
+         4.0 * PI * self.radius * self.half_height
+     }
+ 
+     /// Get the surface area of one base of the cylinder
+-    #[inline(always)]
++    #[inline]
+     pub fn base_area(&self) -> f32 {
+         PI * self.radius.squared()
+     }
+@@ -824,13 +824,13 @@ impl Cylinder {
+ 
+ impl Measured3d for Cylinder {
+     /// Get the total surface area of the cylinder
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         2.0 * PI * self.radius * (self.radius + 2.0 * self.half_height)
+     }
+ 
+     /// Get the volume of the cylinder
+-    #[inline(always)]
++    #[inline]
+     fn volume(&self) -> f32 {
+         self.base_area() * 2.0 * self.half_height
+     }
+@@ -880,7 +880,7 @@ impl Capsule3d {
+ 
+     /// Get the part connecting the hemispherical ends
+     /// of the capsule as a [`Cylinder`]
+-    #[inline(always)]
++    #[inline]
+     pub const fn to_cylinder(&self) -> Cylinder {
+         Cylinder {
+             radius: self.radius,
+@@ -891,14 +891,14 @@ impl Capsule3d {
+ 
+ impl Measured3d for Capsule3d {
+     /// Get the surface area of the capsule
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         // Modified version of 2pi * r * (2r + h)
+         4.0 * PI * self.radius * (self.radius + self.half_length)
+     }
+ 
+     /// Get the volume of the capsule
+-    #[inline(always)]
++    #[inline]
+     fn volume(&self) -> f32 {
+         // Modified version of pi * r^2 * (4/3 * r + a)
+         let diameter = self.radius * 2.0;
+@@ -945,7 +945,7 @@ impl Cone {
+         Self { radius, height }
+     }
+     /// Get the base of the cone as a [`Circle`]
+-    #[inline(always)]
++    #[inline]
+     pub const fn base(&self) -> Circle {
+         Circle {
+             radius: self.radius,
+@@ -954,7 +954,7 @@ impl Cone {
+ 
+     /// Get the slant height of the cone, the length of the line segment
+     /// connecting a point on the base to the apex
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "side_length")]
+     pub fn slant_height(&self) -> f32 {
+         ops::hypot(self.radius, self.height)
+@@ -962,14 +962,14 @@ impl Cone {
+ 
+     /// Get the surface area of the side of the cone,
+     /// also known as the lateral area
+-    #[inline(always)]
++    #[inline]
+     #[doc(alias = "side_area")]
+     pub fn lateral_area(&self) -> f32 {
+         PI * self.radius * self.slant_height()
+     }
+ 
+     /// Get the surface area of the base of the cone
+-    #[inline(always)]
++    #[inline]
+     pub fn base_area(&self) -> f32 {
+         PI * self.radius.squared()
+     }
+@@ -977,13 +977,13 @@ impl Cone {
+ 
+ impl Measured3d for Cone {
+     /// Get the total surface area of the cone
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         self.base_area() + self.lateral_area()
+     }
+ 
+     /// Get the volume of the cone
+-    #[inline(always)]
++    #[inline]
+     fn volume(&self) -> f32 {
+         (self.base_area() * self.height) / 3.0
+     }
+@@ -1086,7 +1086,7 @@ impl Torus {
+     ///
+     /// The inner radius is the radius of the hole, and the outer radius
+     /// is the radius of the entire object
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(inner_radius: f32, outer_radius: f32) -> Self {
+         let minor_radius = (outer_radius - inner_radius) / 2.0;
+         let major_radius = outer_radius - minor_radius;
+@@ -1100,7 +1100,7 @@ impl Torus {
+     /// Get the inner radius of the torus.
+     /// For a ring torus, this corresponds to the radius of the hole,
+     /// or `major_radius - minor_radius`
+-    #[inline(always)]
++    #[inline]
+     pub const fn inner_radius(&self) -> f32 {
+         self.major_radius - self.minor_radius
+     }
+@@ -1108,7 +1108,7 @@ impl Torus {
+     /// Get the outer radius of the torus.
+     /// This corresponds to the overall radius of the entire object,
+     /// or `major_radius + minor_radius`
+-    #[inline(always)]
++    #[inline]
+     pub const fn outer_radius(&self) -> f32 {
+         self.major_radius + self.minor_radius
+     }
+@@ -1121,7 +1121,7 @@ impl Torus {
+     ///
+     /// If the minor or major radius is non-positive, infinite, or `NaN`,
+     /// [`TorusKind::Invalid`] is returned
+-    #[inline(always)]
++    #[inline]
+     pub fn kind(&self) -> TorusKind {
+         // Invalid if minor or major radius is non-positive, infinite, or NaN
+         if self.minor_radius <= 0.0
+@@ -1143,14 +1143,14 @@ impl Torus {
+ impl Measured3d for Torus {
+     /// Get the surface area of the torus. Note that this only produces
+     /// the expected result when the torus has a ring and isn't self-intersecting
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         4.0 * PI.squared() * self.major_radius * self.minor_radius
+     }
+ 
+     /// Get the volume of the torus. Note that this only produces
+     /// the expected result when the torus has a ring and isn't self-intersecting
+-    #[inline(always)]
++    #[inline]
+     fn volume(&self) -> f32 {
+         2.0 * PI.squared() * self.major_radius * self.minor_radius.squared()
+     }
+@@ -1190,7 +1190,7 @@ impl Default for Triangle3d {
+ 
+ impl Triangle3d {
+     /// Create a new [`Triangle3d`] from points `a`, `b`, and `c`.
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(a: Vec3, b: Vec3, c: Vec3) -> Self {
+         Self {
+             vertices: [a, b, c],
+@@ -1206,7 +1206,7 @@ impl Triangle3d {
+     ///
+     /// Returns [`Err(InvalidDirectionError)`](InvalidDirectionError) if the length
+     /// of the given vector is zero (or very close to zero), infinite, or `NaN`.
+-    #[inline(always)]
++    #[inline]
+     pub fn normal(&self) -> Result<Dir3, InvalidDirectionError> {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1218,7 +1218,7 @@ impl Triangle3d {
+     ///
+     /// A triangle is degenerate if the cross product of the vectors `ab` and `ac` has a length less than `10e-7`.
+     /// This indicates that the three vertices are collinear or nearly collinear.
+-    #[inline(always)]
++    #[inline]
+     pub fn is_degenerate(&self) -> bool {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1227,7 +1227,7 @@ impl Triangle3d {
+     }
+ 
+     /// Checks if the triangle is acute, meaning all angles are less than 90 degrees
+-    #[inline(always)]
++    #[inline]
+     pub fn is_acute(&self) -> bool {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1245,7 +1245,7 @@ impl Triangle3d {
+     }
+ 
+     /// Checks if the triangle is obtuse, meaning one angle is greater than 90 degrees
+-    #[inline(always)]
++    #[inline]
+     pub fn is_obtuse(&self) -> bool {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1263,13 +1263,13 @@ impl Triangle3d {
+     }
+ 
+     /// Reverse the triangle by swapping the first and last vertices.
+-    #[inline(always)]
++    #[inline]
+     pub fn reverse(&mut self) {
+         self.vertices.swap(0, 2);
+     }
+ 
+     /// This triangle but reversed.
+-    #[inline(always)]
++    #[inline]
+     #[must_use]
+     pub fn reversed(mut self) -> Triangle3d {
+         self.reverse();
+@@ -1281,7 +1281,7 @@ impl Triangle3d {
+     /// This function finds the geometric center of the triangle by averaging the vertices:
+     /// `centroid = (a + b + c) / 3`.
+     #[doc(alias("center", "barycenter", "baricenter"))]
+-    #[inline(always)]
++    #[inline]
+     pub fn centroid(&self) -> Vec3 {
+         (self.vertices[0] + self.vertices[1] + self.vertices[2]) / 3.0
+     }
+@@ -1289,7 +1289,7 @@ impl Triangle3d {
+     /// Get the largest side of the triangle.
+     ///
+     /// Returns the two points that form the largest side of the triangle.
+-    #[inline(always)]
++    #[inline]
+     pub fn largest_side(&self) -> (Vec3, Vec3) {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1314,7 +1314,7 @@ impl Triangle3d {
+     }
+ 
+     /// Get the circumcenter of the triangle.
+-    #[inline(always)]
++    #[inline]
+     pub fn circumcenter(&self) -> Vec3 {
+         if self.is_degenerate() {
+             // If the triangle is degenerate, the circumcenter is the midpoint of the largest side.
+@@ -1335,7 +1335,7 @@ impl Triangle3d {
+ 
+ impl Measured2d for Triangle3d {
+     /// Get the area of the triangle.
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         let [a, b, c] = self.vertices;
+         let ab = b - a;
+@@ -1344,7 +1344,7 @@ impl Measured2d for Triangle3d {
+     }
+ 
+     /// Get the perimeter of the triangle.
+-    #[inline(always)]
++    #[inline]
+     fn perimeter(&self) -> f32 {
+         let [a, b, c] = self.vertices;
+         a.distance(b) + b.distance(c) + c.distance(a)
+@@ -1387,7 +1387,7 @@ impl Default for Tetrahedron {
+ 
+ impl Tetrahedron {
+     /// Create a new [`Tetrahedron`] from points `a`, `b`, `c` and `d`.
+-    #[inline(always)]
++    #[inline]
+     pub const fn new(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> Self {
+         Self {
+             vertices: [a, b, c, d],
+@@ -1399,7 +1399,7 @@ impl Tetrahedron {
+     /// If it's negative, the normal vector of the face defined by
+     /// the first three points using the right-hand rule points
+     /// away from the fourth vertex.
+-    #[inline(always)]
++    #[inline]
+     pub fn signed_volume(&self) -> f32 {
+         let [a, b, c, d] = self.vertices;
+         let ab = b - a;
+@@ -1413,7 +1413,7 @@ impl Tetrahedron {
+     /// This function finds the geometric center of the tetrahedron
+     /// by averaging the vertices: `centroid = (a + b + c + d) / 4`.
+     #[doc(alias("center", "barycenter", "baricenter"))]
+-    #[inline(always)]
++    #[inline]
+     pub fn centroid(&self) -> Vec3 {
+         (self.vertices[0] + self.vertices[1] + self.vertices[2] + self.vertices[3]) / 4.0
+     }
+@@ -1423,7 +1423,7 @@ impl Tetrahedron {
+     /// Note that the orientations of the faces are determined by that of the tetrahedron; if the
+     /// signed volume of this tetrahedron is positive, then the triangles' normals will point
+     /// outward, and if the signed volume is negative they will point inward.
+-    #[inline(always)]
++    #[inline]
+     pub fn faces(&self) -> [Triangle3d; 4] {
+         let [a, b, c, d] = self.vertices;
+         [
+@@ -1437,7 +1437,7 @@ impl Tetrahedron {
+ 
+ impl Measured3d for Tetrahedron {
+     /// Get the surface area of the tetrahedron.
+-    #[inline(always)]
++    #[inline]
+     fn area(&self) -> f32 {
+         let [a, b, c, d] = self.vertices;
+         let ab = b - a;
+@@ -1453,7 +1453,7 @@ impl Measured3d for Tetrahedron {
+     }
+ 
+     /// Get the volume of the tetrahedron.
+-    #[inline(always)]
++    #[inline]
+     fn volume(&self) -> f32 {
+         ops::abs(self.signed_volume())
+     }
+diff --git a/crates/bevy_math/src/primitives/polygon.rs b/crates/bevy_math/src/primitives/polygon.rs
+index a95461d11aa45..6c25601505879 100644
+--- a/crates/bevy_math/src/primitives/polygon.rs
++++ b/crates/bevy_math/src/primitives/polygon.rs
+@@ -270,7 +270,7 @@ impl<'a> SweepLine<'a> {
+         reason = "this function is only used with the alloc feature"
+     )
+ )]
+-#[inline(always)]
++#[inline]
+ const fn point_side(p1: Vec2, p2: Vec2, q: Vec2) -> f32 {
+     (p2.x - p1.x) * (q.y - p1.y) - (q.x - p1.x) * (p2.y - p1.y)
+ }

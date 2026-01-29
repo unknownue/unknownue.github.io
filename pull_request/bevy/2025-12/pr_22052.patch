@@ -1,0 +1,197 @@
+diff --git a/.github/workflows/example-run.yml b/.github/workflows/example-run.yml
+index 107da778429eb..c41396eab7078 100644
+--- a/.github/workflows/example-run.yml
++++ b/.github/workflows/example-run.yml
+@@ -48,7 +48,7 @@ jobs:
+             example_name=`basename $example .ron`
+             echo -n $example_name > last_example_run
+             echo "running $example_name - "`date`
+-            time TRACE_CHROME=trace-$example_name.json CI_TESTING_CONFIG=$example cargo run --example $example_name --features "bevy_ci_testing,trace,trace_chrome"
++            time TRACE_CHROME=trace-$example_name.json CI_TESTING_CONFIG=$example cargo run --example $example_name --features "bevy_ci_testing,trace,trace_chrome,bevy_ui_debug"
+             sleep 10
+             if [ `find ./ -maxdepth 1 -name 'screenshot-*.png' -print -quit` ]; then
+               mkdir screenshots-$example_name
+@@ -123,7 +123,7 @@ jobs:
+             example_name=`basename $example .ron`
+             echo -n $example_name > last_example_run
+             echo "running $example_name - "`date`
+-            time TRACE_CHROME=trace-$example_name.json CI_TESTING_CONFIG=$example xvfb-run cargo run --example $example_name --features "bevy_ci_testing,trace,trace_chrome"
++            time TRACE_CHROME=trace-$example_name.json CI_TESTING_CONFIG=$example xvfb-run cargo run --example $example_name --features "bevy_ci_testing,trace,trace_chrome,bevy_ui_debug"
+             sleep 10
+             if [ `find ./ -maxdepth 1 -name 'screenshot-*.png' -print -quit` ]; then
+               mkdir screenshots-$example_name
+@@ -187,7 +187,7 @@ jobs:
+             example_name=`basename $example .ron`
+             echo -n $example_name > last_example_run
+             echo "running $example_name - "`date`
+-            time WGPU_BACKEND=dx12 TRACE_CHROME=trace-$example_name.json CI_TESTING_CONFIG=$example cargo run --example $example_name --features "statically-linked-dxc,bevy_ci_testing,trace,trace_chrome"
++            time WGPU_BACKEND=dx12 TRACE_CHROME=trace-$example_name.json CI_TESTING_CONFIG=$example cargo run --example $example_name --features "statically-linked-dxc,bevy_ci_testing,trace,trace_chrome,bevy_ui_debug"
+             sleep 10
+             if [ `find ./ -maxdepth 1 -name 'screenshot-*.png' -print -quit` ]; then
+               mkdir screenshots-$example_name
+diff --git a/crates/bevy_ui_render/src/debug_overlay.rs b/crates/bevy_ui_render/src/debug_overlay.rs
+index dacc52a195791..c528efecaf82c 100644
+--- a/crates/bevy_ui_render/src/debug_overlay.rs
++++ b/crates/bevy_ui_render/src/debug_overlay.rs
+@@ -7,6 +7,7 @@ use crate::shader_flags;
+ use bevy_asset::AssetId;
+ use bevy_camera::visibility::InheritedVisibility;
+ use bevy_color::Hsla;
++use bevy_color::LinearRgba;
+ use bevy_ecs::entity::Entity;
+ use bevy_ecs::prelude::ReflectResource;
+ use bevy_ecs::resource::Resource;
+@@ -34,6 +35,8 @@ pub struct UiDebugOptions {
+     pub enabled: bool,
+     /// Width of the overlay's lines in logical pixels
+     pub line_width: f32,
++    /// Override Color for the overlay's lines
++    pub line_color_override: Option<LinearRgba>,
+     /// Show outlines for non-visible UI nodes
+     pub show_hidden: bool,
+     /// Show outlines for clipped sections of UI nodes
+@@ -51,6 +54,7 @@ impl Default for UiDebugOptions {
+         Self {
+             enabled: false,
+             line_width: 1.,
++            line_color_override: None,
+             show_hidden: false,
+             show_clipped: false,
+         }
+@@ -101,7 +105,9 @@ pub fn extract_debug_overlay(
+             extracted_camera_entity,
+             transform: transform.into(),
+             item: ExtractedUiItem::Node {
+-                color: Hsla::sequential_dispersed(entity.index_u32()).into(),
++                color: debug_options
++                    .line_color_override
++                    .unwrap_or_else(|| Hsla::sequential_dispersed(entity.index_u32()).into()),
+                 rect: Rect {
+                     min: Vec2::ZERO,
+                     max: uinode.size,
+diff --git a/examples/testbed/ui.rs b/examples/testbed/ui.rs
+index 956dead5b1494..652408632e727 100644
+--- a/examples/testbed/ui.rs
++++ b/examples/testbed/ui.rs
+@@ -25,6 +25,12 @@ fn main() {
+         .add_systems(OnEnter(Scene::Transformations), transformations::setup)
+         .add_systems(Update, switch_scene);
+ 
++    #[cfg(feature = "bevy_ui_debug")]
++    {
++        app.add_systems(OnEnter(Scene::DebugOutlines), debug_outlines::setup);
++        app.add_systems(OnExit(Scene::DebugOutlines), debug_outlines::teardown);
++    }
++
+     #[cfg(feature = "bevy_ci_testing")]
+     app.add_systems(Update, helpers::switch_scene_in_ci::<Scene>);
+ 
+@@ -47,6 +53,8 @@ enum Scene {
+     LinearGradient,
+     RadialGradient,
+     Transformations,
++    #[cfg(feature = "bevy_ui_debug")]
++    DebugOutlines,
+ }
+ 
+ impl Next for Scene {
+@@ -62,6 +70,11 @@ impl Next for Scene {
+             Scene::Slice => Scene::LayoutRounding,
+             Scene::LayoutRounding => Scene::LinearGradient,
+             Scene::LinearGradient => Scene::RadialGradient,
++            #[cfg(feature = "bevy_ui_debug")]
++            Scene::RadialGradient => Scene::DebugOutlines,
++            #[cfg(feature = "bevy_ui_debug")]
++            Scene::DebugOutlines => Scene::Transformations,
++            #[cfg(not(feature = "bevy_ui_debug"))]
+             Scene::RadialGradient => Scene::Transformations,
+             Scene::Transformations => Scene::Image,
+         }
+@@ -969,3 +982,87 @@ mod transformations {
+             });
+     }
+ }
++
++#[cfg(feature = "bevy_ui_debug")]
++mod debug_outlines {
++    use bevy::{
++        color::palettes::css::{BLUE, GRAY, RED},
++        prelude::*,
++        ui_render::UiDebugOptions,
++    };
++
++    pub fn setup(mut commands: Commands, mut debug_options: ResMut<UiDebugOptions>) {
++        debug_options.enabled = true;
++        debug_options.line_width = 5.;
++        debug_options.line_color_override = Some(LinearRgba::GREEN);
++        debug_options.show_hidden = true;
++        debug_options.show_clipped = true;
++        commands.spawn((Camera2d, DespawnOnExit(super::Scene::DebugOutlines)));
++        commands
++            .spawn((
++                Node {
++                    width: percent(100),
++                    height: percent(100),
++                    align_items: AlignItems::Center,
++                    justify_content: JustifyContent::SpaceAround,
++                    ..default()
++                },
++                DespawnOnExit(super::Scene::DebugOutlines),
++            ))
++            .with_children(|parent| {
++                parent.spawn((
++                    Node {
++                        width: px(100),
++                        height: px(100),
++                        ..default()
++                    },
++                    BackgroundColor(GRAY.into()),
++                    UiTransform::from_rotation(Rot2::degrees(45.)),
++                ));
++
++                parent.spawn((Text::new("Regular Text"), TextFont::default()));
++
++                parent.spawn((
++                    Node {
++                        width: px(100),
++                        height: px(100),
++                        ..default()
++                    },
++                    Text::new("Invisible"),
++                    BackgroundColor(GRAY.into()),
++                    TextFont::default(),
++                    Visibility::Hidden,
++                ));
++
++                parent
++                    .spawn((
++                        Node {
++                            width: px(100),
++                            height: px(100),
++                            padding: UiRect {
++                                left: px(25),
++                                top: px(25),
++                                ..Default::default()
++                            },
++                            overflow: Overflow::clip(),
++                            ..default()
++                        },
++                        BackgroundColor(RED.into()),
++                    ))
++                    .with_children(|child| {
++                        child.spawn((
++                            Node {
++                                min_width: px(100),
++                                min_height: px(100),
++                                ..default()
++                            },
++                            BackgroundColor(BLUE.into()),
++                        ));
++                    });
++            });
++    }
++
++    pub fn teardown(mut debug_options: ResMut<UiDebugOptions>) {
++        *debug_options = UiDebugOptions::default();
++    }
++}
