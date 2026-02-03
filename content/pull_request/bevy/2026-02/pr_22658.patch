@@ -1,0 +1,324 @@
+diff --git a/benches/benches/bevy_ecs/main.rs b/benches/benches/bevy_ecs/main.rs
+index 406c7418ce239..9e59d31aca00c 100644
+--- a/benches/benches/bevy_ecs/main.rs
++++ b/benches/benches/bevy_ecs/main.rs
+@@ -96,9 +96,7 @@ mod world_builder {
+ 
+             // free
+             entities.shuffle(&mut self.rng);
+-            entities
+-                .drain(..)
+-                .for_each(|e| self.world.entity_allocator_mut().free(e));
++            self.world.entity_allocator_mut().free_many(&entities);
+ 
+             self
+         }
+diff --git a/benches/benches/bevy_ecs/world/entity_allocator.rs b/benches/benches/bevy_ecs/world/entity_allocator.rs
+index c954139d9a7f1..32bd704bc81cf 100644
+--- a/benches/benches/bevy_ecs/world/entity_allocator.rs
++++ b/benches/benches/bevy_ecs/world/entity_allocator.rs
+@@ -72,6 +72,29 @@ pub fn entity_allocator_benches(criterion: &mut Criterion) {
+ 
+     group.finish();
+ 
++    let mut group = criterion.benchmark_group("entity_allocator_free_bulk");
++    group.warm_up_time(core::time::Duration::from_millis(500));
++    group.measurement_time(core::time::Duration::from_secs(4));
++
++    for entity_count in ENTITY_COUNTS {
++        group.bench_function(format!("{entity_count}_entities"), |bencher| {
++            bencher.iter_batched_ref(
++                || {
++                    let world = World::new();
++                    let entities =
++                        Vec::from_iter(world.entity_allocator().alloc_many(entity_count));
++                    (world, entities)
++                },
++                |(world, entities)| {
++                    world.entity_allocator_mut().free_many(entities);
++                },
++                BatchSize::SmallInput,
++            );
++        });
++    }
++
++    group.finish();
++
+     let mut group = criterion.benchmark_group("entity_allocator_allocate_reused");
+     group.warm_up_time(core::time::Duration::from_millis(500));
+     group.measurement_time(core::time::Duration::from_secs(4));
+@@ -81,11 +104,9 @@ pub fn entity_allocator_benches(criterion: &mut Criterion) {
+             bencher.iter_batched_ref(
+                 || {
+                     let mut world = World::new();
+-                    let mut entities =
++                    let entities =
+                         Vec::from_iter(world.entity_allocator().alloc_many(entity_count));
+-                    entities
+-                        .drain(..)
+-                        .for_each(|e| world.entity_allocator_mut().free(e));
++                    world.entity_allocator_mut().free_many(&entities);
+                     world
+                 },
+                 |world| {
+@@ -110,11 +131,9 @@ pub fn entity_allocator_benches(criterion: &mut Criterion) {
+             bencher.iter_batched_ref(
+                 || {
+                     let mut world = World::new();
+-                    let mut entities =
++                    let entities =
+                         Vec::from_iter(world.entity_allocator().alloc_many(entity_count));
+-                    entities
+-                        .drain(..)
+-                        .for_each(|e| world.entity_allocator_mut().free(e));
++                    world.entity_allocator_mut().free_many(&entities);
+                     world
+                 },
+                 |world| {
+diff --git a/crates/bevy_ecs/Cargo.toml b/crates/bevy_ecs/Cargo.toml
+index 38f12bd42a1ac..4489549431f88 100644
+--- a/crates/bevy_ecs/Cargo.toml
++++ b/crates/bevy_ecs/Cargo.toml
+@@ -17,7 +17,7 @@ default = ["std", "bevy_reflect", "async_executor", "backtrace"]
+ 
+ ## Enables multithreading support. Schedules will attempt to run systems on
+ ## multiple threads whenever possible.
+-multi_threaded = ["bevy_tasks/multi_threaded", "dep:arrayvec"]
++multi_threaded = ["bevy_tasks/multi_threaded"]
+ 
+ ## Adds serialization support through `serde`.
+ serialize = ["dep:serde", "bevy_platform/serialize", "indexmap/serde"]
+@@ -73,7 +73,7 @@ std = [
+   "indexmap/std",
+   "serde?/std",
+   "nonmax/std",
+-  "arrayvec?/std",
++  "arrayvec/std",
+   "log/std",
+   "bevy_platform/std",
+ ]
+@@ -114,7 +114,7 @@ derive_more = { version = "2", default-features = false, features = [
+   "as_ref",
+ ] }
+ nonmax = { version = "0.5", default-features = false }
+-arrayvec = { version = "0.7.4", default-features = false, optional = true }
++arrayvec = { version = "0.7.4", default-features = false }
+ smallvec = { version = "1", default-features = false, features = [
+   "union",
+   "const_generics",
+diff --git a/crates/bevy_ecs/src/entity/map_entities.rs b/crates/bevy_ecs/src/entity/map_entities.rs
+index 7fd83859e46b9..459823859a667 100644
+--- a/crates/bevy_ecs/src/entity/map_entities.rs
++++ b/crates/bevy_ecs/src/entity/map_entities.rs
+@@ -404,13 +404,12 @@ mod tests {
+         );
+ 
+         mapper.finish(&mut world);
+-        // Next allocated entity should be a further generation on the same index
+-        let entity = world.spawn_empty().id();
+-        assert_eq!(entity.index(), dead_ref.index());
+-        assert!(entity
++        let freed_dead_ref = world.entities().resolve_from_index(dead_ref.index());
++        assert!(freed_dead_ref
+             .generation()
+             .cmp_approx(&dead_ref.generation())
+             .is_gt());
++        assert!(world.entities().check_can_spawn_at(freed_dead_ref).is_ok());
+     }
+ 
+     #[test]
+@@ -422,12 +421,11 @@ mod tests {
+             mapper.get_mapped(Entity::from_raw_u32(0).unwrap())
+         });
+ 
+-        // Next allocated entity should be a further generation on the same index
+-        let entity = world.spawn_empty().id();
+-        assert_eq!(entity.index(), dead_ref.index());
+-        assert!(entity
++        let freed_dead_ref = world.entities().resolve_from_index(dead_ref.index());
++        assert!(freed_dead_ref
+             .generation()
+             .cmp_approx(&dead_ref.generation())
+             .is_gt());
++        assert!(world.entities().check_can_spawn_at(freed_dead_ref).is_ok());
+     }
+ }
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index 9873a40308df8..c9f7d122643a0 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -733,6 +733,14 @@ impl EntityAllocator {
+         self.inner.free(freed);
+     }
+ 
++    /// This allows `freed` to be retrieved from [`alloc`](Self::alloc), etc.
++    ///
++    /// The same caveats of [`free`](Self::free) apply here.
++    /// (Eg. the slice should not contain duplicates.)
++    pub fn free_many(&mut self, freed: &[Entity]) {
++        self.inner.free_many(freed);
++    }
++
+     /// Allocates some [`Entity`].
+     /// The result could have come from a [`free`](Self::free) or be a brand new [`EntityIndex`].
+     ///
+diff --git a/crates/bevy_ecs/src/entity/remote_allocator.rs b/crates/bevy_ecs/src/entity/remote_allocator.rs
+index 0888df3d6b965..0bee1c55140c8 100644
+--- a/crates/bevy_ecs/src/entity/remote_allocator.rs
++++ b/crates/bevy_ecs/src/entity/remote_allocator.rs
+@@ -30,9 +30,10 @@
+ //! These types are summed up in [`SharedAllocator`], which is highly unsafe.
+ //! The interfaces [`Allocator`] and [`RemoteAllocator`] provide safe interfaces to them.
+ 
++use arrayvec::ArrayVec;
+ use bevy_platform::{
+     cell::SyncUnsafeCell,
+-    prelude::Vec,
++    prelude::{Box, Vec},
+     sync::{
+         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
+         Arc,
+@@ -571,31 +572,35 @@ impl FreeList {
+         self.len.state(Ordering::Relaxed).length()
+     }
+ 
+-    /// Frees the `entity` allowing it to be reused.
++    /// Frees the `entities` allowing them to be reused.
+     ///
+     /// # Safety
+     ///
+     /// There must be a clear, strict order between this call and calls to [`Self::free`], [`Self::alloc_many`], and [`Self::alloc`].
+     /// Otherwise, the compiler will make unsound optimizations.
+     #[inline]
+-    unsafe fn free(&self, entity: Entity) {
++    unsafe fn free(&self, entities: &[Entity]) {
+         // Disable remote allocation.
+         // We don't need to acquire the most recent memory from remote threads because we never read it.
+         // We do not need to release to remote threads because we only changed the disabled bit,
+         // which the remote allocator would with relaxed ordering.
+         let state = self.len.disable_len_for_state(Ordering::Relaxed);
+ 
+-        // Push onto the buffer
+-        let len = state.length();
+-        // SAFETY: Caller ensures this does not conflict with `free` or `alloc` calls,
+-        // and we just disabled remote allocation with a strict memory ordering.
+-        // We only call `set` during a free, and the caller ensures that is not called concurrently.
+-        unsafe {
+-            self.buffer.set(len, entity);
+-        }
++        // Append onto the buffer
++        let mut len = state.length();
++        // `for_each` is typically faster than `for` here.
++        entities.iter().for_each(|&entity| {
++            // SAFETY: Caller ensures this does not conflict with `free` or `alloc` calls,
++            // and we just disabled remote allocation with a strict memory ordering.
++            // We only call `set` during a free, and the caller ensures that is not called concurrently.
++            unsafe {
++                self.buffer.set(len, entity);
++            }
++            len += 1;
++        });
+ 
+         // Update length
+-        let new_state = state.with_length(len + 1);
++        let new_state = state.with_length(len);
+         // This is safe because `alloc` is not being called and `remote_alloc` checks that it is not disabled.
+         // We don't need to change the generation since this will change the length, which changes the value anyway.
+         // If, from a `remote_alloc` perspective, this does not change the length (i.e. this changes it *back* to what it was),
+@@ -881,7 +886,11 @@ impl SharedAllocator {
+ /// If this were cloned, that assumption would be broken, leading to undefined behavior.
+ /// This is in contrast to the [`RemoteAllocator`], which may be cloned freely.
+ pub(super) struct Allocator {
++    /// The shared allocator state, which we share with any [`RemoteAllocator`]s.
+     shared: Arc<SharedAllocator>,
++    /// The local free list.
++    /// We use this to amortize the cost of freeing to the shared allocator since that is expensive.
++    local_free: Box<ArrayVec<Entity, 128>>,
+ }
+ 
+ impl Default for Allocator {
+@@ -895,6 +904,7 @@ impl Allocator {
+     pub(super) fn new() -> Self {
+         Self {
+             shared: Arc::new(SharedAllocator::new()),
++            local_free: Box::new(ArrayVec::new()),
+         }
+     }
+ 
+@@ -918,12 +928,25 @@ impl Allocator {
+         self.shared.free.num_free()
+     }
+ 
++    /// Flushes the [`local_free`](Self::local_free) list to the shared allocator.
++    #[inline]
++    fn flush_freed(&mut self) {
++        // SAFETY: We have `&mut self`.
++        unsafe {
++            self.shared.free.free(self.local_free.as_slice());
++        }
++        self.local_free.clear();
++    }
++
+     /// Frees the entity allowing it to be reused.
+     #[inline]
+     pub(super) fn free(&mut self, entity: Entity) {
+-        // SAFETY: We have `&mut self`.
++        if self.local_free.is_full() {
++            self.flush_freed();
++        }
++        // SAFETY: The `ArrayVec` is not full or has just been cleared.
+         unsafe {
+-            self.shared.free.free(entity);
++            self.local_free.push_unchecked(entity);
+         }
+     }
+ 
+@@ -933,6 +956,17 @@ impl Allocator {
+         // SAFETY: `free` takes `&mut self`, and this lifetime is captured by the iterator.
+         unsafe { self.shared.alloc_many(count) }
+     }
++
++    /// Frees the entities allowing them to be reused.
++    #[inline]
++    pub(super) fn free_many(&mut self, entities: &[Entity]) {
++        if self.local_free.try_extend_from_slice(entities).is_err() {
++            // SAFETY: We have `&mut self`.
++            unsafe {
++                self.shared.free.free(entities);
++            }
++        }
++    }
+ }
+ 
+ impl Drop for Allocator {
+@@ -1132,6 +1166,7 @@ mod tests {
+         allocator.free(e1);
+         allocator.free(e2);
+         allocator.free(e3);
++        allocator.flush_freed();
+ 
+         let r0 = allocator.alloc();
+         let mut many = allocator.alloc_many(2);
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 5c37688d23637..4513efefed0f7 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -4404,7 +4404,7 @@ mod tests {
+             world.entities.entity_get_spawn_or_despawn_tick(entity),
+             Some(world.change_tick())
+         );
+-        world.despawn(entity);
++        let new = world.despawn_no_free(entity).unwrap();
+         assert_eq!(
+             world.entities.entity_get_spawned_or_despawned_by(entity),
+             MaybeLocation::new(Some(Location::caller()))
+@@ -4413,7 +4413,8 @@ mod tests {
+             world.entities.entity_get_spawn_or_despawn_tick(entity),
+             Some(world.change_tick())
+         );
+-        let new = world.spawn_empty().id();
++
++        world.spawn_empty_at(new).unwrap();
+         assert_eq!(entity.index(), new.index());
+         assert_eq!(
+             world.entities.entity_get_spawned_or_despawned_by(entity),
