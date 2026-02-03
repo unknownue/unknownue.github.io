@@ -1,0 +1,524 @@
+diff --git a/crates/bevy_anti_alias/src/taa/mod.rs b/crates/bevy_anti_alias/src/taa/mod.rs
+index 1ddec151ca840..d14473fb981cc 100644
+--- a/crates/bevy_anti_alias/src/taa/mod.rs
++++ b/crates/bevy_anti_alias/src/taa/mod.rs
+@@ -17,7 +17,7 @@ use bevy_ecs::{
+ };
+ use bevy_image::{BevyDefault as _, ToExtents};
+ use bevy_math::vec2;
+-use bevy_post_process::{bloom::bloom, motion_blur::node::motion_blur};
++use bevy_post_process::{bloom::bloom, motion_blur::motion_blur};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+     camera::{ExtractedCamera, MipBias, TemporalJitter},
+diff --git a/crates/bevy_post_process/src/auto_exposure/mod.rs b/crates/bevy_post_process/src/auto_exposure/mod.rs
+index 5d3ca904ddec8..c18cf2c4773fd 100644
+--- a/crates/bevy_post_process/src/auto_exposure/mod.rs
++++ b/crates/bevy_post_process/src/auto_exposure/mod.rs
+@@ -2,18 +2,22 @@ use bevy_app::prelude::*;
+ use bevy_asset::{embedded_asset, AssetApp, Assets, Handle};
+ use bevy_ecs::prelude::*;
+ use bevy_render::{
++    diagnostic::RecordDiagnostics,
+     extract_component::ExtractComponentPlugin,
+-    render_asset::RenderAssetPlugin,
++    globals::GlobalsBuffer,
++    render_asset::{RenderAssetPlugin, RenderAssets},
+     render_resource::{
+-        Buffer, BufferDescriptor, BufferUsages, PipelineCache, SpecializedComputePipelines,
++        BindGroupEntries, Buffer, BufferBinding, BufferDescriptor, BufferUsages,
++        ComputePassDescriptor, PipelineCache, ShaderType, SpecializedComputePipelines,
+     },
+-    renderer::RenderDevice,
++    renderer::{RenderContext, RenderDevice, ViewQuery},
++    texture::{FallbackImage, GpuImage},
++    view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+     ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ 
+ mod buffers;
+ mod compensation_curve;
+-mod node;
+ mod pipeline;
+ mod settings;
+ 
+@@ -75,7 +79,7 @@ impl Plugin for AutoExposurePlugin {
+             )
+             .add_systems(
+                 Core3d,
+-                node::auto_exposure
++                auto_exposure
+                     .before(tonemapping)
+                     .in_set(Core3dSystems::PostProcess),
+             );
+@@ -114,3 +118,96 @@ fn queue_view_auto_exposure_pipelines(
+         });
+     }
+ }
++
++fn auto_exposure(
++    view: ViewQuery<(
++        &ViewUniformOffset,
++        &ViewTarget,
++        &ViewAutoExposurePipeline,
++        &ExtractedView,
++    )>,
++    pipeline_cache: Res<PipelineCache>,
++    pipeline: Res<AutoExposurePipeline>,
++    resources: Res<AutoExposureResources>,
++    view_uniforms: Res<ViewUniforms>,
++    globals_buffer: Res<GlobalsBuffer>,
++    auto_exposure_buffers: Res<AutoExposureBuffers>,
++    fallback: Res<FallbackImage>,
++    gpu_images: Res<RenderAssets<GpuImage>>,
++    compensation_curves: Res<RenderAssets<GpuAutoExposureCompensationCurve>>,
++    mut ctx: RenderContext,
++) {
++    let view_entity = view.entity();
++    let (view_uniform_offset, view_target, auto_exposure_pipeline, extracted_view) =
++        view.into_inner();
++
++    let Some(auto_exposure_buffer) = auto_exposure_buffers.buffers.get(&view_entity) else {
++        return;
++    };
++
++    let (Some(histogram_pipeline), Some(average_pipeline)) = (
++        pipeline_cache.get_compute_pipeline(auto_exposure_pipeline.histogram_pipeline),
++        pipeline_cache.get_compute_pipeline(auto_exposure_pipeline.mean_luminance_pipeline),
++    ) else {
++        return;
++    };
++
++    let view_uniforms_buffer = view_uniforms.uniforms.buffer().unwrap();
++    let source = view_target.main_texture_view();
++
++    let mask = gpu_images
++        .get(&auto_exposure_pipeline.metering_mask)
++        .map(|i| &i.texture_view)
++        .unwrap_or(&fallback.d2.texture_view);
++
++    let Some(compensation_curve) =
++        compensation_curves.get(&auto_exposure_pipeline.compensation_curve)
++    else {
++        return;
++    };
++
++    let compute_bind_group = ctx.render_device().create_bind_group(
++        None,
++        &pipeline_cache.get_bind_group_layout(&pipeline.histogram_layout),
++        &BindGroupEntries::sequential((
++            &globals_buffer.buffer,
++            &auto_exposure_buffer.settings,
++            source,
++            mask,
++            &compensation_curve.texture_view,
++            &compensation_curve.extents,
++            resources.histogram.as_entire_buffer_binding(),
++            &auto_exposure_buffer.state,
++            BufferBinding {
++                buffer: view_uniforms_buffer,
++                size: Some(ViewUniform::min_size()),
++                offset: 0,
++            },
++        )),
++    );
++
++    let diagnostics = ctx.diagnostic_recorder();
++    let diagnostics = diagnostics.as_deref();
++    let time_span = diagnostics.time_span(ctx.command_encoder(), "auto_exposure");
++
++    {
++        let mut compute_pass = ctx
++            .command_encoder()
++            .begin_compute_pass(&ComputePassDescriptor {
++                label: Some("auto_exposure"),
++                timestamp_writes: None,
++            });
++
++        compute_pass.set_bind_group(0, &compute_bind_group, &[view_uniform_offset.offset]);
++        compute_pass.set_pipeline(histogram_pipeline);
++        compute_pass.dispatch_workgroups(
++            extracted_view.viewport.z.div_ceil(16),
++            extracted_view.viewport.w.div_ceil(16),
++            1,
++        );
++        compute_pass.set_pipeline(average_pipeline);
++        compute_pass.dispatch_workgroups(1, 1, 1);
++    }
++
++    time_span.end(ctx.command_encoder());
++}
+diff --git a/crates/bevy_post_process/src/auto_exposure/node.rs b/crates/bevy_post_process/src/auto_exposure/node.rs
+deleted file mode 100644
+index 994b8510fb5f7..0000000000000
+--- a/crates/bevy_post_process/src/auto_exposure/node.rs
++++ /dev/null
+@@ -1,109 +0,0 @@
+-use super::{
+-    buffers::AutoExposureBuffers,
+-    compensation_curve::GpuAutoExposureCompensationCurve,
+-    pipeline::{AutoExposurePipeline, ViewAutoExposurePipeline},
+-    AutoExposureResources,
+-};
+-use bevy_ecs::prelude::*;
+-use bevy_render::{
+-    diagnostic::RecordDiagnostics,
+-    globals::GlobalsBuffer,
+-    render_asset::RenderAssets,
+-    render_resource::*,
+-    renderer::{RenderContext, ViewQuery},
+-    texture::{FallbackImage, GpuImage},
+-    view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+-};
+-
+-pub(crate) fn auto_exposure(
+-    view: ViewQuery<(
+-        &ViewUniformOffset,
+-        &ViewTarget,
+-        &ViewAutoExposurePipeline,
+-        &ExtractedView,
+-    )>,
+-    pipeline_cache: Res<PipelineCache>,
+-    pipeline: Res<AutoExposurePipeline>,
+-    resources: Res<AutoExposureResources>,
+-    view_uniforms: Res<ViewUniforms>,
+-    globals_buffer: Res<GlobalsBuffer>,
+-    auto_exposure_buffers: Res<AutoExposureBuffers>,
+-    fallback: Res<FallbackImage>,
+-    gpu_images: Res<RenderAssets<GpuImage>>,
+-    compensation_curves: Res<RenderAssets<GpuAutoExposureCompensationCurve>>,
+-    mut ctx: RenderContext,
+-) {
+-    let view_entity = view.entity();
+-    let (view_uniform_offset, view_target, auto_exposure_pipeline, extracted_view) =
+-        view.into_inner();
+-
+-    let Some(auto_exposure_buffer) = auto_exposure_buffers.buffers.get(&view_entity) else {
+-        return;
+-    };
+-
+-    let (Some(histogram_pipeline), Some(average_pipeline)) = (
+-        pipeline_cache.get_compute_pipeline(auto_exposure_pipeline.histogram_pipeline),
+-        pipeline_cache.get_compute_pipeline(auto_exposure_pipeline.mean_luminance_pipeline),
+-    ) else {
+-        return;
+-    };
+-
+-    let view_uniforms_buffer = view_uniforms.uniforms.buffer().unwrap();
+-    let source = view_target.main_texture_view();
+-
+-    let mask = gpu_images
+-        .get(&auto_exposure_pipeline.metering_mask)
+-        .map(|i| &i.texture_view)
+-        .unwrap_or(&fallback.d2.texture_view);
+-
+-    let Some(compensation_curve) =
+-        compensation_curves.get(&auto_exposure_pipeline.compensation_curve)
+-    else {
+-        return;
+-    };
+-
+-    let compute_bind_group = ctx.render_device().create_bind_group(
+-        None,
+-        &pipeline_cache.get_bind_group_layout(&pipeline.histogram_layout),
+-        &BindGroupEntries::sequential((
+-            &globals_buffer.buffer,
+-            &auto_exposure_buffer.settings,
+-            source,
+-            mask,
+-            &compensation_curve.texture_view,
+-            &compensation_curve.extents,
+-            resources.histogram.as_entire_buffer_binding(),
+-            &auto_exposure_buffer.state,
+-            BufferBinding {
+-                buffer: view_uniforms_buffer,
+-                size: Some(ViewUniform::min_size()),
+-                offset: 0,
+-            },
+-        )),
+-    );
+-
+-    let diagnostics = ctx.diagnostic_recorder();
+-    let diagnostics = diagnostics.as_deref();
+-    let time_span = diagnostics.time_span(ctx.command_encoder(), "auto_exposure");
+-
+-    {
+-        let mut compute_pass = ctx
+-            .command_encoder()
+-            .begin_compute_pass(&ComputePassDescriptor {
+-                label: Some("auto_exposure"),
+-                timestamp_writes: None,
+-            });
+-
+-        compute_pass.set_bind_group(0, &compute_bind_group, &[view_uniform_offset.offset]);
+-        compute_pass.set_pipeline(histogram_pipeline);
+-        compute_pass.dispatch_workgroups(
+-            extracted_view.viewport.z.div_ceil(16),
+-            extracted_view.viewport.w.div_ceil(16),
+-            1,
+-        );
+-        compute_pass.set_pipeline(average_pipeline);
+-        compute_pass.dispatch_workgroups(1, 1, 1);
+-    }
+-
+-    time_span.end(ctx.command_encoder());
+-}
+diff --git a/crates/bevy_post_process/src/motion_blur/mod.rs b/crates/bevy_post_process/src/motion_blur/mod.rs
+index a829fb20fc056..167cf6298e3a0 100644
+--- a/crates/bevy_post_process/src/motion_blur/mod.rs
++++ b/crates/bevy_post_process/src/motion_blur/mod.rs
+@@ -2,12 +2,15 @@
+ //!
+ //! Add the [`MotionBlur`] component to a camera to enable motion blur.
+ 
+-use crate::bloom::bloom;
++use crate::{
++    bloom::bloom,
++    motion_blur::pipeline::{MotionBlurPipeline, MotionBlurPipelineId},
++};
+ use bevy_app::{App, Plugin};
+ use bevy_asset::embedded_asset;
+ use bevy_camera::Camera;
+ use bevy_core_pipeline::{
+-    prepass::{DepthPrepass, MotionVectorPrepass},
++    prepass::{DepthPrepass, MotionVectorPrepass, ViewPrepassTextures},
+     schedule::{Core3d, Core3dSystems},
+ };
+ use bevy_ecs::{
+@@ -15,15 +18,24 @@ use bevy_ecs::{
+     query::{QueryItem, With},
+     reflect::ReflectComponent,
+     schedule::IntoScheduleConfigs,
++    system::Res,
+ };
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+-    extract_component::{ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin},
+-    render_resource::{ShaderType, SpecializedRenderPipelines},
++    diagnostic::RecordDiagnostics,
++    extract_component::{
++        ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
++    },
++    globals::GlobalsBuffer,
++    render_resource::{
++        BindGroupEntries, Operations, PipelineCache, RenderPassColorAttachment,
++        RenderPassDescriptor, ShaderType, SpecializedRenderPipelines,
++    },
++    renderer::{RenderContext, ViewQuery},
++    view::{Msaa, ViewTarget},
+     Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ 
+-pub mod node;
+ pub mod pipeline;
+ 
+ /// A component that enables and configures motion blur when added to a camera.
+@@ -144,7 +156,7 @@ impl Plugin for MotionBlurPlugin {
+         };
+ 
+         render_app
+-            .init_resource::<SpecializedRenderPipelines<pipeline::MotionBlurPipeline>>()
++            .init_resource::<SpecializedRenderPipelines<MotionBlurPipeline>>()
+             .add_systems(RenderStartup, pipeline::init_motion_blur_pipeline)
+             .add_systems(
+                 Render,
+@@ -153,9 +165,89 @@ impl Plugin for MotionBlurPlugin {
+ 
+         render_app.add_systems(
+             Core3d,
+-            node::motion_blur
+-                .before(bloom)
+-                .in_set(Core3dSystems::PostProcess),
++            motion_blur.before(bloom).in_set(Core3dSystems::PostProcess),
+         );
+     }
+ }
++
++pub fn motion_blur(
++    view: ViewQuery<(
++        &ViewTarget,
++        &MotionBlurPipelineId,
++        &ViewPrepassTextures,
++        &MotionBlurUniform,
++        &Msaa,
++    )>,
++    motion_blur_pipeline: Res<MotionBlurPipeline>,
++    pipeline_cache: Res<PipelineCache>,
++    settings_uniforms: Res<ComponentUniforms<MotionBlurUniform>>,
++    globals_buffer: Res<GlobalsBuffer>,
++    mut ctx: RenderContext,
++) {
++    let (view_target, pipeline_id, prepass_textures, motion_blur_uniform, msaa) = view.into_inner();
++
++    if motion_blur_uniform.samples == 0 || motion_blur_uniform.shutter_angle <= 0.0 {
++        return; // We can skip running motion blur in these cases.
++    }
++
++    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
++        return;
++    };
++
++    let Some(settings_binding) = settings_uniforms.uniforms().binding() else {
++        return;
++    };
++    let (Some(prepass_motion_vectors_texture), Some(prepass_depth_texture)) =
++        (&prepass_textures.motion_vectors, &prepass_textures.depth)
++    else {
++        return;
++    };
++    let Some(globals_uniforms) = globals_buffer.buffer.binding() else {
++        return;
++    };
++
++    let post_process = view_target.post_process_write();
++
++    let layout = if msaa.samples() == 1 {
++        &motion_blur_pipeline.layout
++    } else {
++        &motion_blur_pipeline.layout_msaa
++    };
++
++    let bind_group = ctx.render_device().create_bind_group(
++        Some("motion_blur_bind_group"),
++        &pipeline_cache.get_bind_group_layout(layout),
++        &BindGroupEntries::sequential((
++            post_process.source,
++            &prepass_motion_vectors_texture.texture.default_view,
++            &prepass_depth_texture.texture.default_view,
++            &motion_blur_pipeline.sampler,
++            settings_binding.clone(),
++            globals_uniforms.clone(),
++        )),
++    );
++
++    let diagnostics = ctx.diagnostic_recorder();
++    let diagnostics = diagnostics.as_deref();
++
++    let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
++        label: Some("motion_blur"),
++        color_attachments: &[Some(RenderPassColorAttachment {
++            view: post_process.destination,
++            depth_slice: None,
++            resolve_target: None,
++            ops: Operations::default(),
++        })],
++        depth_stencil_attachment: None,
++        timestamp_writes: None,
++        occlusion_query_set: None,
++        multiview_mask: None,
++    });
++    let pass_span = diagnostics.pass_span(&mut render_pass, "motion_blur");
++
++    render_pass.set_render_pipeline(pipeline);
++    render_pass.set_bind_group(0, &bind_group, &[]);
++    render_pass.draw(0..3, 0..1);
++
++    pass_span.end(&mut render_pass);
++}
+diff --git a/crates/bevy_post_process/src/motion_blur/node.rs b/crates/bevy_post_process/src/motion_blur/node.rs
+deleted file mode 100644
+index f91de7e93c9ad..0000000000000
+--- a/crates/bevy_post_process/src/motion_blur/node.rs
++++ /dev/null
+@@ -1,101 +0,0 @@
+-use bevy_ecs::prelude::*;
+-use bevy_render::{
+-    diagnostic::RecordDiagnostics,
+-    extract_component::ComponentUniforms,
+-    globals::GlobalsBuffer,
+-    render_resource::{
+-        BindGroupEntries, Operations, PipelineCache, RenderPassColorAttachment,
+-        RenderPassDescriptor,
+-    },
+-    renderer::{RenderContext, ViewQuery},
+-    view::{Msaa, ViewTarget},
+-};
+-
+-use bevy_core_pipeline::prepass::ViewPrepassTextures;
+-
+-use super::{
+-    pipeline::{MotionBlurPipeline, MotionBlurPipelineId},
+-    MotionBlurUniform,
+-};
+-
+-pub fn motion_blur(
+-    view: ViewQuery<(
+-        &ViewTarget,
+-        &MotionBlurPipelineId,
+-        &ViewPrepassTextures,
+-        &MotionBlurUniform,
+-        &Msaa,
+-    )>,
+-    motion_blur_pipeline: Res<MotionBlurPipeline>,
+-    pipeline_cache: Res<PipelineCache>,
+-    settings_uniforms: Res<ComponentUniforms<MotionBlurUniform>>,
+-    globals_buffer: Res<GlobalsBuffer>,
+-    mut ctx: RenderContext,
+-) {
+-    let (view_target, pipeline_id, prepass_textures, motion_blur_uniform, msaa) = view.into_inner();
+-
+-    if motion_blur_uniform.samples == 0 || motion_blur_uniform.shutter_angle <= 0.0 {
+-        return; // We can skip running motion blur in these cases.
+-    }
+-
+-    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
+-        return;
+-    };
+-
+-    let Some(settings_binding) = settings_uniforms.uniforms().binding() else {
+-        return;
+-    };
+-    let (Some(prepass_motion_vectors_texture), Some(prepass_depth_texture)) =
+-        (&prepass_textures.motion_vectors, &prepass_textures.depth)
+-    else {
+-        return;
+-    };
+-    let Some(globals_uniforms) = globals_buffer.buffer.binding() else {
+-        return;
+-    };
+-
+-    let post_process = view_target.post_process_write();
+-
+-    let layout = if msaa.samples() == 1 {
+-        &motion_blur_pipeline.layout
+-    } else {
+-        &motion_blur_pipeline.layout_msaa
+-    };
+-
+-    let bind_group = ctx.render_device().create_bind_group(
+-        Some("motion_blur_bind_group"),
+-        &pipeline_cache.get_bind_group_layout(layout),
+-        &BindGroupEntries::sequential((
+-            post_process.source,
+-            &prepass_motion_vectors_texture.texture.default_view,
+-            &prepass_depth_texture.texture.default_view,
+-            &motion_blur_pipeline.sampler,
+-            settings_binding.clone(),
+-            globals_uniforms.clone(),
+-        )),
+-    );
+-
+-    let diagnostics = ctx.diagnostic_recorder();
+-    let diagnostics = diagnostics.as_deref();
+-
+-    let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+-        label: Some("motion_blur"),
+-        color_attachments: &[Some(RenderPassColorAttachment {
+-            view: post_process.destination,
+-            depth_slice: None,
+-            resolve_target: None,
+-            ops: Operations::default(),
+-        })],
+-        depth_stencil_attachment: None,
+-        timestamp_writes: None,
+-        occlusion_query_set: None,
+-        multiview_mask: None,
+-    });
+-    let pass_span = diagnostics.pass_span(&mut render_pass, "motion_blur");
+-
+-    render_pass.set_render_pipeline(pipeline);
+-    render_pass.set_bind_group(0, &bind_group, &[]);
+-    render_pass.draw(0..3, 0..1);
+-
+-    pass_span.end(&mut render_pass);
+-}
