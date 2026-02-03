@@ -1,0 +1,257 @@
+diff --git a/crates/bevy_asset/src/lib.rs b/crates/bevy_asset/src/lib.rs
+index 949a0c7529ac4..4cdfd35005096 100644
+--- a/crates/bevy_asset/src/lib.rs
++++ b/crates/bevy_asset/src/lib.rs
+@@ -740,7 +740,7 @@ mod tests {
+         sync::Mutex,
+     };
+     use bevy_reflect::TypePath;
+-    use core::time::Duration;
++    use core::{any::TypeId, time::Duration};
+     use futures_lite::AsyncReadExt;
+     use serde::{Deserialize, Serialize};
+     use std::path::{Path, PathBuf};
+@@ -2906,4 +2906,169 @@ mod tests {
+         // Now that the dependency is loaded, the subasset is counted as loaded with dependencies!
+         assert!(asset_server.is_loaded_with_dependencies(&subasset_handle));
+     }
++
++    // A simplified version of `LoadState` for easier comparison.
++    #[derive(Debug, PartialEq, Eq)]
++    enum TestLoadState {
++        NotLoaded,
++        Loading,
++        Loaded,
++        Failed(TestAssetLoadError),
++    }
++
++    // A simplified subset of `AssetLoadError` for easier comparison.
++    #[derive(Debug, PartialEq, Eq)]
++    enum TestAssetLoadError {
++        RequestedHandleTypeMismatch {
++            requested: TypeId,
++            actual_asset_name: &'static str,
++        },
++        MissingAssetLoader,
++        AssetReaderErrorNotFound,
++        AssetLoaderError,
++        MissingLabel,
++    }
++
++    impl From<LoadState> for TestLoadState {
++        fn from(value: LoadState) -> Self {
++            match value {
++                LoadState::NotLoaded => Self::NotLoaded,
++                LoadState::Loading => Self::Loading,
++                LoadState::Loaded => Self::Loaded,
++                LoadState::Failed(err) => Self::Failed((&*err).into()),
++            }
++        }
++    }
++
++    impl From<&AssetLoadError> for TestAssetLoadError {
++        fn from(value: &AssetLoadError) -> TestAssetLoadError {
++            match value {
++                AssetLoadError::RequestedHandleTypeMismatch {
++                    requested,
++                    actual_asset_name,
++                    ..
++                } => Self::RequestedHandleTypeMismatch {
++                    requested: *requested,
++                    actual_asset_name,
++                },
++                AssetLoadError::MissingAssetLoader { .. } => Self::MissingAssetLoader,
++                AssetLoadError::AssetReaderError(AssetReaderError::NotFound(_)) => {
++                    Self::AssetReaderErrorNotFound
++                }
++                AssetLoadError::AssetLoaderError { .. } => Self::AssetLoaderError,
++                AssetLoadError::MissingLabel { .. } => Self::MissingLabel,
++                _ => panic!("TestAssetLoadError's From<&AssetLoaderError> is missing a case for AssetLoadError \"{:?}\".", value),
++            }
++        }
++    }
++
++    // An asset type that doesn't have a registered loader.
++    #[derive(Asset, TypePath)]
++    struct LoaderlessAsset;
++
++    // Load the given path and test that `AssetServer::get_load_state` returns
++    // the given state.
++    fn test_load_state<A: Asset>(
++        label: &'static str,
++        path: &'static str,
++        expected_load_state: TestLoadState,
++    ) {
++        let (mut app, dir) = create_app();
++
++        app.init_asset::<CoolText>()
++            .init_asset::<SubText>()
++            .init_asset::<LoaderlessAsset>()
++            .register_asset_loader(CoolTextLoader);
++
++        dir.insert_asset_text(
++            Path::new("test.cool.ron"),
++            r#"
++(
++    text: "test",
++    dependencies: [],
++    embedded_dependencies: [],
++    sub_texts: ["subasset"],
++)"#,
++        );
++
++        dir.insert_asset_text(Path::new("malformed.cool.ron"), "MALFORMED");
++
++        let asset_server = app.world().resource::<AssetServer>().clone();
++        let handle = asset_server.load::<A>(path);
++        let mut load_state = TestLoadState::NotLoaded;
++
++        for _ in 0..LARGE_ITERATION_COUNT {
++            app.update();
++            load_state = asset_server.get_load_state(&handle).unwrap().into();
++            if load_state == expected_load_state {
++                break;
++            }
++        }
++
++        assert!(
++            load_state == expected_load_state,
++            "For test \"{}\", expected {:?} but got {:?}.",
++            label,
++            expected_load_state,
++            load_state,
++        );
++    }
++
++    // Tests that `AssetServer::get_load_state` returns the correct state after
++    // various loads, some of which trigger errors.
++    #[test]
++    fn load_failure() {
++        test_load_state::<CoolText>("root asset exists", "test.cool.ron", TestLoadState::Loaded);
++
++        test_load_state::<SubText>(
++            "sub-asset exists",
++            "test.cool.ron#subasset",
++            TestLoadState::Loaded,
++        );
++
++        test_load_state::<CoolText>(
++            "root asset does not exist",
++            "does_not_exist.cool.ron",
++            TestLoadState::Failed(TestAssetLoadError::AssetReaderErrorNotFound),
++        );
++
++        test_load_state::<CoolText>(
++            "sub-asset of root asset that does not exist",
++            "does_not_exist.cool.ron#subasset",
++            TestLoadState::Failed(TestAssetLoadError::AssetReaderErrorNotFound),
++        );
++
++        test_load_state::<SubText>(
++            "sub-asset does not exist",
++            "test.cool.ron#does_not_exist",
++            TestLoadState::Failed(TestAssetLoadError::MissingLabel),
++        );
++
++        test_load_state::<CoolText>(
++            "sub-asset is not requested type",
++            "test.cool.ron#subasset",
++            TestLoadState::Failed(TestAssetLoadError::RequestedHandleTypeMismatch {
++                requested: TypeId::of::<CoolText>(),
++                actual_asset_name: "bevy_asset::tests::SubText",
++            }),
++        );
++
++        test_load_state::<CoolText>(
++            "malformed root asset",
++            "malformed.cool.ron",
++            TestLoadState::Failed(TestAssetLoadError::AssetLoaderError),
++        );
++
++        test_load_state::<CoolText>(
++            "sub-asset of malformed root asset",
++            "malformed.cool.ron#subasset",
++            TestLoadState::Failed(TestAssetLoadError::AssetLoaderError),
++        );
++
++        test_load_state::<LoaderlessAsset>(
++            "root asset has no loader",
++            "loaderless",
++            TestLoadState::Failed(TestAssetLoadError::MissingAssetLoader),
++        );
++    }
+ }
+diff --git a/crates/bevy_asset/src/server/mod.rs b/crates/bevy_asset/src/server/mod.rs
+index e9eb53f532934..92d0cfa677323 100644
+--- a/crates/bevy_asset/src/server/mod.rs
++++ b/crates/bevy_asset/src/server/mod.rs
+@@ -839,7 +839,27 @@ impl AssetServer {
+             Ok(loaded_asset) => {
+                 let final_handle = if let Some(label) = path.label_cow() {
+                     match loaded_asset.labeled_assets.get(&label) {
+-                        Some(labeled_asset) => Some(labeled_asset.handle.clone()),
++                        Some(labeled_asset) => {
++                            // If we know the requested type then check it
++                            // matches the labeled asset.
++                            if let Some(asset_id) = asset_id
++                                && asset_id.type_id != labeled_asset.handle.type_id()
++                            {
++                                let error = AssetLoadError::RequestedHandleTypeMismatch {
++                                    path: path.clone(),
++                                    requested: asset_id.type_id,
++                                    actual_asset_name: labeled_asset.asset.value.asset_type_name(),
++                                    loader_name: loader.type_path(),
++                                };
++                                self.send_asset_event(InternalAssetEvent::Failed {
++                                    index: asset_id,
++                                    error: error.clone(),
++                                    path: path.into_owned(),
++                                });
++                                return Err(error);
++                            }
++                            Some(labeled_asset.handle.clone())
++                        }
+                         None => {
+                             let mut all_labels: Vec<String> = loaded_asset
+                                 .labeled_assets
+@@ -847,11 +867,19 @@ impl AssetServer {
+                                 .map(|s| (**s).to_owned())
+                                 .collect();
+                             all_labels.sort_unstable();
+-                            return Err(AssetLoadError::MissingLabel {
++                            let error = AssetLoadError::MissingLabel {
+                                 base_path,
+                                 label: label.to_string(),
+                                 all_labels,
+-                            });
++                            };
++                            if let Some(asset_id) = asset_id {
++                                self.send_asset_event(InternalAssetEvent::Failed {
++                                    index: asset_id,
++                                    error: error.clone(),
++                                    path: path.into_owned(),
++                                });
++                            }
++                            return Err(error);
+                         }
+                     }
+                 } else {
+@@ -865,11 +893,13 @@ impl AssetServer {
+                 Ok(final_handle)
+             }
+             Err(err) => {
+-                self.send_asset_event(InternalAssetEvent::Failed {
+-                    index: base_asset_id,
+-                    error: err.clone(),
+-                    path: path.into_owned(),
+-                });
++                if let Some(asset_id) = asset_id {
++                    self.send_asset_event(InternalAssetEvent::Failed {
++                        index: asset_id,
++                        error: err.clone(),
++                        path: path.into_owned(),
++                    });
++                }
+                 Err(err)
+             }
+         }
