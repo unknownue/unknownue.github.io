@@ -1,0 +1,1423 @@
+diff --git a/.gitignore b/.gitignore
+index b93530654e4e0..9a066723a72f4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,6 +25,7 @@ imported_assets
+ .web-asset-cache
+ examples/large_scenes/bistro/assets/*
+ examples/large_scenes/caldera_hotel/assets/*
++examples/asset/saved_assets
+ 
+ # Bevy Examples
+ example_showcase_config.ron
+diff --git a/Cargo.toml b/Cargo.toml
+index f19b5138b63fa..55dadc2c67ef5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -2015,6 +2015,18 @@ description = "Demonstrates various methods to load assets"
+ category = "Assets"
+ wasm = false
+ 
++[[example]]
++name = "asset_saving"
++path = "examples/asset/asset_saving.rs"
++doc-scrape-examples = true
++required-features = ["bevy_picking", "sprite_picking"]
++
++[package.metadata.example.asset_saving]
++name = "Asset Saving"
++description = "Demonstrates how to save an asset (with subassets)"
++category = "Assets"
++wasm = true
++
+ [[example]]
+ name = "asset_settings"
+ path = "examples/asset/asset_settings.rs"
+diff --git a/crates/bevy_asset/src/processor/process.rs b/crates/bevy_asset/src/processor/process.rs
+index 6126fff7591c6..44f50155b3c0e 100644
+--- a/crates/bevy_asset/src/processor/process.rs
++++ b/crates/bevy_asset/src/processor/process.rs
+@@ -16,6 +16,7 @@ use alloc::{
+     string::{String, ToString},
+     vec::Vec,
+ };
++use bevy_ecs::error::BevyError;
+ use bevy_reflect::TypePath;
+ use bevy_tasks::{BoxedFuture, ConditionalSendFuture};
+ use core::marker::PhantomData;
+@@ -160,7 +161,7 @@ pub enum ProcessError {
+     WrongMetaType,
+     #[error("Encountered an error while saving the asset: {0}")]
+     #[from(ignore)]
+-    AssetSaveError(Box<dyn core::error::Error + Send + Sync + 'static>),
++    AssetSaveError(BevyError),
+     #[error("Encountered an error while transforming the asset: {0}")]
+     #[from(ignore)]
+     AssetTransformError(Box<dyn core::error::Error + Send + Sync + 'static>),
+diff --git a/crates/bevy_asset/src/processor/tests.rs b/crates/bevy_asset/src/processor/tests.rs
+index e869066cb10c1..b0f59209b83a8 100644
+--- a/crates/bevy_asset/src/processor/tests.rs
++++ b/crates/bevy_asset/src/processor/tests.rs
+@@ -32,7 +32,7 @@ use crate::{
+         AssetProcessor, GetProcessorError, LoadTransformAndSave, LogEntry, Process, ProcessContext,
+         ProcessError, ProcessorState, ProcessorTransactionLog, ProcessorTransactionLogFactory,
+     },
+-    saver::AssetSaver,
++    saver::{tests::CoolTextSaver, AssetSaver},
+     tests::{
+         read_asset_as_string, read_meta_as_string, run_app_until, CoolText, CoolTextLoader,
+         CoolTextRon, SubText,
+@@ -426,43 +426,6 @@ fn run_app_until_finished_processing(app: &mut App, guard: RwLockWriteGuard<'_,
+     });
+ }
+ 
+-#[derive(TypePath)]
+-struct CoolTextSaver;
+-
+-impl AssetSaver for CoolTextSaver {
+-    type Asset = CoolText;
+-    type Settings = ();
+-    type OutputLoader = CoolTextLoader;
+-    type Error = std::io::Error;
+-
+-    async fn save(
+-        &self,
+-        writer: &mut crate::io::Writer,
+-        asset: crate::saver::SavedAsset<'_, Self::Asset>,
+-        _: &Self::Settings,
+-    ) -> Result<(), Self::Error> {
+-        let ron = CoolTextRon {
+-            text: asset.text.clone(),
+-            sub_texts: asset
+-                .iter_labels()
+-                .map(|label| asset.get_labeled::<SubText, _>(label).unwrap().text.clone())
+-                .collect(),
+-            dependencies: asset
+-                .dependencies
+-                .iter()
+-                .map(|handle| handle.path().unwrap().path())
+-                .map(|path| path.to_str().unwrap().to_string())
+-                .collect(),
+-            // NOTE: We can't handle embedded dependencies in any way, since we need to write to
+-            // another file to do so.
+-            embedded_dependencies: vec![],
+-        };
+-        let ron = ron::ser::to_string_pretty(&ron, PrettyConfig::new().new_line("\n")).unwrap();
+-        writer.write_all(ron.as_bytes()).await?;
+-        Ok(())
+-    }
+-}
+-
+ // Note: while we allow any Fn, since closures are unnameable types, creating a processor with a
+ // closure cannot be used (since we need to include the name of the transformer in the meta
+ // file).
+@@ -637,7 +600,7 @@ fn asset_processor_transforms_asset_with_meta() {
+     source_dir.insert_meta_text(path, r#"(
+     meta_format_version: "1.0",
+     asset: Process(
+-        processor: "bevy_asset::processor::process::LoadTransformAndSave<bevy_asset::tests::CoolTextLoader, bevy_asset::processor::tests::RootAssetTransformer<bevy_asset::processor::tests::AddText, bevy_asset::tests::CoolText>, bevy_asset::processor::tests::CoolTextSaver>",
++        processor: "bevy_asset::processor::process::LoadTransformAndSave<bevy_asset::tests::CoolTextLoader, bevy_asset::processor::tests::RootAssetTransformer<bevy_asset::processor::tests::AddText, bevy_asset::tests::CoolText>, bevy_asset::saver::tests::CoolTextSaver>",
+         settings: (
+             loader_settings: (),
+             transformer_settings: (),
+@@ -846,7 +809,7 @@ impl AssetSaver for FakeBsnSaver {
+     async fn save(
+         &self,
+         writer: &mut crate::io::Writer,
+-        asset: crate::saver::SavedAsset<'_, Self::Asset>,
++        asset: crate::saver::SavedAsset<'_, '_, Self::Asset>,
+         _settings: &Self::Settings,
+     ) -> Result<(), Self::Error> {
+         use std::io::{Error, ErrorKind};
+@@ -1336,7 +1299,7 @@ fn nested_loads_of_processed_asset_reprocesses_on_reload() {
+         async fn save(
+             &self,
+             writer: &mut crate::io::Writer,
+-            asset: crate::saver::SavedAsset<'_, Self::Asset>,
++            asset: crate::saver::SavedAsset<'_, '_, Self::Asset>,
+             _settings: &Self::Settings,
+         ) -> Result<<Self::OutputLoader as AssetLoader>::Settings, Self::Error> {
+             let serialized = serialize_as_leaf(asset.get().value.clone());
+@@ -1557,6 +1520,8 @@ fn only_reprocesses_wrong_hash_on_startup() {
+             }
+             asset.text.push(' ');
+             asset.text.push_str(&asset.embedded);
++            // Clear the embedded text so that saving doesn't break.
++            asset.embedded.clear();
+         }
+     }
+ 
+@@ -1759,7 +1724,7 @@ fn writes_default_meta_for_processor() {
+         r#"(
+     meta_format_version: "1.0",
+     asset: Process(
+-        processor: "bevy_asset::processor::process::LoadTransformAndSave<bevy_asset::tests::CoolTextLoader, bevy_asset::processor::tests::RootAssetTransformer<bevy_asset::processor::tests::AddText, bevy_asset::tests::CoolText>, bevy_asset::processor::tests::CoolTextSaver>",
++        processor: "bevy_asset::processor::process::LoadTransformAndSave<bevy_asset::tests::CoolTextLoader, bevy_asset::processor::tests::RootAssetTransformer<bevy_asset::processor::tests::AddText, bevy_asset::tests::CoolText>, bevy_asset::saver::tests::CoolTextSaver>",
+         settings: (
+             loader_settings: (),
+             transformer_settings: (),
+diff --git a/crates/bevy_asset/src/saver.rs b/crates/bevy_asset/src/saver.rs
+index 524e63989d47a..850bc7801a2ef 100644
+--- a/crates/bevy_asset/src/saver.rs
++++ b/crates/bevy_asset/src/saver.rs
+@@ -1,14 +1,20 @@
+ use crate::{
+-    io::Writer, meta::Settings, transformer::TransformedAsset, Asset, AssetLoader,
+-    ErasedLoadedAsset, Handle, LabeledAsset, UntypedHandle,
++    io::{AssetWriterError, MissingAssetSourceError, MissingAssetWriterError, Writer},
++    meta::{AssetAction, AssetMeta, AssetMetaDyn, Settings},
++    transformer::TransformedAsset,
++    Asset, AssetContainer, AssetLoader, AssetPath, AssetServer, ErasedLoadedAsset, Handle,
++    LabeledAsset, UntypedHandle,
+ };
+-use alloc::boxed::Box;
++use alloc::{boxed::Box, string::ToString, sync::Arc};
+ use atomicow::CowArc;
++use bevy_ecs::error::BevyError;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::TypePath;
+ use bevy_tasks::{BoxedFuture, ConditionalSendFuture};
+-use core::{borrow::Borrow, hash::Hash, ops::Deref};
++use core::{any::TypeId, borrow::Borrow, ops::Deref};
++use futures_lite::AsyncWriteExt;
+ use serde::{Deserialize, Serialize};
++use thiserror::Error;
+ 
+ /// Saves an [`Asset`] of a given [`AssetSaver::Asset`] type. [`AssetSaver::OutputLoader`] will then be used to load the saved asset
+ /// in the final deployed application. The saver should produce asset bytes in a format that [`AssetSaver::OutputLoader`] can read.
+@@ -28,14 +34,14 @@ pub trait AssetSaver: TypePath + Send + Sync + 'static {
+     /// The type of [`AssetLoader`] used to load this [`Asset`]
+     type OutputLoader: AssetLoader;
+     /// The type of [error](`std::error::Error`) which could be encountered by this saver.
+-    type Error: Into<Box<dyn core::error::Error + Send + Sync + 'static>>;
++    type Error: Into<BevyError>;
+ 
+     /// Saves the given runtime [`Asset`] by writing it to a byte format using `writer`. The passed in `settings` can influence how the
+     /// `asset` is saved.
+     fn save(
+         &self,
+         writer: &mut Writer,
+-        asset: SavedAsset<'_, Self::Asset>,
++        asset: SavedAsset<'_, '_, Self::Asset>,
+         settings: &Self::Settings,
+     ) -> impl ConditionalSendFuture<
+         Output = Result<<Self::OutputLoader as AssetLoader>::Settings, Self::Error>,
+@@ -51,7 +57,7 @@ pub trait ErasedAssetSaver: Send + Sync + 'static {
+         writer: &'a mut Writer,
+         asset: &'a ErasedLoadedAsset,
+         settings: &'a dyn Settings,
+-    ) -> BoxedFuture<'a, Result<(), Box<dyn core::error::Error + Send + Sync + 'static>>>;
++    ) -> BoxedFuture<'a, Result<(), BevyError>>;
+ 
+     /// The type name of the [`AssetSaver`].
+     fn type_name(&self) -> &'static str;
+@@ -63,7 +69,7 @@ impl<S: AssetSaver> ErasedAssetSaver for S {
+         writer: &'a mut Writer,
+         asset: &'a ErasedLoadedAsset,
+         settings: &'a dyn Settings,
+-    ) -> BoxedFuture<'a, Result<(), Box<dyn core::error::Error + Send + Sync + 'static>>> {
++    ) -> BoxedFuture<'a, Result<(), BevyError>> {
+         Box::pin(async move {
+             let settings = settings
+                 .downcast_ref::<S::Settings>()
+@@ -81,12 +87,13 @@ impl<S: AssetSaver> ErasedAssetSaver for S {
+ }
+ 
+ /// An [`Asset`] (and any labeled "sub assets") intended to be saved.
+-pub struct SavedAsset<'a, A: Asset> {
++#[derive(Clone)]
++pub struct SavedAsset<'a, 'b, A: Asset> {
+     value: &'a A,
+-    labeled_assets: &'a HashMap<CowArc<'static, str>, LabeledAsset>,
++    labeled_assets: Moo<'b, HashMap<CowArc<'a, str>, LabeledSavedAsset<'a>>>,
+ }
+ 
+-impl<'a, A: Asset> Deref for SavedAsset<'a, A> {
++impl<A: Asset> Deref for SavedAsset<'_, '_, A> {
+     type Target = A;
+ 
+     fn deref(&self) -> &Self::Target {
+@@ -94,21 +101,67 @@ impl<'a, A: Asset> Deref for SavedAsset<'a, A> {
+     }
+ }
+ 
+-impl<'a, A: Asset> SavedAsset<'a, A> {
++impl<'a, 'b, A: Asset> SavedAsset<'a, 'b, A> {
++    fn from_value_and_labeled_saved_assets(
++        value: &'a A,
++        labeled_saved_assets: &'b HashMap<CowArc<'a, str>, LabeledSavedAsset<'a>>,
++    ) -> Self {
++        Self {
++            value,
++            labeled_assets: Moo::Borrowed(labeled_saved_assets),
++        }
++    }
++
++    fn from_value_and_labeled_assets(
++        value: &'a A,
++        labeled_assets: &'a HashMap<CowArc<'static, str>, LabeledAsset>,
++    ) -> Self {
++        Self {
++            value,
++            labeled_assets: Moo::Owned(
++                labeled_assets
++                    .iter()
++                    .map(|(label, labeled_asset)| {
++                        (
++                            CowArc::Borrowed(label.borrow()),
++                            LabeledSavedAsset::from_labeled_asset(labeled_asset),
++                        )
++                    })
++                    .collect(),
++            ),
++        }
++    }
++
+     /// Creates a new [`SavedAsset`] from `asset` if its internal value matches `A`.
+     pub fn from_loaded(asset: &'a ErasedLoadedAsset) -> Option<Self> {
+         let value = asset.value.downcast_ref::<A>()?;
+-        Some(SavedAsset {
++        Some(Self::from_value_and_labeled_assets(
+             value,
+-            labeled_assets: &asset.labeled_assets,
+-        })
++            &asset.labeled_assets,
++        ))
+     }
+ 
+     /// Creates a new [`SavedAsset`] from the a [`TransformedAsset`]
+     pub fn from_transformed(asset: &'a TransformedAsset<A>) -> Self {
++        Self::from_value_and_labeled_assets(&asset.value, &asset.labeled_assets)
++    }
++
++    /// Creates a new [`SavedAsset`] holding only the provided value with no labeled assets.
++    pub fn from_asset(value: &'a A) -> Self {
+         Self {
+-            value: &asset.value,
+-            labeled_assets: &asset.labeled_assets,
++            value,
++            labeled_assets: Moo::Owned(HashMap::default()),
++        }
++    }
++
++    /// Casts this typed asset into its type-erased form.
++    pub fn upcast(self) -> ErasedSavedAsset<'a, 'a>
++    where
++        'b: 'a,
++    {
++        ErasedSavedAsset {
++            value: self.value,
++            labeled_assets: self.labeled_assets,
+         }
+     }
+ 
+@@ -119,46 +172,26 @@ impl<'a, A: Asset> SavedAsset<'a, A> {
+     }
+ 
+     /// Returns the labeled asset, if it exists and matches this type.
+-    pub fn get_labeled<B: Asset, Q>(&self, label: &Q) -> Option<SavedAsset<'_, B>>
+-    where
+-        CowArc<'static, str>: Borrow<Q>,
+-        Q: ?Sized + Hash + Eq,
+-    {
+-        let labeled = self.labeled_assets.get(label)?;
+-        let value = labeled.asset.value.downcast_ref::<B>()?;
+-        Some(SavedAsset {
+-            value,
+-            labeled_assets: &labeled.asset.labeled_assets,
+-        })
++    pub fn get_labeled<B: Asset>(&self, label: impl AsRef<str>) -> Option<SavedAsset<'a, '_, B>> {
++        let labeled = self.labeled_assets.get(label.as_ref())?;
++        labeled.asset.downcast()
+     }
+ 
+     /// Returns the type-erased labeled asset, if it exists and matches this type.
+-    pub fn get_erased_labeled<Q>(&self, label: &Q) -> Option<&ErasedLoadedAsset>
+-    where
+-        CowArc<'static, str>: Borrow<Q>,
+-        Q: ?Sized + Hash + Eq,
+-    {
+-        let labeled = self.labeled_assets.get(label)?;
++    pub fn get_erased_labeled(&self, label: impl AsRef<str>) -> Option<&ErasedSavedAsset<'a, '_>> {
++        let labeled = self.labeled_assets.get(label.as_ref())?;
+         Some(&labeled.asset)
+     }
+ 
+     /// Returns the [`UntypedHandle`] of the labeled asset with the provided 'label', if it exists.
+-    pub fn get_untyped_handle<Q>(&self, label: &Q) -> Option<UntypedHandle>
+-    where
+-        CowArc<'static, str>: Borrow<Q>,
+-        Q: ?Sized + Hash + Eq,
+-    {
+-        let labeled = self.labeled_assets.get(label)?;
++    pub fn get_untyped_handle(&self, label: impl AsRef<str>) -> Option<UntypedHandle> {
++        let labeled = self.labeled_assets.get(label.as_ref())?;
+         Some(labeled.handle.clone())
+     }
+ 
+     /// Returns the [`Handle`] of the labeled asset with the provided 'label', if it exists and is an asset of type `B`
+-    pub fn get_handle<Q, B: Asset>(&self, label: &Q) -> Option<Handle<B>>
+-    where
+-        CowArc<'static, str>: Borrow<Q>,
+-        Q: ?Sized + Hash + Eq,
+-    {
+-        let labeled = self.labeled_assets.get(label)?;
++    pub fn get_handle<B: Asset>(&self, label: impl AsRef<str>) -> Option<Handle<B>> {
++        let labeled = self.labeled_assets.get(label.as_ref())?;
+         if let Ok(handle) = labeled.handle.clone().try_typed::<B>() {
+             return Some(handle);
+         }
+@@ -170,3 +203,504 @@ impl<'a, A: Asset> SavedAsset<'a, A> {
+         self.labeled_assets.keys().map(|s| &**s)
+     }
+ }
++
++#[derive(Clone)]
++pub struct ErasedSavedAsset<'a: 'b, 'b> {
++    value: &'a dyn AssetContainer,
++    labeled_assets: Moo<'b, HashMap<CowArc<'a, str>, LabeledSavedAsset<'a>>>,
++}
++
++impl<'a> ErasedSavedAsset<'a, '_> {
++    fn from_loaded(asset: &'a ErasedLoadedAsset) -> Self {
++        Self {
++            value: &*asset.value,
++            labeled_assets: Moo::Owned(
++                asset
++                    .labeled_assets
++                    .iter()
++                    .map(|(label, asset)| {
++                        (
++                            CowArc::Borrowed(label.borrow()),
++                            LabeledSavedAsset::from_labeled_asset(asset),
++                        )
++                    })
++                    .collect(),
++            ),
++        }
++    }
++}
++
++impl<'a> ErasedSavedAsset<'a, '_> {
++    /// Attempts to downcast this erased asset into type `A`.
++    ///
++    /// Returns [`None`] if the asset is the wrong type.
++    pub fn downcast<'b, A: Asset>(&'b self) -> Option<SavedAsset<'a, 'b, A>> {
++        let value = self.value.downcast_ref::<A>()?;
++        Some(SavedAsset::from_value_and_labeled_saved_assets(
++            value,
++            &self.labeled_assets,
++        ))
++    }
++}
++
++/// Container for a single labeled asset (which also includes its labeled assets, for nested
++/// assets).
++#[derive(Clone)]
++struct LabeledSavedAsset<'a> {
++    /// The asset and its labeled assets.
++    asset: ErasedSavedAsset<'a, 'a>,
++    /// The handle of this labeled asset.
++    handle: UntypedHandle,
++}
++
++impl<'a> LabeledSavedAsset<'a> {
++    /// Creates an instance that corresponds to the same data as [`LabeledAsset`].
++    fn from_labeled_asset(asset: &'a LabeledAsset) -> Self {
++        Self {
++            asset: ErasedSavedAsset::from_loaded(&asset.asset),
++            handle: asset.handle.clone(),
++        }
++    }
++}
++
++/// A builder for creating [`SavedAsset`] instances (for use with asset saving).
++///
++/// This is commonly used in tandem with [`save_using_saver`].
++pub struct SavedAssetBuilder<'a> {
++    /// The labeled assets for this saved asset.
++    labeled_assets: HashMap<CowArc<'a, str>, LabeledSavedAsset<'a>>,
++    /// The asset path (with no label) that this saved asset is "tied" to.
++    ///
++    /// All labeled assets will use this asset path (with their substituted labels). Note labeled
++    /// assets **of labeled assets** may not use the same asset path (to represent nested-loaded
++    /// assets).
++    asset_path: AssetPath<'static>,
++    /// The asset server to use for creating handles.
++    asset_server: AssetServer,
++}
++
++impl<'a> SavedAssetBuilder<'a> {
++    /// Creates a new builder for the given `asset_path` and using the `asset_server` to back its
++    /// handles.
++    pub fn new(asset_server: AssetServer, mut asset_path: AssetPath<'static>) -> Self {
++        asset_path.remove_label();
++        Self {
++            asset_server,
++            asset_path,
++            labeled_assets: Default::default(),
++        }
++    }
++
++    /// Adds a labeled asset, creates a handle for it, and returns the handle (for use in creating
++    /// an asset).
++    ///
++    /// This is primarily used when **constructing** a new asset to be saved. Since assets commonly
++    /// store handles to their subassets, this function returns a handle that can be stored in your
++    /// root asset.
++    ///
++    /// If you already have a root asset instance (which already contains a subasset handle), use
++    /// [`Self::add_labeled_asset_with_existing_handle`] instead.
++    #[must_use]
++    pub fn add_labeled_asset_with_new_handle<'b: 'a, A: Asset>(
++        &mut self,
++        label: impl Into<CowArc<'b, str>>,
++        asset: SavedAsset<'a, 'a, A>,
++    ) -> Handle<A> {
++        let label = label.into();
++        let handle = Handle::Strong(
++            self.asset_server
++                .read_infos()
++                .handle_providers
++                .get(&TypeId::of::<A>())
++                .expect("asset type has been initialized")
++                .reserve_handle_internal(
++                    false,
++                    Some(self.asset_path.clone().with_label(label.to_string())),
++                    None,
++                ),
++        );
++        self.add_labeled_asset_with_existing_handle(label, asset, handle.clone());
++        handle
++    }
++
++    /// Adds a labeled asset with a pre-existing handle.
++    ///
++    /// This is primarily used when attempting to save a (root) asset that you already have an
++    /// instance of. Since this root asset instance already must have its fields populated
++    /// (including any subasset handles), this function allows you to record the subasset that
++    /// should be associated with that handle.
++    ///
++    /// If you do not have a root asset instance (you're creating one from scratch), use
++    /// [`Self::add_labeled_asset_with_new_handle`] instead.
++    pub fn add_labeled_asset_with_existing_handle<'b: 'a, A: Asset>(
++        &mut self,
++        label: impl Into<CowArc<'b, str>>,
++        asset: SavedAsset<'a, 'a, A>,
++        handle: Handle<A>,
++    ) {
++        self.add_labeled_asset_with_existing_handle_erased(
++            label.into(),
++            asset.upcast(),
++            handle.untyped(),
++        );
++    }
++
++    /// Same as [`Self::add_labeled_asset_with_new_handle`], but type-erased to allow for dynamic
++    /// types.
++    #[must_use]
++    pub fn add_labeled_asset_with_new_handle_erased<'b: 'a>(
++        &mut self,
++        label: impl Into<CowArc<'b, str>>,
++        asset: ErasedSavedAsset<'a, 'a>,
++    ) -> UntypedHandle {
++        let label = label.into();
++        let handle = UntypedHandle::Strong(
++            self.asset_server
++                .read_infos()
++                .handle_providers
++                .get(&asset.value.type_id())
++                .expect("asset type has been initialized")
++                .reserve_handle_internal(
++                    false,
++                    Some(self.asset_path.clone().with_label(label.to_string())),
++                    None,
++                ),
++        );
++        self.add_labeled_asset_with_existing_handle_erased(label, asset, handle.clone());
++        handle
++    }
++
++    /// Same as [`Self::add_labeled_asset_with_existing_handle`], but type-erased to allow for
++    /// dynamic types.
++    pub fn add_labeled_asset_with_existing_handle_erased<'b: 'a>(
++        &mut self,
++        label: impl Into<CowArc<'b, str>>,
++        asset: ErasedSavedAsset<'a, 'a>,
++        handle: UntypedHandle,
++    ) {
++        // TODO: Check asset and handle have the same type.
++        self.labeled_assets
++            .insert(label.into(), LabeledSavedAsset { asset, handle });
++    }
++
++    /// Creates the final saved asset from this builder.
++    pub fn build<'b, A: Asset>(self, asset: &'b A) -> SavedAsset<'b, 'b, A>
++    where
++        'a: 'b,
++    {
++        SavedAsset {
++            value: asset,
++            labeled_assets: Moo::Owned(self.labeled_assets),
++        }
++    }
++}
++
++/// An alternative to [`Cow`] but simplified to just a `T` or `&T`.
++///
++/// Associated types are **always** considered "invariant" (see
++/// <https://doc.rust-lang.org/nomicon/subtyping.html>). Since [`Cow`] uses the [`ToOwned`] trait
++/// and its associated type of [`ToOwned::Owned`], this means [`Cow`] types are invariant (which
++/// TL;DR means that in some cases Rust is not allowed to shorten lifetimes, causing lifetime
++/// errors).
++///
++/// This type also allows working with any type, not just those that implement [`ToOwned`] - at the
++/// cost of losing the ability to mutate the value.
++///
++/// `Moo` stands for maybe-owned-object.
++///
++/// [`Cow`]: alloc::borrow::Cow
++/// [`ToOwned`]: alloc::borrow::ToOwned
++/// [`ToOwned::Owned`]: alloc::borrow::ToOwned::Owned
++#[derive(Clone)]
++enum Moo<'a, T> {
++    Owned(T),
++    Borrowed(&'a T),
++}
++
++impl<T> Deref for Moo<'_, T> {
++    type Target = T;
++
++    fn deref(&self) -> &Self::Target {
++        match self {
++            Self::Owned(t) => t,
++            Self::Borrowed(t) => t,
++        }
++    }
++}
++
++/// Saves `asset` to `path` using the provided `saver` and `settings`.
++pub async fn save_using_saver<S: AssetSaver>(
++    asset_server: AssetServer,
++    saver: &S,
++    path: &AssetPath<'_>,
++    asset: SavedAsset<'_, '_, S::Asset>,
++    settings: &S::Settings,
++) -> Result<(), SaveAssetError> {
++    let source = asset_server.get_source(path.source())?;
++    let writer = source.writer()?;
++
++    let mut file_writer = writer.write(path.path()).await?;
++
++    let loader_settings = saver
++        .save(&mut file_writer, asset, settings)
++        .await
++        .map_err(|err| SaveAssetError::SaverError(Arc::new(err.into())))?;
++
++    file_writer.flush().await.map_err(AssetWriterError::Io)?;
++
++    let meta = AssetMeta::<S::OutputLoader, ()>::new(AssetAction::Load {
++        loader: S::OutputLoader::type_path().into(),
++        settings: loader_settings,
++    });
++
++    let meta = AssetMetaDyn::serialize(&meta);
++    writer.write_meta_bytes(path.path(), &meta).await?;
++
++    Ok(())
++}
++
++/// An error occurring when saving an asset.
++#[derive(Error, Debug)]
++pub enum SaveAssetError {
++    #[error(transparent)]
++    MissingSource(#[from] MissingAssetSourceError),
++    #[error(transparent)]
++    MissingWriter(#[from] MissingAssetWriterError),
++    #[error(transparent)]
++    WriterError(#[from] AssetWriterError),
++    #[error("Failed to save asset due to error from saver: {0}")]
++    SaverError(Arc<BevyError>),
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use alloc::{string::ToString, vec, vec::Vec};
++    use bevy_reflect::TypePath;
++    use bevy_tasks::block_on;
++    use futures_lite::AsyncWriteExt;
++    use ron::ser::PrettyConfig;
++
++    use crate::{
++        saver::{save_using_saver, AssetSaver, SavedAsset, SavedAssetBuilder},
++        tests::{create_app, run_app_until, CoolText, CoolTextLoader, CoolTextRon, SubText},
++        AssetApp, AssetServer, Assets,
++    };
++
++    fn new_subtext(text: &str) -> SubText {
++        SubText {
++            text: text.to_string(),
++        }
++    }
++
++    #[derive(TypePath)]
++    pub struct CoolTextSaver;
++
++    impl AssetSaver for CoolTextSaver {
++        type Asset = CoolText;
++        type Settings = ();
++        type OutputLoader = CoolTextLoader;
++        type Error = std::io::Error;
++
++        async fn save(
++            &self,
++            writer: &mut crate::io::Writer,
++            asset: SavedAsset<'_, '_, Self::Asset>,
++            _: &Self::Settings,
++        ) -> Result<(), Self::Error> {
++            // NOTE: We can't handle embedded dependencies in any way, since we need to write to
++            // another file to do so.
++            assert!(asset.embedded.is_empty());
++            let ron = CoolTextRon {
++                text: asset.text.clone(),
++                sub_texts: asset
++                    .iter_labels()
++                    .map(|label| asset.get_labeled::<SubText>(label).unwrap().text.clone())
++                    .collect(),
++                dependencies: asset
++                    .dependencies
++                    .iter()
++                    .map(|handle| handle.path().unwrap().path())
++                    .map(|path| path.to_str().unwrap().to_string())
++                    .collect(),
++                embedded_dependencies: vec![],
++            };
++            let ron = ron::ser::to_string_pretty(&ron, PrettyConfig::new().new_line("\n")).unwrap();
++            writer.write_all(ron.as_bytes()).await?;
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn builds_saved_asset_for_new_asset() {
++        let mut app = create_app().0;
++
++        app.init_asset::<CoolText>()
++            .init_asset::<SubText>()
++            .register_asset_loader(CoolTextLoader);
++
++        // Update a few times before saving to show that assets can be entirely created from
++        // scratch.
++        app.update();
++        app.update();
++        app.update();
++
++        let hiya_subasset = new_subtext("hiya");
++        let goodbye_subasset = new_subtext("goodbye");
++        let idk_subasset = new_subtext("idk");
++
++        let asset_server = app.world().resource::<AssetServer>().clone();
++        let mut saved_asset_builder =
++            SavedAssetBuilder::new(asset_server.clone(), "some/target/path.cool.ron".into());
++        let hiya_handle = saved_asset_builder
++            .add_labeled_asset_with_new_handle("hiya", SavedAsset::from_asset(&hiya_subasset));
++        let goodbye_handle = saved_asset_builder.add_labeled_asset_with_new_handle(
++            "goodbye",
++            SavedAsset::from_asset(&goodbye_subasset),
++        );
++        let idk_handle = saved_asset_builder
++            .add_labeled_asset_with_new_handle("idk", SavedAsset::from_asset(&idk_subasset));
++
++        let main_asset = CoolText {
++            text: "wassup".into(),
++            sub_texts: vec![hiya_handle, goodbye_handle, idk_handle],
++            ..Default::default()
++        };
++
++        let saved_asset = saved_asset_builder.build(&main_asset);
++        let mut asset_labels = saved_asset
++            .labeled_assets
++            .keys()
++            .map(|label| label.as_ref().to_string())
++            .collect::<Vec<_>>();
++        asset_labels.sort();
++        assert_eq!(asset_labels, &["goodbye", "hiya", "idk"]);
++
++        {
++            let asset_server = asset_server.clone();
++            block_on(async move {
++                save_using_saver(
++                    asset_server,
++                    &CoolTextSaver,
++                    &"some/target/path.cool.ron".into(),
++                    saved_asset,
++                    &(),
++                )
++                .await
++            })
++            .unwrap();
++        }
++
++        let readback = asset_server.load("some/target/path.cool.ron");
++        run_app_until(&mut app, |_| {
++            asset_server.is_loaded(&readback).then_some(())
++        });
++
++        let cool_text = app
++            .world()
++            .resource::<Assets<CoolText>>()
++            .get(&readback)
++            .unwrap();
++
++        let subtexts = app.world().resource::<Assets<SubText>>();
++        let mut asset_labels = cool_text
++            .sub_texts
++            .iter()
++            .map(|handle| subtexts.get(handle).unwrap().text.clone())
++            .collect::<Vec<_>>();
++        asset_labels.sort();
++        assert_eq!(asset_labels, &["goodbye", "hiya", "idk"]);
++    }
++
++    #[test]
++    fn builds_saved_asset_for_existing_asset() {
++        let (mut app, _) = create_app();
++
++        app.init_asset::<CoolText>()
++            .init_asset::<SubText>()
++            .register_asset_loader(CoolTextLoader);
++
++        let mut subtexts = app.world_mut().resource_mut::<Assets<SubText>>();
++        let hiya_handle = subtexts.add(new_subtext("hiya"));
++        let goodbye_handle = subtexts.add(new_subtext("goodbye"));
++        let idk_handle = subtexts.add(new_subtext("idk"));
++
++        let mut cool_texts = app.world_mut().resource_mut::<Assets<CoolText>>();
++        let cool_text_handle = cool_texts.add(CoolText {
++            text: "wassup".into(),
++            sub_texts: vec![
++                hiya_handle.clone(),
++                goodbye_handle.clone(),
++                idk_handle.clone(),
++            ],
++            ..Default::default()
++        });
++
++        let subtexts = app.world().resource::<Assets<SubText>>();
++        let cool_texts = app.world().resource::<Assets<CoolText>>();
++        let asset_server = app.world().resource::<AssetServer>().clone();
++        let mut saved_asset_builder =
++            SavedAssetBuilder::new(asset_server.clone(), "some/target/path.cool.ron".into());
++        saved_asset_builder.add_labeled_asset_with_existing_handle(
++            "hiya",
++            SavedAsset::from_asset(subtexts.get(&hiya_handle).unwrap()),
++            hiya_handle,
++        );
++        saved_asset_builder.add_labeled_asset_with_existing_handle(
++            "goodbye",
++            SavedAsset::from_asset(subtexts.get(&goodbye_handle).unwrap()),
++            goodbye_handle,
++        );
++        saved_asset_builder.add_labeled_asset_with_existing_handle(
++            "idk",
++            SavedAsset::from_asset(subtexts.get(&idk_handle).unwrap()),
++            idk_handle,
++        );
++
++        let saved_asset = saved_asset_builder.build(cool_texts.get(&cool_text_handle).unwrap());
++        let mut asset_labels = saved_asset
++            .labeled_assets
++            .keys()
++            .map(|label| label.as_ref().to_string())
++            .collect::<Vec<_>>();
++        asset_labels.sort();
++        assert_eq!(asset_labels, &["goodbye", "hiya", "idk"]);
++
++        // While this example is supported, it is **not** recommended. This currently blocks the
++        // entire world from updating. A slow write could cause visible stutters. However we do this
++        // here to show it's possible to use assets directly out of the Assets resources.
++        {
++            let asset_server = asset_server.clone();
++            block_on(async move {
++                save_using_saver(
++                    asset_server,
++                    &CoolTextSaver,
++                    &"some/target/path.cool.ron".into(),
++                    saved_asset,
++                    &(),
++                )
++                .await
++            })
++            .unwrap();
++        }
++
++        let readback = asset_server.load("some/target/path.cool.ron");
++        run_app_until(&mut app, |_| {
++            asset_server.is_loaded(&readback).then_some(())
++        });
++
++        let cool_text = app
++            .world()
++            .resource::<Assets<CoolText>>()
++            .get(&readback)
++            .unwrap();
++
++        let subtexts = app.world().resource::<Assets<SubText>>();
++        let mut asset_labels = cool_text
++            .sub_texts
++            .iter()
++            .map(|handle| subtexts.get(handle).unwrap().text.clone())
++            .collect::<Vec<_>>();
++        asset_labels.sort();
++        assert_eq!(asset_labels, &["goodbye", "hiya", "idk"]);
++    }
++}
+diff --git a/crates/bevy_image/src/compressed_image_saver.rs b/crates/bevy_image/src/compressed_image_saver.rs
+index f5eb168ff8570..dfd7843eb04a5 100644
+--- a/crates/bevy_image/src/compressed_image_saver.rs
++++ b/crates/bevy_image/src/compressed_image_saver.rs
+@@ -27,7 +27,7 @@ impl AssetSaver for CompressedImageSaver {
+     async fn save(
+         &self,
+         writer: &mut bevy_asset::io::Writer,
+-        image: SavedAsset<'_, Self::Asset>,
++        image: SavedAsset<'_, '_, Self::Asset>,
+         _settings: &Self::Settings,
+     ) -> Result<ImageLoaderSettings, Self::Error> {
+         let is_srgb = image.texture_descriptor.format.is_srgb();
+diff --git a/crates/bevy_pbr/src/meshlet/asset.rs b/crates/bevy_pbr/src/meshlet/asset.rs
+index 38b0270326bd9..3348627d51333 100644
+--- a/crates/bevy_pbr/src/meshlet/asset.rs
++++ b/crates/bevy_pbr/src/meshlet/asset.rs
+@@ -157,7 +157,7 @@ impl AssetSaver for MeshletMeshSaver {
+     async fn save(
+         &self,
+         writer: &mut Writer,
+-        asset: SavedAsset<'_, MeshletMesh>,
++        asset: SavedAsset<'_, '_, MeshletMesh>,
+         _settings: &(),
+     ) -> Result<(), MeshletMeshSaveOrLoadError> {
+         // Write asset magic number
+diff --git a/examples/README.md b/examples/README.md
+index f13c4971e7a7f..41ee31a07404e 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -255,6 +255,7 @@ Example | Description
+ [Asset Decompression](../examples/asset/asset_decompression.rs) | Demonstrates loading a compressed asset
+ [Asset Loading](../examples/asset/asset_loading.rs) | Demonstrates various methods to load assets
+ [Asset Processing](../examples/asset/processing/asset_processing.rs) | Demonstrates how to process and load custom assets
++[Asset Saving](../examples/asset/asset_saving.rs) | Demonstrates how to save an asset (with subassets)
+ [Asset Settings](../examples/asset/asset_settings.rs) | Demonstrates various methods of applying settings when loading an asset
+ [Custom Asset](../examples/asset/custom_asset.rs) | Implements a custom asset loader
+ [Custom Asset IO](../examples/asset/custom_asset_reader.rs) | Implements a custom AssetReader
+diff --git a/examples/asset/asset_saving.rs b/examples/asset/asset_saving.rs
+new file mode 100644
+index 0000000000000..4ec5cff19bdb7
+--- /dev/null
++++ b/examples/asset/asset_saving.rs
+@@ -0,0 +1,372 @@
++//! This example demonstrates how to save assets.
++
++use bevy::{
++    asset::{
++        io::{Reader, Writer},
++        saver::{save_using_saver, AssetSaver, SavedAsset, SavedAssetBuilder},
++        AssetLoader, AsyncWriteExt, LoadContext,
++    },
++    color::palettes::tailwind,
++    input::common_conditions::input_just_pressed,
++    prelude::*,
++    tasks::IoTaskPool,
++};
++use serde::{Deserialize, Serialize};
++
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins.set(AssetPlugin {
++            // This is just overriding the default asset paths to scope this to the correct example
++            // folder. You can generally skip this in your own projects.
++            file_path: "examples/asset/saved_assets".to_string(),
++            ..Default::default()
++        }))
++        .add_plugins(box_editing_plugin)
++        .init_asset::<OneBox>()
++        .init_asset::<ManyBoxes>()
++        .register_asset_loader(ManyBoxesLoader)
++        .add_systems(
++            PreUpdate,
++            (
++                perform_save.run_if(input_just_pressed(KeyCode::F5)),
++                (
++                    start_load.run_if(input_just_pressed(KeyCode::F6)),
++                    wait_for_pending_loads,
++                )
++                    .chain(),
++            ),
++        )
++        .run();
++}
++
++const ASSET_PATH: &str = "my_scene.boxes";
++
++/// A system that takes the scene data, passes it to a task, and saves that scene data to
++/// [`ASSET_PATH`].
++fn perform_save(boxes: Query<(&Sprite, &Transform), With<Box>>, asset_server: Res<AssetServer>) {
++    // First we extract all the data needed to produce an asset we can save.
++    let boxes = boxes
++        .iter()
++        .map(|(sprite, transform)| OneBox {
++            position: transform.translation.xy(),
++            color: sprite.color,
++        })
++        .collect::<Vec<_>>();
++
++    let asset_server = asset_server.clone();
++    IoTaskPool::get()
++        .spawn(async move {
++            // Build a `SavedAsset` instance from the boxes we extracted.
++            let mut builder = SavedAssetBuilder::new(asset_server.clone(), ASSET_PATH.into());
++            let mut many_boxes = ManyBoxes { boxes: vec![] };
++            for (index, one_box) in boxes.iter().enumerate() {
++                many_boxes
++                    .boxes
++                    .push(builder.add_labeled_asset_with_new_handle(
++                        index.to_string(),
++                        SavedAsset::from_asset(one_box),
++                    ));
++            }
++
++            let saved_asset = builder.build(&many_boxes);
++            // Save the asset using the provided saver.
++            match save_using_saver(
++                asset_server.clone(),
++                &ManyBoxesSaver,
++                &ASSET_PATH.into(),
++                saved_asset,
++                &(),
++            )
++            .await
++            {
++                Ok(()) => info!("Completed save of {ASSET_PATH}"),
++                Err(err) => error!("Failed to save asset: {err}"),
++            }
++        })
++        .detach();
++}
++
++/// A system the starts loading [`ASSET_PATH`].
++fn start_load(mut commands: Commands, asset_server: Res<AssetServer>) {
++    commands.spawn(PendingLoad(asset_server.load(ASSET_PATH)));
++}
++
++/// Marks that a handle is currently loading.
++///
++/// Once loading is complete, the [`ManyBoxes`] data will be spawned.
++#[derive(Component)]
++struct PendingLoad(Handle<ManyBoxes>);
++
++/// Waits for any [`PendingLoad`]s to complete, and spawns in their boxes when they do.
++fn wait_for_pending_loads(
++    loads: Populated<(Entity, &PendingLoad)>,
++    many_boxes: Res<Assets<ManyBoxes>>,
++    one_boxes: Res<Assets<OneBox>>,
++    existing_boxes: Query<Entity, With<Box>>,
++    mut commands: Commands,
++) {
++    for (entity, load) in loads.iter() {
++        let Some(many_boxes) = many_boxes.get(&load.0) else {
++            continue;
++        };
++
++        commands.entity(entity).despawn();
++        for entity in existing_boxes.iter() {
++            commands.entity(entity).despawn();
++        }
++
++        for box_handle in many_boxes.boxes.iter() {
++            let Some(one_box) = one_boxes.get(box_handle) else {
++                return;
++            };
++            commands.spawn((
++                Sprite::from_color(one_box.color, Vec2::new(100.0, 100.0)),
++                Transform::from_translation(one_box.position.extend(0.0)),
++                Pickable::default(),
++                Box,
++            ));
++        }
++    }
++}
++
++/// An asset representing a single box.
++#[derive(Asset, TypePath, Clone, Serialize, Deserialize)]
++struct OneBox {
++    /// The position of the box.
++    position: Vec2,
++    /// The color of the box.
++    color: Color,
++}
++
++/// An asset representing many boxes.
++#[derive(Asset, TypePath)]
++struct ManyBoxes {
++    /// Stores handles to all the boxes that should be spawned.
++    ///
++    /// Note: in this trivial example, it seems more reasonable to just store [`Vec<OneBox>`], but
++    /// in a more realistic example this could be something like a whole [`Mesh`] (where a handle
++    /// makes more sense). We use a handle here to demonstrate saving subassets as well.
++    boxes: Vec<Handle<OneBox>>,
++}
++
++/// A serializable version of [`ManyBoxes`].
++#[derive(Serialize, Deserialize)]
++struct SerializableManyBoxes {
++    /// The boxes that exist in this scene.
++    boxes: Vec<OneBox>,
++}
++
++/// Am asset saver to save [`ManyBoxes`] assets.
++#[derive(TypePath)]
++struct ManyBoxesSaver;
++
++impl AssetSaver for ManyBoxesSaver {
++    type Asset = ManyBoxes;
++    type Error = BevyError;
++    type OutputLoader = ManyBoxesLoader;
++    type Settings = ();
++
++    async fn save(
++        &self,
++        writer: &mut Writer,
++        asset: SavedAsset<'_, '_, Self::Asset>,
++        _settings: &Self::Settings,
++    ) -> Result<(), Self::Error> {
++        let boxes = asset
++            .boxes
++            .iter()
++            .map(|handle| {
++                // TODO: We should have a better to get the asset for a subasset handle.
++                let label = handle
++                    .path()
++                    .and_then(|path| path.label())
++                    .ok_or_else(|| format!("Failed to get label for handle {handle:?}"))?;
++                asset
++                    .get_labeled::<OneBox>(label)
++                    .map(|subasset| subasset.get().clone())
++                    .ok_or_else(|| format!("Failed to find labeled asset for label {label}"))
++            })
++            .collect::<Result<Vec<_>, _>>()?;
++
++        // Note: serializing to string isn't ideal since we can't do a streaming write, but this is
++        // fine for an example.
++        let serialized = ron::to_string(&SerializableManyBoxes { boxes })?;
++        writer.write_all(serialized.as_bytes()).await?;
++
++        Ok(())
++    }
++}
++
++/// An asset loader for loading [`ManyBoxes`] assets.
++#[derive(TypePath)]
++struct ManyBoxesLoader;
++
++impl AssetLoader for ManyBoxesLoader {
++    type Asset = ManyBoxes;
++    type Error = BevyError;
++    type Settings = ();
++
++    async fn load(
++        &self,
++        reader: &mut dyn Reader,
++        _settings: &Self::Settings,
++        load_context: &mut LoadContext<'_>,
++    ) -> Result<Self::Asset, Self::Error> {
++        let mut bytes = vec![];
++        reader.read_to_end(&mut bytes).await?;
++
++        let serialized: SerializableManyBoxes = ron::de::from_bytes(&bytes)?;
++
++        // Add the boxes as subassets.
++        let mut result_boxes = vec![];
++        for (index, one_box) in serialized.boxes.into_iter().enumerate() {
++            result_boxes.push(load_context.add_labeled_asset(index.to_string(), one_box));
++        }
++
++        Ok(ManyBoxes {
++            boxes: result_boxes,
++        })
++    }
++
++    fn extensions(&self) -> &[&str] {
++        &["boxes"]
++    }
++}
++
++/// Plugin for doing all the box-editing.
++///
++/// This doesn't really have anything to do with asset saving, but provides a real use-case.
++fn box_editing_plugin(app: &mut App) {
++    app.add_systems(Startup, setup)
++        .add_observer(spawn_box)
++        .add_observer(start_rotate_box_hue)
++        .add_observer(end_rotate_box_hue_on_release)
++        .add_observer(end_rotate_box_hue_on_out)
++        .add_systems(Update, rotate_hue)
++        .add_observer(stop_propagate_on_clicked_box)
++        .add_observer(drag_box);
++}
++
++#[derive(Component)]
++struct Box;
++
++/// Spawns the initial scene.
++fn setup(mut commands: Commands) {
++    commands.spawn(Camera2d);
++
++    commands.spawn(Text(
++        r"LMB (on background) - spawn new box
++LMB (on box) - drag to move
++RMB (on box) - rotate colors
++F5 - Save boxes
++F6 - Load boxes"
++            .into(),
++    ));
++}
++
++/// Spawns a new box whenever you left-click on the background.
++fn spawn_box(
++    event: On<Pointer<Press>>,
++    window: Query<(), With<Window>>,
++    camera: Single<(&Camera, &GlobalTransform)>,
++    mut commands: Commands,
++) {
++    if event.button != PointerButton::Primary {
++        return;
++    }
++    if !window.contains(event.entity) {
++        return;
++    }
++
++    let (camera, camera_transform) = camera.into_inner();
++    let Ok(click_point) =
++        camera.viewport_to_world_2d(camera_transform, event.pointer_location.position)
++    else {
++        return;
++    };
++    commands.spawn((
++        Sprite::from_color(tailwind::RED_500, Vec2::new(100.0, 100.0)),
++        Transform::from_translation(click_point.extend(0.0)),
++        Pickable::default(),
++        Box,
++    ));
++}
++
++/// A component to rotate the hue of a sprite every frame.
++#[derive(Component)]
++struct RotateHue;
++
++/// Rotates the hue of each [`Sprite`] tagged with [`RotateHue`].
++fn rotate_hue(time: Res<Time>, mut sprites: Query<&mut Sprite, With<RotateHue>>) {
++    for mut sprite in sprites.iter_mut() {
++        // Make a full rotation every 2 seconds.
++        sprite.color = sprite.color.rotate_hue(time.delta_secs() * 180.0);
++    }
++}
++
++/// Starts rotating the hue of a box that has been right-clicked.
++fn start_rotate_box_hue(
++    event: On<Pointer<Press>>,
++    boxes: Query<(), With<Box>>,
++    mut commands: Commands,
++) {
++    if event.button != PointerButton::Secondary {
++        return;
++    }
++    if !boxes.contains(event.entity) {
++        return;
++    }
++    commands.entity(event.entity).insert(RotateHue);
++}
++
++/// Stops rotating the box hue if it's right-click is released.
++fn end_rotate_box_hue_on_release(
++    event: On<Pointer<Release>>,
++    boxes: Query<(), (With<Box>, With<RotateHue>)>,
++    mut commands: Commands,
++) {
++    if event.button != PointerButton::Secondary {
++        return;
++    }
++    if !boxes.contains(event.entity) {
++        return;
++    }
++    commands.entity(event.entity).remove::<RotateHue>();
++}
++
++/// Stops rotating the box hue if the cursor moves off the entity.
++fn end_rotate_box_hue_on_out(
++    event: On<Pointer<Out>>,
++    boxes: Query<(), (With<Box>, With<RotateHue>)>,
++    mut commands: Commands,
++) {
++    if !boxes.contains(event.entity) {
++        return;
++    }
++    commands.entity(event.entity).remove::<RotateHue>();
++}
++
++/// Blocks propagation of pointer press events on left-clicked boxes.
++fn stop_propagate_on_clicked_box(mut event: On<Pointer<Press>>, boxes: Query<(), With<Box>>) {
++    if event.button != PointerButton::Primary {
++        return;
++    }
++    if !boxes.contains(event.entity) {
++        return;
++    }
++    event.propagate(false);
++}
++
++/// Drags a box when you left-click on one.
++fn drag_box(event: On<Pointer<Drag>>, mut boxes: Query<&mut Transform, With<Box>>) {
++    if event.button != PointerButton::Primary {
++        return;
++    }
++    let Ok(mut transform) = boxes.get_mut(event.entity) else {
++        return;
++    };
++
++    // This is wrong in general (e.g., doesn't consider scale), but it's close enough for our
++    // purposes.
++    transform.translation += Vec3::new(event.delta.x, -event.delta.y, 0.0);
++}
+diff --git a/examples/asset/processing/asset_processing.rs b/examples/asset/processing/asset_processing.rs
+index 651dbe2148a76..a6d946ca6f56d 100644
+--- a/examples/asset/processing/asset_processing.rs
++++ b/examples/asset/processing/asset_processing.rs
+@@ -218,7 +218,7 @@ impl AssetSaver for CoolTextSaver {
+     async fn save(
+         &self,
+         writer: &mut Writer,
+-        asset: SavedAsset<'_, Self::Asset>,
++        asset: SavedAsset<'_, '_, Self::Asset>,
+         _settings: &Self::Settings,
+     ) -> Result<TextSettings, Self::Error> {
+         writer.write_all(asset.text.as_bytes()).await?;
+diff --git a/release-content/migration-guides/asset_saver_changes.md b/release-content/migration-guides/asset_saver_changes.md
+new file mode 100644
+index 0000000000000..4963e371924e2
+--- /dev/null
++++ b/release-content/migration-guides/asset_saver_changes.md
+@@ -0,0 +1,47 @@
++---
++title: SavedAsset now contains two lifetimes.
++pull_requests: []
++---
++
++`SavedAsset` now holds two lifetimes instead of one. This is primarily used in the context of
++`AssetSaver`. So previously, users may have:
++
++```rust
++impl AssetSaver for MySaver {
++    type Asset = MyAsset;
++    type Settings = ();
++    type OutputLoader = MyLoader;
++    type Error = std::io::Error;
++
++    async fn save(
++        &self,
++        writer: &mut Writer,
++        asset: SavedAsset<'_, Self::Asset>,
++        settings: &Self::Settings,
++    ) -> Result<(), Self::Error> {
++        todo!()
++    }
++}
++```
++
++Now with the extra `SavedAsset` lifetime:
++
++```rust
++impl AssetSaver for MySaver {
++    type Asset = MyAsset;
++    type Settings = ();
++    type OutputLoader = MyLoader;
++    type Error = std::io::Error;
++
++    async fn save(
++        &self,
++        writer: &mut Writer,
++        asset: SavedAsset<'_, '_, Self::Asset>,
++        settings: &Self::Settings,
++    ) -> Result<(), Self::Error> {
++        todo!()
++    }
++}
++```
++
++In practice, this should not have an impact on usages.
+diff --git a/release-content/release-notes/asset_saving.md b/release-content/release-notes/asset_saving.md
+new file mode 100644
+index 0000000000000..3fb6f039568d8
+--- /dev/null
++++ b/release-content/release-notes/asset_saving.md
+@@ -0,0 +1,61 @@
++---
++title: Asset Saving
++authors: ["@andriyDev"]
++pull_requests: []
++---
++
++Since Bevy 0.12, we've had the `AssetSaver` trait. Unfortunately, this trait was not really usable
++for asset saving: it was only intended for use with asset processing! This was a common stumbling
++block for users, and pointed to a gap in our API.
++
++Now, users can save their assets using `save_using_saver`. To use this involves two steps.
++
++## 1. Building the `SavedAsset`
++
++To build the `SavedAsset`, either use `SavedAsset::from_asset`:
++
++```rust
++let main_asset = InlinedBook {
++    lines: vec!["Save me!".to_string(), "Please!".to_string()],
++};
++let saved_asset = SavedAsset::from_asset(&main_asset);
++```
++
++Or for more complicated cases, `SavedAssetBuilder`:
++
++```rust
++let asset_path: AssetPath<'static> = "my/file/path.whatever";
++let mut builder = SavedAssetBuilder::new(asset_server.clone(), asset_path.clone());
++
++let subasset_1 = Line("howdy".into());
++let subasset_2 = Line("goodbye".into());
++let handle_1 = builder.add_labeled_asset_with_new_handle(
++    "TheFirstLabel", SavedAsset::from_asset(&subasset_1));
++let handle_2 = builder.add_labeled_asset_with_new_handle(
++    "AnotherOne", SavedAsset::from_asset(&subasset_2));
++
++let main_asset = Book {
++    lines: vec![handle_1, handle_2],
++};
++let saved_asset = builder.build(&main_asset);
++```
++
++Note that since these assets are borrowed, building the `SavedAsset` should happen in the same async
++task as the next step.
++
++## 2. Calling `save_using_saver`
++
++Now, with a `SavedAsset`, we can just call `save_using_saver` and fill in any arguments:
++
++```rust
++save_using_saver(
++    asset_server.clone(),
++    &MyAssetSaver::default(),
++    &asset_path,
++    saved_asset,
++    &MySettings::default(),
++).await.unwrap();
++```
++
++Part of this includes implementing the `AssetSaver` trait on `MyAssetSaver`. In addition, this is an
++async function, so it is likely you will want to spawn this using `IoTaskPool::get().spawn(...)`.
