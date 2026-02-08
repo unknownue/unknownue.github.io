@@ -1,0 +1,1161 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e362ae62d145c..efc44322159cc 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -135,6 +135,7 @@ default = [
+   "bevy_audio",
+   "bevy_color",
+   "bevy_core_pipeline",
++  "bevy_post_process",
+   "bevy_core_widgets",
+   "bevy_anti_alias",
+   "bevy_gilrs",
+@@ -216,6 +217,9 @@ bevy_color = ["bevy_internal/bevy_color"]
+ # Provides cameras and other basic render pipeline features
+ bevy_core_pipeline = ["bevy_internal/bevy_core_pipeline"]
+ 
++# Provides post process effects such as depth of field, bloom, chromatic aberration.
++bevy_post_process = ["bevy_internal/bevy_post_process"]
++
+ # Provides various anti aliasing solutions
+ bevy_anti_alias = ["bevy_internal/bevy_anti_alias"]
+ 
+diff --git a/crates/bevy_anti_alias/src/contrast_adaptive_sharpening/mod.rs b/crates/bevy_anti_alias/src/contrast_adaptive_sharpening/mod.rs
+index fd10e3b7b91a0..43790dc393520 100644
+--- a/crates/bevy_anti_alias/src/contrast_adaptive_sharpening/mod.rs
++++ b/crates/bevy_anti_alias/src/contrast_adaptive_sharpening/mod.rs
+@@ -98,6 +98,7 @@ impl ExtractComponent for ContrastAdaptiveSharpening {
+ }
+ 
+ /// Adds Support for Contrast Adaptive Sharpening (CAS).
++#[derive(Default)]
+ pub struct CasPlugin;
+ 
+ impl Plugin for CasPlugin {
+diff --git a/crates/bevy_anti_alias/src/fxaa/mod.rs b/crates/bevy_anti_alias/src/fxaa/mod.rs
+index 69b26ffa8abc7..075c7a82f610e 100644
+--- a/crates/bevy_anti_alias/src/fxaa/mod.rs
++++ b/crates/bevy_anti_alias/src/fxaa/mod.rs
+@@ -82,6 +82,7 @@ impl Default for Fxaa {
+ }
+ 
+ /// Adds support for Fast Approximate Anti-Aliasing (FXAA)
++#[derive(Default)]
+ pub struct FxaaPlugin;
+ impl Plugin for FxaaPlugin {
+     fn build(&self, app: &mut App) {
+diff --git a/crates/bevy_anti_alias/src/lib.rs b/crates/bevy_anti_alias/src/lib.rs
+index 9276494b67c16..326df3c28d5b4 100644
+--- a/crates/bevy_anti_alias/src/lib.rs
++++ b/crates/bevy_anti_alias/src/lib.rs
+@@ -18,8 +18,10 @@ pub mod fxaa;
+ pub mod smaa;
+ pub mod taa;
+ 
++/// Adds fxaa, smaa, taa, contrast aware sharpening, and optional dlss support.
+ #[derive(Default)]
+ pub struct AntiAliasPlugin;
++
+ impl Plugin for AntiAliasPlugin {
+     fn build(&self, app: &mut bevy_app::App) {
+         app.add_plugins((
+diff --git a/crates/bevy_anti_alias/src/smaa/mod.rs b/crates/bevy_anti_alias/src/smaa/mod.rs
+index 3a65f6ce6c593..9d7d7cd6593c5 100644
+--- a/crates/bevy_anti_alias/src/smaa/mod.rs
++++ b/crates/bevy_anti_alias/src/smaa/mod.rs
+@@ -80,6 +80,7 @@ use bevy_shader::{Shader, ShaderDefVal};
+ use bevy_utils::prelude::default;
+ 
+ /// Adds support for subpixel morphological antialiasing, or SMAA.
++#[derive(Default)]
+ pub struct SmaaPlugin;
+ 
+ /// A component for enabling Subpixel Morphological Anti-Aliasing (SMAA)
+diff --git a/crates/bevy_anti_alias/src/taa/mod.rs b/crates/bevy_anti_alias/src/taa/mod.rs
+index 28c04ea3593b4..5a65726f39d81 100644
+--- a/crates/bevy_anti_alias/src/taa/mod.rs
++++ b/crates/bevy_anti_alias/src/taa/mod.rs
+@@ -45,6 +45,7 @@ use tracing::warn;
+ /// Plugin for temporal anti-aliasing.
+ ///
+ /// See [`TemporalAntiAliasing`] for more details.
++#[derive(Default)]
+ pub struct TemporalAntiAliasPlugin;
+ 
+ impl Plugin for TemporalAntiAliasPlugin {
+diff --git a/crates/bevy_core_pipeline/src/core_3d/mod.rs b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+index 95b72eb6f6278..ffc25046a57e5 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/mod.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+@@ -121,7 +121,6 @@ use crate::{
+         AlphaMask3dDeferred, Opaque3dDeferred, DEFERRED_LIGHTING_PASS_ID_FORMAT,
+         DEFERRED_PREPASS_FORMAT,
+     },
+-    dof::DepthOfFieldNode,
+     prepass::{
+         node::{EarlyPrepassNode, LatePrepassNode},
+         AlphaMask3dPrepass, DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass,
+@@ -214,7 +213,6 @@ impl Plugin for Core3dPlugin {
+                 Node3d::MainTransparentPass,
+             )
+             .add_render_graph_node::<EmptyNode>(Core3d, Node3d::EndMainPass)
+-            .add_render_graph_node::<ViewNodeRunner<DepthOfFieldNode>>(Core3d, Node3d::DepthOfField)
+             .add_render_graph_node::<ViewNodeRunner<TonemappingNode>>(Core3d, Node3d::Tonemapping)
+             .add_render_graph_node::<EmptyNode>(Core3d, Node3d::EndMainPassPostProcessing)
+             .add_render_graph_node::<ViewNodeRunner<UpscalingNode>>(Core3d, Node3d::Upscaling)
+diff --git a/crates/bevy_core_pipeline/src/lib.rs b/crates/bevy_core_pipeline/src/lib.rs
+index 80cb8cdb0dbad..6ca7915a7c2b8 100644
+--- a/crates/bevy_core_pipeline/src/lib.rs
++++ b/crates/bevy_core_pipeline/src/lib.rs
+@@ -6,18 +6,12 @@
+     html_favicon_url = "https://bevy.org/assets/icon.png"
+ )]
+ 
+-pub mod auto_exposure;
+ pub mod blit;
+-pub mod bloom;
+ pub mod core_2d;
+ pub mod core_3d;
+ pub mod deferred;
+-pub mod dof;
+ pub mod experimental;
+-pub mod motion_blur;
+-pub mod msaa_writeback;
+ pub mod oit;
+-pub mod post_process;
+ pub mod prepass;
+ pub mod tonemapping;
+ pub mod upscaling;
+@@ -29,11 +23,10 @@ mod fullscreen_vertex_shader;
+ mod skybox;
+ 
+ use crate::{
+-    blit::BlitPlugin, bloom::BloomPlugin, core_2d::Core2dPlugin, core_3d::Core3dPlugin,
+-    deferred::copy_lighting_id::CopyDeferredLightingIdPlugin, dof::DepthOfFieldPlugin,
+-    experimental::mip_generation::MipGenerationPlugin, motion_blur::MotionBlurPlugin,
+-    msaa_writeback::MsaaWritebackPlugin, post_process::PostProcessingPlugin,
+-    tonemapping::TonemappingPlugin, upscaling::UpscalingPlugin,
++    blit::BlitPlugin, core_2d::Core2dPlugin, core_3d::Core3dPlugin,
++    deferred::copy_lighting_id::CopyDeferredLightingIdPlugin,
++    experimental::mip_generation::MipGenerationPlugin, tonemapping::TonemappingPlugin,
++    upscaling::UpscalingPlugin,
+ };
+ use bevy_app::{App, Plugin};
+ use bevy_asset::embedded_asset;
+@@ -50,13 +43,8 @@ impl Plugin for CorePipelinePlugin {
+         app.add_plugins((Core2dPlugin, Core3dPlugin, CopyDeferredLightingIdPlugin))
+             .add_plugins((
+                 BlitPlugin,
+-                MsaaWritebackPlugin,
+                 TonemappingPlugin,
+                 UpscalingPlugin,
+-                BloomPlugin,
+-                MotionBlurPlugin,
+-                DepthOfFieldPlugin,
+-                PostProcessingPlugin,
+                 OrderIndependentTransparencyPlugin,
+                 MipGenerationPlugin,
+             ));
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 57d2f10f50665..babb95a4dac1c 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -235,6 +235,7 @@ bevy_render = [
+ ]
+ bevy_core_pipeline = ["dep:bevy_core_pipeline", "bevy_render"]
+ bevy_anti_alias = ["dep:bevy_anti_alias", "bevy_core_pipeline"]
++bevy_post_process = ["dep:bevy_post_process", "bevy_core_pipeline"]
+ bevy_pbr = [
+   "dep:bevy_pbr",
+   "bevy_light",
+@@ -474,6 +475,7 @@ bevy_color = { path = "../bevy_color", optional = true, version = "0.17.0-dev",
+   "bevy_reflect",
+ ] }
+ bevy_core_pipeline = { path = "../bevy_core_pipeline", optional = true, version = "0.17.0-dev" }
++bevy_post_process = { path = "../bevy_post_process", optional = true, version = "0.17.0-dev" }
+ bevy_core_widgets = { path = "../bevy_core_widgets", optional = true, version = "0.17.0-dev" }
+ bevy_anti_alias = { path = "../bevy_anti_alias", optional = true, version = "0.17.0-dev" }
+ bevy_dev_tools = { path = "../bevy_dev_tools", optional = true, version = "0.17.0-dev" }
+diff --git a/crates/bevy_internal/src/default_plugins.rs b/crates/bevy_internal/src/default_plugins.rs
+index 887e8f4c73b56..4467da12f4f11 100644
+--- a/crates/bevy_internal/src/default_plugins.rs
++++ b/crates/bevy_internal/src/default_plugins.rs
+@@ -50,6 +50,8 @@ plugin_group! {
+         bevy_render::pipelined_rendering:::PipelinedRenderingPlugin,
+         #[cfg(feature = "bevy_core_pipeline")]
+         bevy_core_pipeline:::CorePipelinePlugin,
++        #[cfg(feature = "bevy_post_process")]
++        bevy_post_process:::PostProcessPlugin,
+         #[cfg(feature = "bevy_anti_alias")]
+         bevy_anti_alias:::AntiAliasPlugin,
+         #[cfg(feature = "bevy_sprite")]
+diff --git a/crates/bevy_internal/src/lib.rs b/crates/bevy_internal/src/lib.rs
+index 303f865e4e6e6..78c8ba2b221f5 100644
+--- a/crates/bevy_internal/src/lib.rs
++++ b/crates/bevy_internal/src/lib.rs
+@@ -64,6 +64,8 @@ pub use bevy_pbr as pbr;
+ #[cfg(feature = "bevy_picking")]
+ pub use bevy_picking as picking;
+ pub use bevy_platform as platform;
++#[cfg(feature = "bevy_post_process")]
++pub use bevy_post_process as post_process;
+ pub use bevy_ptr as ptr;
+ pub use bevy_reflect as reflect;
+ #[cfg(feature = "bevy_remote")]
+diff --git a/crates/bevy_post_process/Cargo.toml b/crates/bevy_post_process/Cargo.toml
+new file mode 100644
+index 0000000000000..6610758567f06
+--- /dev/null
++++ b/crates/bevy_post_process/Cargo.toml
+@@ -0,0 +1,50 @@
++[package]
++name = "bevy_post_process"
++version = "0.17.0-dev"
++edition = "2024"
++description = "Provides post process effects for Bevy Engine."
++homepage = "https://bevy.org"
++repository = "https://github.com/bevyengine/bevy"
++license = "MIT OR Apache-2.0"
++keywords = ["bevy"]
++
++[features]
++trace = []
++webgl = []
++webgpu = []
++
++[dependencies]
++# bevy
++bevy_app = { path = "../bevy_app", version = "0.17.0-dev" }
++bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
++bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
++bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.17.0-dev" }
++bevy_derive = { path = "../bevy_derive", version = "0.17.0-dev" }
++bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
++bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
++bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
++bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
++bevy_shader = { path = "../bevy_shader", version = "0.17.0-dev" }
++bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
++bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
++bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
++bevy_utils = { path = "../bevy_utils", version = "0.17.0-dev" }
++bevy_window = { path = "../bevy_window", version = "0.17.0-dev" }
++bevy_platform = { path = "../bevy_platform", version = "0.17.0-dev", default-features = false, features = [
++  "std",
++  "serialize",
++] }
++
++bitflags = "2.3"
++radsort = "0.1"
++nonmax = "0.5"
++smallvec = { version = "1", default-features = false }
++thiserror = { version = "2", default-features = false }
++tracing = { version = "0.1", default-features = false, features = ["std"] }
++
++[lints]
++workspace = true
++
++[package.metadata.docs.rs]
++rustdoc-args = ["-Zunstable-options", "--generate-link-to-definition"]
++all-features = true
+diff --git a/crates/bevy_post_process/LICENSE-APACHE b/crates/bevy_post_process/LICENSE-APACHE
+new file mode 100644
+index 0000000000000..d9a10c0d8e868
+--- /dev/null
++++ b/crates/bevy_post_process/LICENSE-APACHE
+@@ -0,0 +1,176 @@
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
+diff --git a/crates/bevy_post_process/LICENSE-MIT b/crates/bevy_post_process/LICENSE-MIT
+new file mode 100644
+index 0000000000000..9cf106272ac3b
+--- /dev/null
++++ b/crates/bevy_post_process/LICENSE-MIT
+@@ -0,0 +1,19 @@
++MIT License
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/crates/bevy_post_process/README.md b/crates/bevy_post_process/README.md
+new file mode 100644
+index 0000000000000..922c9523817ca
+--- /dev/null
++++ b/crates/bevy_post_process/README.md
+@@ -0,0 +1,7 @@
++# Bevy Post Process
++
++[![License](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/bevyengine/bevy#license)
++[![Crates.io](https://img.shields.io/crates/v/bevy_core_pipeline.svg)](https://crates.io/crates/bevy_core_pipeline)
++[![Downloads](https://img.shields.io/crates/d/bevy_core_pipeline.svg)](https://crates.io/crates/bevy_core_pipeline)
++[![Docs](https://docs.rs/bevy_core_pipeline/badge.svg)](https://docs.rs/bevy_core_pipeline/latest/bevy_core_pipeline/)
++[![Discord](https://img.shields.io/discord/691052431525675048.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/bevy)
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/auto_exposure.wgsl b/crates/bevy_post_process/src/auto_exposure/auto_exposure.wgsl
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/auto_exposure/auto_exposure.wgsl
+rename to crates/bevy_post_process/src/auto_exposure/auto_exposure.wgsl
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/buffers.rs b/crates/bevy_post_process/src/auto_exposure/buffers.rs
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/auto_exposure/buffers.rs
+rename to crates/bevy_post_process/src/auto_exposure/buffers.rs
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/compensation_curve.rs b/crates/bevy_post_process/src/auto_exposure/compensation_curve.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/auto_exposure/compensation_curve.rs
+rename to crates/bevy_post_process/src/auto_exposure/compensation_curve.rs
+index 7c2036fa72153..c7c4fcbecb174 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/compensation_curve.rs
++++ b/crates/bevy_post_process/src/auto_exposure/compensation_curve.rs
+@@ -86,7 +86,7 @@ impl AutoExposureCompensationCurve {
+     /// # use bevy_asset::prelude::*;
+     /// # use bevy_math::vec2;
+     /// # use bevy_math::cubic_splines::*;
+-    /// # use bevy_core_pipeline::auto_exposure::AutoExposureCompensationCurve;
++    /// # use bevy_post_process::auto_exposure::AutoExposureCompensationCurve;
+     /// # let mut compensation_curves = Assets::<AutoExposureCompensationCurve>::default();
+     /// let curve: Handle<AutoExposureCompensationCurve> = compensation_curves.add(
+     ///     AutoExposureCompensationCurve::from_curve(LinearSpline::new([
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs b/crates/bevy_post_process/src/auto_exposure/mod.rs
+similarity index 95%
+rename from crates/bevy_core_pipeline/src/auto_exposure/mod.rs
+rename to crates/bevy_post_process/src/auto_exposure/mod.rs
+index f054cd3d3a3d9..d8975aa4ec9a9 100644
+--- a/crates/bevy_core_pipeline/src/auto_exposure/mod.rs
++++ b/crates/bevy_post_process/src/auto_exposure/mod.rs
+@@ -24,12 +24,10 @@ use node::AutoExposureNode;
+ use pipeline::{AutoExposurePass, AutoExposurePipeline, ViewAutoExposurePipeline};
+ pub use settings::AutoExposure;
+ 
+-use crate::{
+-    auto_exposure::{
+-        compensation_curve::GpuAutoExposureCompensationCurve, pipeline::init_auto_exposure_pipeline,
+-    },
+-    core_3d::graph::{Core3d, Node3d},
++use crate::auto_exposure::{
++    compensation_curve::GpuAutoExposureCompensationCurve, pipeline::init_auto_exposure_pipeline,
+ };
++use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
+ 
+ /// Plugin for the auto exposure feature.
+ ///
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/node.rs b/crates/bevy_post_process/src/auto_exposure/node.rs
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/auto_exposure/node.rs
+rename to crates/bevy_post_process/src/auto_exposure/node.rs
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs b/crates/bevy_post_process/src/auto_exposure/pipeline.rs
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/auto_exposure/pipeline.rs
+rename to crates/bevy_post_process/src/auto_exposure/pipeline.rs
+diff --git a/crates/bevy_core_pipeline/src/auto_exposure/settings.rs b/crates/bevy_post_process/src/auto_exposure/settings.rs
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/auto_exposure/settings.rs
+rename to crates/bevy_post_process/src/auto_exposure/settings.rs
+diff --git a/crates/bevy_core_pipeline/src/bloom/bloom.wgsl b/crates/bevy_post_process/src/bloom/bloom.wgsl
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/bloom/bloom.wgsl
+rename to crates/bevy_post_process/src/bloom/bloom.wgsl
+diff --git a/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs b/crates/bevy_post_process/src/bloom/downsampling_pipeline.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
+rename to crates/bevy_post_process/src/bloom/downsampling_pipeline.rs
+index 6d6fc1d4dbd2d..2e66e1d25dbaf 100644
+--- a/crates/bevy_core_pipeline/src/bloom/downsampling_pipeline.rs
++++ b/crates/bevy_post_process/src/bloom/downsampling_pipeline.rs
+@@ -1,4 +1,4 @@
+-use crate::FullscreenShader;
++use bevy_core_pipeline::FullscreenShader;
+ 
+ use super::{Bloom, BLOOM_TEXTURE_FORMAT};
+ use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+diff --git a/crates/bevy_core_pipeline/src/bloom/mod.rs b/crates/bevy_post_process/src/bloom/mod.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/bloom/mod.rs
+rename to crates/bevy_post_process/src/bloom/mod.rs
+index f07675fad36c7..e0f2424ec2eb5 100644
+--- a/crates/bevy_core_pipeline/src/bloom/mod.rs
++++ b/crates/bevy_post_process/src/bloom/mod.rs
+@@ -5,17 +5,17 @@ mod upsampling_pipeline;
+ use bevy_image::ToExtents;
+ pub use settings::{Bloom, BloomCompositeMode, BloomPrefilter};
+ 
+-use crate::{
+-    bloom::{
+-        downsampling_pipeline::init_bloom_downsampling_pipeline,
+-        upsampling_pipeline::init_bloom_upscaling_pipeline,
+-    },
+-    core_2d::graph::{Core2d, Node2d},
+-    core_3d::graph::{Core3d, Node3d},
++use crate::bloom::{
++    downsampling_pipeline::init_bloom_downsampling_pipeline,
++    upsampling_pipeline::init_bloom_upscaling_pipeline,
+ };
+ use bevy_app::{App, Plugin};
+ use bevy_asset::embedded_asset;
+ use bevy_color::{Gray, LinearRgba};
++use bevy_core_pipeline::{
++    core_2d::graph::{Core2d, Node2d},
++    core_3d::graph::{Core3d, Node3d},
++};
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_math::{ops, UVec2};
+ use bevy_render::{
+@@ -43,6 +43,7 @@ use upsampling_pipeline::{
+ 
+ const BLOOM_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rg11b10Ufloat;
+ 
++#[derive(Default)]
+ pub struct BloomPlugin;
+ 
+ impl Plugin for BloomPlugin {
+diff --git a/crates/bevy_core_pipeline/src/bloom/settings.rs b/crates/bevy_post_process/src/bloom/settings.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/bloom/settings.rs
+rename to crates/bevy_post_process/src/bloom/settings.rs
+index 1d96d9cbb0c10..39457dac8efd2 100644
+--- a/crates/bevy_core_pipeline/src/bloom/settings.rs
++++ b/crates/bevy_post_process/src/bloom/settings.rs
+@@ -23,7 +23,7 @@ use bevy_render::{extract_component::ExtractComponent, view::Hdr};
+ /// Often used in conjunction with `bevy_pbr::StandardMaterial::emissive` for 3d meshes.
+ ///
+ /// Bloom is best used alongside a tonemapping function that desaturates bright colors,
+-/// such as [`crate::tonemapping::Tonemapping::TonyMcMapface`].
++/// such as [`bevy_core_pipeline::tonemapping::Tonemapping::TonyMcMapface`].
+ ///
+ /// Bevy's implementation uses a parametric curve to blend between a set of
+ /// blurred (lower frequency) images generated from the camera's view.
+diff --git a/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs b/crates/bevy_post_process/src/bloom/upsampling_pipeline.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
+rename to crates/bevy_post_process/src/bloom/upsampling_pipeline.rs
+index c528ffd9b4243..775ca55fb3529 100644
+--- a/crates/bevy_core_pipeline/src/bloom/upsampling_pipeline.rs
++++ b/crates/bevy_post_process/src/bloom/upsampling_pipeline.rs
+@@ -1,4 +1,4 @@
+-use crate::FullscreenShader;
++use bevy_core_pipeline::FullscreenShader;
+ 
+ use super::{
+     downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode, BLOOM_TEXTURE_FORMAT,
+diff --git a/crates/bevy_core_pipeline/src/dof/dof.wgsl b/crates/bevy_post_process/src/dof/dof.wgsl
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/dof/dof.wgsl
+rename to crates/bevy_post_process/src/dof/dof.wgsl
+diff --git a/crates/bevy_core_pipeline/src/dof/mod.rs b/crates/bevy_post_process/src/dof/mod.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/dof/mod.rs
+rename to crates/bevy_post_process/src/dof/mod.rs
+index 7f6a84beccae6..9b0077d8569a3 100644
+--- a/crates/bevy_core_pipeline/src/dof/mod.rs
++++ b/crates/bevy_post_process/src/dof/mod.rs
+@@ -63,7 +63,7 @@ use bevy_utils::{default, once};
+ use smallvec::SmallVec;
+ use tracing::{info, warn};
+ 
+-use crate::{
++use bevy_core_pipeline::{
+     core_3d::{
+         graph::{Core3d, Node3d},
+         DEPTH_TEXTURE_SAMPLING_SUPPORTED,
+@@ -72,6 +72,7 @@ use crate::{
+ };
+ 
+ /// A plugin that adds support for the depth of field effect to Bevy.
++#[derive(Default)]
+ pub struct DepthOfFieldPlugin;
+ 
+ /// A component that enables a [depth of field] postprocessing effect when attached to a [`Camera3d`],
+diff --git a/crates/bevy_core_pipeline/src/post_process/chromatic_aberration.wgsl b/crates/bevy_post_process/src/effect_stack/chromatic_aberration.wgsl
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/post_process/chromatic_aberration.wgsl
+rename to crates/bevy_post_process/src/effect_stack/chromatic_aberration.wgsl
+diff --git a/crates/bevy_core_pipeline/src/post_process/mod.rs b/crates/bevy_post_process/src/effect_stack/mod.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/post_process/mod.rs
+rename to crates/bevy_post_process/src/effect_stack/mod.rs
+index 337e9ad7802d5..8ad769efaa53a 100644
+--- a/crates/bevy_core_pipeline/src/post_process/mod.rs
++++ b/crates/bevy_post_process/src/effect_stack/mod.rs
+@@ -44,7 +44,7 @@ use bevy_render::{
+ use bevy_shader::{load_shader_library, Shader};
+ use bevy_utils::prelude::default;
+ 
+-use crate::{
++use bevy_core_pipeline::{
+     core_2d::graph::{Core2d, Node2d},
+     core_3d::graph::{Core3d, Node3d},
+     FullscreenShader,
+@@ -71,7 +71,8 @@ struct DefaultChromaticAberrationLut(Handle<Image>);
+ /// effects.
+ ///
+ /// Currently, this only consists of chromatic aberration.
+-pub struct PostProcessingPlugin;
++#[derive(Default)]
++pub struct EffectStackPlugin;
+ 
+ /// Adds colored fringes to the edges of objects in the scene.
+ ///
+@@ -183,7 +184,7 @@ pub struct PostProcessingUniformBufferOffsets {
+ #[derive(Default)]
+ pub struct PostProcessingNode;
+ 
+-impl Plugin for PostProcessingPlugin {
++impl Plugin for EffectStackPlugin {
+     fn build(&self, app: &mut App) {
+         load_shader_library!(app, "chromatic_aberration.wgsl");
+ 
+diff --git a/crates/bevy_core_pipeline/src/post_process/post_process.wgsl b/crates/bevy_post_process/src/effect_stack/post_process.wgsl
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/post_process/post_process.wgsl
+rename to crates/bevy_post_process/src/effect_stack/post_process.wgsl
+diff --git a/crates/bevy_post_process/src/lib.rs b/crates/bevy_post_process/src/lib.rs
+new file mode 100644
+index 0000000000000..05241bc4c7960
+--- /dev/null
++++ b/crates/bevy_post_process/src/lib.rs
+@@ -0,0 +1,36 @@
++#![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
++#![forbid(unsafe_code)]
++#![cfg_attr(docsrs, feature(doc_auto_cfg))]
++#![doc(
++    html_logo_url = "https://bevy.org/assets/icon.png",
++    html_favicon_url = "https://bevy.org/assets/icon.png"
++)]
++
++pub mod auto_exposure;
++pub mod bloom;
++pub mod dof;
++pub mod effect_stack;
++pub mod motion_blur;
++pub mod msaa_writeback;
++
++use crate::{
++    bloom::BloomPlugin, dof::DepthOfFieldPlugin, effect_stack::EffectStackPlugin,
++    motion_blur::MotionBlurPlugin, msaa_writeback::MsaaWritebackPlugin,
++};
++use bevy_app::{App, Plugin};
++
++/// Adds bloom, motion blur, depth of field, and chromatic aberration support.
++#[derive(Default)]
++pub struct PostProcessPlugin;
++
++impl Plugin for PostProcessPlugin {
++    fn build(&self, app: &mut App) {
++        app.add_plugins((
++            MsaaWritebackPlugin,
++            BloomPlugin,
++            MotionBlurPlugin,
++            DepthOfFieldPlugin,
++            EffectStackPlugin,
++        ));
++    }
++}
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/mod.rs b/crates/bevy_post_process/src/motion_blur/mod.rs
+similarity index 98%
+rename from crates/bevy_core_pipeline/src/motion_blur/mod.rs
+rename to crates/bevy_post_process/src/motion_blur/mod.rs
+index ff2a77ff7a29f..9026fb7e813ad 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/mod.rs
++++ b/crates/bevy_post_process/src/motion_blur/mod.rs
+@@ -2,13 +2,13 @@
+ //!
+ //! Add the [`MotionBlur`] component to a camera to enable motion blur.
+ 
+-use crate::{
+-    core_3d::graph::{Core3d, Node3d},
+-    prepass::{DepthPrepass, MotionVectorPrepass},
+-};
+ use bevy_app::{App, Plugin};
+ use bevy_asset::embedded_asset;
+ use bevy_camera::Camera;
++use bevy_core_pipeline::{
++    core_3d::graph::{Core3d, Node3d},
++    prepass::{DepthPrepass, MotionVectorPrepass},
++};
+ use bevy_ecs::{
+     component::Component,
+     query::{QueryItem, With},
+@@ -47,7 +47,7 @@ pub mod pipeline;
+ /// camera.
+ ///
+ /// ```
+-/// # use bevy_core_pipeline::motion_blur::MotionBlur;
++/// # use bevy_post_process::motion_blur::MotionBlur;
+ /// # use bevy_camera::Camera3d;
+ /// # use bevy_ecs::prelude::*;
+ /// # fn test(mut commands: Commands) {
+@@ -128,6 +128,7 @@ pub struct MotionBlurUniform {
+ }
+ 
+ /// Adds support for per-object motion blur to the app. See [`MotionBlur`] for details.
++#[derive(Default)]
+ pub struct MotionBlurPlugin;
+ impl Plugin for MotionBlurPlugin {
+     fn build(&self, app: &mut App) {
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/motion_blur.wgsl b/crates/bevy_post_process/src/motion_blur/motion_blur.wgsl
+similarity index 100%
+rename from crates/bevy_core_pipeline/src/motion_blur/motion_blur.wgsl
+rename to crates/bevy_post_process/src/motion_blur/motion_blur.wgsl
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/node.rs b/crates/bevy_post_process/src/motion_blur/node.rs
+similarity index 98%
+rename from crates/bevy_core_pipeline/src/motion_blur/node.rs
+rename to crates/bevy_post_process/src/motion_blur/node.rs
+index 00e4d4df873d5..5ac04df141612 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/node.rs
++++ b/crates/bevy_post_process/src/motion_blur/node.rs
+@@ -12,7 +12,7 @@ use bevy_render::{
+     view::{Msaa, ViewTarget},
+ };
+ 
+-use crate::prepass::ViewPrepassTextures;
++use bevy_core_pipeline::prepass::ViewPrepassTextures;
+ 
+ use super::{
+     pipeline::{MotionBlurPipeline, MotionBlurPipelineId},
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs b/crates/bevy_post_process/src/motion_blur/pipeline.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
+rename to crates/bevy_post_process/src/motion_blur/pipeline.rs
+index 80b08dd920287..dc9dbe8f762f3 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
++++ b/crates/bevy_post_process/src/motion_blur/pipeline.rs
+@@ -1,5 +1,5 @@
+-use crate::FullscreenShader;
+ use bevy_asset::{load_embedded_asset, AssetServer, Handle};
++use bevy_core_pipeline::FullscreenShader;
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+diff --git a/crates/bevy_core_pipeline/src/msaa_writeback.rs b/crates/bevy_post_process/src/msaa_writeback.rs
+similarity index 99%
+rename from crates/bevy_core_pipeline/src/msaa_writeback.rs
+rename to crates/bevy_post_process/src/msaa_writeback.rs
+index 15f5a03c5ac6b..ddc44896fd20e 100644
+--- a/crates/bevy_core_pipeline/src/msaa_writeback.rs
++++ b/crates/bevy_post_process/src/msaa_writeback.rs
+@@ -1,10 +1,10 @@
+-use crate::{
++use bevy_app::{App, Plugin};
++use bevy_color::LinearRgba;
++use bevy_core_pipeline::{
+     blit::{BlitPipeline, BlitPipelineKey},
+     core_2d::graph::{Core2d, Node2d},
+     core_3d::graph::{Core3d, Node3d},
+ };
+-use bevy_app::{App, Plugin};
+-use bevy_color::LinearRgba;
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_render::{
+     camera::ExtractedCamera,
+@@ -18,6 +18,7 @@ use bevy_render::{
+ 
+ /// This enables "msaa writeback" support for the `core_2d` and `core_3d` pipelines, which can be enabled on cameras
+ /// using [`bevy_camera::Camera::msaa_writeback`]. See the docs on that field for more information.
++#[derive(Default)]
+ pub struct MsaaWritebackPlugin;
+ 
+ impl Plugin for MsaaWritebackPlugin {
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index d02a7e941e75f..530ba2c52a04d 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -34,6 +34,7 @@ The default feature set enables most of the expected features of a game engine,
+ |bevy_mesh_picking_backend|Provides an implementation for picking meshes|
+ |bevy_pbr|Adds PBR rendering|
+ |bevy_picking|Provides picking functionality|
++|bevy_post_process|Provides post process effects such as depth of field, bloom, chromatic aberration.|
+ |bevy_render|Provides rendering functionality|
+ |bevy_scene|Provides scene functionality|
+ |bevy_shader|Provides shaders usable through asset handles.|
+diff --git a/examples/2d/bloom_2d.rs b/examples/2d/bloom_2d.rs
+index 8fe0298246812..11377ac43675d 100644
+--- a/examples/2d/bloom_2d.rs
++++ b/examples/2d/bloom_2d.rs
+@@ -1,10 +1,8 @@
+ //! Illustrates bloom post-processing in 2d.
+ 
+ use bevy::{
+-    core_pipeline::{
+-        bloom::{Bloom, BloomCompositeMode},
+-        tonemapping::{DebandDither, Tonemapping},
+-    },
++    core_pipeline::tonemapping::{DebandDither, Tonemapping},
++    post_process::bloom::{Bloom, BloomCompositeMode},
+     prelude::*,
+ };
+ 
+diff --git a/examples/3d/atmosphere.rs b/examples/3d/atmosphere.rs
+index 2ad87bb6a8edc..ff70d34fe6fe6 100644
+--- a/examples/3d/atmosphere.rs
++++ b/examples/3d/atmosphere.rs
+@@ -4,9 +4,10 @@ use std::f32::consts::PI;
+ 
+ use bevy::{
+     camera::Exposure,
+-    core_pipeline::{bloom::Bloom, tonemapping::Tonemapping},
++    core_pipeline::tonemapping::Tonemapping,
+     light::{light_consts::lux, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder},
+     pbr::{Atmosphere, AtmosphereSettings},
++    post_process::bloom::Bloom,
+     prelude::*,
+ };
+ 
+diff --git a/examples/3d/auto_exposure.rs b/examples/3d/auto_exposure.rs
+index 41d65894eb658..5d9e42c9310c8 100644
+--- a/examples/3d/auto_exposure.rs
++++ b/examples/3d/auto_exposure.rs
+@@ -12,11 +12,11 @@
+ //! | `V`                | Visualize Metering Mask                |
+ 
+ use bevy::{
+-    core_pipeline::{
+-        auto_exposure::{AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin},
+-        Skybox,
+-    },
++    core_pipeline::Skybox,
+     math::{cubic_splines::LinearSpline, primitives::Plane3d, vec2},
++    post_process::auto_exposure::{
++        AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin,
++    },
+     prelude::*,
+ };
+ 
+diff --git a/examples/3d/bloom_3d.rs b/examples/3d/bloom_3d.rs
+index c97de7f3e62ca..95d87507d91e7 100644
+--- a/examples/3d/bloom_3d.rs
++++ b/examples/3d/bloom_3d.rs
+@@ -1,11 +1,9 @@
+ //! Illustrates bloom post-processing using HDR and emissive materials.
+ 
+ use bevy::{
+-    core_pipeline::{
+-        bloom::{Bloom, BloomCompositeMode},
+-        tonemapping::Tonemapping,
+-    },
++    core_pipeline::tonemapping::Tonemapping,
+     math::ops,
++    post_process::bloom::{Bloom, BloomCompositeMode},
+     prelude::*,
+ };
+ use std::{
+diff --git a/examples/3d/depth_of_field.rs b/examples/3d/depth_of_field.rs
+index 82159963324eb..db2b7f65139de 100644
+--- a/examples/3d/depth_of_field.rs
++++ b/examples/3d/depth_of_field.rs
+@@ -11,13 +11,13 @@
+ 
+ use bevy::{
+     camera::PhysicalCameraParameters,
+-    core_pipeline::{
++    core_pipeline::tonemapping::Tonemapping,
++    gltf::GltfMeshName,
++    pbr::Lightmap,
++    post_process::{
+         bloom::Bloom,
+         dof::{self, DepthOfField, DepthOfFieldMode},
+-        tonemapping::Tonemapping,
+     },
+-    gltf::GltfMeshName,
+-    pbr::Lightmap,
+     prelude::*,
+ };
+ 
+diff --git a/examples/3d/mesh_ray_cast.rs b/examples/3d/mesh_ray_cast.rs
+index 8093a873a728e..1df9624ea8396 100644
+--- a/examples/3d/mesh_ray_cast.rs
++++ b/examples/3d/mesh_ray_cast.rs
+@@ -4,11 +4,8 @@
+ use std::f32::consts::{FRAC_PI_2, PI};
+ 
+ use bevy::{
+-    color::palettes::css,
+-    core_pipeline::{bloom::Bloom, tonemapping::Tonemapping},
+-    math::vec3,
+-    picking::backend::ray::RayMap,
+-    prelude::*,
++    color::palettes::css, core_pipeline::tonemapping::Tonemapping, math::vec3,
++    picking::backend::ray::RayMap, post_process::bloom::Bloom, prelude::*,
+ };
+ 
+ fn main() {
+diff --git a/examples/3d/motion_blur.rs b/examples/3d/motion_blur.rs
+index f82c81fab3613..bf67f98b74db0 100644
+--- a/examples/3d/motion_blur.rs
++++ b/examples/3d/motion_blur.rs
+@@ -2,9 +2,9 @@
+ //! camera using the [`MotionBlur`] component.z
+ 
+ use bevy::{
+-    core_pipeline::motion_blur::MotionBlur,
+     image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor},
+     math::ops,
++    post_process::motion_blur::MotionBlur,
+     prelude::*,
+ };
+ 
+diff --git a/examples/3d/post_processing.rs b/examples/3d/post_processing.rs
+index dbfdfb927e192..c2348105a57d1 100644
+--- a/examples/3d/post_processing.rs
++++ b/examples/3d/post_processing.rs
+@@ -5,8 +5,8 @@
+ use std::f32::consts::PI;
+ 
+ use bevy::{
+-    core_pipeline::post_process::ChromaticAberration, light::CascadeShadowConfigBuilder,
+-    prelude::*, render::view::Hdr,
++    light::CascadeShadowConfigBuilder, post_process::effect_stack::ChromaticAberration, prelude::*,
++    render::view::Hdr,
+ };
+ 
+ /// The number of units per frame to add to or subtract from intensity when the
+diff --git a/examples/3d/scrolling_fog.rs b/examples/3d/scrolling_fog.rs
+index 760cd3e1c5aef..2edc2c358d81b 100644
+--- a/examples/3d/scrolling_fog.rs
++++ b/examples/3d/scrolling_fog.rs
+@@ -12,12 +12,12 @@
+ 
+ use bevy::{
+     anti_alias::taa::TemporalAntiAliasing,
+-    core_pipeline::bloom::Bloom,
+     image::{
+         ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler,
+         ImageSamplerDescriptor,
+     },
+     light::{DirectionalLightShadowMap, FogVolume, VolumetricFog, VolumetricLight},
++    post_process::bloom::Bloom,
+     prelude::*,
+ };
+ 
+diff --git a/examples/3d/transmission.rs b/examples/3d/transmission.rs
+index 0fee9347b215f..5db06e04edad2 100644
+--- a/examples/3d/transmission.rs
++++ b/examples/3d/transmission.rs
+@@ -23,9 +23,10 @@ use std::f32::consts::PI;
+ use bevy::{
+     camera::{Exposure, ScreenSpaceTransmissionQuality},
+     color::palettes::css::*,
+-    core_pipeline::{bloom::Bloom, prepass::DepthPrepass, tonemapping::Tonemapping},
++    core_pipeline::{prepass::DepthPrepass, tonemapping::Tonemapping},
+     light::{NotShadowCaster, PointLightShadowMap, TransmittedShadowReceiver},
+     math::ops,
++    post_process::bloom::Bloom,
+     prelude::*,
+     render::{
+         camera::TemporalJitter,
+diff --git a/examples/3d/volumetric_fog.rs b/examples/3d/volumetric_fog.rs
+index 2d15c4b0b4e19..8e3b8f65e581d 100644
+--- a/examples/3d/volumetric_fog.rs
++++ b/examples/3d/volumetric_fog.rs
+@@ -2,9 +2,10 @@
+ 
+ use bevy::{
+     color::palettes::css::RED,
+-    core_pipeline::{bloom::Bloom, tonemapping::Tonemapping, Skybox},
++    core_pipeline::{tonemapping::Tonemapping, Skybox},
+     light::{FogVolume, VolumetricFog, VolumetricLight},
+     math::vec3,
++    post_process::bloom::Bloom,
+     prelude::*,
+ };
+ 
+diff --git a/examples/animation/animation_events.rs b/examples/animation/animation_events.rs
+index b6e86a7f1b64a..2834889d1a0a3 100644
+--- a/examples/animation/animation_events.rs
++++ b/examples/animation/animation_events.rs
+@@ -2,7 +2,7 @@
+ 
+ use bevy::{
+     color::palettes::css::{ALICE_BLUE, BLACK, CRIMSON},
+-    core_pipeline::bloom::Bloom,
++    post_process::bloom::Bloom,
+     prelude::*,
+ };
+ 
+diff --git a/examples/camera/2d_top_down_camera.rs b/examples/camera/2d_top_down_camera.rs
+index 7e7b819318bf1..59744615f9bc1 100644
+--- a/examples/camera/2d_top_down_camera.rs
++++ b/examples/camera/2d_top_down_camera.rs
+@@ -9,7 +9,7 @@
+ //! | `A`                  | Move left     |
+ //! | `D`                  | Move right    |
+ 
+-use bevy::{core_pipeline::bloom::Bloom, prelude::*};
++use bevy::{post_process::bloom::Bloom, prelude::*};
+ 
+ /// Player movement speed factor.
+ const PLAYER_SPEED: f32 = 100.;
+diff --git a/examples/math/sampling_primitives.rs b/examples/math/sampling_primitives.rs
+index fa9b8a7c705db..98c56c4e18715 100644
+--- a/examples/math/sampling_primitives.rs
++++ b/examples/math/sampling_primitives.rs
+@@ -3,9 +3,10 @@
+ use std::f32::consts::PI;
+ 
+ use bevy::{
+-    core_pipeline::{bloom::Bloom, tonemapping::Tonemapping},
++    core_pipeline::tonemapping::Tonemapping,
+     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseButtonInput},
+     math::prelude::*,
++    post_process::bloom::Bloom,
+     prelude::*,
+ };
+ use rand::{seq::IndexedRandom, Rng, SeedableRng};
+diff --git a/examples/testbed/2d.rs b/examples/testbed/2d.rs
+index b38599558bbfc..0a10ee04e408d 100644
+--- a/examples/testbed/2d.rs
++++ b/examples/testbed/2d.rs
+@@ -108,10 +108,7 @@ mod shapes {
+ }
+ 
+ mod bloom {
+-    use bevy::{
+-        core_pipeline::{bloom::Bloom, tonemapping::Tonemapping},
+-        prelude::*,
+-    };
++    use bevy::{core_pipeline::tonemapping::Tonemapping, post_process::bloom::Bloom, prelude::*};
+ 
+     pub fn setup(
+         mut commands: Commands,
+diff --git a/examples/testbed/3d.rs b/examples/testbed/3d.rs
+index 92917a91831e3..173fae84a6218 100644
+--- a/examples/testbed/3d.rs
++++ b/examples/testbed/3d.rs
+@@ -151,10 +151,7 @@ mod light {
+ }
+ 
+ mod bloom {
+-    use bevy::{
+-        core_pipeline::{bloom::Bloom, tonemapping::Tonemapping},
+-        prelude::*,
+-    };
++    use bevy::{core_pipeline::tonemapping::Tonemapping, post_process::bloom::Bloom, prelude::*};
+ 
+     const CURRENT_SCENE: super::Scene = super::Scene::Bloom;
+ 
+diff --git a/release-content/migration-guides/bevy_render_reorganization.md b/release-content/migration-guides/bevy_render_reorganization.md
+index c17f15748f0c9..af7bf6c4102b7 100644
+--- a/release-content/migration-guides/bevy_render_reorganization.md
++++ b/release-content/migration-guides/bevy_render_reorganization.md
+@@ -1,6 +1,6 @@
+ ---
+ title: "`bevy_render` reorganization"
+-pull_requests: [20485, 20330, 18703, 20587, 20502, 19997, 19991, 20000, 19949, 19943, 19953, 20498, 20496, 20493, 20492, 20491, 20488, 20487, 20486, 20483, 20480, 20479, 20478, 20477, 20473, 20472, 20471, 20470, 20392, 20390, 20388, 20345, 20344, 20051, 19985, 19973, 19965, 19963, 19962, 19960, 19959, 19958, 19957, 19956, 19955, 19954, 16620, 16619, 15700, 15666, 15650]
++pull_requests: [20485, 20330, 18703, 20587, 20502, 19997, 19991, 20000, 19949, 19943, 19953, 20498, 20496, 20493, 20492, 20491, 20488, 20487, 20486, 20483, 20480, 20479, 20478, 20477, 20473, 20472, 20471, 20470, 20392, 20390, 20388, 20345, 20344, 20051, 19985, 19973, 19965, 19963, 19962, 19960, 19959, 19958, 19957, 19956, 19955, 19954, 16620, 16619, 15700, 15666, 15650, 20778, 20857, 18323]
+ ---
+ 
+ You must now import `bevy_render::NormalizedRenderTargetExt` to use methods on `NormalizedRenderTarget`
+@@ -32,3 +32,10 @@ Import them directly or from `bevy::sprite_render` now.
+ 
+ `RenderAssetUsages` is no longer re-exported by `bevy_render`.
+ Import it from `bevy_asset` or `bevy::asset` instead.
++
++`bevy_core_pipeline` used to be home to many non-core things, including post process effects.
++They have now been given a new home in `bevy_anti_alias` and `bevy_post_process`.
++
++If you were importing FxaaPlugin, SmaaPlugin, TemporalAntiAliasPlugin, or CasPlugin from `bevy_core_pipeline` or `bevy::core_pipeline`, you must now import them from `bevy_anti_alias` or `bevy::anti_alias`.
++
++If you were importing Bloom, AutoExposure, ChromaticAberration, DepthOfField, or MotionBlur from `bevy_core_pipeline` or `bevy::core_pipeline`, you must now import them from `bevy_post_process` or `bevy::post_process`.
+diff --git a/tests/3d/test_invalid_skinned_mesh.rs b/tests/3d/test_invalid_skinned_mesh.rs
+index db149c7cbc887..a5e5b25feef2e 100644
+--- a/tests/3d/test_invalid_skinned_mesh.rs
++++ b/tests/3d/test_invalid_skinned_mesh.rs
+@@ -3,12 +3,12 @@
+ use bevy::{
+     asset::RenderAssetUsages,
+     camera::ScalingMode,
+-    core_pipeline::motion_blur::MotionBlur,
+     math::ops,
+     mesh::{
+         skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+         Indices, PrimitiveTopology, VertexAttributeValues,
+     },
++    post_process::motion_blur::MotionBlur,
+     prelude::*,
+ };
+ use core::f32::consts::TAU;

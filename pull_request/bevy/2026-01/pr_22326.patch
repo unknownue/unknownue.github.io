@@ -1,0 +1,269 @@
+diff --git a/crates/bevy_render/src/diagnostic/internal.rs b/crates/bevy_render/src/diagnostic/internal.rs
+index 641f5a9efc668..97bdde77193cf 100644
+--- a/crates/bevy_render/src/diagnostic/internal.rs
++++ b/crates/bevy_render/src/diagnostic/internal.rs
+@@ -11,8 +11,9 @@ use bevy_ecs::system::{Res, ResMut};
+ use bevy_platform::time::Instant;
+ use std::sync::Mutex;
+ use wgpu::{
+-    Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePass, Features, MapMode,
+-    PipelineStatisticsTypes, QuerySet, QuerySetDescriptor, QueryType, RenderPass,
++    Buffer, BufferDescriptor, BufferSize, BufferSlice, BufferUsages, CommandEncoder, ComputePass,
++    Device, Features, MapMode, PipelineStatisticsTypes, QuerySet, QuerySetDescriptor, QueryType,
++    RenderPass,
+ };
+ 
+ use crate::renderer::{RenderAdapterInfo, RenderDevice, RenderQueue, WgpuWrapper};
+@@ -144,6 +145,42 @@ impl DiagnosticsRecorder {
+ }
+ 
+ impl RecordDiagnostics for DiagnosticsRecorder {
++    fn record_f32<N>(&self, command_encoder: &mut CommandEncoder, buffer: &BufferSlice, name: N)
++    where
++        N: Into<Cow<'static, str>>,
++    {
++        assert_eq!(
++            buffer.size(),
++            BufferSize::new(4).unwrap(),
++            "DiagnosticsRecorder::record_f32 buffer slice must be 4 bytes long"
++        );
++        assert!(
++            buffer.buffer().usage().contains(BufferUsages::COPY_SRC),
++            "DiagnosticsRecorder::record_f32 buffer must have BufferUsages::COPY_SRC"
++        );
++
++        self.current_frame_lock()
++            .record_value(command_encoder, buffer, name.into(), true);
++    }
++
++    fn record_u32<N>(&self, command_encoder: &mut CommandEncoder, buffer: &BufferSlice, name: N)
++    where
++        N: Into<Cow<'static, str>>,
++    {
++        assert_eq!(
++            buffer.size(),
++            BufferSize::new(4).unwrap(),
++            "DiagnosticsRecorder::record_u32 buffer slice must be 4 bytes long"
++        );
++        assert!(
++            buffer.buffer().usage().contains(BufferUsages::COPY_SRC),
++            "DiagnosticsRecorder::record_u32 buffer must have BufferUsages::COPY_SRC"
++        );
++
++        self.current_frame_lock()
++            .record_value(command_encoder, buffer, name.into(), false);
++    }
++
+     fn begin_time_span<E: WriteTimestamp>(&self, encoder: &mut E, span_name: Cow<'static, str>) {
+         self.current_frame_lock()
+             .begin_time_span(encoder, span_name);
+@@ -174,6 +211,7 @@ struct SpanRecord {
+ }
+ 
+ struct FrameData {
++    device: Device,
+     timestamps_query_set: Option<QuerySet>,
+     num_timestamps: u32,
+     supports_timestamps_inside_passes: bool,
+@@ -187,6 +225,7 @@ struct FrameData {
+     path_components: Vec<Cow<'static, str>>,
+     open_spans: Vec<SpanRecord>,
+     closed_spans: Vec<SpanRecord>,
++    value_buffers: Vec<(Buffer, Cow<'static, str>, bool)>,
+     is_mapped: Arc<AtomicBool>,
+     callback: Option<Box<dyn FnOnce(RenderDiagnostics) + Send + Sync + 'static>>,
+     #[cfg(feature = "tracing-tracy")]
+@@ -246,6 +285,7 @@ impl FrameData {
+         };
+ 
+         FrameData {
++            device: wgpu_device.clone(),
+             timestamps_query_set,
+             num_timestamps: 0,
+             supports_timestamps_inside_passes: features
+@@ -261,6 +301,7 @@ impl FrameData {
+             path_components: Vec::new(),
+             open_spans: Vec::new(),
+             closed_spans: Vec::new(),
++            value_buffers: Vec::new(),
+             is_mapped: Arc::new(AtomicBool::new(false)),
+             callback: None,
+             #[cfg(feature = "tracing-tracy")]
+@@ -367,6 +408,33 @@ impl FrameData {
+         self.closed_spans.last_mut().unwrap()
+     }
+ 
++    fn record_value(
++        &mut self,
++        command_encoder: &mut CommandEncoder,
++        buffer: &BufferSlice,
++        name: Cow<'static, str>,
++        is_f32: bool,
++    ) {
++        let dest_buffer = self.device.create_buffer(&BufferDescriptor {
++            label: Some(&format!("render_diagnostic_{name}")),
++            size: 4,
++            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        });
++
++        command_encoder.copy_buffer_to_buffer(
++            buffer.buffer(),
++            buffer.offset(),
++            &dest_buffer,
++            0,
++            Some(buffer.size().into()),
++        );
++
++        command_encoder.map_buffer_on_submit(&dest_buffer, MapMode::Read, .., |_| {});
++
++        self.value_buffers.push((dest_buffer, name, is_f32));
++    }
++
+     fn begin_time_span(&mut self, encoder: &mut impl WriteTimestamp, name: Cow<'static, str>) {
+         let begin_instant = Instant::now();
+         let begin_timestamp_index = self.write_timestamp(encoder, false);
+@@ -464,6 +532,22 @@ impl FrameData {
+                 }
+             }
+ 
++            for (buffer, diagnostic_path, is_f32) in self.value_buffers.drain(..) {
++                let buffer = buffer.get_mapped_range(..);
++                diagnostics.push(RenderDiagnostic {
++                    path: DiagnosticPath::from_components(
++                        core::iter::once("render")
++                            .chain(core::iter::once(diagnostic_path.as_ref())),
++                    ),
++                    suffix: "",
++                    value: if is_f32 {
++                        f32::from_le_bytes((*buffer).try_into().unwrap()) as f64
++                    } else {
++                        u32::from_le_bytes((*buffer).try_into().unwrap()) as f64
++                    },
++                });
++            }
++
+             callback(RenderDiagnostics(diagnostics));
+             return;
+         };
+@@ -584,6 +668,21 @@ impl FrameData {
+             }
+         }
+ 
++        for (buffer, diagnostic_path, is_f32) in self.value_buffers.drain(..) {
++            let buffer = buffer.get_mapped_range(..);
++            diagnostics.push(RenderDiagnostic {
++                path: DiagnosticPath::from_components(
++                    core::iter::once("render").chain(core::iter::once(diagnostic_path.as_ref())),
++                ),
++                suffix: "",
++                value: if is_f32 {
++                    f32::from_le_bytes((*buffer).try_into().unwrap()) as f64
++                } else {
++                    u32::from_le_bytes((*buffer).try_into().unwrap()) as f64
++                },
++            });
++        }
++
+         callback(RenderDiagnostics(diagnostics));
+ 
+         drop(data);
+diff --git a/crates/bevy_render/src/diagnostic/mod.rs b/crates/bevy_render/src/diagnostic/mod.rs
+index d2425d3e80b65..4eb31d39d6685 100644
+--- a/crates/bevy_render/src/diagnostic/mod.rs
++++ b/crates/bevy_render/src/diagnostic/mod.rs
+@@ -11,6 +11,7 @@ mod tracy_gpu;
+ 
+ use alloc::{borrow::Cow, sync::Arc};
+ use core::marker::PhantomData;
++use wgpu::{BufferSlice, CommandEncoder};
+ 
+ use bevy_app::{App, Plugin, PreUpdate};
+ 
+@@ -114,6 +115,20 @@ pub trait RecordDiagnostics: Send + Sync {
+         }
+     }
+ 
++    /// Reads a f32 from the specified buffer and uploads it as a diagnostic.
++    ///
++    /// The provided buffer slice must be 4 bytes long, and the buffer must have [`wgpu::BufferUsages::COPY_SRC`];
++    fn record_f32<N>(&self, command_encoder: &mut CommandEncoder, buffer: &BufferSlice, name: N)
++    where
++        N: Into<Cow<'static, str>>;
++
++    /// Reads a u32 from the specified buffer and uploads it as a diagnostic.
++    ///
++    /// The provided buffer slice must be 4 bytes long, and the buffer must have [`wgpu::BufferUsages::COPY_SRC`];
++    fn record_u32<N>(&self, command_encoder: &mut CommandEncoder, buffer: &BufferSlice, name: N)
++    where
++        N: Into<Cow<'static, str>>;
++
+     #[doc(hidden)]
+     fn begin_time_span<E: WriteTimestamp>(&self, encoder: &mut E, name: Cow<'static, str>);
+ 
+@@ -173,6 +188,24 @@ impl<R: ?Sized, P> Drop for PassSpanGuard<'_, R, P> {
+ }
+ 
+ impl<T: RecordDiagnostics> RecordDiagnostics for Option<Arc<T>> {
++    fn record_f32<N>(&self, command_encoder: &mut CommandEncoder, buffer: &BufferSlice, name: N)
++    where
++        N: Into<Cow<'static, str>>,
++    {
++        if let Some(recorder) = &self {
++            recorder.record_f32(command_encoder, buffer, name);
++        }
++    }
++
++    fn record_u32<N>(&self, command_encoder: &mut CommandEncoder, buffer: &BufferSlice, name: N)
++    where
++        N: Into<Cow<'static, str>>,
++    {
++        if let Some(recorder) = &self {
++            recorder.record_u32(command_encoder, buffer, name);
++        }
++    }
++
+     fn begin_time_span<E: WriteTimestamp>(&self, encoder: &mut E, name: Cow<'static, str>) {
+         if let Some(recorder) = &self {
+             recorder.begin_time_span(encoder, name);
+diff --git a/release-content/release-notes/render_diagnostics_additions.md b/release-content/release-notes/render_diagnostics_additions.md
+new file mode 100644
+index 0000000000000..a0b337904caba
+--- /dev/null
++++ b/release-content/release-notes/render_diagnostics_additions.md
+@@ -0,0 +1,35 @@
++---
++title: Render Diagnostic Additions
++authors: ["@JMS55"]
++pull_requests: [22326]
++---
++
++Bevy's [RenderDiagnosticPlugin](https://docs.rs/bevy/0.19.0/bevy/render/diagnostic/struct.RenderDiagnosticsPlugin.html) has new methods for uploading data from GPU buffers to bevy_diagnostic.
++
++```rust
++impl ViewNode for Foo {
++    fn run(
++        &self,
++        _graph: &mut RenderGraphContext,
++        render_context: &mut RenderContext,
++        _: QueryItem<Self::ViewQuery>,
++        world: &World,
++    ) -> Result<(), NodeRunError> {
++        let diagnostics = render_context.diagnostic_recorder();
++
++        diagnostics.record_u32(
++            render_context.command_encoder(),
++            &my_buffer1.slice(..), // Buffer slice must be 4 bytes, and buffer must have BufferUsages::COPY_SRC
++            "my_diagnostics/foo",
++        );
++
++        diagnostics.record_f32(
++            render_context.command_encoder(),
++            &my_buffer2.slice(..), // Buffer slice must be 4 bytes, and buffer must have BufferUsages::COPY_SRC
++            "my_diagnostics/bar",
++        );
++
++        Ok(())
++    }
++}
++```

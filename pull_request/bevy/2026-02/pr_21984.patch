@@ -1,0 +1,2576 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 983aa4a4cf2c4..2f033519d150b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5403,6 +5403,17 @@ description = "Example Pan-Camera Styled Camera Controller for 2D scenes"
+ category = "Camera"
+ wasm = true
+ 
++[[example]]
++name = "contiguous_query"
++path = "examples/ecs/contiguous_query.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.contiguous_query]
++name = "Contiguous Query"
++description = "Demonstrates contiguous queries"
++category = "ECS (Entity Component System)"
++wasm = false
++
+ [[example]]
+ name = "clustered_decal_maps"
+ path = "examples/3d/clustered_decal_maps.rs"
+diff --git a/benches/benches/bevy_ecs/iteration/iter_simple_contiguous.rs b/benches/benches/bevy_ecs/iteration/iter_simple_contiguous.rs
+new file mode 100644
+index 0000000000000..07b5fa86134cb
+--- /dev/null
++++ b/benches/benches/bevy_ecs/iteration/iter_simple_contiguous.rs
+@@ -0,0 +1,46 @@
++use bevy_ecs::prelude::*;
++use glam::*;
++
++#[derive(Component, Copy, Clone)]
++struct Transform(Mat4);
++
++#[derive(Component, Copy, Clone)]
++struct Position(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Rotation(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Velocity(Vec3);
++
++pub struct Benchmark<'w>(World, QueryState<(&'w Velocity, &'w mut Position)>);
++
++impl<'w> Benchmark<'w> {
++    pub fn new() -> Self {
++        let mut world = World::new();
++
++        world.spawn_batch(core::iter::repeat_n(
++            (
++                Transform(Mat4::from_scale(Vec3::ONE)),
++                Position(Vec3::X),
++                Rotation(Vec3::X),
++                Velocity(Vec3::X),
++            ),
++            10_000,
++        ));
++
++        let query = world.query::<(&Velocity, &mut Position)>();
++        Self(world, query)
++    }
++
++    #[inline(never)]
++    pub fn run(&mut self) {
++        let iter = self.1.contiguous_iter_mut(&mut self.0).unwrap();
++        for (velocity, mut position) in iter {
++            assert!(velocity.len() == position.len());
++            for (v, p) in velocity.iter().zip(position.iter_mut()) {
++                p.0 += v.0;
++            }
++        }
++    }
++}
+diff --git a/benches/benches/bevy_ecs/iteration/iter_simple_contiguous_avx2.rs b/benches/benches/bevy_ecs/iteration/iter_simple_contiguous_avx2.rs
+new file mode 100644
+index 0000000000000..a0ce817cbcfa1
+--- /dev/null
++++ b/benches/benches/bevy_ecs/iteration/iter_simple_contiguous_avx2.rs
+@@ -0,0 +1,64 @@
++use bevy_ecs::prelude::*;
++use glam::*;
++
++#[derive(Component, Copy, Clone)]
++struct Transform(Mat4);
++
++#[derive(Component, Copy, Clone)]
++struct Position(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Rotation(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Velocity(Vec3);
++
++pub struct Benchmark<'w>(World, QueryState<(&'w Velocity, &'w mut Position)>);
++
++impl<'w> Benchmark<'w> {
++    pub fn supported() -> bool {
++        is_x86_feature_detected!("avx2")
++    }
++
++    pub fn new() -> Option<Self> {
++        if !Self::supported() {
++            return None;
++        }
++
++        let mut world = World::new();
++
++        world.spawn_batch(core::iter::repeat_n(
++            (
++                Transform(Mat4::from_scale(Vec3::ONE)),
++                Position(Vec3::X),
++                Rotation(Vec3::X),
++                Velocity(Vec3::X),
++            ),
++            10_000,
++        ));
++
++        let query = world.query::<(&Velocity, &mut Position)>();
++        Some(Self(world, query))
++    }
++
++    #[inline(never)]
++    pub fn run(&mut self) {
++        /// # Safety
++        /// avx2 must be supported
++        #[target_feature(enable = "avx2")]
++        unsafe fn exec(position: &mut [Position], velocity: &[Velocity]) {
++            assert!(position.len() == velocity.len());
++            for i in 0..position.len() {
++                position[i].0 += velocity[i].0;
++            }
++        }
++
++        let iter = self.1.contiguous_iter_mut(&mut self.0).unwrap();
++        for (velocity, mut position) in iter {
++            // SAFETY: checked in new
++            unsafe {
++                exec(position.as_mut(), velocity);
++            }
++        }
++    }
++}
+diff --git a/benches/benches/bevy_ecs/iteration/iter_simple_no_detection.rs b/benches/benches/bevy_ecs/iteration/iter_simple_no_detection.rs
+new file mode 100644
+index 0000000000000..7381d3a5db67e
+--- /dev/null
++++ b/benches/benches/bevy_ecs/iteration/iter_simple_no_detection.rs
+@@ -0,0 +1,42 @@
++use bevy_ecs::prelude::*;
++use glam::*;
++
++#[derive(Component, Copy, Clone)]
++struct Transform(Mat4);
++
++#[derive(Component, Copy, Clone)]
++struct Position(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Rotation(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Velocity(Vec3);
++
++pub struct Benchmark<'w>(World, QueryState<(&'w Velocity, &'w mut Position)>);
++
++impl<'w> Benchmark<'w> {
++    pub fn new() -> Self {
++        let mut world = World::new();
++
++        world.spawn_batch(core::iter::repeat_n(
++            (
++                Transform(Mat4::from_scale(Vec3::ONE)),
++                Position(Vec3::X),
++                Rotation(Vec3::X),
++                Velocity(Vec3::X),
++            ),
++            10_000,
++        ));
++
++        let query = world.query::<(&Velocity, &mut Position)>();
++        Self(world, query)
++    }
++
++    #[inline(never)]
++    pub fn run(&mut self) {
++        for (velocity, mut position) in self.1.iter_mut(&mut self.0) {
++            position.bypass_change_detection().0 += velocity.0;
++        }
++    }
++}
+diff --git a/benches/benches/bevy_ecs/iteration/iter_simple_no_detection_contiguous.rs b/benches/benches/bevy_ecs/iteration/iter_simple_no_detection_contiguous.rs
+new file mode 100644
+index 0000000000000..8b8eb3d15df15
+--- /dev/null
++++ b/benches/benches/bevy_ecs/iteration/iter_simple_no_detection_contiguous.rs
+@@ -0,0 +1,49 @@
++use bevy_ecs::prelude::*;
++use glam::*;
++
++#[derive(Component, Copy, Clone)]
++struct Transform(Mat4);
++
++#[derive(Component, Copy, Clone)]
++struct Position(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Rotation(Vec3);
++
++#[derive(Component, Copy, Clone)]
++struct Velocity(Vec3);
++
++pub struct Benchmark<'w>(World, QueryState<(&'w Velocity, &'w mut Position)>);
++
++impl<'w> Benchmark<'w> {
++    pub fn new() -> Self {
++        let mut world = World::new();
++
++        world.spawn_batch(core::iter::repeat_n(
++            (
++                Transform(Mat4::from_scale(Vec3::ONE)),
++                Position(Vec3::X),
++                Rotation(Vec3::X),
++                Velocity(Vec3::X),
++            ),
++            10_000,
++        ));
++
++        let query = world.query::<(&Velocity, &mut Position)>();
++        Self(world, query)
++    }
++
++    #[inline(never)]
++    pub fn run(&mut self) {
++        let iter = self.1.contiguous_iter_mut(&mut self.0).unwrap();
++        for (velocity, mut position) in iter {
++            assert!(velocity.len() == position.len());
++            for (v, p) in velocity
++                .iter()
++                .zip(position.bypass_change_detection().iter_mut())
++            {
++                p.0 += v.0;
++            }
++        }
++    }
++}
+diff --git a/benches/benches/bevy_ecs/iteration/mod.rs b/benches/benches/bevy_ecs/iteration/mod.rs
+index b296c5ce0b091..7867507f62f67 100644
+--- a/benches/benches/bevy_ecs/iteration/mod.rs
++++ b/benches/benches/bevy_ecs/iteration/mod.rs
+@@ -8,11 +8,16 @@ mod iter_frag_sparse;
+ mod iter_frag_wide;
+ mod iter_frag_wide_sparse;
+ mod iter_simple;
++mod iter_simple_contiguous;
++#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
++mod iter_simple_contiguous_avx2;
+ mod iter_simple_foreach;
+ mod iter_simple_foreach_hybrid;
+ mod iter_simple_foreach_sparse_set;
+ mod iter_simple_foreach_wide;
+ mod iter_simple_foreach_wide_sparse_set;
++mod iter_simple_no_detection;
++mod iter_simple_no_detection_contiguous;
+ mod iter_simple_sparse_set;
+ mod iter_simple_system;
+ mod iter_simple_wide;
+@@ -40,6 +45,27 @@ fn iter_simple(c: &mut Criterion) {
+         let mut bench = iter_simple::Benchmark::new();
+         b.iter(move || bench.run());
+     });
++    group.bench_function("base_contiguous", |b| {
++        let mut bench = iter_simple_contiguous::Benchmark::new();
++        b.iter(move || bench.run());
++    });
++    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
++    {
++        if iter_simple_contiguous_avx2::Benchmark::supported() {
++            group.bench_function("base_contiguous_avx2", |b| {
++                let mut bench = iter_simple_contiguous_avx2::Benchmark::new().unwrap();
++                b.iter(move || bench.run());
++            });
++        }
++    }
++    group.bench_function("base_no_detection", |b| {
++        let mut bench = iter_simple_no_detection::Benchmark::new();
++        b.iter(move || bench.run());
++    });
++    group.bench_function("base_no_detection_contiguous", |b| {
++        let mut bench = iter_simple_no_detection_contiguous::Benchmark::new();
++        b.iter(move || bench.run());
++    });
+     group.bench_function("wide", |b| {
+         let mut bench = iter_simple_wide::Benchmark::new();
+         b.iter(move || bench.run());
+diff --git a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs
+index 9c2c5832e5f26..ce4ea266db9f6 100644
+--- a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs
++++ b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.rs
+@@ -12,7 +12,7 @@ struct MutableUnmarked {
+ 
+ #[derive(QueryData)]
+ #[query_data(mut)]
+-//~^ ERROR: invalid attribute, expected `mutable` or `derive`
++//~^ ERROR: invalid attribute, expected `mutable`, `derive` or `contiguous`
+ struct MutableInvalidAttribute {
+     a: &'static mut Foo,
+ }
+diff --git a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr
+index 2ece1b014ebd1..edc6998ec5e32 100644
+--- a/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr
++++ b/crates/bevy_ecs/compile_fail/tests/ui/world_query_derive.stderr
+@@ -1,4 +1,4 @@
+-error: invalid attribute, expected `mutable` or `derive`
++error: invalid attribute, expected `mutable`, `derive` or `contiguous`
+   --> tests/ui/world_query_derive.rs:14:14
+    |
+ 14 | #[query_data(mut)]
+diff --git a/crates/bevy_ecs/macros/src/query_data.rs b/crates/bevy_ecs/macros/src/query_data.rs
+index 51018f78676b8..af58318e5883b 100644
+--- a/crates/bevy_ecs/macros/src/query_data.rs
++++ b/crates/bevy_ecs/macros/src/query_data.rs
+@@ -3,7 +3,8 @@ use proc_macro::TokenStream;
+ use proc_macro2::{Ident, Span};
+ use quote::{format_ident, quote};
+ use syn::{
+-    parse_macro_input, parse_quote, punctuated::Punctuated, token::Comma, DeriveInput, Meta,
++    parse_macro_input, parse_quote, punctuated::Punctuated, token::Comma, Attribute, DeriveInput,
++    Fields, ImplGenerics, Member, Meta, Type, TypeGenerics, Visibility, WhereClause,
+ };
+ 
+ use crate::{
+@@ -15,11 +16,15 @@ use crate::{
+ struct QueryDataAttributes {
+     pub is_mutable: bool,
+ 
++    pub is_contiguous_mutable: bool,
++    pub is_contiguous_immutable: bool,
++
+     pub derive_args: Punctuated<Meta, Comma>,
+ }
+ 
+ static MUTABLE_ATTRIBUTE_NAME: &str = "mutable";
+ static DERIVE_ATTRIBUTE_NAME: &str = "derive";
++static CONTIGUOUS_ATTRIBUTE_NAME: &str = "contiguous";
+ 
+ mod field_attr_keywords {
+     syn::custom_keyword!(ignore);
+@@ -27,6 +32,91 @@ mod field_attr_keywords {
+ 
+ pub static QUERY_DATA_ATTRIBUTE_NAME: &str = "query_data";
+ 
++fn contiguous_item_struct(
++    path: &syn::Path,
++    fields: &Fields,
++    derive_macro_call: &proc_macro2::TokenStream,
++    struct_name: &Ident,
++    visibility: &Visibility,
++    item_struct_name: &Ident,
++    field_types: &Vec<Type>,
++    user_impl_generics_with_world_and_state: &ImplGenerics,
++    field_attrs: &Vec<Vec<Attribute>>,
++    field_visibilities: &Vec<Visibility>,
++    field_members: &Vec<Member>,
++    user_ty_generics: &TypeGenerics,
++    user_ty_generics_with_world_and_state: &TypeGenerics,
++    user_where_clauses_with_world_and_state: Option<&WhereClause>,
++) -> proc_macro2::TokenStream {
++    let item_attrs = quote! {
++        #[doc = concat!(
++            "Automatically generated [`ContiguousQueryData`](",
++            stringify!(#path),
++            "::fetch::ContiguousQueryData) item type for [`",
++            stringify!(#struct_name),
++            "`], returned when iterating over contiguous query results",
++        )]
++        #[automatically_derived]
++    };
++
++    match fields {
++        Fields::Named(_) => quote! {
++            #derive_macro_call
++            #item_attrs
++            #visibility struct #item_struct_name #user_impl_generics_with_world_and_state #user_where_clauses_with_world_and_state {
++                #(#(#field_attrs)* #field_visibilities #field_members: <#field_types as #path::query::ContiguousQueryData>::Contiguous<'__w, '__s>,)*
++            }
++        },
++        Fields::Unnamed(_) => quote! {
++            #derive_macro_call
++            #item_attrs
++            #visibility struct #item_struct_name #user_impl_generics_with_world_and_state #user_where_clauses_with_world_and_state (
++                #( #field_visibilities <#field_types as #path::query::ContiguousQueryData>::Contiguous<'__w, '__s>, )*
++            )
++        },
++        Fields::Unit => quote! {
++            #item_attrs
++            #visibility type #item_struct_name #user_ty_generics_with_world_and_state = #struct_name #user_ty_generics;
++        },
++    }
++}
++
++fn contiguous_query_data_impl(
++    path: &syn::Path,
++    struct_name: &Ident,
++    contiguous_item_struct_name: &Ident,
++    field_types: &Vec<Type>,
++    user_impl_generics: &ImplGenerics,
++    user_ty_generics: &TypeGenerics,
++    user_ty_generics_with_world_and_state: &TypeGenerics,
++    field_members: &Vec<Member>,
++    field_aliases: &Vec<Ident>,
++    user_where_clauses: Option<&WhereClause>,
++) -> proc_macro2::TokenStream {
++    quote! {
++        impl #user_impl_generics #path::query::ContiguousQueryData for #struct_name #user_ty_generics #user_where_clauses {
++            type Contiguous<'__w, '__s> = #contiguous_item_struct_name #user_ty_generics_with_world_and_state;
++
++            unsafe fn fetch_contiguous<'__w, '__s>(
++                _state: &'__s <Self as #path::query::WorldQuery>::State,
++                _fetch: &mut <Self as #path::query::WorldQuery>::Fetch<'__w>,
++                _entities: &'__w [#path::entity::Entity],
++            ) -> Self::Contiguous<'__w, '__s> {
++                #contiguous_item_struct_name {
++                    #(
++                        #field_members:
++                        <#field_types>::fetch_contiguous(
++                            &_state.#field_aliases,
++                            &mut _fetch.#field_aliases,
++                            _entities,
++                        ),
++                    )*
++                }
++            }
++        }
++    }
++}
++
+ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+     let tokens = input.clone();
+ 
+@@ -48,8 +138,24 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                     attributes.derive_args.push(Meta::Path(meta.path));
+                     Ok(())
+                 })
++            } else if meta.path.is_ident(CONTIGUOUS_ATTRIBUTE_NAME) {
++                meta.parse_nested_meta(|meta| {
++                    if meta.path.is_ident("all") {
++                        attributes.is_contiguous_mutable = true;
++                        attributes.is_contiguous_immutable = true;
++                        Ok(())
++                    } else if meta.path.is_ident("mutable") {
++                        attributes.is_contiguous_mutable = true;
++                        Ok(())
++                    } else if meta.path.is_ident("immutable") {
++                        attributes.is_contiguous_immutable = true;
++                        Ok(())
++                    } else {
++                        Err(meta.error("invalid target, expected `all`, `mutable` or `immutable`"))
++                    }
++                })
+             } else {
+-                Err(meta.error(format_args!("invalid attribute, expected `{MUTABLE_ATTRIBUTE_NAME}` or `{DERIVE_ATTRIBUTE_NAME}`")))
++                Err(meta.error(format_args!("invalid attribute, expected `{MUTABLE_ATTRIBUTE_NAME}`, `{DERIVE_ATTRIBUTE_NAME}` or `{CONTIGUOUS_ATTRIBUTE_NAME}`")))
+             }
+         });
+ 
+@@ -94,6 +200,19 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+     } else {
+         item_struct_name.clone()
+     };
++    let contiguous_item_struct_name = if attributes.is_contiguous_mutable {
++        Ident::new(&format!("{struct_name}ContiguousItem"), Span::call_site())
++    } else {
++        item_struct_name.clone()
++    };
++    let read_only_contiguous_item_struct_name = if attributes.is_contiguous_immutable {
++        Ident::new(
++            &format!("{struct_name}ReadOnlyContiguousItem"),
++            Span::call_site(),
++        )
++    } else {
++        item_struct_name.clone()
++    };
+ 
+     let fetch_struct_name = Ident::new(&format!("{struct_name}Fetch"), Span::call_site());
+     let fetch_struct_name = ensure_no_collision(fetch_struct_name, tokens.clone());
+@@ -124,7 +243,7 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+         .members()
+         .map(|m| format_ident!("field{}", m))
+         .collect();
+-    let field_types: Vec<syn::Type> = fields.iter().map(|f| f.ty.clone()).collect();
++    let field_types: Vec<Type> = fields.iter().map(|f| f.ty.clone()).collect();
+     let read_only_field_types = field_types
+         .iter()
+         .map(|ty| parse_quote!(<#ty as #path::query::QueryData>::ReadOnly))
+@@ -167,6 +286,43 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+         user_where_clauses_with_world,
+     );
+ 
++    let (mutable_contiguous_item_struct, mutable_contiguous_impl) =
++        if attributes.is_contiguous_mutable {
++            let contiguous_item_struct = contiguous_item_struct(
++                &path,
++                fields,
++                &derive_macro_call,
++                &struct_name,
++                &visibility,
++                &contiguous_item_struct_name,
++                &field_types,
++                &user_impl_generics_with_world_and_state,
++                &field_attrs,
++                &field_visibilities,
++                &field_members,
++                &user_ty_generics,
++                &user_ty_generics_with_world_and_state,
++                user_where_clauses_with_world_and_state,
++            );
++
++            let contiguous_impl = contiguous_query_data_impl(
++                &path,
++                &struct_name,
++                &contiguous_item_struct_name,
++                &field_types,
++                &user_impl_generics,
++                &user_ty_generics,
++                &user_ty_generics_with_world_and_state,
++                &field_members,
++                &field_aliases,
++                user_where_clauses,
++            );
++
++            (contiguous_item_struct, contiguous_impl)
++        } else {
++            (quote! {}, quote! {})
++        };
++
+     let (read_only_struct, read_only_impl) = if attributes.is_mutable {
+         // If the query is mutable, we need to generate a separate readonly version of some things
+         let readonly_item_struct = item_struct(
+@@ -226,6 +382,43 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+         (quote! {}, quote! {})
+     };
+ 
++    let (read_only_contiguous_item_struct, read_only_contiguous_impl) =
++        if attributes.is_mutable && attributes.is_contiguous_immutable {
++            let contiguous_item_struct = contiguous_item_struct(
++                &path,
++                fields,
++                &derive_macro_call,
++                &read_only_struct_name,
++                &visibility,
++                &read_only_contiguous_item_struct_name,
++                &read_only_field_types,
++                &user_impl_generics_with_world_and_state,
++                &field_attrs,
++                &field_visibilities,
++                &field_members,
++                &user_ty_generics,
++                &user_ty_generics_with_world_and_state,
++                user_where_clauses_with_world_and_state,
++            );
++
++            let contiguous_impl = contiguous_query_data_impl(
++                &path,
++                &read_only_struct_name,
++                &read_only_contiguous_item_struct_name,
++                &read_only_field_types,
++                &user_impl_generics,
++                &user_ty_generics,
++                &user_ty_generics_with_world_and_state,
++                &field_members,
++                &field_aliases,
++                user_where_clauses,
++            );
++
++            (contiguous_item_struct, contiguous_impl)
++        } else {
++            (quote! {}, quote! {})
++        };
++
+     let data_impl = {
+         let read_only_data_impl = if attributes.is_mutable {
+             quote! {
+@@ -403,6 +596,10 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+ 
+         #read_only_struct
+ 
++        #mutable_contiguous_item_struct
++
++        #read_only_contiguous_item_struct
++
+         const _: () = {
+             #[doc(hidden)]
+             #[doc = concat!(
+@@ -424,6 +621,10 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+             #data_impl
+ 
+             #read_only_data_impl
++
++            #mutable_contiguous_impl
++
++            #read_only_contiguous_impl
+         };
+ 
+         #[allow(dead_code)]
+diff --git a/crates/bevy_ecs/src/change_detection/params.rs b/crates/bevy_ecs/src/change_detection/params.rs
+index e66d62864a604..eca923f6af289 100644
+--- a/crates/bevy_ecs/src/change_detection/params.rs
++++ b/crates/bevy_ecs/src/change_detection/params.rs
+@@ -3,8 +3,9 @@ use crate::{
+     ptr::PtrMut,
+     resource::Resource,
+ };
+-use bevy_ptr::{Ptr, UnsafeCellDeref};
++use bevy_ptr::{Ptr, ThinSlicePtr, UnsafeCellDeref};
+ use core::{
++    cell::UnsafeCell,
+     ops::{Deref, DerefMut},
+     panic::Location,
+ };
+@@ -42,6 +43,160 @@ impl<'w> ComponentTicksRef<'w> {
+     }
+ }
+ 
++/// Data type storing contiguously lying ticks.
++///
++/// Retrievable via [`ContiguousRef::split`] and probably only useful if you want to use the following
++/// methods:
++/// - [`ContiguousComponentTicksRef::is_changed_iter`],
++/// - [`ContiguousComponentTicksRef::is_added_iter`]
++#[derive(Clone)]
++pub struct ContiguousComponentTicksRef<'w> {
++    pub(crate) added: &'w [Tick],
++    pub(crate) changed: &'w [Tick],
++    pub(crate) changed_by: MaybeLocation<&'w [&'static Location<'static>]>,
++    pub(crate) last_run: Tick,
++    pub(crate) this_run: Tick,
++}
++
++impl<'w> ContiguousComponentTicksRef<'w> {
++    /// # Safety
++    /// - The caller must have permission for all given ticks to be read.
++    /// - `len` must be the length of `added`, `changed` and `changed_by` (unless none) slices.
++    pub(crate) unsafe fn from_slice_ptrs(
++        added: ThinSlicePtr<'w, UnsafeCell<Tick>>,
++        changed: ThinSlicePtr<'w, UnsafeCell<Tick>>,
++        changed_by: MaybeLocation<ThinSlicePtr<'w, UnsafeCell<&'static Location<'static>>>>,
++        len: usize,
++        this_run: Tick,
++        last_run: Tick,
++    ) -> Self {
++        Self {
++            // SAFETY:
++            // - The caller ensures that `len` is the length of the slice.
++            // - The caller ensures we have permission to read the data.
++            added: unsafe { added.cast().as_slice_unchecked(len) },
++            // SAFETY: see above.
++            changed: unsafe { changed.cast().as_slice_unchecked(len) },
++            // SAFETY: see above.
++            changed_by: changed_by.map(|v| unsafe { v.cast().as_slice_unchecked(len) }),
++            last_run,
++            this_run,
++        }
++    }
++
++    /// Creates a new `ContiguousComponentTicksRef` using provided values or returns [`None`] if lengths of
++    /// `added`, `changed` and `changed_by` do not match    
++    ///
++    /// This is an advanced feature, `ContiguousComponentTicksRef`s are designed to be _created_ by
++    /// engine-internal code and _consumed_ by end-user code.
++    ///
++    /// - `added` - [`Tick`]s that store the tick when the wrapped value was created.
++    /// - `changed` - [`Tick`]s that store the last time the wrapped value was changed.
++    /// - `last_run` - A [`Tick`], occurring before `this_run`, which is used
++    ///   as a reference to determine whether the wrapped value is newly added or changed.
++    /// - `this_run` - A [`Tick`] corresponding to the current point in time -- "now".
++    /// - `caller` - [`Location`]s that store the location when the wrapper value was changed.
++    pub fn new(
++        added: &'w [Tick],
++        changed: &'w [Tick],
++        last_run: Tick,
++        this_run: Tick,
++        caller: MaybeLocation<&'w [&'static Location<'static>]>,
++    ) -> Option<Self> {
++        let eq = added.len() == changed.len()
++            && caller
++                .map(|v| v.len() == added.len())
++                .into_option()
++                .unwrap_or(true);
++        eq.then_some(Self {
++            added,
++            changed,
++            changed_by: caller,
++            last_run,
++            this_run,
++        })
++    }
++
++    /// Returns added ticks' slice.
++    pub fn added(&self) -> &'w [Tick] {
++        self.added
++    }
++
++    /// Returns changed ticks' slice.
++    pub fn changed(&self) -> &'w [Tick] {
++        self.changed
++    }
++
++    /// Returns changed by locations' slice.
++    pub fn changed_by(&self) -> MaybeLocation<&[&'static Location<'static>]> {
++        self.changed_by.as_deref()
++    }
++
++    /// Returns the tick the system last ran.
++    pub fn last_run(&self) -> Tick {
++        self.last_run
++    }
++
++    /// Returns the tick of the current system's run.
++    pub fn this_run(&self) -> Tick {
++        self.this_run
++    }
++
++    /// Returns an iterator where the i-th item corresponds to whether the i-th component was
++    /// marked as changed. If the value equals [`prim@true`], then the component was changed.
++    ///
++    /// # Example
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct A(pub i32);
++    ///
++    /// fn some_system(mut query: Query<Ref<A>>) {
++    ///     for a in query.contiguous_iter().unwrap() {
++    ///         let (a_values, a_ticks) = ContiguousRef::split(a);
++    ///         for (value, is_changed) in a_values.iter().zip(a_ticks.is_changed_iter()) {
++    ///             if is_changed {
++    ///                 // do something
++    ///             }
++    ///         }
++    ///     }
++    /// }
++    /// ```
++    pub fn is_changed_iter(&self) -> impl Iterator<Item = bool> {
++        self.changed
++            .iter()
++            .map(|v| v.is_newer_than(self.last_run, self.this_run))
++    }
++
++    /// Returns an iterator where the i-th item corresponds to whether the i-th component was
++    /// marked as added. If the value equals [`prim@true`], then the component was added.
++    ///
++    /// # Example
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct A(pub i32);
++    ///
++    /// fn some_system(mut query: Query<Ref<A>>) {
++    ///     for a in query.contiguous_iter().unwrap() {
++    ///         let (a_values, a_ticks) = ContiguousRef::split(a);
++    ///         for (value, is_added) in a_values.iter().zip(a_ticks.is_added_iter()) {
++    ///             if is_added {
++    ///                 // do something
++    ///             }
++    ///         }
++    ///     }
++    /// }
++    /// ```
++    pub fn is_added_iter(&self) -> impl Iterator<Item = bool> {
++        self.added
++            .iter()
++            .map(|v| v.is_newer_than(self.last_run, self.this_run))
++    }
++}
++
+ /// Used by mutable query parameters (such as [`Mut`] and [`ResMut`])
+ /// to store mutable access to the [`Tick`]s of a single component or resource.
+ pub(crate) struct ComponentTicksMut<'w> {
+@@ -86,6 +241,213 @@ impl<'w> From<ComponentTicksMut<'w>> for ComponentTicksRef<'w> {
+     }
+ }
+ 
++/// Data type storing contiguously lying ticks, which may be accessed to mutate.
++///
++/// Retrievable via [`ContiguousMut::split`] and probably only useful if you want to use the following
++/// methods:
++/// - [`ContiguousComponentTicksMut::is_changed_iter`],
++/// - [`ContiguousComponentTicksMut::is_added_iter`]
++pub struct ContiguousComponentTicksMut<'w> {
++    pub(crate) added: &'w mut [Tick],
++    pub(crate) changed: &'w mut [Tick],
++    pub(crate) changed_by: MaybeLocation<&'w mut [&'static Location<'static>]>,
++    pub(crate) last_run: Tick,
++    pub(crate) this_run: Tick,
++}
++
++impl<'w> ContiguousComponentTicksMut<'w> {
++    /// # Safety
++    /// - The caller must have permission to use all given ticks to be mutated.
++    /// - `len` must be the length of `added`, `changed` and `changed_by` (unless none) slices.
++    pub(crate) unsafe fn from_slice_ptrs(
++        added: ThinSlicePtr<'w, UnsafeCell<Tick>>,
++        changed: ThinSlicePtr<'w, UnsafeCell<Tick>>,
++        changed_by: MaybeLocation<ThinSlicePtr<'w, UnsafeCell<&'static Location<'static>>>>,
++        len: usize,
++        this_run: Tick,
++        last_run: Tick,
++    ) -> Self {
++        Self {
++            // SAFETY:
++            // - The caller ensures that `len` is the length of the slice.
++            // - The caller ensures we have permission to mutate the data.
++            added: unsafe { added.as_mut_slice_unchecked(len) },
++            // SAFETY: see above.
++            changed: unsafe { changed.as_mut_slice_unchecked(len) },
++            // SAFETY: see above.
++            changed_by: changed_by.map(|v| unsafe { v.as_mut_slice_unchecked(len) }),
++            last_run,
++            this_run,
++        }
++    }
++
++    /// Creates a new `ContiguousComponentTicksMut` using provided values or returns [`None`] if lengths of
++    /// `added`, `changed` and `changed_by` do not match    
++    ///
++    /// This is an advanced feature, `ContiguousComponentTicksMut`s are designed to be _created_ by
++    /// engine-internal code and _consumed_ by end-user code.
++    ///
++    /// - `added` - [`Tick`]s that store the tick when the wrapped value was created.
++    /// - `changed` - [`Tick`]s that store the last time the wrapped value was changed.
++    /// - `last_run` - A [`Tick`], occurring before `this_run`, which is used
++    ///   as a reference to determine whether the wrapped value is newly added or changed.
++    /// - `this_run` - A [`Tick`] corresponding to the current point in time -- "now".
++    /// - `caller` - [`Location`]s that store the location when the wrapper value was changed.
++    pub fn new(
++        added: &'w mut [Tick],
++        changed: &'w mut [Tick],
++        last_run: Tick,
++        this_run: Tick,
++        caller: MaybeLocation<&'w mut [&'static Location<'static>]>,
++    ) -> Option<Self> {
++        let eq = added.len() == changed.len()
++            && caller
++                .as_ref()
++                .map(|v| v.len() == added.len())
++                .into_option()
++                .unwrap_or(true);
++        eq.then_some(Self {
++            added,
++            changed,
++            changed_by: caller,
++            last_run,
++            this_run,
++        })
++    }
++
++    /// Returns added ticks' slice.
++    pub fn added(&self) -> &[Tick] {
++        self.added
++    }
++
++    /// Returns changed ticks' slice.
++    pub fn changed(&self) -> &[Tick] {
++        self.changed
++    }
++
++    /// Returns changed by locations' slice.
++    pub fn changed_by(&self) -> MaybeLocation<&[&'static Location<'static>]> {
++        self.changed_by.as_deref()
++    }
++
++    /// Returns mutable added ticks' slice.
++    pub fn added_mut(&mut self) -> &mut [Tick] {
++        self.added
++    }
++
++    /// Returns mutable changed ticks' slice.
++    pub fn changed_mut(&mut self) -> &mut [Tick] {
++        self.changed
++    }
++
++    /// Returns mutable changed by locations' slice.
++    pub fn changed_by_mut(&mut self) -> MaybeLocation<&mut [&'static Location<'static>]> {
++        self.changed_by.as_deref_mut()
++    }
++
++    /// Returns the tick the system last ran.
++    pub fn last_run(&self) -> Tick {
++        self.last_run
++    }
++
++    /// Returns the tick of the current system's run.
++    pub fn this_run(&self) -> Tick {
++        self.this_run
++    }
++
++    /// Returns an iterator where the i-th item corresponds to whether the i-th component was
++    /// marked as changed. If the value equals [`prim@true`], then the component was changed.
++    ///
++    /// # Example
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct A(pub i32);
++    ///
++    /// fn some_system(mut query: Query<&mut A>) {
++    ///     for a in query.contiguous_iter_mut().unwrap() {
++    ///         let (a_values, a_ticks) = ContiguousMut::split(a);
++    ///         for (value, is_changed) in a_values.iter_mut().zip(a_ticks.is_changed_iter()) {
++    ///             if is_changed {
++    ///                 value.0 *= 10;
++    ///             }
++    ///         }
++    ///     }
++    /// }
++    /// ```
++    pub fn is_changed_iter(&self) -> impl Iterator<Item = bool> {
++        self.changed
++            .iter()
++            .map(|v| v.is_newer_than(self.last_run, self.this_run))
++    }
++
++    /// Returns an iterator where the i-th item corresponds to whether the i-th component was
++    /// marked as added. If the value equals [`prim@true`], then the component was added.
++    ///
++    /// # Example
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct A(pub i32);
++    ///
++    /// fn some_system(mut query: Query<&mut A>) {
++    ///     for a in query.contiguous_iter_mut().unwrap() {
++    ///         let (a_values, a_ticks) = ContiguousMut::split(a);
++    ///         for (value, is_added) in a_values.iter_mut().zip(a_ticks.is_added_iter()) {
++    ///             if is_added {
++    ///                 value.0 = 10;
++    ///             }
++    ///         }
++    ///     }
++    /// }
++    /// ```
++    pub fn is_added_iter(&self) -> impl Iterator<Item = bool> {
++        self.added
++            .iter()
++            .map(|v| v.is_newer_than(self.last_run, self.this_run))
++    }
++
++    /// Marks every tick as changed.
++    pub fn mark_all_as_changed(&mut self) {
++        let this_run = self.this_run;
++
++        self.changed_by.as_mut().map(|v| {
++            for v in v.iter_mut() {
++                *v = Location::caller();
++            }
++        });
++
++        for t in self.changed.iter_mut() {
++            *t = this_run;
++        }
++    }
++
++    /// Returns a `ContiguousComponentTicksMut` with a smaller lifetime.
++    pub fn reborrow(&mut self) -> ContiguousComponentTicksMut<'_> {
++        ContiguousComponentTicksMut {
++            added: self.added,
++            changed: self.changed,
++            changed_by: self.changed_by.as_deref_mut(),
++            last_run: self.last_run,
++            this_run: self.this_run,
++        }
++    }
++}
++
++impl<'w> From<ContiguousComponentTicksMut<'w>> for ContiguousComponentTicksRef<'w> {
++    fn from(value: ContiguousComponentTicksMut<'w>) -> Self {
++        Self {
++            added: value.added,
++            changed: value.changed,
++            changed_by: value.changed_by.map(|v| &*v),
++            last_run: value.last_run,
++            this_run: value.this_run,
++        }
++    }
++}
++
+ /// Shared borrow of a [`Resource`].
+ ///
+ /// See the [`Resource`] documentation for usage.
+@@ -362,6 +724,125 @@ impl<'w, T: ?Sized> Ref<'w, T> {
+     }
+ }
+ 
++/// Contiguous equivalent of [`Ref<T>`].
++///
++/// Data type returned by [`ContiguousQueryData::fetch_contiguous`](crate::query::ContiguousQueryData::fetch_contiguous) for [`Ref<T>`].
++#[derive(Clone)]
++pub struct ContiguousRef<'w, T> {
++    pub(crate) value: &'w [T],
++    pub(crate) ticks: ContiguousComponentTicksRef<'w>,
++}
++
++impl<'w, T> ContiguousRef<'w, T> {
++    /// Returns the reference wrapped by this type. The reference is allowed to outlive `self`, which makes this method more flexible than simply borrowing `self`.
++    pub fn into_inner(self) -> &'w [T] {
++        self.value
++    }
++
++    /// Returns the added ticks.
++    #[inline]
++    pub fn added_ticks_slice(&self) -> &'w [Tick] {
++        self.ticks.added
++    }
++
++    /// Returns the changed ticks.
++    #[inline]
++    pub fn changed_ticks_slice(&self) -> &'w [Tick] {
++        self.ticks.changed
++    }
++
++    /// Returns the changed by ticks.
++    #[inline]
++    pub fn changed_by_ticks_slice(&self) -> MaybeLocation<&[&'static Location<'static>]> {
++        self.ticks.changed_by.as_deref()
++    }
++
++    /// Returns the tick when the system last ran.
++    #[inline]
++    pub fn last_run_tick(&self) -> Tick {
++        self.ticks.last_run
++    }
++
++    /// Returns the tick of the system's current run.
++    #[inline]
++    pub fn this_run_tick(&self) -> Tick {
++        self.ticks.this_run
++    }
++
++    /// Creates a new `ContiguousRef` using provided values or returns [`None`] if lengths of
++    /// `value`, `added`, `changed` and `changed_by` do not match    
++    ///
++    /// This is an advanced feature, `ContiguousRef`s are designed to be _created_ by
++    /// engine-internal code and _consumed_ by end-user code.
++    ///
++    /// - `value` - The values wrapped by `ContiguousRef`.
++    /// - `added` - [`Tick`]s that store the tick when the wrapped value was created.
++    /// - `changed` - [`Tick`]s that store the last time the wrapped value was changed.
++    /// - `last_run` - A [`Tick`], occurring before `this_run`, which is used
++    ///   as a reference to determine whether the wrapped value is newly added or changed.
++    /// - `this_run` - A [`Tick`] corresponding to the current point in time -- "now".
++    /// - `caller` - [`Location`]s that store the location when the wrapper value was changed.
++    pub fn new(
++        value: &'w [T],
++        added: &'w [Tick],
++        changed: &'w [Tick],
++        last_run: Tick,
++        this_run: Tick,
++        caller: MaybeLocation<&'w [&'static Location<'static>]>,
++    ) -> Option<Self> {
++        (value.len() == added.len())
++            .then(|| ContiguousComponentTicksRef::new(added, changed, last_run, this_run, caller))
++            .flatten()
++            .map(|ticks| Self { value, ticks })
++    }
++
++    /// Splits [`ContiguousRef`] into it's inner data types.
++    pub fn split(this: Self) -> (&'w [T], ContiguousComponentTicksRef<'w>) {
++        (this.value, this.ticks)
++    }
++
++    /// Reverse of [`ContiguousRef::split`], constructing a [`ContiguousRef`] using components'
++    /// values and ticks.
++    ///
++    /// Returns [`None`] if lengths of `value` and `ticks` do not match, which doesn't happen if
++    /// `ticks` and `value` come from the same [`Self::split`] call.
++    pub fn from_parts(value: &'w [T], ticks: ContiguousComponentTicksRef<'w>) -> Option<Self> {
++        (value.len() == ticks.changed.len()).then_some(Self { value, ticks })
++    }
++}
++
++impl<'w, T> Deref for ContiguousRef<'w, T> {
++    type Target = [T];
++
++    #[inline]
++    fn deref(&self) -> &Self::Target {
++        self.value
++    }
++}
++
++impl<'w, T> AsRef<[T]> for ContiguousRef<'w, T> {
++    #[inline]
++    fn as_ref(&self) -> &[T] {
++        self.deref()
++    }
++}
++
++impl<'w, T> IntoIterator for ContiguousRef<'w, T> {
++    type Item = &'w T;
++
++    type IntoIter = core::slice::Iter<'w, T>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.value.iter()
++    }
++}
++
++impl<'w, T: core::fmt::Debug> core::fmt::Debug for ContiguousRef<'w, T> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_tuple("ContiguousRef").field(&self.value).finish()
++    }
++}
++
+ impl<'w, 'a, T> IntoIterator for &'a Ref<'w, T>
+ where
+     &'a T: IntoIterator,
+@@ -463,6 +944,229 @@ impl<'w, T: ?Sized> Mut<'w, T> {
+     }
+ }
+ 
++/// Data type returned by [`ContiguousQueryData::fetch_contiguous`](crate::query::ContiguousQueryData::fetch_contiguous)
++/// for [`Mut<T>`] and `&mut T`
++///
++/// # Warning
++/// Implementations of [`DerefMut`], [`AsMut`] and [`IntoIterator`] update change ticks, which may effect performance.
++pub struct ContiguousMut<'w, T> {
++    pub(crate) value: &'w mut [T],
++    pub(crate) ticks: ContiguousComponentTicksMut<'w>,
++}
++
++impl<'w, T> ContiguousMut<'w, T> {
++    /// Manually bypasses change detection, allowing you to mutate the underlying values without updating the change tick,
++    /// which may be useful to reduce amount of work to be done.
++    ///
++    /// # Warning
++    /// This is a risky operation, that can have unexpected consequences on any system relying on this code.
++    /// However, it can be an essential escape hatch when, for example,
++    /// you are trying to synchronize representations using change detection and need to avoid infinite recursion.
++    #[inline]
++    pub fn bypass_change_detection(&mut self) -> &mut [T] {
++        self.value
++    }
++
++    /// Returns the immutable added ticks' slice.
++    #[inline]
++    pub fn added_ticks_slice(&self) -> &[Tick] {
++        self.ticks.added
++    }
++
++    /// Returns the immutable changed ticks' slice.
++    #[inline]
++    pub fn changed_ticks_slice(&self) -> &[Tick] {
++        self.ticks.changed
++    }
++
++    /// Returns the mutable changed by ticks' slice
++    #[inline]
++    pub fn changed_by_ticks_mut(&self) -> MaybeLocation<&[&'static Location<'static>]> {
++        self.ticks.changed_by.as_deref()
++    }
++
++    /// Returns the tick when the system last ran.
++    #[inline]
++    pub fn last_run_tick(&self) -> Tick {
++        self.ticks.last_run
++    }
++
++    /// Returns the tick of the system's current run.
++    #[inline]
++    pub fn this_run_tick(&self) -> Tick {
++        self.ticks.this_run
++    }
++
++    /// Returns the mutable added ticks' slice.
++    #[inline]
++    pub fn added_ticks_slice_mut(&mut self) -> &mut [Tick] {
++        self.ticks.added
++    }
++
++    /// Returns the mutable changed ticks' slice.
++    #[inline]
++    pub fn changed_ticks_slice_mut(&mut self) -> &mut [Tick] {
++        self.ticks.changed
++    }
++
++    /// Returns the mutable changed by ticks' slice
++    #[inline]
++    pub fn changed_by_ticks_slice_mut(
++        &mut self,
++    ) -> MaybeLocation<&mut [&'static Location<'static>]> {
++        self.ticks.changed_by.as_deref_mut()
++    }
++
++    /// Marks all components as changed.
++    ///
++    /// **Runs in O(n), where n is the amount of rows**
++    #[inline]
++    pub fn mark_all_as_changed(&mut self) {
++        self.ticks.mark_all_as_changed();
++    }
++
++    /// Creates a new `ContiguousMut` using provided values or returns [`None`] if lengths of
++    /// `value`, `added`, `changed` and `changed_by` do not match    
++    ///
++    /// This is an advanced feature, `ContiguousMut`s are designed to be _created_ by
++    /// engine-internal code and _consumed_ by end-user code.
++    ///
++    /// - `value` - The values wrapped by `ContiguousMut`.
++    /// - `added` - [`Tick`]s that store the tick when the wrapped value was created.
++    /// - `changed` - [`Tick`]s that store the last time the wrapped value was changed.
++    /// - `last_run` - A [`Tick`], occurring before `this_run`, which is used
++    ///   as a reference to determine whether the wrapped value is newly added or changed.
++    /// - `this_run` - A [`Tick`] corresponding to the current point in time -- "now".
++    /// - `caller` - [`Location`]s that store the location when the wrapper value was changed.
++    pub fn new(
++        value: &'w mut [T],
++        added: &'w mut [Tick],
++        changed: &'w mut [Tick],
++        last_run: Tick,
++        this_run: Tick,
++        caller: MaybeLocation<&'w mut [&'static Location<'static>]>,
++    ) -> Option<Self> {
++        (value.len() == added.len())
++            .then(|| ContiguousComponentTicksMut::new(added, changed, last_run, this_run, caller))
++            .flatten()
++            .map(|ticks| Self { value, ticks })
++    }
++
++    /// Returns a `ContiguousMut<T>` with a smaller lifetime.
++    pub fn reborrow(&mut self) -> ContiguousMut<'_, T> {
++        ContiguousMut {
++            value: self.value,
++            ticks: self.ticks.reborrow(),
++        }
++    }
++
++    /// Splits [`ContiguousMut`] into it's inner data types. It may be useful, when you want to
++    /// have an iterator over component values and check ticks simultaneously (using
++    /// [`ContiguousComponentTicksMut::is_changed_iter`] and
++    /// [`ContiguousComponentTicksMut::is_added_iter`]).
++    ///
++    /// Variant of [`Self::split`] which bypasses change detection: [`Self::bypass_change_detection_split`].
++    ///
++    /// Reverse of [`Self::split`] is [`Self::from_parts`].
++    ///
++    /// # Warning
++    /// This version updates changed ticks **before** returning, hence
++    /// [`ContiguousComponentTicksMut::is_changed_iter`] will be useless (the iterator will be filled with
++    /// [`prim@true`]s).
++    // NOTE: `ticks_since_insert` will be 0 (because `this.mark_all_as_changed` makes all changed ticks `this_run`),
++    // `ticks_since_system` won't be 0, `tick` is newer if
++    // `ticks_since_system` > `ticks_since_insert`, hence it will always be true.
++    pub fn split(mut this: Self) -> (&'w mut [T], ContiguousComponentTicksMut<'w>) {
++        this.mark_all_as_changed();
++        (this.value, this.ticks)
++    }
++
++    /// Splits [`ContiguousMut`] into it's inner data types. It may be useful, when you want to
++    /// have an iterator over component values and check ticks simultaneously (using
++    /// [`ContiguousComponentTicksMut::is_changed_iter`] and
++    /// [`ContiguousComponentTicksMut::is_added_iter`]).
++    ///
++    /// Variant of [`Self::bypass_change_detection_split`] which **does not** bypass change detection: [`Self::split`].
++    ///
++    /// Reverse of [`Self::bypass_change_detection_split`] is [`Self::from_parts`].
++    ///
++    /// # Warning
++    /// **Bypasses change detection**, call [`Self::split`] if you don't want to bypass it.
++    ///
++    /// See [`Self::bypass_change_detection`] for further explanations.
++    pub fn bypass_change_detection_split(
++        this: Self,
++    ) -> (&'w mut [T], ContiguousComponentTicksMut<'w>) {
++        (this.value, this.ticks)
++    }
++
++    /// Reverse of [`ContiguousMut::split`] and [`ContiguousMut::bypass_change_detection_split`],
++    /// constructing a [`ContiguousMut`] using components' values and ticks.
++    ///
++    /// Returns [`None`] if lengths of `value` and `ticks` do not match, which doesn't happen if
++    /// `ticks` and `value` come from the same [`Self::split`] or [`Self::bypass_change_detection_split`] call.
++    pub fn from_parts(value: &'w mut [T], ticks: ContiguousComponentTicksMut<'w>) -> Option<Self> {
++        (value.len() == ticks.changed.len()).then_some(Self { value, ticks })
++    }
++}
++
++impl<'w, T> Deref for ContiguousMut<'w, T> {
++    type Target = [T];
++
++    #[inline]
++    fn deref(&self) -> &Self::Target {
++        self.value
++    }
++}
++
++impl<'w, T> DerefMut for ContiguousMut<'w, T> {
++    #[inline]
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        self.mark_all_as_changed();
++        self.value
++    }
++}
++
++impl<'w, T> AsRef<[T]> for ContiguousMut<'w, T> {
++    #[inline]
++    fn as_ref(&self) -> &[T] {
++        self.deref()
++    }
++}
++
++impl<'w, T> AsMut<[T]> for ContiguousMut<'w, T> {
++    #[inline]
++    fn as_mut(&mut self) -> &mut [T] {
++        self.deref_mut()
++    }
++}
++
++impl<'w, T> IntoIterator for ContiguousMut<'w, T> {
++    type Item = &'w mut T;
++
++    type IntoIter = core::slice::IterMut<'w, T>;
++
++    fn into_iter(mut self) -> Self::IntoIter {
++        self.mark_all_as_changed();
++        self.value.iter_mut()
++    }
++}
++
++impl<'w, T: core::fmt::Debug> core::fmt::Debug for ContiguousMut<'w, T> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_tuple("ContiguousMut").field(&self.value).finish()
++    }
++}
++
++impl<'w, T> From<ContiguousMut<'w, T>> for ContiguousRef<'w, T> {
++    fn from(value: ContiguousMut<'w, T>) -> Self {
++        Self {
++            value: value.value,
++            ticks: value.ticks.into(),
++        }
++    }
++}
++
+ impl<'w, T: ?Sized> From<Mut<'w, T>> for Ref<'w, T> {
+     fn from(mut_ref: Mut<'w, T>) -> Self {
+         Self {
+diff --git a/crates/bevy_ecs/src/change_detection/traits.rs b/crates/bevy_ecs/src/change_detection/traits.rs
+index 30025551ada58..393bb3d3d0b86 100644
+--- a/crates/bevy_ecs/src/change_detection/traits.rs
++++ b/crates/bevy_ecs/src/change_detection/traits.rs
+@@ -121,6 +121,7 @@ pub trait DetectChangesMut: DetectChanges {
+     /// The caveats of [`set_last_changed`](DetectChangesMut::set_last_changed) apply. This modifies both the added and changed ticks together.
+     fn set_last_added(&mut self, last_added: Tick);
+ 
++    // NOTE: if you are changing the following comment also change the [`ContiguousMut::bypass_change_detection`] comment.
+     /// Manually bypasses change detection, allowing you to mutate the underlying value without updating the change tick.
+     ///
+     /// # Warning
+diff --git a/crates/bevy_ecs/src/lib.rs b/crates/bevy_ecs/src/lib.rs
+index 7f4a70321c5b3..adbaad6feb0bb 100644
+--- a/crates/bevy_ecs/src/lib.rs
++++ b/crates/bevy_ecs/src/lib.rs
+@@ -66,7 +66,9 @@ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+         bundle::Bundle,
+-        change_detection::{DetectChanges, DetectChangesMut, Mut, Ref},
++        change_detection::{
++            ContiguousMut, ContiguousRef, DetectChanges, DetectChangesMut, Mut, Ref,
++        },
+         children,
+         component::Component,
+         entity::{ContainsEntity, Entity, EntityMapper},
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 88932e044b689..45a2dbb8332a2 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -1,7 +1,10 @@
+ use crate::{
+     archetype::{Archetype, Archetypes},
+     bundle::Bundle,
+-    change_detection::{ComponentTicksMut, ComponentTicksRef, MaybeLocation, Tick},
++    change_detection::{
++        ComponentTicksMut, ComponentTicksRef, ContiguousComponentTicksMut,
++        ContiguousComponentTicksRef, ContiguousMut, ContiguousRef, MaybeLocation, Tick,
++    },
+     component::{Component, ComponentId, Components, Mutable, StorageType},
+     entity::{Entities, Entity, EntityLocation},
+     query::{
+@@ -99,14 +102,16 @@ use variadics_please::all_tuples;
+ ///
+ /// ## Macro expansion
+ ///
+-/// Expanding the macro will declare one or three additional structs, depending on whether or not the struct is marked as mutable.
++/// Expanding the macro will declare one to five additional structs, depending on whether or not the struct is marked as mutable or as contiguous.
+ /// For a struct named `X`, the additional structs will be:
+ ///
+-/// |Struct name|`mutable` only|Description|
+-/// |:---:|:---:|---|
+-/// |`XItem`|---|The type of the query item for `X`|
+-/// |`XReadOnlyItem`|✓|The type of the query item for `XReadOnly`|
+-/// |`XReadOnly`|✓|[`ReadOnly`] variant of `X`|
++/// |Struct name|`mutable` only|`contiguous` target|Description|
++/// |:---:|:---:|:---:|---|
++/// |`XItem`|---|---|The type of the query item for `X`|
++/// |`XReadOnlyItem`|✓|---|The type of the query item for `XReadOnly`|
++/// |`XReadOnly`|✓|---|[`ReadOnly`] variant of `X`|
++/// |`XContiguousItem`|---|`mutable` or `all`|The type of the contiguous query item for `X`|
++/// |`XReadOnlyContiguousItem`|✓|`immutable` or `all`|The type of the contiguous query item for `XReadOnly`|
+ ///
+ /// ## Adding mutable references
+ ///
+@@ -142,11 +147,41 @@ use variadics_please::all_tuples;
+ /// }
+ /// ```
+ ///
++/// ## Supporting contiguous iteration
++///
++/// To create contiguous items additionally (to support contiguous iteration), the struct must be marked with the `#[query_data(contiguous(target))]` attribute,
++/// where the target may be `all`, `mutable` or `immutable` (see the table above).
++///
++/// For mutable queries it may be done like this:
++/// ```
++/// # use bevy_ecs::prelude::*;
++/// # use bevy_ecs::query::QueryData;
++/// #
++/// # #[derive(Component)]
++/// # struct ComponentA;
++/// #
++/// #[derive(QueryData)]
++/// /// - contiguous(all) will create contiguous items for both read and mutable versions
++/// /// - contiguous(mutable) will only create a contiguous item for the mutable version
++/// /// - contiguous(immutable) will only create a contiguous item for the read only version
++/// #[query_data(mutable, contiguous(all))]
++/// struct CustomQuery {
++///     component_a: &'static mut ComponentA,
++/// }
++/// ```
++///
++/// For immutable queries `contiguous(immutable)` attribute will be **ignored**, meanwhile `contiguous(mutable)` and `contiguous(all)`
++/// will only generate a contiguous item for the (original) read only version.
++///
++/// To understand contiguous iteration refer to
++/// [`Query::contiguous_iter`](`crate::system::Query::contiguous_iter`)
++///
+ /// ## Adding methods to query items
+ ///
+ /// It is possible to add methods to query items in order to write reusable logic about related components.
+ /// This will often make systems more readable because low level logic is moved out from them.
+-/// It is done by adding `impl` blocks with methods for the `-Item` or `-ReadOnlyItem` generated structs.
++/// It is done by adding `impl` blocks with methods for the `-Item`, `-ReadOnlyItem`, `-ContiguousItem` or `ContiguousReadOnlyItem`
++/// generated structs.
+ ///
+ /// ```
+ /// # use bevy_ecs::prelude::*;
+@@ -211,7 +246,7 @@ use variadics_please::all_tuples;
+ /// # struct ComponentA;
+ /// #
+ /// #[derive(QueryData)]
+-/// #[query_data(mutable, derive(Debug))]
++/// #[query_data(mutable, derive(Debug), contiguous(all))]
+ /// struct CustomQuery {
+ ///     component_a: &'static ComponentA,
+ /// }
+@@ -221,6 +256,8 @@ use variadics_please::all_tuples;
+ ///
+ /// assert_debug::<CustomQueryItem>();
+ /// assert_debug::<CustomQueryReadOnlyItem>();
++/// assert_debug::<CustomQueryContiguousItem>();
++/// assert_debug::<CustomQueryReadOnlyContiguousItem>();
+ /// ```
+ ///
+ /// ## Query composition
+@@ -352,6 +389,41 @@ pub unsafe trait QueryData: WorldQuery {
+     fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>>;
+ }
+ 
++/// A [`QueryData`] which allows getting a direct access to contiguous chunks of components'
++/// values, which may be used to apply simd-operations.
++///
++/// Contiguous iteration may be done via:
++/// - [`Query::contiguous_iter`](crate::system::Query::contiguous_iter),
++/// - [`Query::contiguous_iter_mut`](crate::system::Query::contiguous_iter_mut),
++///
++// NOTE: Even though all component references (&T, &mut T) implement this trait, it won't be executed for
++// SparseSet components because in that case the query is not dense.
++#[diagnostic::on_unimplemented(
++    message = "`{Self}` cannot be iterated contiguously",
++    label = "invalid contiguous `Query` data",
++    note = "if `{Self}` is a custom query type, using `QueryData` derive macro, ensure that the `#[query_data(contiguous(target))]` attribute is added"
++)]
++pub trait ContiguousQueryData: ArchetypeQueryData {
++    /// Item returned by [`ContiguousQueryData::fetch_contiguous`].
++    /// Represents a contiguous chunk of memory.
++    type Contiguous<'w, 's>;
++
++    /// Fetch [`ContiguousQueryData::Contiguous`] which represents a contiguous chunk of memory (e.g., an array) in the current [`Table`].
++    /// This must always be called after [`WorldQuery::set_table`].
++    ///
++    /// # Safety
++    ///
++    /// - Must always be called _after_ [`WorldQuery::set_table`].
++    /// - `entities`'s length must match the length of the set table.
++    /// - `entities` must match the entities of the set table.
++    /// - There must not be simultaneous conflicting component access registered in `update_component_access`.
++    unsafe fn fetch_contiguous<'w, 's>(
++        state: &'s Self::State,
++        fetch: &mut Self::Fetch<'w>,
++        entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's>;
++}
++
+ /// A [`QueryData`] that is read only.
+ ///
+ /// # Safety
+@@ -475,6 +547,18 @@ impl ReleaseStateQueryData for Entity {
+ 
+ impl ArchetypeQueryData for Entity {}
+ 
++impl ContiguousQueryData for Entity {
++    type Contiguous<'w, 's> = &'w [Entity];
++
++    unsafe fn fetch_contiguous<'w, 's>(
++        _state: &'s Self::State,
++        _fetch: &mut Self::Fetch<'w>,
++        entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's> {
++        entities
++    }
++}
++
+ // SAFETY:
+ // `update_component_access` does nothing.
+ // This is sound because `fetch` does not access components.
+@@ -1722,6 +1806,34 @@ unsafe impl<T: Component> QueryData for &T {
+     }
+ }
+ 
++impl<T: Component> ContiguousQueryData for &T {
++    type Contiguous<'w, 's> = &'w [T];
++
++    unsafe fn fetch_contiguous<'w, 's>(
++        _state: &'s Self::State,
++        fetch: &mut Self::Fetch<'w>,
++        entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's> {
++        fetch.components.extract(
++            |table| {
++                // SAFETY: The caller ensures `set_table` was previously called
++                let table = unsafe { table.debug_checked_unwrap() };
++                // SAFETY:
++                // - `table` is `entities.len()` long
++                // - `UnsafeCell<T>` has the same layout as `T`
++                unsafe { table.cast().as_slice_unchecked(entities.len()) }
++            },
++            |_| {
++                #[cfg(debug_assertions)]
++                unreachable!();
++                // SAFETY: The caller ensures query is dense
++                #[cfg(not(debug_assertions))]
++                core::hint::unreachable_unchecked();
++            },
++        )
++    }
++}
++
+ // SAFETY: access is read only
+ unsafe impl<T: Component> ReadOnlyQueryData for &T {}
+ 
+@@ -1950,6 +2062,50 @@ impl<T: Component> ReleaseStateQueryData for Ref<'_, T> {
+ 
+ impl<T: Component> ArchetypeQueryData for Ref<'_, T> {}
+ 
++impl<T: Component> ContiguousQueryData for Ref<'_, T> {
++    type Contiguous<'w, 's> = ContiguousRef<'w, T>;
++
++    unsafe fn fetch_contiguous<'w, 's>(
++        _state: &'s Self::State,
++        fetch: &mut Self::Fetch<'w>,
++        entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's> {
++        fetch.components.extract(
++            |table| {
++                // SAFETY: set_table was previously called
++                let (table_components, added_ticks, changed_ticks, callers) =
++                    unsafe { table.debug_checked_unwrap() };
++
++                ContiguousRef {
++                    // SAFETY: `entities` has the same length as the rows in the set table.
++                    value: unsafe { table_components.cast().as_slice_unchecked(entities.len()) },
++                    // SAFETY:
++                    // - The caller ensures the permission to access ticks.
++                    // - `entities` has the same length as the rows in the set table hence the
++                    // ticks.
++                    ticks: unsafe {
++                        ContiguousComponentTicksRef::from_slice_ptrs(
++                            added_ticks,
++                            changed_ticks,
++                            callers,
++                            entities.len(),
++                            fetch.this_run,
++                            fetch.last_run,
++                        )
++                    },
++                }
++            },
++            |_| {
++                #[cfg(debug_assertions)]
++                unreachable!();
++                // SAFETY: the caller ensures that [`Self::set_table`] was called beforehand.
++                #[cfg(not(debug_assertions))]
++                core::hint::unreachable_unchecked();
++            },
++        )
++    }
++}
++
+ /// The [`WorldQuery::Fetch`] type for `&mut T`.
+ pub struct WriteFetch<'w, T: Component> {
+     components: StorageSwitch<
+@@ -2164,6 +2320,50 @@ impl<T: Component<Mutability = Mutable>> ReleaseStateQueryData for &mut T {
+ 
+ impl<T: Component<Mutability = Mutable>> ArchetypeQueryData for &mut T {}
+ 
++impl<T: Component<Mutability = Mutable>> ContiguousQueryData for &mut T {
++    type Contiguous<'w, 's> = ContiguousMut<'w, T>;
++
++    unsafe fn fetch_contiguous<'w, 's>(
++        _state: &'s Self::State,
++        fetch: &mut Self::Fetch<'w>,
++        entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's> {
++        fetch.components.extract(
++            |table| {
++                // SAFETY: set_table was previously called
++                let (table_components, added_ticks, changed_ticks, callers) =
++                    unsafe { table.debug_checked_unwrap() };
++
++                ContiguousMut {
++                    // SAFETY: `entities` has the same length as the rows in the set table.
++                    value: unsafe { table_components.as_mut_slice_unchecked(entities.len()) },
++                    // SAFETY:
++                    // - The caller ensures the permission to access ticks.
++                    // - `entities` has the same length as the rows in the set table hence the
++                    // ticks.
++                    ticks: unsafe {
++                        ContiguousComponentTicksMut::from_slice_ptrs(
++                            added_ticks,
++                            changed_ticks,
++                            callers,
++                            entities.len(),
++                            fetch.this_run,
++                            fetch.last_run,
++                        )
++                    },
++                }
++            },
++            |_| {
++                #[cfg(debug_assertions)]
++                unreachable!();
++                // SAFETY: the caller ensures that [`Self::set_table`] was called beforehand.
++                #[cfg(not(debug_assertions))]
++                core::hint::unreachable_unchecked();
++            },
++        )
++    }
++}
++
+ /// When `Mut<T>` is used in a query, it will be converted to `Ref<T>` when transformed into its read-only form, providing access to change detection methods.
+ ///
+ /// By contrast `&mut T` will result in a `Mut<T>` item in mutable form to record mutations, but result in a bare `&T` in read-only form.
+@@ -2283,6 +2483,18 @@ impl<T: Component<Mutability = Mutable>> ReleaseStateQueryData for Mut<'_, T> {
+ 
+ impl<T: Component<Mutability = Mutable>> ArchetypeQueryData for Mut<'_, T> {}
+ 
++impl<'__w, T: Component<Mutability = Mutable>> ContiguousQueryData for Mut<'__w, T> {
++    type Contiguous<'w, 's> = ContiguousMut<'w, T>;
++
++    unsafe fn fetch_contiguous<'w, 's>(
++        state: &'s Self::State,
++        fetch: &mut Self::Fetch<'w>,
++        entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's> {
++        <&mut T as ContiguousQueryData>::fetch_contiguous(state, fetch, entities)
++    }
++}
++
+ #[doc(hidden)]
+ pub struct OptionFetch<'w, T: WorldQuery> {
+     fetch: T::Fetch<'w>,
+@@ -2440,6 +2652,21 @@ impl<T: ReleaseStateQueryData> ReleaseStateQueryData for Option<T> {
+ // so it's always an `ArchetypeQueryData`, even for non-archetypal `T`.
+ impl<T: QueryData> ArchetypeQueryData for Option<T> {}
+ 
++impl<T: ContiguousQueryData> ContiguousQueryData for Option<T> {
++    type Contiguous<'w, 's> = Option<T::Contiguous<'w, 's>>;
++
++    unsafe fn fetch_contiguous<'w, 's>(
++        state: &'s Self::State,
++        fetch: &mut Self::Fetch<'w>,
++        entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's> {
++        fetch
++            .matches
++            // SAFETY: The invariants are upheld by the caller
++            .then(|| unsafe { T::fetch_contiguous(state, &mut fetch.fetch, entities) })
++    }
++}
++
+ /// Returns a bool that describes if an entity has the component `T`.
+ ///
+ /// This can be used in a [`Query`](crate::system::Query) if you want to know whether or not entities
+@@ -2618,6 +2845,18 @@ impl<T: Component> ReleaseStateQueryData for Has<T> {
+ 
+ impl<T: Component> ArchetypeQueryData for Has<T> {}
+ 
++impl<T: Component> ContiguousQueryData for Has<T> {
++    type Contiguous<'w, 's> = bool;
++
++    unsafe fn fetch_contiguous<'w, 's>(
++        _state: &'s Self::State,
++        fetch: &mut Self::Fetch<'w>,
++        _entities: &'w [Entity],
++    ) -> Self::Contiguous<'w, 's> {
++        *fetch
++    }
++}
++
+ /// The `AnyOf` query parameter fetches entities with any of the component types included in T.
+ ///
+ /// `Query<AnyOf<(&A, &B, &mut C)>>` is equivalent to `Query<(Option<&A>, Option<&B>, Option<&mut C>), Or<(With<A>, With<B>, With<C>)>>`.
+@@ -2708,6 +2947,38 @@ macro_rules! impl_tuple_query_data {
+ 
+         $(#[$meta])*
+         impl<$($name: ArchetypeQueryData),*> ArchetypeQueryData for ($($name,)*) {}
++
++        #[expect(
++            clippy::allow_attributes,
++            reason = "This is a tuple-related macro; as such the lints below may not always apply."
++        )]
++        #[allow(
++            non_snake_case,
++            reason = "The names of some variables are provided by the macro's caller, not by us."
++        )]
++        #[allow(
++            unused_variables,
++            reason = "Zero-length tuples won't use any of the parameters."
++        )]
++        #[allow(
++            clippy::unused_unit,
++            reason = "Zero-length tuples will generate some function bodies equivalent to `()`; however, this macro is meant for all applicable tuples, and as such it makes no sense to rewrite it just for that case."
++        )]
++        $(#[$meta])*
++        impl<$($name: ContiguousQueryData),*> ContiguousQueryData for ($($name,)*) {
++            type Contiguous<'w, 's> = ($($name::Contiguous::<'w, 's>,)*);
++
++            unsafe fn fetch_contiguous<'w, 's>(
++                state: &'s Self::State,
++                fetch: &mut Self::Fetch<'w>,
++                entities: &'w [Entity],
++            ) -> Self::Contiguous<'w, 's> {
++                let ($($state,)*) = state;
++                let ($($name,)*) = fetch;
++                // SAFETY: The invariants are upheld by the caller.
++                ($(unsafe {$name::fetch_contiguous($state, $name, entities)},)*)
++            }
++        }
+     };
+ }
+ 
+@@ -2909,6 +3180,42 @@ macro_rules! impl_anytuple_fetch {
+ 
+         $(#[$meta])*
+         impl<$($name: ArchetypeQueryData),*> ArchetypeQueryData for AnyOf<($($name,)*)> {}
++
++
++        #[expect(
++            clippy::allow_attributes,
++            reason = "This is a tuple-related macro; as such the lints below may not always apply."
++        )]
++        #[allow(
++            non_snake_case,
++            reason = "The names of some variables are provided by the macro's caller, not by us."
++        )]
++        #[allow(
++            unused_variables,
++            reason = "Zero-length tuples won't use any of the parameters."
++        )]
++        #[allow(
++            clippy::unused_unit,
++            reason = "Zero-length tuples will generate some function bodies equivalent to `()`; however, this macro is meant for all applicable tuples, and as such it makes no sense to rewrite it just for that case."
++        )]
++        $(#[$meta])*
++        impl<$($name: ContiguousQueryData),*> ContiguousQueryData for AnyOf<($($name,)*)> {
++            type Contiguous<'w, 's> = ($(Option<$name::Contiguous<'w,'s>>,)*);
++
++            unsafe fn fetch_contiguous<'w, 's>(
++                state: &'s Self::State,
++                fetch: &mut Self::Fetch<'w>,
++                entities: &'w [Entity],
++            ) -> Self::Contiguous<'w, 's> {
++                let ($($name,)*) = fetch;
++                let ($($state,)*) = state;
++                // Matches the [`QueryData::fetch`] except it always returns Some
++                ($(
++                    // SAFETY: The invariants are upheld by the caller
++                    $name.1.then(|| unsafe { $name::fetch_contiguous($state, &mut $name.0, entities) }),
++                )*)
++            }
++        }
+     };
+ }
+ 
+@@ -3184,6 +3491,7 @@ impl<C: Component, T: Copy, S: Copy> Copy for StorageSwitch<C, T, S> {}
+ mod tests {
+     use super::*;
+     use crate::change_detection::DetectChanges;
++    use crate::query::Without;
+     use crate::system::{assert_is_system, Query};
+     use bevy_ecs::prelude::Schedule;
+     use bevy_ecs_macros::QueryData;
+@@ -3432,4 +3740,154 @@ mod tests {
+         // we want EntityRef to use the change ticks of the system
+         schedule.run(&mut world);
+     }
++
++    #[test]
++    fn test_contiguous_query_data() {
++        #[derive(Component, PartialEq, Eq, Debug)]
++        pub struct C(i32);
++
++        #[derive(Component, PartialEq, Eq, Debug)]
++        pub struct D(bool);
++
++        let mut world = World::new();
++        world.spawn((C(0), D(true)));
++        world.spawn((C(1), D(false)));
++        world.spawn(C(2));
++
++        let mut query = world.query::<(&C, &D)>();
++        let mut iter = query.contiguous_iter(&world).unwrap();
++        let c = iter.next().unwrap();
++        assert_eq!(c.0, [C(0), C(1)].as_slice());
++        assert_eq!(c.1, [D(true), D(false)].as_slice());
++        assert!(iter.next().is_none());
++
++        let mut query = world.query::<&C>();
++        let mut iter = query.contiguous_iter(&world).unwrap();
++        let mut present = [false; 3];
++        let mut len = 0;
++        for _ in 0..2 {
++            let c = iter.next().unwrap();
++            for c in c {
++                present[c.0 as usize] = true;
++                len += 1;
++            }
++        }
++        assert!(iter.next().is_none());
++        assert_eq!(len, 3);
++        assert_eq!(present, [true; 3]);
++
++        let mut query = world.query::<&mut C>();
++        let mut iter = query.contiguous_iter_mut(&mut world).unwrap();
++        for _ in 0..2 {
++            let c = iter.next().unwrap();
++            for c in c {
++                c.0 *= 2;
++            }
++        }
++        assert!(iter.next().is_none());
++        let mut iter = query.contiguous_iter(&world).unwrap();
++        let mut present = [false; 6];
++        let mut len = 0;
++        for _ in 0..2 {
++            let c = iter.next().unwrap();
++            for c in c {
++                present[c.0 as usize] = true;
++                len += 1;
++            }
++        }
++        assert_eq!(present, [true, false, true, false, true, false]);
++        assert_eq!(len, 3);
++
++        let mut query = world.query_filtered::<&C, Without<D>>();
++        let mut iter = query.contiguous_iter(&world).unwrap();
++        assert_eq!(iter.next().unwrap(), &[C(4)]);
++        assert!(iter.next().is_none());
++    }
++
++    #[test]
++    fn sparse_set_contiguous_query() {
++        #[derive(Component, Debug, PartialEq, Eq)]
++        #[component(storage = "SparseSet")]
++        pub struct S(i32);
++
++        let mut world = World::new();
++        world.spawn(S(0));
++
++        let mut query = world.query::<&mut S>();
++        let iter = query.contiguous_iter_mut(&mut world);
++        assert!(iter.is_none());
++    }
++
++    #[test]
++    fn any_of_contiguous_test() {
++        #[derive(Component, Debug, Clone, Copy)]
++        pub struct C(i32);
++
++        #[derive(Component, Debug, Clone, Copy)]
++        pub struct D(i32);
++
++        let mut world = World::new();
++        world.spawn((C(0), D(1)));
++        world.spawn(C(2));
++        world.spawn(D(3));
++        world.spawn(());
++
++        let mut query = world.query::<AnyOf<(&C, &D)>>();
++        let iter = query.contiguous_iter(&world).unwrap();
++        let mut present = [false; 4];
++
++        for (c, d) in iter {
++            assert!(c.is_some() || d.is_some());
++            let c = c.unwrap_or_default();
++            let d = d.unwrap_or_default();
++            for i in 0..c.len().max(d.len()) {
++                let c = c.get(i).cloned();
++                let d = d.get(i).cloned();
++                if let Some(C(c)) = c {
++                    assert!(!present[c as usize]);
++                    present[c as usize] = true;
++                }
++                if let Some(D(d)) = d {
++                    assert!(!present[d as usize]);
++                    present[d as usize] = true;
++                }
++            }
++        }
++
++        assert_eq!(present, [true; 4]);
++    }
++
++    #[test]
++    fn option_contiguous_test() {
++        #[derive(Component, Clone, Copy)]
++        struct C(i32);
++
++        #[derive(Component, Clone, Copy)]
++        struct D(i32);
++
++        let mut world = World::new();
++        world.spawn((C(0), D(1)));
++        world.spawn(D(2));
++        world.spawn(C(3));
++
++        let mut query = world.query::<(Option<&C>, &D)>();
++        let iter = query.contiguous_iter(&world).unwrap();
++        let mut present = [false; 3];
++
++        for (c, d) in iter {
++            let c = c.unwrap_or_default();
++            for i in 0..d.len() {
++                let c = c.get(i).cloned();
++                let D(d) = d[i];
++                if let Some(C(c)) = c {
++                    assert!(!present[c as usize]);
++                    present[c as usize] = true;
++                }
++                assert!(!present[d as usize]);
++                present[d as usize] = true;
++            }
++        }
++
++        assert_eq!(present, [true; 3]);
++    }
+ }
+diff --git a/crates/bevy_ecs/src/query/filter.rs b/crates/bevy_ecs/src/query/filter.rs
+index fe0cd553e1269..b9e0b6b59553f 100644
+--- a/crates/bevy_ecs/src/query/filter.rs
++++ b/crates/bevy_ecs/src/query/filter.rs
+@@ -563,7 +563,6 @@ macro_rules! impl_tuple_query_filter {
+                 true $(&& unsafe { $name::filter_fetch($state, $name, entity, table_row) })*
+             }
+         }
+-
+     };
+ }
+ 
+@@ -1240,8 +1239,9 @@ unsafe impl QueryFilter for Spawned {
+ 
+ /// A marker trait to indicate that the filter works at an archetype level.
+ ///
+-/// This is needed to implement [`ExactSizeIterator`] for
+-/// [`QueryIter`](crate::query::QueryIter) that contains archetype-level filters.
++/// This is needed to:
++/// - implement [`ExactSizeIterator`] for [`QueryIter`](crate::query::QueryIter) that contains archetype-level filters.
++/// - ensure table filtering for [`QueryContiguousIter`](crate::query::QueryContiguousIter).
+ ///
+ /// The trait must only be implemented for filters where its corresponding [`QueryFilter::IS_ARCHETYPAL`]
+ /// is [`prim@true`]. As such, only the [`With`] and [`Without`] filters can implement the trait.
+diff --git a/crates/bevy_ecs/src/query/iter.rs b/crates/bevy_ecs/src/query/iter.rs
+index 0bd178ba03727..6bb98a8671f2b 100644
+--- a/crates/bevy_ecs/src/query/iter.rs
++++ b/crates/bevy_ecs/src/query/iter.rs
+@@ -4,7 +4,10 @@ use crate::{
+     bundle::Bundle,
+     change_detection::Tick,
+     entity::{ContainsEntity, Entities, Entity, EntityEquivalent, EntitySet, EntitySetIterator},
+-    query::{ArchetypeFilter, ArchetypeQueryData, DebugCheckedUnwrap, QueryState, StorageId},
++    query::{
++        ArchetypeFilter, ArchetypeQueryData, ContiguousQueryData, DebugCheckedUnwrap, QueryState,
++        StorageId,
++    },
+     storage::{Table, TableRow, Tables},
+     world::{
+         unsafe_world_cell::UnsafeWorldCell, EntityMut, EntityMutExcept, EntityRef, EntityRefExcept,
+@@ -992,6 +995,91 @@ impl<'w, 's, D: ReadOnlyQueryData, F: QueryFilter> Clone for QueryIter<'w, 's, D
+     }
+ }
+ 
++/// Iterator for contiguous chunks of memory
++pub struct QueryContiguousIter<'w, 's, D: ContiguousQueryData, F: ArchetypeFilter> {
++    tables: &'w Tables,
++    storage_id_iter: core::slice::Iter<'s, StorageId>,
++    query_state: &'s QueryState<D, F>,
++    fetch: D::Fetch<'w>,
++    // NOTE: no need for F::Fetch because it always returns true
++}
++
++impl<'w, 's, D: ContiguousQueryData, F: ArchetypeFilter> QueryContiguousIter<'w, 's, D, F> {
++    /// # Safety
++    /// - `world` must have permission to access any of the components registered in `query_state`.
++    /// - `world` must be the same one used to initialize `query_state`.
++    pub(crate) unsafe fn new(
++        world: UnsafeWorldCell<'w>,
++        query_state: &'s QueryState<D, F>,
++        last_run: Tick,
++        this_run: Tick,
++    ) -> Option<Self> {
++        query_state.is_dense.then(|| Self {
++            // SAFETY: We only access table data that has been registered in `query_state`
++            tables: unsafe { &world.storages().tables },
++            storage_id_iter: query_state.matched_storage_ids.iter(),
++            // SAFETY: The invariants are upheld by the caller.
++            fetch: unsafe { D::init_fetch(world, &query_state.fetch_state, last_run, this_run) },
++            query_state,
++        })
++    }
++}
++
++impl<'w, 's, D: ContiguousQueryData, F: ArchetypeFilter> Iterator
++    for QueryContiguousIter<'w, 's, D, F>
++{
++    type Item = D::Contiguous<'w, 's>;
++
++    #[inline(always)]
++    fn next(&mut self) -> Option<Self::Item> {
++        loop {
++            // SAFETY: Query is dense
++            let table_id = unsafe { self.storage_id_iter.next()?.table_id };
++            // SAFETY: `table_id` was returned by `self.storage_id_iter` which always returns a
++            // valid id
++            let table = unsafe { self.tables.get(table_id).debug_checked_unwrap() };
++            if table.is_empty() {
++                continue;
++            }
++            // SAFETY:
++            // - `table` is from the same world as `self.query_state` (`self.storage_id_iter` is
++            // from the same world as `self.query_state`, see [`Self::new`])
++            // - `self.fetch` was initialized with `self.query_state` (in [`Self::new`])
++            unsafe {
++                D::set_table(&mut self.fetch, &self.query_state.fetch_state, table);
++            }
++
++            // no filtering because `F` implements `ArchetypeFilter` which ensures that `QueryFilter::fetch`
++            // always returns true
++
++            // SAFETY:
++            // - [`D::set_table`] is executed prior.
++            // - `table.entities()` return a valid entity array
++            // - the caller of [`Self::new`] ensures that the world has permission to access any of
++            // the components registered in `self.query_state`
++            let item = unsafe {
++                D::fetch_contiguous(
++                    &self.query_state.fetch_state,
++                    &mut self.fetch,
++                    table.entities(),
++                )
++            };
++
++            return Some(item);
++        }
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        (0, self.storage_id_iter.size_hint().1)
++    }
++}
++
++// [`QueryIterationCursor::next_contiguous`] always returns None when exhausted
++impl<'w, 's, D: ContiguousQueryData, F: ArchetypeFilter> FusedIterator
++    for QueryContiguousIter<'w, 's, D, F>
++{
++}
++
+ /// An [`Iterator`] over sorted query results of a [`Query`](crate::system::Query).
+ ///
+ /// This struct is created by the [`QueryIter::sort`], [`QueryIter::sort_unstable`],
+@@ -2533,7 +2621,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIterationCursor<'w, 's, D, F> {
+     // NOTE: If you are changing query iteration code, remember to update the following places, where relevant:
+     // QueryIter, QueryIterationCursor, QuerySortedIter, QueryManyIter, QuerySortedManyIter, QueryCombinationIter,
+     // QueryState::par_fold_init_unchecked_manual, QueryState::par_many_fold_init_unchecked_manual,
+-    // QueryState::par_many_unique_fold_init_unchecked_manual
++    // QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
+     /// # Safety
+     /// `tables` and `archetypes` must belong to the same world that the [`QueryIterationCursor`]
+     /// was initialized for.
+@@ -2546,6 +2634,8 @@ impl<'w, 's, D: QueryData, F: QueryFilter> QueryIterationCursor<'w, 's, D, F> {
+         query_state: &'s QueryState<D, F>,
+     ) -> Option<D::Item<'w, 's>> {
+         if self.is_dense {
++            // NOTE: if you are changing this branch you would probably have to change
++            // QueryContiguousIter::next as well
+             loop {
+                 // we are on the beginning of the query, or finished processing a table, so skip to the next
+                 if self.current_row == self.current_len {
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index 448335db8ed0f..4f65ab4996209 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -5,7 +5,10 @@ use crate::{
+     entity::{Entity, EntityEquivalent, EntitySet, UniqueEntityArray},
+     entity_disabling::DefaultQueryFilters,
+     prelude::FromWorld,
+-    query::{FilteredAccess, QueryCombinationIter, QueryIter, QueryParIter, WorldQuery},
++    query::{
++        ArchetypeFilter, ContiguousQueryData, FilteredAccess, QueryCombinationIter,
++        QueryContiguousIter, QueryIter, QueryParIter, WorldQuery,
++    },
+     storage::{SparseSetIndex, TableId},
+     system::Query,
+     world::{unsafe_world_cell::UnsafeWorldCell, World, WorldId},
+@@ -1404,6 +1407,36 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         self.query_mut(world).par_iter_inner()
+     }
+ 
++    /// Returns a contiguous iterator over the query results for the given [`World`] or [`None`] if
++    /// the query is not dense hence not contiguously iterable.
++    #[inline]
++    pub fn contiguous_iter<'w, 's>(
++        &'s mut self,
++        world: &'w World,
++    ) -> Option<QueryContiguousIter<'w, 's, D::ReadOnly, F>>
++    where
++        D::ReadOnly: ContiguousQueryData,
++        F: ArchetypeFilter,
++    {
++        self.query(world).contiguous_iter_inner().ok()
++    }
++
++    /// Returns a contiguous iterator over the query results for the given [`World`] or [`None`] if
++    /// the query is not dense hence not contiguously iterable.
++    ///
++    /// This can only be called for mutable queries, see [`Self::contiguous_iter`] for read-only-queries.
++    #[inline]
++    pub fn contiguous_iter_mut<'w, 's>(
++        &'s mut self,
++        world: &'w mut World,
++    ) -> Option<QueryContiguousIter<'w, 's, D, F>>
++    where
++        D: ContiguousQueryData,
++        F: ArchetypeFilter,
++    {
++        self.query_mut(world).contiguous_iter_inner().ok()
++    }
++
+     /// Runs `func` on each query result in parallel for the given [`World`], where the last change and
+     /// the current change tick are given. This is faster than the equivalent
+     /// `iter()` method, but cannot be chained like a normal [`Iterator`].
+@@ -1435,7 +1468,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+     {
+         // NOTE: If you are changing query iteration code, remember to update the following places, where relevant:
+         // QueryIter, QueryIterationCursor, QueryManyIter, QueryCombinationIter,QueryState::par_fold_init_unchecked_manual,
+-        // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual
++        // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
+         use arrayvec::ArrayVec;
+ 
+         bevy_tasks::ComputeTaskPool::get().scope(|scope| {
+@@ -1551,7 +1584,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+     {
+         // NOTE: If you are changing query iteration code, remember to update the following places, where relevant:
+         // QueryIter, QueryIterationCursor, QueryManyIter, QueryCombinationIter,QueryState::par_fold_init_unchecked_manual
+-        // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual
++        // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
+ 
+         bevy_tasks::ComputeTaskPool::get().scope(|scope| {
+             let chunks = entity_list.chunks_exact(batch_size as usize);
+@@ -1614,7 +1647,7 @@ impl<D: ReadOnlyQueryData, F: QueryFilter> QueryState<D, F> {
+     {
+         // NOTE: If you are changing query iteration code, remember to update the following places, where relevant:
+         // QueryIter, QueryIterationCursor, QueryManyIter, QueryCombinationIter, QueryState::par_fold_init_unchecked_manual
+-        // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual
++        // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
+ 
+         bevy_tasks::ComputeTaskPool::get().scope(|scope| {
+             let chunks = entity_list.chunks_exact(batch_size as usize);
+diff --git a/crates/bevy_ecs/src/system/query.rs b/crates/bevy_ecs/src/system/query.rs
+index b8c29d448adbf..c6293ede5c0b1 100644
+--- a/crates/bevy_ecs/src/system/query.rs
++++ b/crates/bevy_ecs/src/system/query.rs
+@@ -5,8 +5,9 @@ use crate::{
+     change_detection::Tick,
+     entity::{Entity, EntityEquivalent, EntitySet, UniqueEntityArray},
+     query::{
+-        DebugCheckedUnwrap, NopWorldQuery, QueryCombinationIter, QueryData, QueryEntityError,
+-        QueryFilter, QueryIter, QueryManyIter, QueryManyUniqueIter, QueryParIter, QueryParManyIter,
++        ArchetypeFilter, ContiguousQueryData, DebugCheckedUnwrap, NopWorldQuery,
++        QueryCombinationIter, QueryContiguousIter, QueryData, QueryEntityError, QueryFilter,
++        QueryIter, QueryManyIter, QueryManyUniqueIter, QueryParIter, QueryParManyIter,
+         QueryParManyUniqueIter, QuerySingleError, QueryState, ROQueryItem, ReadOnlyQueryData,
+     },
+     world::unsafe_world_cell::UnsafeWorldCell,
+@@ -1354,6 +1355,103 @@ impl<'w, 's, D: QueryData, F: QueryFilter> Query<'w, 's, D, F> {
+         }
+     }
+ 
++    /// Returns a contiguous iterator over the query results for the given
++    /// [`World`](crate::world::World) or [`None`] if the query is not dense hence not contiguously
++    /// iterable.
++    ///
++    /// Contiguous iteration enables getting slices of contiguously lying components (which lie in the same table), which for example
++    /// may be used for simd-operations, which may accelerate an algorithm.
++    ///
++    /// # Example
++    ///
++    /// The following system despawns all entities which health is negative.
++    ///
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct Health(pub f32);
++    ///
++    /// fn despawn_all_dead_entities(mut commands: Commands, query: Query<(Entity, &Health)>) {
++    ///     for (entities, health) in query.contiguous_iter().unwrap() {
++    ///         // For each entity there is one component, hence it always holds true
++    ///         assert!(entities.len() == health.len());
++    ///         for (entity, health) in entities.iter().zip(health.iter()) {
++    ///             if health.0 < 0.0 {
++    ///                 commands.entity(*entity).despawn();
++    ///             }
++    ///         }
++    ///     }
++    /// }
++    ///
++    /// ```
++    ///
++    /// A mutable version: [`Self::contiguous_iter_mut`]
++    pub fn contiguous_iter(&self) -> Option<QueryContiguousIter<'_, 's, D::ReadOnly, F>>
++    where
++        D::ReadOnly: ContiguousQueryData,
++        F: ArchetypeFilter,
++    {
++        self.as_readonly().contiguous_iter_inner().ok()
++    }
++
++    /// Returns a mutable contiguous iterator over the query results for the given
++    /// [`World`](crate::world::World) or [`None`] if the query is not dense hence not contiguously
++    /// iterable.
++    ///
++    /// Contiguous iteration enables getting slices of contiguously lying components (which lie in the same table), which for example
++    /// may be used for simd-operations, which may accelerate an algorithm.
++    ///
++    /// # Example
++    ///
++    /// The following system applies a "health decay" effect on all entities, which reduces their
++    /// health by some fraction.
++    ///
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct Health(pub f32);
++    /// #
++    /// # #[derive(Component)]
++    /// # struct HealthDecay(pub f32);
++    ///
++    /// fn apply_health_decay(mut query: Query<(&mut Health, &HealthDecay)>) {
++    ///     for (mut health, decay) in query.contiguous_iter_mut().unwrap() {
++    ///         // all data slices returned by component queries are the same size
++    ///         assert!(health.len() == decay.len());
++    ///         // we could have used health.bypass_change_detection() to do less work.
++    ///         for (health, decay) in health.iter_mut().zip(decay) {
++    ///             health.0 *= decay.0;
++    ///         }
++    ///     }
++    /// }
++    /// ```
++    /// An immutable version: [`Self::contiguous_iter`]
++    pub fn contiguous_iter_mut(&mut self) -> Option<QueryContiguousIter<'_, 's, D, F>>
++    where
++        D: ContiguousQueryData,
++        F: ArchetypeFilter,
++    {
++        self.reborrow().contiguous_iter_inner().ok()
++    }
++
++    /// Returns a contiguous iterator over the query results for the given
++    /// [`World`](crate::world::World) or [`Err`] with this [`Query`] if the query is not dense hence not contiguously
++    /// iterable.
++    /// This consumes the [`Query`] to return results with the actual "inner" world lifetime.
++    pub fn contiguous_iter_inner(self) -> Result<QueryContiguousIter<'w, 's, D, F>, Self>
++    where
++        D: ContiguousQueryData,
++        F: ArchetypeFilter,
++    {
++        // SAFETY:
++        // - `self.world` has permission to access the required components
++        // - `self.world` was used to initialize `self.state`
++        unsafe { QueryContiguousIter::new(self.world, self.state, self.last_run, self.this_run) }
++            .ok_or(self)
++    }
++
+     /// Returns the read-only query item for the given [`Entity`].
+     ///
+     /// In case of a nonexisting entity or mismatched component, a [`QueryEntityError`] is returned instead.
+diff --git a/crates/bevy_ptr/src/lib.rs b/crates/bevy_ptr/src/lib.rs
+index ab05449566d0c..1d20535d914f7 100644
+--- a/crates/bevy_ptr/src/lib.rs
++++ b/crates/bevy_ptr/src/lib.rs
+@@ -1104,6 +1104,24 @@ impl<'a, T> ThinSlicePtr<'a, T> {
+         unsafe { &*self.ptr.add(index).as_ptr() }
+     }
+ 
++    /// Returns a slice without performing bounds checks.
++    ///
++    /// # Safety
++    ///
++    /// - There must be no mutable aliases for the lifetime `'a` to the slice. to the slice.
++    /// - `len` must be less than or equal to the length of the slice.
++    pub unsafe fn as_slice_unchecked(&self, len: usize) -> &'a [T] {
++        #[cfg(debug_assertions)]
++        assert!(len <= self.len, "tried to create an out-of-bounds slice");
++
++        // SAFETY:
++        // - The caller guarantees `len` is not greater than the length of the slice.
++        // - The caller guarantees the aliasing rules.
++        // - `self.ptr` is a valid pointer for the type `T`.
++        // - `len` is valid hence `len * size_of::<T>()` is less than `isize::MAX`.
++        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), len) }
++    }
++
+     /// Indexes the slice without performing bounds checks.
+     ///
+     /// # Safety
+@@ -1116,6 +1134,36 @@ impl<'a, T> ThinSlicePtr<'a, T> {
+     }
+ }
+ 
++impl<'a, T> ThinSlicePtr<'a, UnsafeCell<T>> {
++    /// Returns a mutable reference of the slice
++    ///
++    /// # Safety
++    ///
++    /// - There must not be any aliases for the lifetime `'a` to the slice.
++    /// - `len` must be less than or equal to the length of the slice.
++    pub unsafe fn as_mut_slice_unchecked(&self, len: usize) -> &'a mut [T] {
++        #[cfg(debug_assertions)]
++        assert!(len <= self.len, "tried to create an out-of-bounds slice");
++
++        // SAFETY:
++        // - The caller ensures no aliases exist and `len` is in-bounds.
++        // - `self.ptr` is a valid pointer for the type `T`.
++        // - `len` is valid hence `len * size_of::<T>()` is less than `isize::MAX`.
++        unsafe { core::slice::from_raw_parts_mut(UnsafeCell::raw_get(self.ptr.as_ptr()), len) }
++    }
++
++    /// Returns a slice pointer to the underlying type `T`.
++    pub fn cast(&self) -> ThinSlicePtr<'a, T> {
++        ThinSlicePtr {
++            // SAFETY: `self.ptr` is non null hence `UnsafeCell::raw_get` always returns a non null pointer
++            ptr: unsafe { NonNull::new_unchecked(UnsafeCell::raw_get(self.ptr.as_ptr())) },
++            #[cfg(debug_assertions)]
++            len: self.len,
++            _marker: PhantomData,
++        }
++    }
++}
++
+ impl<'a, T> Clone for ThinSlicePtr<'a, T> {
+     fn clone(&self) -> Self {
+         *self
+diff --git a/examples/README.md b/examples/README.md
+index ca85600ccb105..e990065da84e4 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -318,6 +318,7 @@ Example | Description
+ --- | ---
+ [Change Detection](../examples/ecs/change_detection.rs) | Change detection on components and resources
+ [Component Hooks](../examples/ecs/component_hooks.rs) | Define component hooks to manage component lifecycle events
++[Contiguous Query](../examples/ecs/contiguous_query.rs) | Demonstrates contiguous queries
+ [Custom Query Parameters](../examples/ecs/custom_query_param.rs) | Groups commonly used compound queries and query filters into a single type
+ [Custom Schedule](../examples/ecs/custom_schedule.rs) | Demonstrates how to add custom schedules
+ [Dynamic ECS](../examples/ecs/dynamic.rs) | Dynamically create components, spawn entities with those components and query those components
+diff --git a/examples/ecs/contiguous_query.rs b/examples/ecs/contiguous_query.rs
+new file mode 100644
+index 0000000000000..a6d5ec7418bcf
+--- /dev/null
++++ b/examples/ecs/contiguous_query.rs
+@@ -0,0 +1,67 @@
++//! Demonstrates how contiguous queries work.
++//!
++//! Contiguous iteration enables getting slices of contiguously lying components (which lie in the same table), which for example
++//! may be used for simd-operations, which may accelerate an algorithm.
++//!
++//! Contiguous iteration may be used for example via [`Query::contiguous_iter`], [`Query::contiguous_iter_mut`],
++//! both of which return an option which is only [`None`] when the query doesn't support contiguous
++//! iteration due to it not being dense (iteration happens on archetypes, not tables) or filters not being archetypal.
++//!
++//! For further documentation refer to:
++//! - [`Query::contiguous_iter`]
++//! - [`ContiguousQueryData`](`bevy::ecs::query::ContiguousQueryData`)
++//! - [`ArchetypeFilter`](`bevy::ecs::query::ArchetypeFilter`)
++
++use bevy::prelude::*;
++
++#[derive(Component)]
++/// When the value reaches 0.0 the entity dies
++pub struct Health(pub f32);
++
++#[derive(Component)]
++/// Each tick an entity will have it's health multiplied by the factor, which
++/// for a big amount of entities can be accelerated using contiguous queries
++pub struct HealthDecay(pub f32);
++
++fn apply_health_decay(mut query: Query<(&mut Health, &HealthDecay)>) {
++    // contiguous_iter_mut() would return None if query couldn't be iterated contiguously
++    for (mut health, decay) in query.contiguous_iter_mut().unwrap() {
++        // all data slices returned by component queries are the same size
++        assert!(health.len() == decay.len());
++        // we could also bypass change detection via bypass_change_detection() because we do not
++        // use it anyways.
++        for (health, decay) in health.iter_mut().zip(decay) {
++            health.0 *= decay.0;
++        }
++    }
++}
++
++fn finish_off_first(mut commands: Commands, mut query: Query<(Entity, &mut Health)>) {
++    if let Some((entity, mut health)) = query.iter_mut().next() {
++        health.0 -= 1.0;
++        if health.0 <= 0.0 {
++            commands.entity(entity).despawn();
++            println!("Finishing off {entity:?}");
++        }
++    }
++}
++
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins)
++        .add_systems(Update, (apply_health_decay, finish_off_first).chain())
++        .add_systems(Startup, setup)
++        .run();
++}
++
++fn setup(mut commands: Commands) {
++    let mut i = 0;
++    commands.spawn_batch(std::iter::from_fn(move || {
++        i += 1;
++        if i == 10_000 {
++            None
++        } else {
++            Some((Health(i as f32 * 5.0), HealthDecay(0.9)))
++        }
++    }));
++}
+diff --git a/examples/ecs/custom_query_param.rs b/examples/ecs/custom_query_param.rs
+index 8960557ef4e85..b442bd6ce3d4d 100644
+--- a/examples/ecs/custom_query_param.rs
++++ b/examples/ecs/custom_query_param.rs
+@@ -28,6 +28,7 @@ fn main() {
+                 print_components_iter_mut,
+                 print_components_iter,
+                 print_components_tuple,
++                print_components_contiguous_iter,
+             )
+                 .chain(),
+         )
+@@ -111,7 +112,7 @@ struct NestedQuery {
+ }
+ 
+ #[derive(QueryData)]
+-#[query_data(derive(Debug))]
++#[query_data(derive(Debug), contiguous(mutable))]
+ struct GenericQuery<T: Component, P: Component> {
+     generic: (&'static T, &'static P),
+ }
+@@ -192,4 +193,35 @@ fn print_components_tuple(
+         println!("Nested: {:?} {:?}", nested.0, nested.1);
+         println!("Generic: {generic_c:?} {generic_d:?}");
+     }
++    println!();
++}
++
++/// If you are going to contiguously iterate the data in a query, you must mark it with the `contiguous` attribute,
++/// which accepts one of 3 targets (`all`, `immutable` and `mutable`)
++///
++/// - `all` will make read only query as well as mutable query both be able to be iterated contiguosly
++/// - `mutable` will only make the original query (i.e., in that case [`CustomContiguousQuery`]) be able to be iterated contiguously
++/// - `immutable` will only make the read only query (which is only useful when you mark the original query as `mutable`)
++///   be able to be iterated contiguously
++#[derive(QueryData)]
++#[query_data(derive(Debug), contiguous(all))]
++struct CustomContiguousQuery<T: Component + Debug, P: Component + Debug> {
++    entity: Entity,
++    a: Ref<'static, ComponentA>,
++    b: Option<&'static ComponentB>,
++    generic: GenericQuery<T, P>,
++}
++
++fn print_components_contiguous_iter(query: Query<CustomContiguousQuery<ComponentC, ComponentD>>) {
++    println!("Print components (contiguous_iter):");
++    for e in query.contiguous_iter().unwrap() {
++        let e: CustomContiguousQueryContiguousItem<'_, '_, _, _> = e;
++        println!("Entity: {:?}", e.entity);
++        println!("A: {:?}", e.a);
++        println!("B: {:?}", e.b);
++        println!(
++            "Generic: {:?} {:?}",
++            e.generic.generic.0, e.generic.generic.1
++        );
++    }
+ }
+diff --git a/release-content/release-notes/contiguous_access.md b/release-content/release-notes/contiguous_access.md
+new file mode 100644
+index 0000000000000..6921cd30c09f3
+--- /dev/null
++++ b/release-content/release-notes/contiguous_access.md
+@@ -0,0 +1,30 @@
++---
++title: Contiguous access
++authors: ["@Jenya705"]
++pull_requests: [21984]
++---
++
++Enables accessing slices from tables directly via Queries.
++
++## Goals
++
++`Query` and `QueryState` have new methods `contiguous_iter`, `contiguous_iter_mut` and `contiguous_iter_inner`, which allows querying contiguously (i.e., over tables). For it to work the query data must implement `ContiguousQueryData` and the query filter `ArchetypeFilter`. When a contiguous iterator is used, the iterator will jump over whole tables, returning corresponding data. Some notable implementors of `ContiguousQueryData` are `&T` and `&mut T`, returning `&[T]` and `ContiguousMut<T>` correspondingly, where the latter structure lets you get a mutable slice of components as well as corresponding ticks. Some notable implementors of `ArchetypeFilter` are `With<T>` and `Without<T>` and notable types **not implementing** it are `Changed<T>` and `Added<T>`.
++
++For example, this is useful, when an operation must be applied on a large amount of entities lying in the same tables, which allows for the compiler to auto-vectorize the code, thus speeding it up.
++
++### Usage
++
++`Query::contiguous_iter` and `Query::contiguous_iter_mut` return a `Option<QueryContiguousIter>`, which is only `None`, when the query is not dense (i.e., iterates over archetypes, not over tables).
++
++```rust
++fn apply_velocity(query: Query<(&Velocity, &mut Position)>) {
++    // `contiguous_iter_mut()` cannot ensure all invariants on the compilation stage, thus
++    // when a component uses a sparse set storage, the method will return `None`
++    for (velocity, mut position) in query.contiguous_iter_mut().unwrap() {
++        // we could also have used position.bypass_change_detection() to do even less work.
++        for (v, p) in velocity.iter().zip(position.iter_mut()) {
++            p.0 += v.0;
++        }
++    }
++}
++```

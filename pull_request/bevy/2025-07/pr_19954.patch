@@ -1,0 +1,175 @@
+diff --git a/crates/bevy_camera/src/visibility/mod.rs b/crates/bevy_camera/src/visibility/mod.rs
+index 684ac403c7cf6..478db336e32a3 100644
+--- a/crates/bevy_camera/src/visibility/mod.rs
++++ b/crates/bevy_camera/src/visibility/mod.rs
+@@ -3,7 +3,7 @@ mod render_layers;
+ 
+ use core::any::TypeId;
+ 
+-use bevy_ecs::entity::EntityHashSet;
++use bevy_ecs::entity::{EntityHashMap, EntityHashSet};
+ use bevy_ecs::lifecycle::HookContext;
+ use bevy_ecs::world::DeferredWorld;
+ use derive_more::derive::{Deref, DerefMut};
+@@ -267,6 +267,50 @@ impl VisibleEntities {
+     }
+ }
+ 
++/// Collection of mesh entities visible for 3D lighting.
++///
++/// This component contains all mesh entities visible from the current light view.
++/// The collection is updated automatically by `bevy_pbr::SimulationLightSystems`.
++#[derive(Component, Clone, Debug, Default, Reflect, Deref, DerefMut)]
++#[reflect(Component, Debug, Default, Clone)]
++pub struct VisibleMeshEntities {
++    #[reflect(ignore, clone)]
++    pub entities: Vec<Entity>,
++}
++
++#[derive(Component, Clone, Debug, Default, Reflect)]
++#[reflect(Component, Debug, Default, Clone)]
++pub struct CubemapVisibleEntities {
++    #[reflect(ignore, clone)]
++    data: [VisibleMeshEntities; 6],
++}
++
++impl CubemapVisibleEntities {
++    pub fn get(&self, i: usize) -> &VisibleMeshEntities {
++        &self.data[i]
++    }
++
++    pub fn get_mut(&mut self, i: usize) -> &mut VisibleMeshEntities {
++        &mut self.data[i]
++    }
++
++    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &VisibleMeshEntities> {
++        self.data.iter()
++    }
++
++    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut VisibleMeshEntities> {
++        self.data.iter_mut()
++    }
++}
++
++#[derive(Component, Clone, Debug, Default, Reflect)]
++#[reflect(Component, Default, Clone)]
++pub struct CascadesVisibleEntities {
++    /// Map of view entity to the visible entities for each cascade frustum.
++    #[reflect(ignore, clone)]
++    pub entities: EntityHashMap<Vec<VisibleMeshEntities>>,
++}
++
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+ pub enum VisibilitySystems {
+     /// Label for the [`calculate_bounds`], `calculate_bounds_2d` and `calculate_bounds_text2d` systems,
+@@ -303,6 +347,9 @@ impl Plugin for VisibilityPlugin {
+             .register_type::<RenderLayers>()
+             .register_type::<Visibility>()
+             .register_type::<VisibleEntities>()
++            .register_type::<CascadesVisibleEntities>()
++            .register_type::<VisibleMeshEntities>()
++            .register_type::<CubemapVisibleEntities>()
+             .register_required_components::<Mesh3d, Visibility>()
+             .register_required_components::<Mesh3d, VisibilityClass>()
+             .register_required_components::<Mesh2d, Visibility>()
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index 56dfbf77b33a6..754627558cfd7 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -44,6 +44,7 @@ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
++bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_tasks = { path = "../bevy_tasks", version = "0.17.0-dev", optional = true }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+ bevy_utils = { path = "../bevy_utils", version = "0.17.0-dev" }
+diff --git a/crates/bevy_pbr/src/components.rs b/crates/bevy_pbr/src/components.rs
+index fca31b3b034af..4c451e53f55c9 100644
+--- a/crates/bevy_pbr/src/components.rs
++++ b/crates/bevy_pbr/src/components.rs
+@@ -1,19 +1,12 @@
++pub use bevy_camera::visibility::{
++    CascadesVisibleEntities, CubemapVisibleEntities, VisibleMeshEntities,
++};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::component::Component;
+ use bevy_ecs::entity::{Entity, EntityHashMap};
+ use bevy_ecs::reflect::ReflectComponent;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::sync_world::MainEntity;
+-/// Collection of mesh entities visible for 3D lighting.
+-///
+-/// This component contains all mesh entities visible from the current light view.
+-/// The collection is updated automatically by [`crate::SimulationLightSystems`].
+-#[derive(Component, Clone, Debug, Default, Reflect, Deref, DerefMut)]
+-#[reflect(Component, Debug, Default, Clone)]
+-pub struct VisibleMeshEntities {
+-    #[reflect(ignore, clone)]
+-    pub entities: Vec<Entity>,
+-}
+ 
+ #[derive(Component, Clone, Debug, Default, Reflect, Deref, DerefMut)]
+ #[reflect(Component, Debug, Default, Clone)]
+@@ -22,31 +15,6 @@ pub struct RenderVisibleMeshEntities {
+     pub entities: Vec<(Entity, MainEntity)>,
+ }
+ 
+-#[derive(Component, Clone, Debug, Default, Reflect)]
+-#[reflect(Component, Debug, Default, Clone)]
+-pub struct CubemapVisibleEntities {
+-    #[reflect(ignore, clone)]
+-    data: [VisibleMeshEntities; 6],
+-}
+-
+-impl CubemapVisibleEntities {
+-    pub fn get(&self, i: usize) -> &VisibleMeshEntities {
+-        &self.data[i]
+-    }
+-
+-    pub fn get_mut(&mut self, i: usize) -> &mut VisibleMeshEntities {
+-        &mut self.data[i]
+-    }
+-
+-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &VisibleMeshEntities> {
+-        self.data.iter()
+-    }
+-
+-    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut VisibleMeshEntities> {
+-        self.data.iter_mut()
+-    }
+-}
+-
+ #[derive(Component, Clone, Debug, Default, Reflect)]
+ #[reflect(Component, Debug, Default, Clone)]
+ pub struct RenderCubemapVisibleEntities {
+@@ -72,14 +40,6 @@ impl RenderCubemapVisibleEntities {
+     }
+ }
+ 
+-#[derive(Component, Clone, Debug, Default, Reflect)]
+-#[reflect(Component, Default, Clone)]
+-pub struct CascadesVisibleEntities {
+-    /// Map of view entity to the visible entities for each cascade frustum.
+-    #[reflect(ignore, clone)]
+-    pub entities: EntityHashMap<Vec<VisibleMeshEntities>>,
+-}
+-
+ #[derive(Component, Clone, Debug, Default, Reflect)]
+ #[reflect(Component, Default, Clone)]
+ pub struct RenderCascadesVisibleEntities {
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index f0e6fa90d724d..86d2bf8ede15c 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -208,10 +208,7 @@ impl Plugin for PbrPlugin {
+             .register_type::<AmbientLight>()
+             .register_type::<CascadeShadowConfig>()
+             .register_type::<Cascades>()
+-            .register_type::<CascadesVisibleEntities>()
+-            .register_type::<VisibleMeshEntities>()
+             .register_type::<ClusterConfig>()
+-            .register_type::<CubemapVisibleEntities>()
+             .register_type::<DirectionalLight>()
+             .register_type::<DirectionalLightShadowMap>()
+             .register_type::<NotShadowCaster>()

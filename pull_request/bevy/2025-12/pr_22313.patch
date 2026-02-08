@@ -1,0 +1,121 @@
+diff --git a/crates/bevy_solari/src/realtime/mod.rs b/crates/bevy_solari/src/realtime/mod.rs
+index 0ab1e13fe6029..c9a6f7ff1d1e8 100644
+--- a/crates/bevy_solari/src/realtime/mod.rs
++++ b/crates/bevy_solari/src/realtime/mod.rs
+@@ -39,7 +39,7 @@ impl Plugin for SolariLightingPlugin {
+         load_shader_library!(app, "presample_light_tiles.wgsl");
+         embedded_asset!(app, "restir_di.wgsl");
+         embedded_asset!(app, "restir_gi.wgsl");
+-        embedded_asset!(app, "specular_gi.wgsl");
++        load_shader_library!(app, "specular_gi.wgsl");
+         load_shader_library!(app, "world_cache_query.wgsl");
+         embedded_asset!(app, "world_cache_compact.wgsl");
+         embedded_asset!(app, "world_cache_update.wgsl");
+diff --git a/crates/bevy_solari/src/realtime/restir_di.wgsl b/crates/bevy_solari/src/realtime/restir_di.wgsl
+index 77a36cebd28de..01f2cbec13a3e 100644
+--- a/crates/bevy_solari/src/realtime/restir_di.wgsl
++++ b/crates/bevy_solari/src/realtime/restir_di.wgsl
+@@ -6,11 +6,12 @@
+ #import bevy_pbr::utils::{rand_f, rand_range_u, sample_disk}
+ #import bevy_render::maths::PI
+ #import bevy_render::view::View
+-#import bevy_solari::brdf::evaluate_brdf
++#import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf}
+ #import bevy_solari::gbuffer_utils::{gpixel_resolve, pixel_dissimilar, permute_pixel}
+ #import bevy_solari::presample_light_tiles::{ResolvedLightSamplePacked, unpack_resolved_light_sample}
+ #import bevy_solari::sampling::{LightSample, calculate_resolved_light_contribution, resolve_and_calculate_light_contribution, resolve_light_sample, trace_light_visibility, balance_heuristic}
+ #import bevy_solari::scene_bindings::{light_sources, previous_frame_light_id_translations, LIGHT_NOT_PRESENT_THIS_FRAME}
++#import bevy_solari::specular_gi::SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD
+ 
+ @group(1) @binding(0) var view_output: texture_storage_2d<rgba16float, read_write>;
+ @group(1) @binding(1) var<storage, read_write> light_tile_samples: array<LightSample>;
+@@ -93,7 +94,13 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
+ #endif
+ 
+     let wo = normalize(view.world_position - surface.world_position);
+-    let brdf = evaluate_brdf(surface.world_normal, wo, merge_result.wi, surface.material);
++    var brdf: vec3<f32>;
++    // If the surface is very smooth, let specular GI handle the specular lobe
++    if surface.material.roughness <= SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD {
++        brdf = evaluate_diffuse_brdf(surface.material.base_color, surface.material.metallic);
++    } else {
++        brdf = evaluate_brdf(surface.world_normal, wo, merge_result.wi, surface.material);
++    }
+ 
+     var pixel_color = merge_result.selected_sample_radiance * combined_reservoir.unbiased_contribution_weight;
+     pixel_color *= brdf;
+diff --git a/crates/bevy_solari/src/realtime/specular_gi.wgsl b/crates/bevy_solari/src/realtime/specular_gi.wgsl
+index 58b400076cdef..8c3d0e2496cbe 100644
+--- a/crates/bevy_solari/src/realtime/specular_gi.wgsl
++++ b/crates/bevy_solari/src/realtime/specular_gi.wgsl
+@@ -1,3 +1,5 @@
++#define_import_path bevy_solari::specular_gi
++
+ #import bevy_pbr::pbr_functions::calculate_tbn_mikktspace
+ #import bevy_render::maths::{orthonormalize, PI}
+ #import bevy_render::view::View
+@@ -16,6 +18,7 @@ struct PushConstants { frame_index: u32, reset: u32 }
+ var<push_constant> constants: PushConstants;
+ 
+ const DIFFUSE_GI_REUSE_ROUGHNESS_THRESHOLD: f32 = 0.4;
++const SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD: f32 = 0.0225;
+ const TERMINATE_IN_WORLD_CACHE_THRESHOLD: f32 = 0.03;
+ 
+ @compute @workgroup_size(8, 8, 1)
+@@ -57,7 +60,7 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
+         var a0 = dot(wo_unnormalized, wo_unnormalized) / (4.0 * PI * cos_theta);
+         a0 *= TERMINATE_IN_WORLD_CACHE_THRESHOLD;
+ 
+-        radiance = trace_glossy_path(surface.world_position, wi, pdf, a0, &rng) / pdf;
++        radiance = trace_glossy_path(surface.world_position, wi, surface.material.roughness, pdf, a0, &rng) / pdf;
+     }
+ 
+     let brdf = evaluate_specular_brdf(surface.world_normal, wo, wi, surface.material.base_color, surface.material.metallic,
+@@ -74,7 +77,7 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
+ #endif
+ }
+ 
+-fn trace_glossy_path(initial_ray_origin: vec3<f32>, initial_wi: vec3<f32>, initial_p_bounce: f32, a0: f32, rng: ptr<function, u32>) -> vec3<f32> {
++fn trace_glossy_path(initial_ray_origin: vec3<f32>, initial_wi: vec3<f32>, initial_roughness: f32, initial_p_bounce: f32, a0: f32, rng: ptr<function, u32>) -> vec3<f32> {
+     var ray_origin = initial_ray_origin;
+     var wi = initial_wi;
+     var p_bounce = initial_p_bounce;
+@@ -98,10 +101,9 @@ fn trace_glossy_path(initial_ray_origin: vec3<f32>, initial_wi: vec3<f32>, initi
+         let wo = -wi;
+         let wo_tangent = vec3(dot(wo, T), dot(wo, B), dot(wo, N));
+ 
+-        // Add emissive contribution (but not on the first bounce, since ReSTIR DI handles that)
+-        if i != 0u {
+-            radiance += throughput * emissive_mis_weight(p_bounce, ray_hit, surface_perfectly_specular) * ray_hit.material.emissive;
+-        }
++        // Add emissive contribution
++        let mis_weight = emissive_mis_weight(i, initial_roughness, p_bounce, ray_hit, surface_perfectly_specular);
++        radiance += throughput * mis_weight * ray_hit.material.emissive;
+ 
+         // Should not perform NEE for mirror-like surfaces
+         surface_perfectly_specular = ray_hit.material.roughness <= 0.001 && ray_hit.material.metallic > 0.9999;
+@@ -137,11 +139,20 @@ fn trace_glossy_path(initial_ray_origin: vec3<f32>, initial_wi: vec3<f32>, initi
+     return radiance;
+ }
+ 
+-fn emissive_mis_weight(p_bounce: f32, ray_hit: ResolvedRayHitFull, previous_surface_perfectly_specular: bool) -> f32 {
+-    if previous_surface_perfectly_specular { return 1.0; }
++fn emissive_mis_weight(i: u32, initial_roughness: f32, p_bounce: f32, ray_hit: ResolvedRayHitFull, previous_surface_perfectly_specular: bool) -> f32 {
++    if i != 0u {
++        if previous_surface_perfectly_specular { return 1.0; }
+ 
+-    let p_light = random_emissive_light_pdf(ray_hit);
+-    return power_heuristic(p_bounce, p_light);
++        let p_light = random_emissive_light_pdf(ray_hit);
++        return power_heuristic(p_bounce, p_light);
++    } else {
++        // The first bounce gets MIS weight 0.0 or 1.0 depending on if ReSTIR DI shaded using the specular lobe or not
++        if initial_roughness <= SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD {
++            return 1.0;
++        } else {
++            return 0.0;
++        }
++    }
+ }
+ 
+ fn nee_mis_weight(inverse_p_light: f32, brdf_rays_can_hit: bool, wo_tangent: vec3<f32>, wi: vec3<f32>, ray_hit: ResolvedRayHitFull, TBN: mat3x3<f32>) -> f32 {

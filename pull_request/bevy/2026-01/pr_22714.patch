@@ -1,0 +1,249 @@
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index 7c313648acdea..9b45c6bd74736 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -90,6 +90,7 @@ use alloc::sync::Arc;
+ use batching::gpu_preprocessing::BatchingPlugin;
+ use bevy_app::{App, AppLabel, Plugin, SubApp};
+ use bevy_asset::{AssetApp, AssetServer};
++use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     prelude::*,
+     schedule::{ScheduleBuildSettings, ScheduleLabel},
+@@ -99,7 +100,6 @@ use bevy_shader::{load_shader_library, Shader, ShaderLoader};
+ use bevy_utils::prelude::default;
+ use bevy_window::{PrimaryWindow, RawHandleWrapperHolder};
+ use bitflags::bitflags;
+-use core::ops::{Deref, DerefMut};
+ use globals::GlobalsPlugin;
+ use occlusion_culling::OcclusionCullingPlugin;
+ use render_asset::{
+@@ -260,25 +260,11 @@ pub struct ExtractSchedule;
+ /// This resource is only available during [`ExtractSchedule`] and not
+ /// during command application of that schedule.
+ /// See [`Extract`] for more details.
+-#[derive(Resource, Default)]
++#[derive(Resource, Default, Deref, DerefMut)]
+ pub struct MainWorld(World);
+ 
+-impl Deref for MainWorld {
+-    type Target = World;
+-
+-    fn deref(&self) -> &Self::Target {
+-        &self.0
+-    }
+-}
+-
+-impl DerefMut for MainWorld {
+-    fn deref_mut(&mut self) -> &mut Self::Target {
+-        &mut self.0
+-    }
+-}
+-
+-#[derive(Resource)]
+-struct FutureRenderResources(Arc<Mutex<Option<RenderResources>>>);
++#[derive(Resource, Default, Clone, Deref)]
++pub(crate) struct FutureRenderResources(Arc<Mutex<Option<RenderResources>>>);
+ 
+ /// A label for the rendering sub-app.
+ #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, AppLabel)]
+@@ -290,64 +276,31 @@ impl Plugin for RenderPlugin {
+         app.init_asset::<Shader>()
+             .init_asset_loader::<ShaderLoader>();
+ 
+-        match &self.render_creation {
+-            RenderCreation::Manual(resources) => {
+-                let future_render_resources_wrapper = Arc::new(Mutex::new(Some(resources.clone())));
+-                app.insert_resource(FutureRenderResources(
+-                    future_render_resources_wrapper.clone(),
+-                ));
+-                // SAFETY: Plugins should be set up on the main thread.
+-                unsafe { initialize_render_app(app) };
+-            }
+-            RenderCreation::Automatic(render_creation) => {
+-                if let Some(backends) = render_creation.backends {
+-                    let future_render_resources_wrapper = Arc::new(Mutex::new(None));
+-                    app.insert_resource(FutureRenderResources(
+-                        future_render_resources_wrapper.clone(),
+-                    ));
+-
+-                    let primary_window = app
+-                        .world_mut()
+-                        .query_filtered::<&RawHandleWrapperHolder, With<PrimaryWindow>>()
+-                        .single(app.world())
+-                        .ok()
+-                        .cloned();
+-
+-                    let settings = render_creation.clone();
+-
+-                    #[cfg(feature = "raw_vulkan_init")]
+-                    let raw_vulkan_init_settings = app
+-                        .world_mut()
+-                        .get_resource::<renderer::raw_vulkan_init::RawVulkanInitSettings>()
+-                        .cloned()
+-                        .unwrap_or_default();
+-
+-                    let async_renderer = async move {
+-                        let render_resources = renderer::initialize_renderer(
+-                            backends,
+-                            primary_window,
+-                            &settings,
+-                            #[cfg(feature = "raw_vulkan_init")]
+-                            raw_vulkan_init_settings,
+-                        )
+-                        .await;
+-
+-                        *future_render_resources_wrapper.lock().unwrap() = Some(render_resources);
+-                    };
+-
+-                    // In wasm, spawn a task and detach it for execution
+-                    #[cfg(target_arch = "wasm32")]
+-                    bevy_tasks::IoTaskPool::get()
+-                        .spawn_local(async_renderer)
+-                        .detach();
+-                    // Otherwise, just block for it to complete
+-                    #[cfg(not(target_arch = "wasm32"))]
+-                    bevy_tasks::block_on(async_renderer);
+-
+-                    // SAFETY: Plugins should be set up on the main thread.
+-                    unsafe { initialize_render_app(app) };
+-                }
+-            }
++        let primary_window = app
++            .world_mut()
++            .query_filtered::<&RawHandleWrapperHolder, With<PrimaryWindow>>()
++            .single(app.world())
++            .ok()
++            .cloned();
++
++        #[cfg(feature = "raw_vulkan_init")]
++        let raw_vulkan_init_settings = app
++            .world_mut()
++            .get_resource::<renderer::raw_vulkan_init::RawVulkanInitSettings>()
++            .cloned()
++            .unwrap_or_default();
++
++        let future_resources = FutureRenderResources::default();
++        if self.render_creation.create_render(
++            future_resources.clone(),
++            primary_window,
++            #[cfg(feature = "raw_vulkan_init")]
++            raw_vulkan_init_settings,
++        ) {
++            // Note that `future_resources` is not necessarily populated here yet.
++            app.insert_resource(future_resources);
++            // SAFETY: Plugins should be set up on the main thread.
++            unsafe { initialize_render_app(app) };
+         };
+ 
+         app.add_plugins((
+@@ -383,9 +336,17 @@ impl Plugin for RenderPlugin {
+     }
+ 
+     fn ready(&self, app: &App) -> bool {
++        // This is a little tricky. `FutureRenderResources` is added in `build`, which runs synchronously before `ready`.
++        // It is only added if there is a wgpu backend and thus the renderer can be created.
++        // Hence, if we try and get the resource and it is not present, that means we are ready, because we dont need it.
++        // On the other hand, if the resource is present, then we try and lock on it. The lock can fail, in which case
++        // we currently can assume that means the `FutureRenderResources` is in the act of being populated, because
++        // that is the only other place the lock may be held. If it is being populated, we can assume we're ready. This
++        // happens via the `and_then` falling through to the same `unwrap_or(true)` case as when there's no resource.
++        // If the lock succeeds, we can straightforwardly check if it is populated. If it is not, then we're not ready.
+         app.world()
+             .get_resource::<FutureRenderResources>()
+-            .and_then(|frr| frr.0.try_lock().map(|locked| locked.is_some()).ok())
++            .and_then(|frr| frr.try_lock().map(|locked| locked.is_some()).ok())
+             .unwrap_or(true)
+     }
+ 
+diff --git a/crates/bevy_render/src/settings.rs b/crates/bevy_render/src/settings.rs
+index c3b284ecc13b4..34a2382017a40 100644
+--- a/crates/bevy_render/src/settings.rs
++++ b/crates/bevy_render/src/settings.rs
+@@ -1,7 +1,9 @@
+-use crate::renderer::{
+-    RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue,
++use crate::{
++    renderer::{self, RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue},
++    FutureRenderResources,
+ };
+ use alloc::borrow::Cow;
++use bevy_window::RawHandleWrapperHolder;
+ 
+ pub use wgpu::{
+     Backends, Dx12Compiler, Features as WgpuFeatures, Gles3MinorVersion, InstanceFlags,
+@@ -151,8 +153,7 @@ pub struct RenderResources(
+     pub RenderAdapterInfo,
+     pub RenderAdapter,
+     pub RenderInstance,
+-    #[cfg(feature = "raw_vulkan_init")]
+-    pub  crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures,
++    #[cfg(feature = "raw_vulkan_init")] pub renderer::raw_vulkan_init::AdditionalVulkanFeatures,
+ );
+ 
+ /// An enum describing how the renderer will initialize resources. This is used when creating the [`RenderPlugin`](crate::RenderPlugin).
+@@ -176,7 +177,7 @@ impl RenderCreation {
+         adapter: RenderAdapter,
+         instance: RenderInstance,
+         #[cfg(feature = "raw_vulkan_init")]
+-        additional_vulkan_features: crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures,
++        additional_vulkan_features: renderer::raw_vulkan_init::AdditionalVulkanFeatures,
+     ) -> Self {
+         RenderResources(
+             device,
+@@ -189,6 +190,55 @@ impl RenderCreation {
+         )
+         .into()
+     }
++
++    /// Creates [`RenderResources`] from this [`RenderCreation`] and an optional primary window
++    /// and writes them into `future_resources`, possibly asynchronously.
++    ///
++    /// Returns true if creation was successful, false otherwise.
++    ///
++    /// Note: [`RenderCreation::Manual`] will ignore the provided primary window.
++    pub(crate) fn create_render(
++        &self,
++        future_resources: FutureRenderResources,
++        primary_window: Option<RawHandleWrapperHolder>,
++        #[cfg(feature = "raw_vulkan_init")]
++        raw_vulkan_init_settings: renderer::raw_vulkan_init::RawVulkanInitSettings,
++    ) -> bool {
++        match self {
++            RenderCreation::Manual(resources) => {
++                *future_resources.lock().unwrap() = Some(resources.clone());
++            }
++            RenderCreation::Automatic(render_creation) => {
++                let Some(backends) = render_creation.backends else {
++                    return false;
++                };
++                let settings = render_creation.clone();
++
++                let async_renderer = async move {
++                    let render_resources = renderer::initialize_renderer(
++                        backends,
++                        primary_window,
++                        &settings,
++                        #[cfg(feature = "raw_vulkan_init")]
++                        raw_vulkan_init_settings,
++                    )
++                    .await;
++
++                    *future_resources.lock().unwrap() = Some(render_resources);
++                };
++
++                // In wasm, spawn a task and detach it for execution
++                #[cfg(target_arch = "wasm32")]
++                bevy_tasks::IoTaskPool::get()
++                    .spawn_local(async_renderer)
++                    .detach();
++                // Otherwise, just block for it to complete
++                #[cfg(not(target_arch = "wasm32"))]
++                bevy_tasks::block_on(async_renderer);
++            }
++        }
++        true
++    }
+ }
+ 
+ impl From<RenderResources> for RenderCreation {

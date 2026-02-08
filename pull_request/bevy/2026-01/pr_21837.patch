@@ -1,0 +1,1759 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 680a16549dc94..5e9f2d26060bb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5092,6 +5092,14 @@ doc-scrape-examples = false
+ [package.metadata.example.test_invalid_skinned_mesh]
+ hidden = true
+ 
++[[example]]
++name = "test_skinned_mesh_bounds"
++path = "tests/3d/test_skinned_mesh_bounds.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.test_skinned_mesh_bounds]
++hidden = true
++
+ [profile.wasm-release]
+ inherits = "release"
+ opt-level = "z"
+diff --git a/crates/bevy_camera/src/visibility/mod.rs b/crates/bevy_camera/src/visibility/mod.rs
+index f8c0faa3f73db..515dc79c3afd1 100644
+--- a/crates/bevy_camera/src/visibility/mod.rs
++++ b/crates/bevy_camera/src/visibility/mod.rs
+@@ -6,6 +6,9 @@ use core::any::TypeId;
+ use bevy_ecs::entity::EntityHashMap;
+ use bevy_ecs::lifecycle::HookContext;
+ use bevy_ecs::world::DeferredWorld;
++use bevy_mesh::skinning::{
++    entity_aabb_from_skinned_mesh_bounds, SkinnedMesh, SkinnedMeshInverseBindposes,
++};
+ use derive_more::derive::{Deref, DerefMut};
+ pub use range::*;
+ pub use render_layers::*;
+@@ -265,6 +268,19 @@ impl<'a> SetViewVisibility for Mut<'a, ViewVisibility> {
+ #[reflect(Component, Default, Debug)]
+ pub struct NoFrustumCulling;
+ 
++/// Use this component to enable dynamic skinned mesh bounds. The [`Aabb`]
++/// component of the skinned mesh will be automatically updated each frame based
++/// on the current joint transforms.
++///
++/// `DynamicSkinnedMeshBounds` depends on data from `Mesh::skinned_mesh_bounds`
++/// and `SkinnedMesh`. The resulting `Aabb` will reliably enclose meshes where
++/// vertex positions are only affected by skinning. But the `Aabb` may be larger
++/// than is optimal, and doesn't account for morph targets, vertex shaders, and
++/// anything else that modifies vertex positions.
++#[derive(Debug, Component, Default, Reflect)]
++#[reflect(Component, Default, Debug)]
++pub struct DynamicSkinnedMeshBounds;
++
+ /// Collection of entities visible from the current view.
+ ///
+ /// This component contains all entities which are visible from the currently
+@@ -420,7 +436,9 @@ impl Plugin for VisibilityPlugin {
+             .add_systems(
+                 PostUpdate,
+                 (
+-                    calculate_bounds.in_set(CalculateBounds),
++                    (calculate_bounds, update_skinned_mesh_bounds)
++                        .chain()
++                        .in_set(CalculateBounds),
+                     (visibility_propagate_system, reset_view_visibility)
+                         .in_set(VisibilityPropagate),
+                     check_visibility.in_set(CheckVisibility),
+@@ -485,6 +503,36 @@ pub fn calculate_bounds(
+         });
+ }
+ 
++// Update the `Aabb` component of all skinned mesh entities with a `DynamicSkinnedMeshBounds`
++// component.
++fn update_skinned_mesh_bounds(
++    inverse_bindposes_assets: Res<Assets<SkinnedMeshInverseBindposes>>,
++    mesh_assets: Res<Assets<Mesh>>,
++    mut mesh_entities: Query<
++        (&mut Aabb, &Mesh3d, &SkinnedMesh, Option<&GlobalTransform>),
++        With<DynamicSkinnedMeshBounds>,
++    >,
++    joint_entities: Query<&GlobalTransform>,
++) {
++    mesh_entities
++        .par_iter_mut()
++        .for_each(|(mut aabb, mesh, skinned_mesh, world_from_entity)| {
++            if let Some(inverse_bindposes_asset) =
++                inverse_bindposes_assets.get(&skinned_mesh.inverse_bindposes)
++                && let Some(mesh_asset) = mesh_assets.get(mesh)
++                && let Ok(skinned_aabb) = entity_aabb_from_skinned_mesh_bounds(
++                    &joint_entities,
++                    mesh_asset,
++                    skinned_mesh,
++                    inverse_bindposes_asset,
++                    world_from_entity,
++                )
++            {
++                *aabb = skinned_aabb.into();
++            }
++        });
++}
++
+ /// Updates [`Frustum`].
+ ///
+ /// This system is used in [`CameraProjectionPlugin`](crate::CameraProjectionPlugin).
+diff --git a/crates/bevy_gizmos/Cargo.toml b/crates/bevy_gizmos/Cargo.toml
+index 21b9ba0529720..fc709fa9bce65 100644
+--- a/crates/bevy_gizmos/Cargo.toml
++++ b/crates/bevy_gizmos/Cargo.toml
+@@ -21,6 +21,7 @@ bevy_reflect = { path = "../bevy_reflect", version = "0.19.0-dev" }
+ bevy_transform = { path = "../bevy_transform", version = "0.19.0-dev" }
+ bevy_gizmos_macros = { path = "macros", version = "0.19.0-dev" }
+ bevy_time = { path = "../bevy_time", version = "0.19.0-dev" }
++bevy_mesh = { path = "../bevy_mesh", version = "0.19.0-dev", optional = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/bevy_gizmos/src/lib.rs b/crates/bevy_gizmos/src/lib.rs
+index ef5a51f03dc35..9cf6d38892b90 100755
+--- a/crates/bevy_gizmos/src/lib.rs
++++ b/crates/bevy_gizmos/src/lib.rs
+@@ -36,6 +36,9 @@ pub mod primitives;
+ pub mod retained;
+ pub mod rounded_box;
+ 
++#[cfg(feature = "bevy_mesh")]
++pub mod skinned_mesh_bounds;
++
+ /// The gizmos prelude.
+ ///
+ /// This includes the most common types in this crate, re-exported for your convenience.
+@@ -43,6 +46,12 @@ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::aabb::{AabbGizmoConfigGroup, ShowAabbGizmo};
+ 
++    #[doc(hidden)]
++    #[cfg(feature = "bevy_mesh")]
++    pub use crate::skinned_mesh_bounds::{
++        ShowSkinnedMeshBoundsGizmo, SkinnedMeshBoundsGizmoConfigGroup,
++    };
++
+     #[doc(hidden)]
+     pub use crate::{
+         config::{
+@@ -74,6 +83,9 @@ use config::{DefaultGizmoConfigGroup, GizmoConfig, GizmoConfigGroup, GizmoConfig
+ use core::{any::TypeId, marker::PhantomData, mem};
+ use gizmos::{GizmoStorage, Swap};
+ 
++#[cfg(feature = "bevy_mesh")]
++use crate::skinned_mesh_bounds::SkinnedMeshBoundsGizmoPlugin;
++
+ /// A [`Plugin`] that provides an immediate mode drawing api for visual debugging.
+ #[derive(Default)]
+ pub struct GizmoPlugin;
+@@ -86,6 +98,9 @@ impl Plugin for GizmoPlugin {
+             .init_gizmo_group::<DefaultGizmoConfigGroup>();
+ 
+         app.add_plugins((aabb::AabbGizmoPlugin, global::GlobalGizmosPlugin));
++
++        #[cfg(feature = "bevy_mesh")]
++        app.add_plugins(SkinnedMeshBoundsGizmoPlugin);
+     }
+ }
+ 
+diff --git a/crates/bevy_gizmos/src/skinned_mesh_bounds.rs b/crates/bevy_gizmos/src/skinned_mesh_bounds.rs
+new file mode 100644
+index 0000000000000..2ec322a9976d5
+--- /dev/null
++++ b/crates/bevy_gizmos/src/skinned_mesh_bounds.rs
+@@ -0,0 +1,164 @@
++//! A module adding debug visualization of [`DynamicSkinnedMeshBounds`].
++
++use bevy_app::{Plugin, PostUpdate};
++use bevy_asset::Assets;
++use bevy_camera::visibility::DynamicSkinnedMeshBounds;
++use bevy_color::Color;
++use bevy_ecs::{
++    component::Component,
++    query::{With, Without},
++    reflect::ReflectComponent,
++    schedule::IntoScheduleConfigs,
++    system::{Query, Res},
++};
++use bevy_math::Affine3A;
++use bevy_mesh::{
++    mark_3d_meshes_as_changed_if_their_assets_changed,
++    skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
++    Mesh, Mesh3d,
++};
++use bevy_reflect::{std_traits::ReflectDefault, Reflect};
++use bevy_transform::{components::GlobalTransform, TransformSystems};
++
++use crate::{
++    config::{GizmoConfigGroup, GizmoConfigStore},
++    gizmos::Gizmos,
++    AppGizmoBuilder,
++};
++
++/// A [`Plugin`] that provides visualization of entities with [`DynamicSkinnedMeshBounds`].
++pub struct SkinnedMeshBoundsGizmoPlugin;
++
++impl Plugin for SkinnedMeshBoundsGizmoPlugin {
++    fn build(&self, app: &mut bevy_app::App) {
++        app.init_gizmo_group::<SkinnedMeshBoundsGizmoConfigGroup>()
++            .add_systems(
++                PostUpdate,
++                (
++                    draw_skinned_mesh_bounds,
++                    draw_all_skinned_mesh_bounds.run_if(|config: Res<GizmoConfigStore>| {
++                        config
++                            .config::<SkinnedMeshBoundsGizmoConfigGroup>()
++                            .1
++                            .draw_all
++                    }),
++                )
++                    .after(TransformSystems::Propagate)
++                    .ambiguous_with(mark_3d_meshes_as_changed_if_their_assets_changed),
++            );
++    }
++}
++/// The [`GizmoConfigGroup`] used for debug visualizations of entities with [`DynamicSkinnedMeshBounds`]
++#[derive(Clone, Reflect, GizmoConfigGroup)]
++#[reflect(Clone, Default)]
++pub struct SkinnedMeshBoundsGizmoConfigGroup {
++    /// When set to `true`, draws all the bounds that contribute to skinned mesh
++    /// bounds.
++    ///
++    /// To draw a specific entity's skinned mesh bounds, you can add the [`ShowSkinnedMeshBoundsGizmo`] component.
++    ///
++    /// Defaults to `false`.
++    pub draw_all: bool,
++    /// The default color for skinned mesh bounds gizmos.
++    pub default_color: Color,
++}
++
++impl Default for SkinnedMeshBoundsGizmoConfigGroup {
++    fn default() -> Self {
++        Self {
++            draw_all: false,
++            default_color: Color::WHITE,
++        }
++    }
++}
++
++/// Add this [`Component`] to an entity to draw its [`DynamicSkinnedMeshBounds`] component.
++#[derive(Component, Reflect, Default, Debug)]
++#[reflect(Component, Default, Debug)]
++pub struct ShowSkinnedMeshBoundsGizmo {
++    /// The color of the bounds.
++    ///
++    /// The default color from the [`SkinnedMeshBoundsGizmoConfigGroup`] config is used if `None`,
++    pub color: Option<Color>,
++}
++
++fn draw(
++    color: Color,
++    mesh: &Mesh3d,
++    mesh_assets: &Res<Assets<Mesh>>,
++    skinned_mesh: &SkinnedMesh,
++    joint_entities: &Query<&GlobalTransform>,
++    inverse_bindposes_assets: &Res<Assets<SkinnedMeshInverseBindposes>>,
++    gizmos: &mut Gizmos<SkinnedMeshBoundsGizmoConfigGroup>,
++) {
++    if let Some(mesh_asset) = mesh_assets.get(mesh)
++        && let Some(bounds) = mesh_asset.skinned_mesh_bounds()
++        && let Some(inverse_bindposes_asset) =
++            inverse_bindposes_assets.get(&skinned_mesh.inverse_bindposes)
++    {
++        for (&joint_index, &joint_aabb) in bounds.iter() {
++            let joint_index = joint_index.0 as usize;
++
++            if let Some(&joint_entity) = skinned_mesh.joints.get(joint_index)
++                && let Ok(&world_from_joint) = joint_entities.get(joint_entity)
++                && let Some(&joint_from_mesh) = inverse_bindposes_asset.get(joint_index)
++            {
++                let world_from_mesh =
++                    world_from_joint.affine() * Affine3A::from_mat4(joint_from_mesh);
++
++                gizmos.aabb_3d(joint_aabb, world_from_mesh, color);
++            }
++        }
++    }
++}
++
++fn draw_skinned_mesh_bounds(
++    mesh_entities: Query<
++        (&Mesh3d, &SkinnedMesh, &ShowSkinnedMeshBoundsGizmo),
++        With<DynamicSkinnedMeshBounds>,
++    >,
++    joint_entities: Query<&GlobalTransform>,
++    mesh_assets: Res<Assets<Mesh>>,
++    inverse_bindposes_assets: Res<Assets<SkinnedMeshInverseBindposes>>,
++    mut gizmos: Gizmos<SkinnedMeshBoundsGizmoConfigGroup>,
++) {
++    for (mesh, skinned_mesh, gizmo) in mesh_entities {
++        let color = gizmo.color.unwrap_or(gizmos.config_ext.default_color);
++
++        draw(
++            color,
++            mesh,
++            &mesh_assets,
++            skinned_mesh,
++            &joint_entities,
++            &inverse_bindposes_assets,
++            &mut gizmos,
++        );
++    }
++}
++
++fn draw_all_skinned_mesh_bounds(
++    mesh_entities: Query<
++        (&Mesh3d, &SkinnedMesh),
++        (
++            With<DynamicSkinnedMeshBounds>,
++            Without<ShowSkinnedMeshBoundsGizmo>,
++        ),
++    >,
++    joint_entities: Query<&GlobalTransform>,
++    mesh_assets: Res<Assets<Mesh>>,
++    inverse_bindposes_assets: Res<Assets<SkinnedMeshInverseBindposes>>,
++    mut gizmos: Gizmos<SkinnedMeshBoundsGizmoConfigGroup>,
++) {
++    for (mesh, skinned_mesh) in mesh_entities {
++        draw(
++            gizmos.config_ext.default_color,
++            mesh,
++            &mesh_assets,
++            skinned_mesh,
++            &joint_entities,
++            &inverse_bindposes_assets,
++            &mut gizmos,
++        );
++    }
++}
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index d9a8640803d53..895bdb6f8b752 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -136,6 +136,7 @@ mod vertex_attributes;
+ extern crate alloc;
+ 
+ use alloc::sync::Arc;
++use serde::{Deserialize, Serialize};
+ use std::sync::Mutex;
+ use tracing::warn;
+ 
+@@ -191,6 +192,24 @@ impl DefaultGltfImageSampler {
+     }
+ }
+ 
++/// Controls the bounds related components that are assigned to skinned mesh
++/// entities. These components are used by systems like frustum culling.
++#[derive(Default, Copy, Clone, PartialEq, Serialize, Deserialize)]
++pub enum GltfSkinnedMeshBoundsPolicy {
++    /// Skinned meshes are assigned an `Aabb` component calculated from the bind
++    /// pose `Mesh`.
++    BindPose,
++    /// Skinned meshes are created with [`SkinnedMeshBounds`](bevy_mesh::skinning::SkinnedMeshBounds)
++    /// and assigned a [`DynamicSkinnedMeshBounds`](bevy_camera::visibility::DynamicSkinnedMeshBounds)
++    /// component. See `DynamicSkinnedMeshBounds` for details.
++    #[default]
++    Dynamic,
++    /// Same as `BindPose`, but also assign a `NoFrustumCulling` component. That
++    /// component tells the `bevy_camera` plugin to avoid frustum culling the
++    /// skinned mesh.
++    NoFrustumCulling,
++}
++
+ /// Adds support for glTF file loading to the app.
+ pub struct GltfPlugin {
+     /// The default image sampler to lay glTF sampler data on top of.
+@@ -206,6 +225,10 @@ pub struct GltfPlugin {
+     ///
+     /// To specify, use [`GltfPlugin::add_custom_vertex_attribute`].
+     pub custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
++
++    /// The default policy for skinned mesh bounds. Can be overridden by
++    /// [`GltfLoaderSettings::skinned_mesh_bounds_policy`].
++    pub skinned_mesh_bounds_policy: GltfSkinnedMeshBoundsPolicy,
+ }
+ 
+ impl Default for GltfPlugin {
+@@ -214,6 +237,7 @@ impl Default for GltfPlugin {
+             default_sampler: ImageSamplerDescriptor::linear(),
+             custom_vertex_attributes: HashMap::default(),
+             convert_coordinates: GltfConvertCoordinates::default(),
++            skinned_mesh_bounds_policy: Default::default(),
+         }
+     }
+ }
+@@ -268,6 +292,7 @@ impl Plugin for GltfPlugin {
+             default_sampler,
+             default_convert_coordinates: self.convert_coordinates,
+             extensions: extensions.0.clone(),
++            default_skinned_mesh_bounds_policy: self.skinned_mesh_bounds_policy,
+         });
+     }
+ }
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index fd60f155659ee..bb5b9ade2e077 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -10,8 +10,9 @@ use bevy_asset::{
+     ReadAssetBytesError, RenderAssetUsages,
+ };
+ use bevy_camera::{
+-    primitives::Aabb, visibility::Visibility, Camera, Camera3d, OrthographicProjection,
+-    PerspectiveProjection, Projection, ScalingMode,
++    primitives::Aabb,
++    visibility::{DynamicSkinnedMeshBounds, NoFrustumCulling, Visibility},
++    Camera, Camera3d, OrthographicProjection, PerspectiveProjection, Projection, ScalingMode,
+ };
+ use bevy_color::{Color, LinearRgba};
+ use bevy_ecs::{
+@@ -57,7 +58,7 @@ use tracing::{error, info_span, warn};
+ use crate::{
+     convert_coordinates::ConvertCoordinates as _, vertex_attributes::convert_attribute, Gltf,
+     GltfAssetLabel, GltfExtras, GltfMaterialExtras, GltfMaterialName, GltfMeshExtras, GltfMeshName,
+-    GltfNode, GltfSceneExtras, GltfSkin,
++    GltfNode, GltfSceneExtras, GltfSkin, GltfSkinnedMeshBoundsPolicy,
+ };
+ 
+ #[cfg(feature = "bevy_animation")]
+@@ -156,6 +157,9 @@ pub struct GltfLoader {
+     /// These are Bevy-side processors designed to access glTF
+     /// extension data during the loading process.
+     pub extensions: Arc<RwLock<Vec<Box<dyn extensions::GltfExtensionHandler>>>>,
++    /// The default policy for skinned mesh bounds. Can be overridden by
++    /// [`GltfLoaderSettings::skinned_mesh_bounds_policy`].
++    pub default_skinned_mesh_bounds_policy: GltfSkinnedMeshBoundsPolicy,
+ }
+ 
+ /// Specifies optional settings for processing gltfs at load time. By default, all recognized contents of
+@@ -205,6 +209,8 @@ pub struct GltfLoaderSettings {
+     ///
+     /// If `None`, uses the global default set by [`GltfPlugin::convert_coordinates`](crate::GltfPlugin::convert_coordinates).
+     pub convert_coordinates: Option<GltfConvertCoordinates>,
++    /// Optionally overrides [`GltfPlugin::skinned_mesh_bounds_policy`](crate::GltfPlugin).
++    pub skinned_mesh_bounds_policy: Option<GltfSkinnedMeshBoundsPolicy>,
+ }
+ 
+ impl Default for GltfLoaderSettings {
+@@ -219,6 +225,7 @@ impl Default for GltfLoaderSettings {
+             default_sampler: None,
+             override_sampler: false,
+             convert_coordinates: None,
++            skinned_mesh_bounds_policy: None,
+         }
+     }
+ }
+@@ -275,6 +282,10 @@ impl GltfLoader {
+             None => loader.default_convert_coordinates,
+         };
+ 
++        let skinned_mesh_bounds_policy = settings
++            .skinned_mesh_bounds_policy
++            .unwrap_or(loader.default_skinned_mesh_bounds_policy);
++
+         #[cfg(feature = "bevy_animation")]
+         let (animations, named_animations, animation_roots) = if settings.load_animations {
+             use bevy_animation::{
+@@ -809,6 +820,13 @@ impl GltfLoader {
+                     });
+                 }
+ 
++                if (skinned_mesh_bounds_policy == GltfSkinnedMeshBoundsPolicy::Dynamic)
++                    && meshes_on_skinned_nodes.contains(&gltf_mesh.index())
++                    && let Err(err) = mesh.generate_skinned_mesh_bounds()
++                {
++                    warn!("Failed to generate skinned mesh bounds: {err}");
++                }
++
+                 let mesh_handle = load_context.add_labeled_asset(primitive_label.to_string(), mesh);
+                 primitives.push(super::GltfPrimitive::new(
+                     &gltf_mesh,
+@@ -994,6 +1012,7 @@ impl GltfLoader {
+                             &texture_handles,
+                             &convert_coordinates,
+                             &mut extensions,
++                            skinned_mesh_bounds_policy,
+                         );
+                         if result.is_err() {
+                             err = Some(result);
+@@ -1459,6 +1478,7 @@ fn load_node(
+     textures: &[Handle<Image>],
+     convert_coordinates: &GltfConvertCoordinates,
+     extensions: &mut [Box<dyn extensions::GltfExtensionHandler>],
++    skinned_mesh_bounds_policy: GltfSkinnedMeshBoundsPolicy,
+ ) -> Result<(), GltfError> {
+     let mut gltf_error = None;
+     let transform = node_transform(gltf_node);
+@@ -1597,6 +1617,18 @@ fn load_node(
+                     mesh_entity_transform,
+                 ));
+ 
++                if gltf_node.skin().is_some() {
++                    match skinned_mesh_bounds_policy {
++                        GltfSkinnedMeshBoundsPolicy::Dynamic => {
++                            mesh_entity.insert(DynamicSkinnedMeshBounds);
++                        }
++                        GltfSkinnedMeshBoundsPolicy::NoFrustumCulling => {
++                            mesh_entity.insert(NoFrustumCulling);
++                        }
++                        _ => {}
++                    }
++                }
++
+                 let target_count = primitive.morph_targets().len();
+                 if target_count != 0 {
+                     let weights = match mesh.weights() {
+@@ -1774,6 +1806,7 @@ fn load_node(
+                 textures,
+                 convert_coordinates,
+                 extensions,
++                skinned_mesh_bounds_policy,
+             ) {
+                 gltf_error = Some(err);
+                 return;
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 5d123bf5a11fe..25fe37c361b53 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -225,7 +225,7 @@ bevy_text = [
+   "bevy_sprite_render?/bevy_text",
+ ]
+ bevy_ui = ["dep:bevy_ui", "bevy_text", "bevy_sprite"]
+-bevy_mesh = ["dep:bevy_mesh", "bevy_image"]
++bevy_mesh = ["dep:bevy_mesh", "bevy_image", "bevy_gizmos?/bevy_mesh"]
+ bevy_animation = ["dep:bevy_animation", "bevy_mesh"]
+ bevy_mikktspace = ["bevy_mesh?/bevy_mikktspace"]
+ bevy_window = ["dep:bevy_window", "dep:bevy_a11y", "bevy_image"]
+diff --git a/crates/bevy_mesh/Cargo.toml b/crates/bevy_mesh/Cargo.toml
+index 7269759a7f2f3..8bdb7fd2a59f5 100644
+--- a/crates/bevy_mesh/Cargo.toml
++++ b/crates/bevy_mesh/Cargo.toml
+@@ -37,6 +37,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
+ derive_more = { version = "2", default-features = false, features = ["from"] }
+ 
+ [dev-dependencies]
++approx = "0.5"
+ serde_json = "1.0.140"
+ 
+ [features]
+diff --git a/crates/bevy_mesh/src/mesh.rs b/crates/bevy_mesh/src/mesh.rs
+index ea6482b1421c8..adf2b65e3a251 100644
+--- a/crates/bevy_mesh/src/mesh.rs
++++ b/crates/bevy_mesh/src/mesh.rs
+@@ -2,6 +2,7 @@ use bevy_transform::components::Transform;
+ pub use wgpu_types::PrimitiveTopology;
+ 
+ use super::{
++    skinning::{SkinnedMeshBounds, SkinnedMeshBoundsError},
+     triangle_area_normal, triangle_normal, FourIterators, Indices, MeshAttributeData,
+     MeshTrianglesError, MeshVertexAttribute, MeshVertexAttributeId, MeshVertexBufferLayout,
+     MeshVertexBufferLayoutRef, MeshVertexBufferLayouts, MeshWindingInvertError,
+@@ -257,6 +258,7 @@ pub struct Mesh {
+     /// Precomputed min and max extents of the mesh position data. Used mainly for constructing `Aabb`s for frustum culling.
+     /// This data will be set if/when a mesh is extracted to the GPU
+     pub final_aabb: Option<Aabb3d>,
++    skinned_mesh_bounds: Option<SkinnedMeshBounds>,
+ }
+ 
+ impl Mesh {
+@@ -349,6 +351,7 @@ impl Mesh {
+             asset_usage,
+             enable_raytracing: true,
+             final_aabb: None,
++            skinned_mesh_bounds: None,
+         }
+     }
+ 
+@@ -2178,6 +2181,37 @@ impl Mesh {
+             ..self.clone()
+         })
+     }
++
++    /// Get this mesh's [`SkinnedMeshBounds`].
++    pub fn skinned_mesh_bounds(&self) -> Option<&SkinnedMeshBounds> {
++        self.skinned_mesh_bounds.as_ref()
++    }
++
++    /// Set this mesh's [`SkinnedMeshBounds`].
++    pub fn set_skinned_mesh_bounds(&mut self, skinned_mesh_bounds: Option<SkinnedMeshBounds>) {
++        self.skinned_mesh_bounds = skinned_mesh_bounds;
++    }
++
++    /// Consumes the mesh and returns a mesh with the given [`SkinnedMeshBounds`].
++    pub fn with_skinned_mesh_bounds(
++        mut self,
++        skinned_mesh_bounds: Option<SkinnedMeshBounds>,
++    ) -> Self {
++        self.set_skinned_mesh_bounds(skinned_mesh_bounds);
++        self
++    }
++
++    /// Generate [`SkinnedMeshBounds`] for this mesh.
++    pub fn generate_skinned_mesh_bounds(&mut self) -> Result<(), SkinnedMeshBoundsError> {
++        self.skinned_mesh_bounds = Some(SkinnedMeshBounds::from_mesh(self)?);
++        Ok(())
++    }
++
++    /// Consumes the mesh and returns a mesh with generated [`SkinnedMeshBounds`].
++    pub fn with_generated_skinned_mesh_bounds(mut self) -> Result<Self, SkinnedMeshBoundsError> {
++        self.generate_skinned_mesh_bounds()?;
++        Ok(self)
++    }
+ }
+ 
+ #[cfg(feature = "morph")]
+diff --git a/crates/bevy_mesh/src/skinning.rs b/crates/bevy_mesh/src/skinning.rs
+index 53b93f9ff2507..bf63f69752d57 100644
+--- a/crates/bevy_mesh/src/skinning.rs
++++ b/crates/bevy_mesh/src/skinning.rs
+@@ -1,8 +1,14 @@
++use crate::{Mesh, MeshVertexAttribute, VertexAttributeValues, VertexFormat};
+ use bevy_asset::{AsAssetId, Asset, AssetId, Handle};
+-use bevy_ecs::{component::Component, entity::Entity, prelude::ReflectComponent};
+-use bevy_math::Mat4;
++use bevy_ecs::{component::Component, entity::Entity, prelude::ReflectComponent, system::Query};
++use bevy_math::{
++    bounding::{Aabb3d, BoundingVolume},
++    Affine3A, Mat4, Vec3, Vec3A,
++};
+ use bevy_reflect::prelude::*;
++use bevy_transform::components::GlobalTransform;
+ use core::ops::Deref;
++use thiserror::Error;
+ 
+ #[derive(Component, Debug, Default, Clone, Reflect)]
+ #[reflect(Component, Default, Debug, Clone)]
+@@ -37,3 +43,682 @@ impl Deref for SkinnedMeshInverseBindposes {
+         &self.0
+     }
+ }
++
++// The AABB of a joint. This is optimized for `transform_aabb` - center/size is
++// slightly faster than the min/max used by `bevy_math::Aabb3d`, and the vectors
++// don't benefit from alignment because they're broadcast loaded.
++#[derive(Copy, Clone, Debug, PartialEq, Reflect)]
++pub struct JointAabb {
++    pub center: Vec3,
++    pub half_size: Vec3,
++}
++
++impl JointAabb {
++    fn min(&self) -> Vec3 {
++        self.center - self.half_size
++    }
++
++    fn max(&self) -> Vec3 {
++        self.center + self.half_size
++    }
++}
++
++impl From<JointAabb> for Aabb3d {
++    fn from(value: JointAabb) -> Self {
++        Self {
++            min: value.min().into(),
++            max: value.max().into(),
++        }
++    }
++}
++
++impl From<Aabb3d> for JointAabb {
++    fn from(value: Aabb3d) -> Self {
++        Self {
++            center: value.center().into(),
++            half_size: value.half_size().into(),
++        }
++    }
++}
++
++/// Data that can be used to calculate the AABB of a skinned mesh.
++#[derive(Clone, Default, Debug, PartialEq, Reflect)]
++#[reflect(Clone)]
++pub struct SkinnedMeshBounds {
++    // Model-space AABBs that enclose the vertices skinned to a joint. Some
++    // joints may not be skinned to any vertices, so not every joint has an
++    // AABB.
++    //
++    // `aabb_index_to_joint_index` maps from an `aabbs` index to a joint index,
++    // which corresponds to `Mesh::ATTRIBUTE_JOINT_INDEX` and `SkinnedMesh::joints`.
++    //
++    // These arrays could be a single `Vec<(JointAabb, JointIndex)>`, but that
++    // would waste two bytes due to alignment.
++    //
++    // TODO: If https://github.com/bevyengine/bevy/issues/11570 is fixed, `Vec<_>`
++    // can be changed to `Box<[_]>`.
++    pub aabbs: Vec<JointAabb>,
++    pub aabb_index_to_joint_index: Vec<JointIndex>,
++}
++
++#[derive(Copy, Clone, PartialEq, Debug, Error)]
++pub enum SkinnedMeshBoundsError {
++    #[error("The mesh does not contain any joints that are skinned to vertices")]
++    NoSkinnedJoints,
++    #[error(transparent)]
++    MeshAttributeError(#[from] MeshAttributeError),
++}
++
++impl SkinnedMeshBounds {
++    /// Create a `SkinnedMeshBounds` from a [`Mesh`].
++    ///
++    /// The mesh is expected to have position, joint index and joint weight
++    /// attributes. If any are missing then a [`MeshAttributeError`] is returned.
++    pub fn from_mesh(mesh: &Mesh) -> Result<SkinnedMeshBounds, SkinnedMeshBoundsError> {
++        let vertex_positions = expect_attribute_float32x3(mesh, Mesh::ATTRIBUTE_POSITION)?;
++        let vertex_influences = InfluenceIterator::new(mesh)?;
++
++        // Find the maximum joint index.
++        let Some(max_joint_index) = vertex_influences
++            .clone()
++            .map(|i| i.joint_index.0 as usize)
++            .reduce(Ord::max)
++        else {
++            return Ok(SkinnedMeshBounds::default());
++        };
++
++        // Create an AABB accumulator for each joint.
++        let mut accumulators: Box<[AabbAccumulator]> =
++            vec![AabbAccumulator::new(); max_joint_index + 1].into();
++
++        // Iterate over all vertex influences and add the vertex position to
++        // the influencing joint's AABB.
++        for influence in vertex_influences {
++            if let Some(&vertex_position) = vertex_positions.get(influence.vertex_index) {
++                accumulators[influence.joint_index.0 as usize]
++                    .add_point(Vec3A::from_array(vertex_position));
++            }
++        }
++
++        // Filter out joints with no AABB.
++        let joint_indices_and_aabbs = accumulators
++            .iter()
++            .enumerate()
++            .filter_map(|(joint_index, &accumulator)| {
++                accumulator.finish().map(|aabb| (joint_index, aabb))
++            })
++            .collect::<Vec<_>>();
++
++        if joint_indices_and_aabbs.is_empty() {
++            return Err(SkinnedMeshBoundsError::NoSkinnedJoints);
++        }
++
++        let aabbs = joint_indices_and_aabbs
++            .iter()
++            .map(|&(_, aabb)| JointAabb::from(aabb))
++            .collect::<Vec<_>>();
++
++        let aabb_index_to_joint_index = joint_indices_and_aabbs
++            .iter()
++            .map(|&(joint_index, _)| JointIndex(joint_index as u16))
++            .collect::<Vec<_>>();
++
++        assert_eq!(aabbs.len(), aabb_index_to_joint_index.len());
++
++        Ok(SkinnedMeshBounds {
++            aabbs,
++            aabb_index_to_joint_index,
++        })
++    }
++
++    pub fn iter(&self) -> impl Iterator<Item = (&JointIndex, &JointAabb)> {
++        self.aabb_index_to_joint_index.iter().zip(self.aabbs.iter())
++    }
++}
++
++#[derive(Copy, Clone, Debug)]
++pub enum EntityAabbFromSkinnedMeshBoundsError {
++    OutOfRangeJointIndex(JointIndex),
++    MissingJointEntity,
++    MissingSkinnedMeshBounds,
++}
++
++/// Given the components of a skinned mesh entity, return an `Aabb3d` that
++/// encloses the skinned vertices of the mesh.
++pub fn entity_aabb_from_skinned_mesh_bounds(
++    joint_entities: &Query<&GlobalTransform>,
++    mesh: &Mesh,
++    skinned_mesh: &SkinnedMesh,
++    skinned_mesh_inverse_bindposes: &SkinnedMeshInverseBindposes,
++    world_from_entity: Option<&GlobalTransform>,
++) -> Result<Aabb3d, EntityAabbFromSkinnedMeshBoundsError> {
++    let Some(skinned_mesh_bounds) = mesh.skinned_mesh_bounds() else {
++        return Err(EntityAabbFromSkinnedMeshBoundsError::MissingSkinnedMeshBounds);
++    };
++
++    let mut accumulator = AabbAccumulator::new();
++
++    // For each model-space joint AABB, transform it to world-space and add it
++    // to the accumulator.
++    for (&joint_index, &modelspace_joint_aabb) in skinned_mesh_bounds.iter() {
++        let Some(joint_from_model) = skinned_mesh_inverse_bindposes
++            .get(joint_index.0 as usize)
++            .map(|&m| Affine3A::from_mat4(m))
++        else {
++            return Err(EntityAabbFromSkinnedMeshBoundsError::OutOfRangeJointIndex(
++                joint_index,
++            ));
++        };
++
++        let Some(&joint_entity) = skinned_mesh.joints.get(joint_index.0 as usize) else {
++            return Err(EntityAabbFromSkinnedMeshBoundsError::OutOfRangeJointIndex(
++                joint_index,
++            ));
++        };
++
++        let Ok(&world_from_joint) = joint_entities.get(joint_entity) else {
++            return Err(EntityAabbFromSkinnedMeshBoundsError::MissingJointEntity);
++        };
++
++        let world_from_model = world_from_joint.affine() * joint_from_model;
++        let worldspace_joint_aabb = transform_aabb(modelspace_joint_aabb, world_from_model);
++
++        accumulator.add_aabb(worldspace_joint_aabb);
++    }
++
++    let Some(worldspace_entity_aabb) = accumulator.finish() else {
++        return Err(EntityAabbFromSkinnedMeshBoundsError::MissingJointEntity);
++    };
++
++    // If the entity has a transform, move the AABB from world-space to entity-space.
++    if let Some(world_from_entity) = world_from_entity {
++        let entityspace_entity_aabb = transform_aabb(
++            worldspace_entity_aabb.into(),
++            world_from_entity.affine().inverse(),
++        );
++
++        Ok(entityspace_entity_aabb)
++    } else {
++        Ok(worldspace_entity_aabb)
++    }
++}
++
++// Return the smallest `Aabb3d` that encloses the transformed `JointAabb`.
++//
++// Algorithm from "Transforming Axis-Aligned Bounding Boxes", James Arvo, Graphics Gems (1990).
++#[inline]
++fn transform_aabb(input: JointAabb, transform: Affine3A) -> Aabb3d {
++    let mx = transform.matrix3.x_axis;
++    let my = transform.matrix3.y_axis;
++    let mz = transform.matrix3.z_axis;
++    let mt = transform.translation;
++
++    let cx = Vec3A::splat(input.center.x);
++    let cy = Vec3A::splat(input.center.y);
++    let cz = Vec3A::splat(input.center.z);
++
++    let sx = Vec3A::splat(input.half_size.x);
++    let sy = Vec3A::splat(input.half_size.y);
++    let sz = Vec3A::splat(input.half_size.z);
++
++    // Transform the center.
++    let tc = (mx * cx) + (my * cy) + (mz * cz) + mt;
++
++    // Calculate a size that encloses the transformed size.
++    let ts = (mx.abs() * sx) + (my.abs() * sy) + (mz.abs() * sz);
++
++    let min = tc - ts;
++    let max = tc + ts;
++
++    Aabb3d { min, max }
++}
++
++// Helper for efficiently accumulating an enclosing AABB from a set of points or
++// other AABBs. Intended for cases where the size of the set is not known in
++// advance and might be zero.
++//
++// ```
++// let a = AabbAccumulator::new();
++//
++// a.add_point(point); // Add a `Vec3A`.
++// a.add_aabb(aabb); // Add an `Aabb3d`.
++//
++// // Returns `Some(Aabb3d)` if at least one thing was added.
++// let result = a.finish();
++// ```
++//
++// For alternatives, see [`Aabb3d::from_point_clound`](`bevy_math::bounding::bounded3d::Aabb3d::from_point_cloud`)
++// and [`BoundingVolume::merge`](`bevy_math::bounding::BoundingVolume::merge`).
++#[derive(Copy, Clone)]
++struct AabbAccumulator {
++    min: Vec3A,
++    max: Vec3A,
++}
++
++impl AabbAccumulator {
++    fn new() -> Self {
++        // Initialize in such a way that adds can be branchless but `finish` can
++        // still detect if nothing was added. The initial state has `min > max`,
++        // but the first add will make `min <= max`.
++        Self {
++            min: Vec3A::MAX,
++            max: Vec3A::MIN,
++        }
++    }
++
++    fn add_aabb(&mut self, aabb: Aabb3d) {
++        self.min = self.min.min(aabb.min);
++        self.max = self.max.max(aabb.max);
++    }
++
++    fn add_point(&mut self, position: Vec3A) {
++        self.min = self.min.min(position);
++        self.max = self.max.max(position);
++    }
++
++    /// Returns the enclosing AABB if at least one thing was added, otherwise `None`.
++    fn finish(self) -> Option<Aabb3d> {
++        if self.min.cmpgt(self.max).any() {
++            None
++        } else {
++            Some(Aabb3d {
++                min: self.min,
++                max: self.max,
++            })
++        }
++    }
++}
++
++// An index that corresponds to `Mesh::ATTRIBUTE_JOINT_INDEX` and `SkinnedMesh::joints`.
++#[derive(Copy, Clone, PartialEq, Debug, Reflect)]
++pub struct JointIndex(pub u16);
++
++/// A single vertex influence. Used by [`InfluenceIterator`].
++#[derive(Copy, Clone, PartialEq, Debug)]
++pub struct Influence {
++    pub vertex_index: usize,
++    pub joint_index: JointIndex,
++    pub joint_weight: f32,
++}
++
++/// Iterator over all vertex influences with non-zero weight.
++#[derive(Clone, Debug)]
++pub struct InfluenceIterator<'a> {
++    vertex_count: usize,
++    joint_indices: &'a [[u16; 4]],
++    joint_weights: &'a [[f32; 4]],
++    vertex_index: usize,
++    influence_index: usize,
++}
++
++impl<'a> InfluenceIterator<'a> {
++    pub fn new(mesh: &'a Mesh) -> Result<Self, MeshAttributeError> {
++        let joint_indices = expect_attribute_uint16x4(mesh, Mesh::ATTRIBUTE_JOINT_INDEX)?;
++        let joint_weights = expect_attribute_float32x4(mesh, Mesh::ATTRIBUTE_JOINT_WEIGHT)?;
++
++        Ok(InfluenceIterator {
++            vertex_count: joint_indices.len().min(joint_weights.len()),
++            joint_indices,
++            joint_weights,
++            vertex_index: 0,
++            influence_index: 0,
++        })
++    }
++
++    // `Mesh` only supports four influences, so we can make this const for
++    // simplicity. If `Mesh` gains support for variable influences then this
++    // will become a variable.
++    const MAX_INFLUENCES: usize = 4;
++}
++
++impl Iterator for InfluenceIterator<'_> {
++    type Item = Influence;
++
++    fn next(&mut self) -> Option<Influence> {
++        loop {
++            assert!(self.influence_index <= Self::MAX_INFLUENCES);
++            assert!(self.vertex_index <= self.vertex_count);
++
++            if self.influence_index >= Self::MAX_INFLUENCES {
++                self.influence_index = 0;
++                self.vertex_index += 1;
++            }
++
++            if self.vertex_index >= self.vertex_count {
++                return None;
++            }
++
++            let joint_index = self.joint_indices[self.vertex_index][self.influence_index];
++            let joint_weight = self.joint_weights[self.vertex_index][self.influence_index];
++
++            self.influence_index += 1;
++
++            if joint_weight > 0.0 {
++                return Some(Influence {
++                    vertex_index: self.vertex_index,
++                    joint_index: JointIndex(joint_index),
++                    joint_weight,
++                });
++            }
++        }
++    }
++}
++
++/// Generic error for when a mesh was expected to have a certain attribute with
++/// a certain format.
++#[derive(Copy, Clone, PartialEq, Debug, Error)]
++pub enum MeshAttributeError {
++    #[error("Missing attribute \"{0}\"")]
++    MissingAttribute(&'static str),
++    #[error("Attribute \"{0}\" has unexpected format {1:?}")]
++    UnexpectedFormat(&'static str, VertexFormat),
++}
++
++// Implements a function that returns a mesh attribute's data or `MeshAttributeError`.
++//
++// ```
++// impl_expect_attribute!(expect_attribute_float32x3, Float32x3, [f32; 3]);
++//
++// let positions: Vec<[f32; 3]> = expect_attribute_float32x3(mesh, Mesh::ATTRIBUTE_POSITION)?;
++// ```
++macro_rules! impl_expect_attribute {
++    ($name:ident, $value_type:ident, $output_type:ty) => {
++        fn $name<'a>(
++            mesh: &'a Mesh,
++            attribute: MeshVertexAttribute,
++        ) -> Result<&'a Vec<$output_type>, MeshAttributeError> {
++            match mesh.attribute(attribute) {
++                Some(VertexAttributeValues::$value_type(v)) => Ok(v),
++                Some(v) => {
++                    return Err(MeshAttributeError::UnexpectedFormat(
++                        attribute.name,
++                        v.into(),
++                    ))
++                }
++                None => return Err(MeshAttributeError::MissingAttribute(attribute.name)),
++            }
++        }
++    };
++}
++
++impl_expect_attribute!(expect_attribute_float32x3, Float32x3, [f32; 3]);
++impl_expect_attribute!(expect_attribute_float32x4, Float32x4, [f32; 4]);
++impl_expect_attribute!(expect_attribute_uint16x4, Uint16x4, [u16; 4]);
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use approx::assert_abs_diff_eq;
++    use bevy_asset::RenderAssetUsages;
++    use bevy_math::{bounding::BoundingVolume, vec3, vec3a};
++
++    #[test]
++    fn aabb_accumulator() {
++        assert_eq!(AabbAccumulator::new().finish(), None);
++
++        let nice_aabbs = &[
++            Aabb3d {
++                min: vec3a(1.0, 2.0, 3.0),
++                max: vec3a(5.0, 4.0, 3.0),
++            },
++            Aabb3d {
++                min: vec3a(-99.0, 2.0, 3.0),
++                max: vec3a(5.0, 4.0, 3.0),
++            },
++            Aabb3d {
++                min: vec3a(1.0, 2.0, 3.0),
++                max: vec3a(5.0, 99.0, 3.0),
++            },
++        ];
++
++        let naughty_aabbs = &[
++            Aabb3d {
++                min: Vec3A::MIN,
++                max: Vec3A::MAX,
++            },
++            Aabb3d {
++                min: Vec3A::MIN,
++                max: Vec3A::MIN,
++            },
++            Aabb3d {
++                min: Vec3A::MAX,
++                max: Vec3A::MAX,
++            },
++        ];
++
++        for aabbs in [nice_aabbs, naughty_aabbs] {
++            for &aabb in aabbs {
++                let point = aabb.min;
++
++                let mut one_aabb = AabbAccumulator::new();
++                let mut one_point = AabbAccumulator::new();
++
++                one_aabb.add_aabb(aabb);
++                one_point.add_point(point);
++
++                assert_eq!(one_aabb.finish(), Some(aabb));
++                assert_eq!(
++                    one_point.finish(),
++                    Some(Aabb3d {
++                        min: point,
++                        max: point
++                    })
++                );
++            }
++
++            {
++                let mut multiple_aabbs = AabbAccumulator::new();
++                let mut multiple_points = AabbAccumulator::new();
++
++                for &aabb in aabbs {
++                    multiple_aabbs.add_aabb(aabb);
++                    multiple_points.add_point(aabb.min);
++                    multiple_points.add_point(aabb.max);
++                }
++
++                let expected = aabbs.iter().cloned().reduce(|l, r| l.merge(&r));
++
++                assert_eq!(multiple_aabbs.finish(), expected);
++                assert_eq!(multiple_points.finish(), expected);
++            }
++        }
++    }
++
++    #[test]
++    fn influence_iterator() {
++        let mesh = Mesh::new(
++            wgpu_types::PrimitiveTopology::TriangleList,
++            RenderAssetUsages::default(),
++        );
++
++        assert_eq!(
++            InfluenceIterator::new(&mesh).err(),
++            Some(MeshAttributeError::MissingAttribute(
++                Mesh::ATTRIBUTE_JOINT_INDEX.name
++            ))
++        );
++
++        let mesh = mesh.with_inserted_attribute(
++            Mesh::ATTRIBUTE_JOINT_INDEX,
++            VertexAttributeValues::Uint16x4(vec![
++                [1, 0, 0, 0],
++                [0, 2, 0, 0],
++                [0, 0, 3, 0],
++                [0, 0, 0, 4],
++                [1, 2, 0, 0],
++                [3, 4, 5, 0],
++                [6, 7, 8, 9],
++            ]),
++        );
++
++        assert_eq!(
++            InfluenceIterator::new(&mesh).err(),
++            Some(MeshAttributeError::MissingAttribute(
++                Mesh::ATTRIBUTE_JOINT_WEIGHT.name
++            ))
++        );
++
++        let mesh = mesh.with_inserted_attribute(
++            Mesh::ATTRIBUTE_JOINT_WEIGHT,
++            VertexAttributeValues::Float32x4(vec![
++                [1.0, 0.0, 0.0, 0.0],
++                [0.0, 1.0, 0.0, 0.0],
++                [0.0, 0.0, 1.0, 0.0],
++                [0.0, 0.0, 0.0, 1.0],
++                [0.1, 0.9, 0.0, 0.0],
++                [0.1, 0.2, 0.7, 0.0],
++                [0.1, 0.2, 0.4, 0.3],
++            ]),
++        );
++
++        let expected = &[
++            Influence {
++                vertex_index: 0,
++                joint_index: JointIndex(1),
++                joint_weight: 1.0,
++            },
++            Influence {
++                vertex_index: 1,
++                joint_index: JointIndex(2),
++                joint_weight: 1.0,
++            },
++            Influence {
++                vertex_index: 2,
++                joint_index: JointIndex(3),
++                joint_weight: 1.0,
++            },
++            Influence {
++                vertex_index: 3,
++                joint_index: JointIndex(4),
++                joint_weight: 1.0,
++            },
++            Influence {
++                vertex_index: 4,
++                joint_index: JointIndex(1),
++                joint_weight: 0.1,
++            },
++            Influence {
++                vertex_index: 4,
++                joint_index: JointIndex(2),
++                joint_weight: 0.9,
++            },
++            Influence {
++                vertex_index: 5,
++                joint_index: JointIndex(3),
++                joint_weight: 0.1,
++            },
++            Influence {
++                vertex_index: 5,
++                joint_index: JointIndex(4),
++                joint_weight: 0.2,
++            },
++            Influence {
++                vertex_index: 5,
++                joint_index: JointIndex(5),
++                joint_weight: 0.7,
++            },
++            Influence {
++                vertex_index: 6,
++                joint_index: JointIndex(6),
++                joint_weight: 0.1,
++            },
++            Influence {
++                vertex_index: 6,
++                joint_index: JointIndex(7),
++                joint_weight: 0.2,
++            },
++            Influence {
++                vertex_index: 6,
++                joint_index: JointIndex(8),
++                joint_weight: 0.4,
++            },
++            Influence {
++                vertex_index: 6,
++                joint_index: JointIndex(9),
++                joint_weight: 0.3,
++            },
++        ];
++
++        assert_eq!(
++            InfluenceIterator::new(&mesh).unwrap().collect::<Vec<_>>(),
++            expected
++        );
++    }
++
++    fn aabb_assert_eq(a: Aabb3d, b: Aabb3d) {
++        assert_abs_diff_eq!(a.min.x, b.min.x);
++        assert_abs_diff_eq!(a.min.y, b.min.y);
++        assert_abs_diff_eq!(a.min.z, b.min.z);
++        assert_abs_diff_eq!(a.max.x, b.max.x);
++        assert_abs_diff_eq!(a.max.y, b.max.y);
++        assert_abs_diff_eq!(a.max.z, b.max.z);
++    }
++
++    // Like `transform_aabb`, but uses the naive method of transforming each corner.
++    fn naive_transform_aabb(input: JointAabb, transform: Affine3A) -> Aabb3d {
++        let minmax = [input.min(), input.max()];
++
++        let mut accumulator = AabbAccumulator::new();
++
++        for i in 0..8 {
++            let corner = vec3(
++                minmax[i & 1].x,
++                minmax[(i >> 1) & 1].y,
++                minmax[(i >> 2) & 1].z,
++            );
++
++            accumulator.add_point(transform.transform_point3(corner).into());
++        }
++
++        accumulator.finish().unwrap()
++    }
++
++    #[test]
++    fn transform_aabb() {
++        let aabbs = [
++            JointAabb {
++                center: Vec3::ZERO,
++                half_size: Vec3::ZERO,
++            },
++            JointAabb {
++                center: Vec3::ZERO,
++                half_size: vec3(2.0, 3.0, 4.0),
++            },
++            JointAabb {
++                center: vec3(2.0, 3.0, 4.0),
++                half_size: Vec3::ZERO,
++            },
++            JointAabb {
++                center: vec3(20.0, -30.0, 40.0),
++                half_size: vec3(5.0, 6.0, 7.0),
++            },
++        ];
++
++        // Various transforms, including awkward ones like skews and
++        // negative/zero scales.
++        let transforms = [
++            Affine3A::IDENTITY,
++            Affine3A::from_cols(Vec3A::X, Vec3A::Z, Vec3A::Y, vec3a(1.0, 2.0, 3.0)),
++            Affine3A::from_cols(Vec3A::Y, Vec3A::X, Vec3A::Z, vec3a(1.0, 2.0, 3.0)),
++            Affine3A::from_cols(Vec3A::Z, Vec3A::Y, Vec3A::X, vec3a(1.0, 2.0, 3.0)),
++            Affine3A::from_scale(Vec3::ZERO),
++            Affine3A::from_scale(vec3(2.0, 3.0, 4.0)),
++            Affine3A::from_scale(vec3(-2.0, 3.0, -4.0)),
++            Affine3A::from_cols(
++                vec3a(1.0, 2.0, -3.0),
++                vec3a(4.0, -5.0, 6.0),
++                vec3a(-7.0, 8.0, 9.0),
++                vec3a(1.0, -2.0, 3.0),
++            ),
++        ];
++
++        for aabb in aabbs {
++            for transform in transforms {
++                aabb_assert_eq(
++                    super::transform_aabb(aabb, transform),
++                    naive_transform_aabb(aabb, transform),
++                );
++            }
++        }
++    }
++}
+diff --git a/examples/animation/custom_skinned_mesh.rs b/examples/animation/custom_skinned_mesh.rs
+index e45d21bbc2282..1177213d008fd 100644
+--- a/examples/animation/custom_skinned_mesh.rs
++++ b/examples/animation/custom_skinned_mesh.rs
+@@ -5,6 +5,7 @@ use std::f32::consts::*;
+ 
+ use bevy::{
+     asset::RenderAssetUsages,
++    camera::visibility::DynamicSkinnedMeshBounds,
+     math::ops,
+     mesh::{
+         skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+@@ -135,7 +136,11 @@ fn setup(
+     // where each 3 vertex indices form a triangle.
+     .with_inserted_indices(Indices::U16(vec![
+         0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4, 4, 5, 7, 4, 7, 6, 6, 7, 9, 6, 9, 8,
+-    ]));
++    ]))
++    // Create skinned mesh bounds. Together with the `DynamicSkinnedMeshBounds`
++    // component, this will ensure the mesh is correctly frustum culled.
++    .with_generated_skinned_mesh_bounds()
++    .unwrap();
+ 
+     let mesh = meshes.add(mesh);
+ 
+@@ -178,6 +183,7 @@ fn setup(
+                 inverse_bindposes: inverse_bindposes.clone(),
+                 joints: joint_entities,
+             },
++            DynamicSkinnedMeshBounds,
+         ));
+     }
+ }
+diff --git a/examples/tools/scene_viewer/scene_viewer_plugin.rs b/examples/tools/scene_viewer/scene_viewer_plugin.rs
+index 4f3ab56011e7d..7f4de259d2a12 100644
+--- a/examples/tools/scene_viewer/scene_viewer_plugin.rs
++++ b/examples/tools/scene_viewer/scene_viewer_plugin.rs
+@@ -4,7 +4,8 @@
+ //! - Insert an initialized `SceneHandle` resource into your App's `AssetServer`.
+ 
+ use bevy::{
+-    camera_controller::free_camera::FreeCamera, gltf::Gltf,
++    camera_controller::free_camera::FreeCamera,
++    gizmos::skinned_mesh_bounds::SkinnedMeshBoundsGizmoConfigGroup, gltf::Gltf,
+     input::common_conditions::input_just_pressed, prelude::*, scene::InstanceId,
+ };
+ 
+@@ -47,6 +48,7 @@ Scene Controls:
+     L           - animate light direction
+     U           - toggle shadows
+     B           - toggle bounding boxes
++    J           - toggle skinned mesh joint bounding boxes
+     C           - cycle through the camera controller and any cameras loaded from the scene
+ 
+     Space       - Play/Pause animation
+@@ -70,7 +72,11 @@ impl Plugin for SceneViewerPlugin {
+                 (
+                     update_lights,
+                     camera_tracker,
+-                    toggle_bounding_boxes.run_if(input_just_pressed(KeyCode::KeyB)),
++                    (
++                        toggle_bounding_boxes.run_if(input_just_pressed(KeyCode::KeyB)),
++                        toggle_skinned_mesh_bounds.run_if(input_just_pressed(KeyCode::KeyJ)),
++                    )
++                        .chain(),
+                 ),
+             );
+     }
+@@ -80,6 +86,13 @@ fn toggle_bounding_boxes(mut config: ResMut<GizmoConfigStore>) {
+     config.config_mut::<AabbGizmoConfigGroup>().1.draw_all ^= true;
+ }
+ 
++fn toggle_skinned_mesh_bounds(mut config: ResMut<GizmoConfigStore>) {
++    config
++        .config_mut::<SkinnedMeshBoundsGizmoConfigGroup>()
++        .1
++        .draw_all ^= true;
++}
++
+ fn scene_load_check(
+     asset_server: Res<AssetServer>,
+     mut scenes: ResMut<Assets<Scene>>,
+diff --git a/release-content/release-notes/skinned_mesh_culling.md b/release-content/release-notes/skinned_mesh_culling.md
+new file mode 100644
+index 0000000000000..2dfec915e5819
+--- /dev/null
++++ b/release-content/release-notes/skinned_mesh_culling.md
+@@ -0,0 +1,68 @@
++---
++title: Improved Skinned Mesh Culling
++authors: ["@greeble-dev"]
++pull_requests: [21837]
++---
++
++Skinned meshes can now update their bounds from joint positions. This mostly
++fixes issues like [#4971](https://github.com/bevyengine/bevy/issues/4971), where
++meshes would disappear at certain camera angles.
++
++*TODO: Maybe add the [video from the PR](https://github.com/bevyengine/bevy/pull/21837) here?*
++
++If you load your skinned meshes from glTFs then you don't need to make any
++changes - the new behavior is automatically enabled.
++
++If you create your own skinned meshes, you'll need to call
++`Mesh::generate_skinned_mesh_bounds` or `Mesh::with_generated_skinned_bounds`
++and add a `DynamicSkinnedMeshBounds` component to your mesh entity.
++
++```rust
++let mut mesh: Mesh = ...;
++mesh.generate_skinned_mesh_bounds()?;
++ 
++entity.insert((
++    Mesh3d(meshes.add(mesh)),
++    DynamicSkinnedMeshBounds,
++));
++```
++
++The new behavior is reliable for meshes that only use skinning. But it doesn't
++account for morph targets, vertex shaders, or anything else that modifies vertex
++positions.
++
++If you don't want the new behavior and you load your skinned meshes from glTFs,
++set `GltfPlugin::skinned_mesh_bounds_policy` to
++`GltfSkinnedMeshBoundsPolicy::BindPose`.
++
++```rust
++app.add_plugins(DefaultPlugins.set(GltfPlugin {
++    skinned_mesh_bounds_policy: GltfSkinnedMeshBoundsPolicy::BindPose,
++    ..default()
++}))
++```
++
++There's also a `GltfSkinnedMeshBoundsPolicy::NoFrustumCulling` option if you
++prefer to entirely disable culling for skinned meshes.
++
++If you want to visualize the bounds, enable these gizmos:
++
++```rust
++fn toggle_skinned_mesh_bounds(mut config: ResMut<GizmoConfigStore>) {
++    // Toggle drawing of the per-mesh `Aabb` component that's used for culling.
++    config.config_mut::<AabbGizmoConfigGroup>().1.draw_all ^= true;
++    // Toggle drawing of the per-joint AABBs used to update the `Aabb` component.
++    config.config_mut::<SkinnedMeshBoundsGizmoConfigGroup>().1.draw_all ^= true;
++}
++```
++
++Or you can load a glTF into the scene viewer example and press `j` and `b` to
++enable the visualizations.
++
++```sh
++cargo run --example scene_viewer --features "free_camera" -- "path/to/your.gltf"
++```
++
++If you were using [`bevy_mod_skinned_aabb`](https://github.com/greeble-dev/bevy_mod_skinned_aabb),
++see [Bevy 0.19 and `bevy_mod_skinned_aabb`](https://github.com/greeble-dev/bevy_mod_skinned_aabb/blob/main/notes/bevy_0_19.md)
++for how to upgrade.
+diff --git a/tests/3d/test_skinned_mesh_bounds.rs b/tests/3d/test_skinned_mesh_bounds.rs
+new file mode 100644
+index 0000000000000..79e31a66181e5
+--- /dev/null
++++ b/tests/3d/test_skinned_mesh_bounds.rs
+@@ -0,0 +1,288 @@
++//! Test `SkinnedMeshBounds` by showing the bounds of various animated meshes.
++
++use bevy::{
++    asset::RenderAssetUsages,
++    camera::visibility::DynamicSkinnedMeshBounds,
++    mesh::{
++        skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
++        PrimitiveTopology, VertexAttributeValues,
++    },
++    prelude::*,
++    scene::SceneInstanceReady,
++};
++use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
++
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins.set(WindowPlugin {
++            primary_window: Some(Window {
++                title: "Test Skinned Mesh Bounds".into(),
++                ..default()
++            }),
++            ..default()
++        }))
++        .insert_gizmo_config(
++            SkinnedMeshBoundsGizmoConfigGroup {
++                draw_all: true,
++                ..Default::default()
++            },
++            GizmoConfig::default(),
++        )
++        .insert_gizmo_config(
++            AabbGizmoConfigGroup {
++                draw_all: true,
++                ..Default::default()
++            },
++            GizmoConfig::default(),
++        )
++        .insert_resource(GlobalAmbientLight {
++            brightness: 2000.0,
++            ..Default::default()
++        })
++        .add_systems(Startup, setup)
++        .add_systems(Startup, load_scene)
++        .add_systems(Update, spawn_scene)
++        .add_systems(Startup, spawn_custom_meshes)
++        .add_systems(Update, update_custom_mesh_animation)
++        .run();
++}
++
++fn setup(mut commands: Commands) {
++    commands.spawn((
++        Camera3d::default(),
++        Transform::from_xyz(0.0, 7.5, 18.0).looking_at(Vec3::new(0.0, 5.5, 0.0), Vec3::Y),
++    ));
++}
++
++#[derive(Component, Debug, Default)]
++struct PendingScene(Handle<Gltf>);
++
++#[derive(Component, Debug, Default)]
++struct PendingAnimation((Handle<AnimationGraph>, AnimationNodeIndex));
++
++fn load_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
++    commands.spawn((
++        PendingScene(asset_server.load("models/animated/Fox.glb")),
++        Transform::from_xyz(1.3, 4.3, 0.0)
++            .with_scale(Vec3::splat(0.08))
++            .looking_to(-Vec3::X, Vec3::Y),
++    ));
++}
++
++fn spawn_scene(
++    mut commands: Commands,
++    query: Query<(Entity, &PendingScene)>,
++    assets: Res<Assets<Gltf>>,
++    mut graphs: ResMut<Assets<AnimationGraph>>,
++) {
++    for (entity, PendingScene(asset)) in query.iter() {
++        if let Some(gltf) = assets.get(asset)
++            && let Some(scene_handle) = gltf.scenes.first()
++            && let Some(animation_handle) = gltf.named_animations.get("Run")
++        {
++            let (graph, graph_node_index) = AnimationGraph::from_clip(animation_handle.clone());
++
++            commands
++                .entity(entity)
++                .remove::<PendingScene>()
++                .insert((
++                    SceneRoot(scene_handle.clone()),
++                    PendingAnimation((graphs.add(graph), graph_node_index)),
++                ))
++                .observe(play_animation);
++        }
++    }
++}
++
++fn play_animation(
++    trigger: On<SceneInstanceReady>,
++    mut commands: Commands,
++    children: Query<&Children>,
++    animations: Query<&PendingAnimation>,
++    mut players: Query<&mut AnimationPlayer>,
++) {
++    if let Ok(PendingAnimation((graph_handle, graph_node_index))) = animations.get(trigger.entity) {
++        for child in children.iter_descendants(trigger.entity) {
++            if let Ok(mut player) = players.get_mut(child) {
++                player.play(*graph_node_index).set_speed(0.6).repeat();
++
++                commands
++                    .entity(child)
++                    .insert(AnimationGraphHandle(graph_handle.clone()));
++            }
++        }
++    }
++
++    commands.entity(trigger.entity).remove::<PendingAnimation>();
++}
++
++type CustomAnimationId = i8;
++
++#[derive(Component)]
++struct CustomAnimation(CustomAnimationId);
++
++fn spawn_custom_meshes(
++    mut commands: Commands,
++    mut mesh_assets: ResMut<Assets<Mesh>>,
++    mut material_assets: ResMut<Assets<StandardMaterial>>,
++    mut inverse_bindposes_assets: ResMut<Assets<SkinnedMeshInverseBindposes>>,
++) {
++    let mesh_handle = mesh_assets.add(
++        Mesh::new(
++            PrimitiveTopology::TriangleStrip,
++            // Test that skinned mesh bounds work even if the mesh is render
++            // world only.
++            RenderAssetUsages::RENDER_WORLD,
++        )
++        .with_inserted_attribute(
++            Mesh::ATTRIBUTE_POSITION,
++            vec![
++                [-0.5, 0.0, 0.0],
++                [0.5, 0.0, 0.0],
++                [-0.5, 0.5, 0.0],
++                [0.5, 0.5, 0.0],
++                [-0.5, 1.0, 0.0],
++                [0.5, 1.0, 0.0],
++                [-0.5, 1.5, 0.0],
++                [0.5, 1.5, 0.0],
++                [-0.5, 2.0, 0.0],
++                [0.5, 2.0, 0.0],
++            ],
++        )
++        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 0.0, 1.0]; 10])
++        .with_inserted_attribute(
++            Mesh::ATTRIBUTE_JOINT_INDEX,
++            VertexAttributeValues::Uint16x4(vec![
++                [1, 0, 0, 0],
++                [1, 0, 0, 0],
++                [1, 2, 0, 0],
++                [1, 2, 0, 0],
++                [1, 2, 0, 0],
++                [1, 2, 0, 0],
++                [2, 1, 0, 0],
++                [2, 1, 0, 0],
++                [2, 0, 0, 0],
++                [2, 0, 0, 0],
++            ]),
++        )
++        .with_inserted_attribute(
++            Mesh::ATTRIBUTE_JOINT_WEIGHT,
++            vec![
++                [1.00, 0.00, 0.0, 0.0],
++                [1.00, 0.00, 0.0, 0.0],
++                [0.75, 0.25, 0.0, 0.0],
++                [0.75, 0.25, 0.0, 0.0],
++                [0.50, 0.50, 0.0, 0.0],
++                [0.50, 0.50, 0.0, 0.0],
++                [0.75, 0.25, 0.0, 0.0],
++                [0.75, 0.25, 0.0, 0.0],
++                [1.00, 0.00, 0.0, 0.0],
++                [1.00, 0.00, 0.0, 0.0],
++            ],
++        )
++        .with_generated_skinned_mesh_bounds()
++        .unwrap(),
++    );
++
++    let inverse_bindposes_handle = inverse_bindposes_assets.add(vec![
++        Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0)),
++        Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0)),
++        Mat4::from_translation(Vec3::new(0.0, -1.0, 0.0)),
++    ]);
++
++    struct MeshInstance {
++        animations: [CustomAnimationId; 2],
++    }
++
++    let mesh_instances = [
++        // Simple cases. First joint is still, second joint is all rotation/translation/scale variations.
++        MeshInstance { animations: [0, 1] },
++        MeshInstance { animations: [0, 2] },
++        MeshInstance { animations: [0, 3] },
++        MeshInstance { animations: [0, 4] },
++        MeshInstance { animations: [0, 5] },
++        MeshInstance { animations: [0, 6] },
++        MeshInstance { animations: [0, 7] },
++        MeshInstance { animations: [0, 8] },
++        // Skewed cases. First joint is non-uniform scaling, second joint is rotation/translation variations.
++        MeshInstance { animations: [9, 1] },
++        MeshInstance { animations: [9, 2] },
++        MeshInstance { animations: [9, 3] },
++        MeshInstance { animations: [9, 4] },
++        MeshInstance { animations: [9, 5] },
++    ];
++
++    for (i, mesh_instance) in mesh_instances.iter().enumerate() {
++        let x = ((i as f32) * 2.0) - ((mesh_instances.len() - 1) as f32);
++
++        let base_entity = commands
++            .spawn((Transform::from_xyz(x, 0.0, 0.0), Visibility::default()))
++            .id();
++
++        let joints = vec![
++            commands.spawn((Transform::IDENTITY,)).id(),
++            commands
++                .spawn((
++                    CustomAnimation(mesh_instance.animations[0]),
++                    Transform::IDENTITY,
++                ))
++                .id(),
++            commands
++                .spawn((
++                    CustomAnimation(mesh_instance.animations[1]),
++                    Transform::IDENTITY,
++                ))
++                .id(),
++        ];
++
++        commands.entity(joints[0]).insert(ChildOf(base_entity));
++
++        commands.entity(joints[1]).insert(ChildOf(joints[0]));
++        commands.entity(joints[2]).insert(ChildOf(joints[1]));
++
++        let mesh_entity = commands
++            .spawn((
++                Transform::IDENTITY,
++                Mesh3d(mesh_handle.clone()),
++                MeshMaterial3d(material_assets.add(StandardMaterial {
++                    base_color: Color::WHITE,
++                    cull_mode: None,
++                    ..default()
++                })),
++                SkinnedMesh {
++                    inverse_bindposes: inverse_bindposes_handle.clone(),
++                    joints: joints.clone(),
++                },
++                DynamicSkinnedMeshBounds,
++            ))
++            .id();
++
++        commands.entity(mesh_entity).insert(ChildOf(base_entity));
++    }
++}
++
++fn update_custom_mesh_animation(
++    time: Res<Time<Virtual>>,
++    mut query: Query<(&mut Transform, &CustomAnimation)>,
++) {
++    let t = time.elapsed_secs();
++    let ts = ops::sin(t);
++    let tc = ops::cos(t);
++    let ots = ops::sin(t + FRAC_PI_4);
++    let otc = ops::cos(t + FRAC_PI_4);
++
++    for (mut transform, animation) in &mut query {
++        match animation.0 {
++            1 => transform.translation = Vec3::new(0.5 * ts, 0.3 + tc, 0.0),
++            2 => transform.translation = Vec3::new(0.0, 0.5 + ts, tc),
++            3 => transform.rotation = Quat::from_rotation_x(FRAC_PI_2 * ts),
++            4 => transform.rotation = Quat::from_rotation_y(FRAC_PI_2 * ts),
++            5 => transform.rotation = Quat::from_rotation_z(FRAC_PI_2 * ts),
++            6 => transform.scale.x = ts * 1.5,
++            7 => transform.scale.y = ts * 1.5,
++            8 => transform.scale = Vec3::new(ts * 1.5, otc * 1.5, 1.0),
++            9 => transform.scale = Vec3::new(ots, 1.0 + (tc * 0.3), 1.0 - (tc * 0.5)),
++            _ => (),
++        }
++    }
++}

@@ -1,0 +1,1890 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 23dd7fd0ee60e..196e711f583c2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5472,3 +5472,15 @@ name = "Parallax-Corrected Cubemaps"
+ description = "Demonstrates parallax-corrected cubemap reflections"
+ category = "3D Rendering"
+ wasm = true
++
++[[example]]
++name = "light_probe_blending"
++path = "examples/3d/light_probe_blending.rs"
++doc-scrape-examples = true
++required-features = ["free_camera", "https"]
++
++[package.metadata.example.light_probe_blending]
++name = "Light Probe Blending"
++description = "Demonstrates blending between multiple reflection probes"
++category = "3D Rendering"
++wasm = false
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index f2619208106a3..a9624b5503297 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -2,7 +2,7 @@
+ 
+ extern crate alloc;
+ 
+-use bevy_app::{App, Plugin, PostUpdate};
++use bevy_app::{App, Plugin, PostUpdate, Update};
+ use bevy_asset::AssetApp;
+ use bevy_camera::{
+     primitives::{Aabb, CascadesFrusta, CubemapFrusta, Frustum, Sphere},
+@@ -33,8 +33,9 @@ use bevy_camera::visibility::SetViewVisibility;
+ 
+ mod probe;
+ pub use probe::{
+-    AtmosphereEnvironmentMapLight, EnvironmentMapLight, GeneratedEnvironmentMapLight,
+-    IrradianceVolume, LightProbe, NoParallaxCorrection, Skybox,
++    automatically_add_parallax_correction_components, AtmosphereEnvironmentMapLight,
++    EnvironmentMapLight, GeneratedEnvironmentMapLight, IrradianceVolume, LightProbe,
++    ParallaxCorrection, Skybox,
+ };
+ pub mod atmosphere;
+ pub use atmosphere::Atmosphere;
+@@ -160,6 +161,7 @@ impl Plugin for LightPlugin {
+                 SimulationLightSystems::CheckLightVisibility
+                     .ambiguous_with(SimulationLightSystems::CheckLightVisibility),
+             )
++            .add_systems(Update, automatically_add_parallax_correction_components)
+             .add_systems(
+                 PostUpdate,
+                 (
+diff --git a/crates/bevy_light/src/probe.rs b/crates/bevy_light/src/probe.rs
+index 27771ada2109f..48bbd915fef47 100644
+--- a/crates/bevy_light/src/probe.rs
++++ b/crates/bevy_light/src/probe.rs
+@@ -3,7 +3,7 @@ use bevy_camera::visibility::Visibility;
+ use bevy_color::{Color, ColorToComponents, Srgba};
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
+-use bevy_math::{Quat, UVec2};
++use bevy_math::{Quat, UVec2, Vec3};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::Transform;
+ use wgpu_types::{
+@@ -18,11 +18,22 @@ use wgpu_types::{
+ /// [`IrradianceVolume`].
+ ///
+ /// The light probe range is conceptually a unit cube (1×1×1) centered on the
+-/// origin. The [`Transform`] applied to this entity can scale, rotate, or translate
+-/// that cube so that it contains all fragments that should take this light probe into account.
++/// origin. The [`Transform`] applied to this entity can scale, rotate, or
++/// translate that cube so that it contains all fragments that should take this
++/// light probe into account.
++///
++/// Light probes may specify a *falloff* range over which their influence tapers
++/// off. The falloff range is expressed as a range from 0, representing
++/// infinitely-sharp falloff, to 1, representing the most gradual falloff,
++/// *inside* the 1×1×1 cube. So, for example, if you set the falloff to 0.5 on
++/// an axis, then any fragments with positions between 0.0 units to 0.25 units
++/// on that axis will receive 100% influence from the light probe, while
++/// fragments with positions between 0.25 units to 0.5 units on that axis will
++/// receive gradually-diminished influence, and fragments more than 0.5 units
++/// from the center of the light probe will receive no influence at all.
+ ///
+ /// When multiple sources of indirect illumination can be applied to a fragment,
+-/// the highest-quality one is chosen. Diffuse and specular illumination are
++/// the highest-quality ones are chosen. Diffuse and specular illumination are
+ /// considered separately, so, for example, Bevy may decide to sample the
+ /// diffuse illumination from an irradiance volume and the specular illumination
+ /// from a reflection probe. From highest priority to lowest priority, the
+@@ -39,6 +50,11 @@ use wgpu_types::{
+ /// not participate in the ranking. That is, ambient light is applied in
+ /// addition to, not instead of, the light sources above.
+ ///
++/// Multiple light probes of the same type can apply to a single fragment. By
++/// setting falloff regions appropriately, one can achieve a gradual blend from
++/// one reflection probe and/or irradiance volume to another as objects move
++/// between them.
++///
+ /// A terminology note: Unfortunately, there is little agreement across game and
+ /// graphics engines as to what to call the various techniques that Bevy groups
+ /// under the term *light probe*. In Bevy, a *light probe* is the generic term
+@@ -52,13 +68,29 @@ use wgpu_types::{
+ #[derive(Component, Debug, Clone, Copy, Default, Reflect)]
+ #[reflect(Component, Default, Debug, Clone)]
+ #[require(Transform, Visibility)]
+-pub struct LightProbe;
++pub struct LightProbe {
++    /// The distance over which the effect of the light probe becomes weaker, on
++    /// each axis.
++    ///
++    /// This is specified as a ratio of the total distance on each axis. So, for
++    /// example, if you specify `Vec3::splat(0.25)` here, then the light probe
++    /// will consist of a 0.75×0.75×0.75 unit cube within which fragments
++    /// receive the maximum influence from the light probe, contained within a
++    /// 1×1×1 cube which influences fragments inside it in a manner that
++    /// diminishes as fragments get farther from its center.
++    ///
++    /// Falloff doesn't affect the influence range of the light probe itself;
++    /// it's still conceptually a 1×1×1 cube, regardless of the falloff setting.
++    /// In other words, falloff modifies the *interior* of the light probe cube
++    /// instead of increasing the *exterior* boundaries of the cube.
++    pub falloff: Vec3,
++}
+ 
+ impl LightProbe {
+     /// Creates a new light probe component.
+     #[inline]
+     pub fn new() -> Self {
+-        Self
++        Self::default()
+     }
+ }
+ 
+@@ -322,8 +354,7 @@ impl Default for IrradianceVolume {
+     }
+ }
+ 
+-/// Add this component to a reflection probe to opt out of *parallax
+-/// correction*.
++/// Add this component to a reflection probe to customize *parallax correction*.
+ ///
+ /// For environment maps added directly to a camera, Bevy renders the reflected
+ /// scene that a cubemap captures as though it were infinitely far away. This is
+@@ -341,11 +372,78 @@ impl Default for IrradianceVolume {
+ /// (1) apply to the objects inside the room and (2) take the positions of those
+ /// objects into account in order to create a realistic reflection.
+ ///
++/// Instead of having the simulated boundaries of the reflected area coincide
++/// with the boundaries of the light probe, it's also possible to specify
++/// *custom* parallax correction boundaries, so that the region of influence of
++/// the light probe doesn't correspond with the simulated boundaries used for
++/// parallax correction. This is commonly used when the boundaries of the light
++/// probe are slightly larger than the room that the light probe contains, for
++/// instance in order to avoid artifacts along the edges of the room that occur
++/// due to rounding error, or else when the *falloff* feature is used that
++/// blends reflection probes into adjacent ones.
++///
+ /// Place this component on an entity that has a [`LightProbe`] and
+-/// [`EnvironmentMapLight`] component in order to opt out of parallax
++/// [`EnvironmentMapLight`] component in order to either (1) opt out of parallax
++/// correction via [`ParallaxCorrection::None`] or (2) specify custom parallax
++/// correction boundaries via [`ParallaxCorrection::Custom`]. If you don't
++/// manually place this component on a reflection probe, Bevy will automatically
++/// add a [`ParallaxCorrection::Auto`] component so that the boundaries of the
++/// light probe will coincide with the simulated boundaries used for parallax
+ /// correction.
+ ///
+-/// See the `pccm` example for an example of usage.
++/// See the `pccm` example for an example of usage of parallax-corrected
++/// cubemaps and the `light_probe_blending` example for an example of use of
++/// custom parallax correction boundaries.
+ #[derive(Clone, Copy, Default, Component, Reflect)]
+ #[reflect(Clone, Default, Component)]
+-pub struct NoParallaxCorrection;
++pub enum ParallaxCorrection {
++    /// No parallax correction is used.
++    ///
++    /// This component causes Bevy to render the reflection as though the
++    /// reflected surface were infinitely distant.
++    None,
++
++    /// The parallax correction boundaries correspond with the boundaries of the
++    /// light probe.
++    ///
++    /// This is the default value. Bevy automatically adds this component value
++    /// to reflection probes that don't have a [`ParallaxCorrection`] component.
++    /// It's equivalent to `ParallaxCorrection::Custom(Vec3::splat(0.5))`.
++    #[default]
++    Auto,
++
++    /// The parallax correction boundaries are specified manually.
++    ///
++    /// The simulated reflection boundaries are specified as an axis-aligned
++    /// cube *in light probe space* with the given *half* extents. Thus, for
++    /// example, if you set the parallax correction boundaries to `vec3(0.5,
++    /// 1.0, 2.0)` and the scale of the light probe is `vec3(3.0, 3.0, 3.0)`,
++    /// then the simulated boundaries of the reflected area used for parallax
++    /// correction will be centered on the reflection probe with a width of 3.0
++    /// m, a height of 6.0 m, and a depth of 12.0 m.
++    Custom(Vec3),
++}
++
++/// A system that automatically adds a [`ParallaxCorrection::Auto`] component to
++/// any reflection probe that doesn't already have a [`ParallaxCorrection`]
++/// component.
++///
++/// A reflection probe is any entity with both an [`EnvironmentMapLight`] and a
++/// [`LightProbe`] component.
++pub fn automatically_add_parallax_correction_components(
++    mut commands: Commands,
++    query: Query<
++        Entity,
++        (
++            With<EnvironmentMapLight>,
++            With<LightProbe>,
++            Without<ParallaxCorrection>,
++        ),
++    >,
++) {
++    for entity in &query {
++        commands
++            .entity(entity)
++            .insert(ParallaxCorrection::default());
++    }
++}
+diff --git a/crates/bevy_pbr/src/light_probe/environment_map.rs b/crates/bevy_pbr/src/light_probe/environment_map.rs
+index 9a60b1c1a70c8..c4c62fbec3e8e 100644
+--- a/crates/bevy_pbr/src/light_probe/environment_map.rs
++++ b/crates/bevy_pbr/src/light_probe/environment_map.rs
+@@ -46,11 +46,12 @@
+ 
+ use bevy_asset::AssetId;
+ use bevy_ecs::{
+-    query::{Has, QueryData, QueryItem},
++    query::{QueryData, QueryItem},
+     system::lifetimeless::Read,
+ };
+ use bevy_image::Image;
+-use bevy_light::{EnvironmentMapLight, NoParallaxCorrection};
++use bevy_light::{EnvironmentMapLight, ParallaxCorrection};
++use bevy_math::{Affine3A, Vec3};
+ use bevy_render::{
+     extract_instances::ExtractInstance,
+     render_asset::RenderAssets,
+@@ -246,7 +247,7 @@ impl LightProbeComponent for EnvironmentMapLight {
+     // view.
+     type ViewLightProbeInfo = EnvironmentMapViewLightProbeInfo;
+ 
+-    type QueryData = Has<NoParallaxCorrection>;
++    type QueryData = Option<Read<ParallaxCorrection>>;
+ 
+     fn id(&self, image_assets: &RenderAssets<GpuImage>) -> Option<Self::AssetId> {
+         if image_assets.get(&self.diffuse_map).is_none()
+@@ -267,13 +268,15 @@ impl LightProbeComponent for EnvironmentMapLight {
+ 
+     fn flags(
+         &self,
+-        no_parallax_correction: <Self::QueryData as QueryData>::Item<'_, '_>,
++        maybe_parallax_correction: &<Self::QueryData as QueryData>::Item<'_, '_>,
+     ) -> RenderLightProbeFlags {
+         let mut flags = RenderLightProbeFlags::empty();
+         if self.affects_lightmapped_mesh_diffuse {
+             flags.insert(RenderLightProbeFlags::AFFECTS_LIGHTMAPPED_MESH_DIFFUSE);
+         }
+-        if !no_parallax_correction {
++        if maybe_parallax_correction.is_some_and(|parallax_correction| {
++            !matches!(*parallax_correction, ParallaxCorrection::None)
++        }) {
+             flags.insert(RenderLightProbeFlags::ENABLE_PARALLAX_CORRECTION);
+         }
+         flags
+@@ -316,6 +319,22 @@ impl LightProbeComponent for EnvironmentMapLight {
+ 
+         render_view_light_probes
+     }
++
++    fn get_world_from_light_matrix(&self, original_transform: &Affine3A) -> Affine3A {
++        // Take the `rotation` field into account.
++        *original_transform * Affine3A::from_quat(self.rotation)
++    }
++
++    fn parallax_correction_bounds(
++        &self,
++        maybe_parallax_correction: &<Self::QueryData as QueryData>::Item<'_, '_>,
++    ) -> Vec3 {
++        match *maybe_parallax_correction {
++            Some(&ParallaxCorrection::Custom(bounds)) => bounds,
++            Some(&ParallaxCorrection::Auto) => Vec3::splat(0.5),
++            Some(&ParallaxCorrection::None) | None => Vec3::ZERO,
++        }
++    }
+ }
+ 
+ impl Default for EnvironmentMapViewLightProbeInfo {
+diff --git a/crates/bevy_pbr/src/light_probe/environment_map.wgsl b/crates/bevy_pbr/src/light_probe/environment_map.wgsl
+index 8d12f917ef427..ab03f6eff16e1 100644
+--- a/crates/bevy_pbr/src/light_probe/environment_map.wgsl
++++ b/crates/bevy_pbr/src/light_probe/environment_map.wgsl
+@@ -1,6 +1,6 @@
+ #define_import_path bevy_pbr::environment_map
+ 
+-#import bevy_pbr::light_probe::query_light_probe
++#import bevy_pbr::light_probe::{light_probe_iterator_new, light_probe_iterator_next}
+ #import bevy_pbr::mesh_view_bindings as bindings
+ #import bevy_pbr::mesh_view_bindings::light_probes
+ #import bevy_pbr::mesh_view_bindings::environment_map_uniform
+@@ -24,10 +24,21 @@ struct EnvironmentMapRadiances {
+ }
+ 
+ // Computes the direction at which to sample the reflection probe.
++//
++// * `light_from_world` is the matrix that transforms world space into light
++//   probe space (a 1×1×1 cube centered on the origin).
++//
++// * `parallax_correction_bounds` is the half-extents of the simulated
++//   reflection boundaries used for parallax correction, in light probe space.
++//   It's ignored if the `parallax_correct` parameter is false.
++//
++// * `parallax_correct` is true if parallax correction is to be applied and
++//   false otherwise.
+ fn compute_cubemap_sample_dir(
+     world_ray_origin: vec3<f32>,
+     world_ray_direction: vec3<f32>,
+     light_from_world: mat4x4<f32>,
++    parallax_correction_bounds: vec3<f32>,
+     parallax_correct: bool
+ ) -> vec3<f32> {
+     var sample_dir: vec3<f32>;
+@@ -44,8 +55,8 @@ fn compute_cubemap_sample_dir(
+         // Since our light probe is a 1×1×1 cube centered at the origin in light
+         // probe space, the faces of the cube are at X = ±0.5, Y = ±0.5, and Z =
+         // ±0.5.
+-        var t0 = (vec3(-0.5) - ray_origin) / ray_direction;
+-        var t1 = (vec3(0.5) - ray_origin) / ray_direction;
++        var t0 = (-parallax_correction_bounds - ray_origin) / ray_direction;
++        var t1 = (parallax_correction_bounds - ray_origin) / ray_direction;
+ 
+         // We're shooting the rays forward, so we need to rule out negative time
+         // values. So, if t is negative, make it a large value so that we won't
+@@ -93,78 +104,99 @@ fn compute_radiances(
+ 
+     var radiances: EnvironmentMapRadiances;
+ 
+-    // Search for a reflection probe that contains the fragment.
+-    var query_result = query_light_probe(
++    // Find all reflection probes that contain the fragment. We're going to
++    // accumulate all the radiance and irradiance from them in a weighted sum.
++    var iterator = light_probe_iterator_new(
+         world_position,
+         /*is_irradiance_volume=*/ false,
+         clusterable_object_index_ranges,
+     );
+ 
+-    // If we didn't find a reflection probe, use the view environment map if applicable.
+-    if (query_result.texture_index < 0) {
+-        query_result.texture_index = light_probes.view_cubemap_index;
+-        query_result.intensity = light_probes.intensity_for_view;
+-        query_result.light_from_world = mat4x4(
+-            vec4(1.0, 0.0, 0.0, 0.0),
+-            vec4(0.0, 1.0, 0.0, 0.0),
+-            vec4(0.0, 0.0, 1.0, 0.0),
+-            vec4(0.0, 0.0, 0.0, 1.0)
+-        );
+-        if light_probes.view_environment_map_affects_lightmapped_mesh_diffuse != 0u {
+-            query_result.flags = LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE;
+-        } else {
+-            query_result.flags = 0u;
++    var total_weight = 0.0;
++    radiances.irradiance = vec3(0.0);
++    radiances.radiance = vec3(0.0);
++
++    while (true) {
++        var query_result = light_probe_iterator_next(&iterator);
++
++        // If we reached the end of the light probe list, and we didn't find
++        // enough reflection probes to reach a weight of 1.0, use the view
++        // environment map if applicable. This allows for e.g. nice transitions
++        // between the interior of a building and the outdoor environment map.
++        if (query_result.texture_index < 0 && total_weight < 0.9999) {
++            query_result.texture_index = light_probes.view_cubemap_index;
++            query_result.intensity = light_probes.intensity_for_view;
++            query_result.light_from_world = mat4x4(
++                vec4(1.0, 0.0, 0.0, 0.0),
++                vec4(0.0, 1.0, 0.0, 0.0),
++                vec4(0.0, 0.0, 1.0, 0.0),
++                vec4(0.0, 0.0, 0.0, 1.0)
++            );
++            query_result.parallax_correction_bounds = vec3(0.0);
++            if light_probes.view_environment_map_affects_lightmapped_mesh_diffuse != 0u {
++                query_result.flags = LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE;
++            } else {
++                query_result.flags = 0u;
++            }
++            query_result.weight = 1.0 - total_weight;
+         }
+-    }
+ 
+-    // If there's no cubemap, bail out.
+-    if (query_result.texture_index < 0) {
+-        radiances.irradiance = vec3(0.0);
+-        radiances.radiance = vec3(0.0);
+-        return radiances;
+-    }
++        // If we reached the end, we're done.
++        if (query_result.texture_index < 0) {
++            break;
++        }
+ 
+-    // Split-sum approximation for image based lighting: https://cdn2.unrealengine.com/Resources/files/2013SiggraphPresentationsNotes-26915738.pdf
+-    let radiance_level = perceptual_roughness * f32(textureNumLevels(
+-        bindings::specular_environment_maps[query_result.texture_index]) - 1u);
++        // Split-sum approximation for image based lighting: https://cdn2.unrealengine.com/Resources/files/2013SiggraphPresentationsNotes-26915738.pdf
++        let radiance_level = perceptual_roughness * f32(textureNumLevels(
++            bindings::specular_environment_maps[query_result.texture_index]) - 1u);
+ 
+-    // If we're lightmapped, and we shouldn't accumulate diffuse light from the
+-    // environment map, note that.
+-    var enable_diffuse = !found_diffuse_indirect;
++        // If we're lightmapped, and we shouldn't accumulate diffuse light from the
++        // environment map, note that.
++        var enable_diffuse = !found_diffuse_indirect;
+ #ifdef LIGHTMAP
+-    enable_diffuse = enable_diffuse &&
+-        (query_result.flags & LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE) != 0u;
++        enable_diffuse = enable_diffuse &&
++            (query_result.flags & LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE) != 0u;
+ #endif  // LIGHTMAP
+ 
+-    let parallax_correct = (query_result.flags & LIGHT_PROBE_FLAG_PARALLAX_CORRECT) != 0u;
++        let parallax_correct = (query_result.flags & LIGHT_PROBE_FLAG_PARALLAX_CORRECT) != 0u;
++
++        if (enable_diffuse) {
++            let irradiance_sample_dir = compute_cubemap_sample_dir(
++                world_position,
++                N,
++                query_result.light_from_world,
++                query_result.parallax_correction_bounds,
++                parallax_correct
++            );
++            radiances.irradiance = textureSampleLevel(
++                bindings::diffuse_environment_maps[query_result.texture_index],
++                bindings::environment_map_sampler,
++                irradiance_sample_dir,
++                0.0).rgb * query_result.intensity * query_result.weight;
++        }
+ 
+-    if (enable_diffuse) {
+-        let irradiance_sample_dir = compute_cubemap_sample_dir(
++        var radiance_sample_dir = radiance_sample_direction(N, R, roughness);
++        radiance_sample_dir = compute_cubemap_sample_dir(
+             world_position,
+-            N,
++            radiance_sample_dir,
+             query_result.light_from_world,
++            query_result.parallax_correction_bounds,
+             parallax_correct
+         );
+-        radiances.irradiance = textureSampleLevel(
+-            bindings::diffuse_environment_maps[query_result.texture_index],
+-            bindings::environment_map_sampler,
+-            irradiance_sample_dir,
+-            0.0).rgb * query_result.intensity;
++        radiances.radiance +=
++            textureSampleLevel(
++                bindings::specular_environment_maps[query_result.texture_index],
++                bindings::environment_map_sampler,
++                radiance_sample_dir,
++                radiance_level).rgb * query_result.intensity * query_result.weight;
++
++        total_weight += query_result.weight;
+     }
+ 
+-    var radiance_sample_dir = radiance_sample_direction(N, R, roughness);
+-    radiance_sample_dir = compute_cubemap_sample_dir(
+-        world_position,
+-        radiance_sample_dir,
+-        query_result.light_from_world,
+-        parallax_correct
+-    );
+-
+-    radiances.radiance = textureSampleLevel(
+-        bindings::specular_environment_maps[query_result.texture_index],
+-        bindings::environment_map_sampler,
+-        radiance_sample_dir,
+-        radiance_level).rgb * query_result.intensity;
++    if (total_weight != 0.0) {
++        radiances.irradiance /= total_weight;
++        radiances.radiance /= total_weight;
++    }
+ 
+     return radiances;
+ }
+@@ -185,6 +217,7 @@ fn compute_radiances(
+ 
+     var radiances: EnvironmentMapRadiances;
+ 
++    // If we have no light probe, bail.
+     if (light_probes.view_cubemap_index < 0) {
+         radiances.irradiance = vec3(0.0);
+         radiances.radiance = vec3(0.0);
+diff --git a/crates/bevy_pbr/src/light_probe/irradiance_volume.rs b/crates/bevy_pbr/src/light_probe/irradiance_volume.rs
+index a65de846f2ce0..151b07fbd1281 100644
+--- a/crates/bevy_pbr/src/light_probe/irradiance_volume.rs
++++ b/crates/bevy_pbr/src/light_probe/irradiance_volume.rs
+@@ -314,7 +314,7 @@ impl LightProbeComponent for IrradianceVolume {
+         self.intensity
+     }
+ 
+-    fn flags(&self, _: Self::QueryData) -> RenderLightProbeFlags {
++    fn flags(&self, _: &Self::QueryData) -> RenderLightProbeFlags {
+         if self.affects_lightmapped_meshes {
+             RenderLightProbeFlags::AFFECTS_LIGHTMAPPED_MESH_DIFFUSE
+         } else {
+diff --git a/crates/bevy_pbr/src/light_probe/irradiance_volume.wgsl b/crates/bevy_pbr/src/light_probe/irradiance_volume.wgsl
+index 5076a1d92af07..a48c4c84af07c 100644
+--- a/crates/bevy_pbr/src/light_probe/irradiance_volume.wgsl
++++ b/crates/bevy_pbr/src/light_probe/irradiance_volume.wgsl
+@@ -1,6 +1,6 @@
+ #define_import_path bevy_pbr::irradiance_volume
+ 
+-#import bevy_pbr::light_probe::query_light_probe
++#import bevy_pbr::light_probe::{light_probe_iterator_new, light_probe_iterator_next}
+ #import bevy_pbr::mesh_view_bindings::{
+     irradiance_volumes,
+     irradiance_volume,
+@@ -19,55 +19,72 @@ fn irradiance_volume_light(
+     N: vec3<f32>,
+     clusterable_object_index_ranges: ptr<function, ClusterableObjectIndexRanges>,
+ ) -> vec3<f32> {
+-    // Search for an irradiance volume that contains the fragment.
+-    let query_result = query_light_probe(
++    // Find all irradiance volumes that contain the fragment. We're going to
++    // accumulate all the irradiance from them in a weighted sum.
++    var iterator = light_probe_iterator_new(
+         world_position,
+         /*is_irradiance_volume=*/ true,
+         clusterable_object_index_ranges,
+     );
+ 
+-    // If there was no irradiance volume found, bail out.
+-    if (query_result.texture_index < 0) {
+-        return vec3(0.0f);
+-    }
++    var total_weight = 0.0;
++    var total_irradiance = vec3(0.0);
+ 
+-    // If we're lightmapped, and the irradiance volume contributes no diffuse
+-    // light, then bail out.
+-#ifdef LIGHTMAP
+-    if ((query_result.flags & LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE) == 0u) {
+-        return vec3(0.0f);
+-    }
+-#endif  // LIGHTMAP
++    while (true) {
++        var query_result = light_probe_iterator_next(&iterator);
++
++        // If there was no irradiance volume found, we're done.
++        if (query_result.texture_index < 0) {
++            break;
++        }
++
++        // If we're lightmapped, and the irradiance volume contributes no diffuse
++        // light, then bail out.
++    #ifdef LIGHTMAP
++        if ((query_result.flags & LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE) == 0u) {
++            continue;
++        }
++    #endif  // LIGHTMAP
++
++    #ifdef MULTIPLE_LIGHT_PROBES_IN_ARRAY
++        let irradiance_volume_texture = irradiance_volumes[query_result.texture_index];
++    #else
++        let irradiance_volume_texture = irradiance_volume;
++    #endif
+ 
+-#ifdef MULTIPLE_LIGHT_PROBES_IN_ARRAY
+-    let irradiance_volume_texture = irradiance_volumes[query_result.texture_index];
+-#else
+-    let irradiance_volume_texture = irradiance_volume;
+-#endif
++        let atlas_resolution = vec3<f32>(textureDimensions(irradiance_volume_texture));
++        let resolution = vec3<f32>(textureDimensions(irradiance_volume_texture) / vec3(1u, 2u, 3u));
+ 
+-    let atlas_resolution = vec3<f32>(textureDimensions(irradiance_volume_texture));
+-    let resolution = vec3<f32>(textureDimensions(irradiance_volume_texture) / vec3(1u, 2u, 3u));
++        // Make sure to clamp to the edges to avoid texture bleed.
++        var unit_pos = (query_result.light_from_world * vec4(world_position, 1.0f)).xyz;
++        let stp = clamp((unit_pos + 0.5) * resolution, vec3(0.5f), resolution - vec3(0.5f));
++        let uvw = stp / atlas_resolution;
+ 
+-    // Make sure to clamp to the edges to avoid texture bleed.
+-    var unit_pos = (query_result.light_from_world * vec4(world_position, 1.0f)).xyz;
+-    let stp = clamp((unit_pos + 0.5) * resolution, vec3(0.5f), resolution - vec3(0.5f));
+-    let uvw = stp / atlas_resolution;
++        // The bottom half of each cube slice is the negative part, so choose it if applicable on each
++        // slice.
++        let neg_offset = select(vec3(0.0f), vec3(0.5f), N < vec3(0.0f));
+ 
+-    // The bottom half of each cube slice is the negative part, so choose it if applicable on each
+-    // slice.
+-    let neg_offset = select(vec3(0.0f), vec3(0.5f), N < vec3(0.0f));
++        let uvw_x = uvw + vec3(0.0f, neg_offset.x, 0.0f);
++        let uvw_y = uvw + vec3(0.0f, neg_offset.y, 1.0f / 3.0f);
++        let uvw_z = uvw + vec3(0.0f, neg_offset.z, 2.0f / 3.0f);
+ 
+-    let uvw_x = uvw + vec3(0.0f, neg_offset.x, 0.0f);
+-    let uvw_y = uvw + vec3(0.0f, neg_offset.y, 1.0f / 3.0f);
+-    let uvw_z = uvw + vec3(0.0f, neg_offset.z, 2.0f / 3.0f);
++        let rgb_x = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_x, 0.0).rgb;
++        let rgb_y = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_y, 0.0).rgb;
++        let rgb_z = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_z, 0.0).rgb;
+ 
+-    let rgb_x = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_x, 0.0).rgb;
+-    let rgb_y = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_y, 0.0).rgb;
+-    let rgb_z = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_z, 0.0).rgb;
++        // Use Valve's formula to sample.
++        let NN = N * N;
++        total_irradiance += (rgb_x * NN.x + rgb_y * NN.y + rgb_z * NN.z) * query_result.intensity *
++            query_result.weight;
++
++        total_weight += query_result.weight;
++    }
++
++    if (total_weight != 0.0) {
++        total_irradiance /= total_weight;
++    }
+ 
+-    // Use Valve's formula to sample.
+-    let NN = N * N;
+-    return (rgb_x * NN.x + rgb_y * NN.y + rgb_z * NN.z) * query_result.intensity;
++    return total_irradiance;
+ }
+ 
+ #endif  // IRRADIANCE_VOLUMES_ARE_USABLE
+diff --git a/crates/bevy_pbr/src/light_probe/light_probe.wgsl b/crates/bevy_pbr/src/light_probe/light_probe.wgsl
+index ac89cfc2fdbd9..12622239fe471 100644
+--- a/crates/bevy_pbr/src/light_probe/light_probe.wgsl
++++ b/crates/bevy_pbr/src/light_probe/light_probe.wgsl
+@@ -9,6 +9,9 @@
+ }
+ 
+ // The result of searching for a light probe.
++//
++// Light probe iterators yield values of this type. Note that multiple light
++// probes can affect a single fragment.
+ struct LightProbeQueryResult {
+     // The index of the light probe texture or textures in the binding array or
+     // arrays.
+@@ -19,6 +22,13 @@ struct LightProbeQueryResult {
+     // Transform from world space to the light probe model space. In light probe
+     // model space, the light probe is a 1×1×1 cube centered on the origin.
+     light_from_world: mat4x4<f32>,
++    // The boundaries of the simulated space used for parallax correction,
++    // specified as *half* extents in light probe space.
++    parallax_correction_bounds: vec3<f32>,
++    // The weight of this light probe, determined by the position of the
++    // fragment within the falloff range. The sum of the weights of all light
++    // probes affecting a fragment need not be 1.
++    weight: f32,
+     // The flags that the light probe has: a combination of
+     // `LIGHT_PROBE_FLAG_*`.
+     flags: u32,
+@@ -35,38 +45,66 @@ fn transpose_affine_matrix(matrix: mat3x4<f32>) -> mat4x4<f32> {
+ 
+ #if AVAILABLE_STORAGE_BUFFER_BINDINGS >= 3
+ 
+-// Searches for a light probe that contains the fragment.
+-//
+-// This is the version that's used when storage buffers are available and
+-// light probes are clustered.
++// A type that allows iterating through the list of light probes that overlap
++// the current fragment.
+ //
+-// TODO: Interpolate between multiple light probes.
+-fn query_light_probe(
++// This is the version used when light probes are clustered.
++struct LightProbeIterator {
++    // The current offset in the light probes list.
++    current_offset: u32,
++    // The last offset in the light probes list.
++    end_offset: u32,
++    // The world-space position of the current fragment.
+     world_position: vec3<f32>,
++    // True if we're searching for an irradiance volume; false if we're
++    // searching for a reflection probe.
+     is_irradiance_volume: bool,
+-    clusterable_object_index_ranges: ptr<function, ClusterableObjectIndexRanges>,
+-) -> LightProbeQueryResult {
+-    var result: LightProbeQueryResult;
+-    result.texture_index = -1;
++}
+ 
++// Creates a new light probe iterator ready to iterate through light probes in
++// the froxel containing the `world_position`.
++fn light_probe_iterator_new(
++    world_position: vec3<f32>,
++    is_irradiance_volume: bool,
++    clusterable_object_index_ranges: ptr<function, ClusterableObjectIndexRanges>,
++) -> LightProbeIterator {
+     // Reflection probe indices are followed by irradiance volume indices in the
+     // cluster index list. Use this fact to create our bracketing range of
+     // indices.
+-    var start_offset: u32;
+-    var end_offset: u32;
++
+     if is_irradiance_volume {
+-        start_offset = (*clusterable_object_index_ranges).first_irradiance_volume_index_offset;
+-        end_offset = (*clusterable_object_index_ranges).first_decal_offset;
+-    } else {
+-        start_offset = (*clusterable_object_index_ranges).first_reflection_probe_index_offset;
+-        end_offset = (*clusterable_object_index_ranges).first_irradiance_volume_index_offset;
++        return LightProbeIterator(
++            (*clusterable_object_index_ranges).first_irradiance_volume_index_offset,
++            (*clusterable_object_index_ranges).first_decal_offset,
++            world_position,
++            true
++        );
+     }
+ 
+-    for (var light_probe_index_offset: u32 = start_offset;
+-            light_probe_index_offset < end_offset && result.texture_index < 0;
+-            light_probe_index_offset += 1u) {
++    return LightProbeIterator(
++        (*clusterable_object_index_ranges).first_reflection_probe_index_offset,
++        (*clusterable_object_index_ranges).first_irradiance_volume_index_offset,
++        world_position,
++        false
++    );
++}
++
++// Searches for a light probe that contains the fragment and returns the next
++// such probe.
++//
++// Note that multiple light probes can affect a fragment. The caller is
++// generally expected to blend their influences together in a weighted sum.
++fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> LightProbeQueryResult {
++    let world_position = (*iterator).world_position;
++
++    var result: LightProbeQueryResult;
++    result.texture_index = -1;
++    result.weight = 0.0;
++
++    while ((*iterator).current_offset < (*iterator).end_offset) {
+         let light_probe_index = i32(clustered_forward::get_clusterable_object_id(
+-            light_probe_index_offset));
++            (*iterator).current_offset));
++        (*iterator).current_offset += 1u;
+ 
+         // FIXME: This happens when one or more images for the light probe
+         // aren't loaded yet. Really, though, we shouldn't be clustering such
+@@ -76,7 +114,7 @@ fn query_light_probe(
+         }
+ 
+         var light_probe: LightProbe;
+-        if is_irradiance_volume {
++        if (*iterator).is_irradiance_volume {
+             light_probe = light_probes.irradiance_volumes[light_probe_index];
+         } else {
+             light_probe = light_probes.reflection_probes[light_probe_index];
+@@ -86,16 +124,30 @@ fn query_light_probe(
+         let light_from_world =
+             transpose_affine_matrix(light_probe.light_from_world_transposed);
+ 
+-        // Check to see if the transformed point is inside the unit cube
+-        // centered at the origin.
++        // Transform the point into local space, with the cube edges at ±0.5 on
++        // each axis.
+         let probe_space_pos = (light_from_world * vec4<f32>(world_position, 1.0f)).xyz;
+-        if (all(abs(probe_space_pos) <= vec3(0.5f))) {
+-            result.texture_index = light_probe.cubemap_index;
+-            result.intensity = light_probe.intensity;
+-            result.light_from_world = light_from_world;
+-            result.flags = light_probe.flags;
+-            break;
++        // Avoid division by zero.
++        let falloff = max(light_probe.falloff, vec3(0.0001));
++        // Calculate the per-axis weight by doing a linear ramp from 0.0 at the
++        // inside of the falloff region to 1.0 at the outside of the falloff
++        // region.
++        let axis_weights = saturate((1.0 - 2.0 * abs(probe_space_pos)) / (2.0 * falloff));
++        // The actual weight is the minimum of all the per-axis weights.
++        let weight = min(min(axis_weights.x, axis_weights.y), axis_weights.z);
++        // If the resulting weight is zero, we're outside the light probe
++        // entirely. Bail.
++        if (weight == 0.0) {
++            continue;
+         }
++
++        result.texture_index = light_probe.cubemap_index;
++        result.intensity = light_probe.intensity;
++        result.light_from_world = light_from_world;
++        result.parallax_correction_bounds = light_probe.parallax_correction_bounds;
++        result.flags = light_probe.flags;
++        result.weight = weight;
++        return result;
+     }
+ 
+     return result;
+@@ -103,31 +155,60 @@ fn query_light_probe(
+ 
+ #else   // AVAILABLE_STORAGE_BUFFER_BINDINGS >= 3
+ 
+-// Searches for a light probe that contains the fragment.
++// A type that allows iterating through the list of light probes that overlap
++// the current fragment.
+ //
+-// This is the version that's used when storage buffers aren't available and
+-// light probes aren't clustered. It simply does a brute force search of all
+-// light probes. Because platforms without sufficient SSBO bindings typically
+-// lack bindless shaders, there will usually only be one of each type of light
+-// probe present anyway.
+-fn query_light_probe(
++// This is the version that's used when sufficient storage buffers aren't
++// available and consequently when light probes aren't clustered. It simply does
++// a brute force search of all light probes. Because platforms without
++// sufficient SSBO bindings typically lack bindless shaders, there will usually
++// only be one of each type of light probe present anyway.
++struct LightProbeIterator {
++    // The current index in the list of light probes for this cluster.
++    current_index: u32,
++    // The last index in the list.
++    end_index: u32,
++    // The position of the current fragment.
++    world_position: vec3<f32>,
++    // True if we're searching for irradiance volumes; false if we're searching
++    // for reflection probes.
++    is_irradiance_volume: bool,
++}
++
++// Creates a new light probe iterator ready to search through light probes.
++fn light_probe_iterator_new(
+     world_position: vec3<f32>,
+     is_irradiance_volume: bool,
+     clusterable_object_index_ranges: ptr<function, ClusterableObjectIndexRanges>,
+-) -> LightProbeQueryResult {
++) -> LightProbeIterator {
++    return LightProbeIterator(
++        0,
++        select(
++            light_probes.reflection_probe_count,
++            light_probes.irradiance_volume_count,
++            is_irradiance_volume
++        ),
++        world_position,
++        is_irradiance_volume
++    );
++}
++
++// Searches for a light probe that contains the fragment and returns the next
++// such probe.
++//
++// Note that, theoretically, multiple light probes can affect a fragment, and
++// the caller is generally expected to blend their influences together in a
++// weighted sum. In practice, this version of `light_probe_iterator_next` is
++// used on platforms that lack bindless shaders, so there will only be at most
++// one light probe that affects the current fragment in the first place.
++fn light_probe_iterator_next(iterator: ptr<function, LightProbeIterator>) -> LightProbeQueryResult {
+     var result: LightProbeQueryResult;
+     result.texture_index = -1;
++    result.weight = 0.0;
+ 
+-    var light_probe_count: i32;
+-    if is_irradiance_volume {
+-        light_probe_count = light_probes.irradiance_volume_count;
+-    } else {
+-        light_probe_count = light_probes.reflection_probe_count;
+-    }
++    while (true) {
++        let light_probe_index = (*iterator).current_index;
+ 
+-    for (var light_probe_index: i32 = 0;
+-            light_probe_index < light_probe_count && result.texture_index < 0;
+-            light_probe_index += 1) {
+         var light_probe: LightProbe;
+         if is_irradiance_volume {
+             light_probe = light_probes.irradiance_volumes[light_probe_index];
+@@ -139,22 +220,30 @@ fn query_light_probe(
+         let light_from_world =
+             transpose_affine_matrix(light_probe.light_from_world_transposed);
+ 
+-        // Check to see if the transformed point is inside the unit cube
+-        // centered at the origin.
++        // Transform the point into local space, with the cube edges at ±0.5 on
++        // each axis.
+         let probe_space_pos = (light_from_world * vec4<f32>(world_position, 1.0f)).xyz;
+-        if (all(abs(probe_space_pos) <= vec3(0.5f))) {
+-            result.texture_index = light_probe.cubemap_index;
+-            result.intensity = light_probe.intensity;
+-            result.light_from_world = light_from_world;
+-            result.flags = light_probe.flags;
+-
+-            // TODO: Workaround for ICE in DXC https://github.com/microsoft/DirectXShaderCompiler/issues/6183
+-            // We can't use `break` here because of the ICE.
+-            // So instead we rely on the fact that we set `result.texture_index`
+-            // above and check its value in the `for` loop header before
+-            // looping.
+-            // break;
++        // Avoid division by zero.
++        let falloff = max(light_probe.falloff, vec3(0.0001));
++        // Calculate the per-axis weight by doing a linear ramp from 0.0 at the
++        // inside of the falloff region to 1.0 at the outside of the falloff
++        // region.
++        let axis_weights = saturate((1.0 - 2.0 * abs(probe_space_pos)) / (2.0 * falloff));
++        // The actual weight is the minimum of all the per-axis weights.
++        let weight = min(min(axis_weights.x, axis_weights.y), axis_weights.z);
++        // If the resulting weight is zero, we're outside the light probe
++        // entirely. Bail.
++        if (weight == 0.0) {
++            continue;
+         }
++
++        result.texture_index = light_probe.cubemap_index;
++        result.intensity = light_probe.intensity;
++        result.light_from_world = light_from_world;
++        result.parallax_correction_bounds = light_probe.parallax_correction_bounds;
++        result.flags = light_probe.flags;
++        result.weight = weight;
++        return result;
+     }
+ 
+     return result;
+diff --git a/crates/bevy_pbr/src/light_probe/mod.rs b/crates/bevy_pbr/src/light_probe/mod.rs
+index 27fbc1346ba0c..424ac386f1812 100644
+--- a/crates/bevy_pbr/src/light_probe/mod.rs
++++ b/crates/bevy_pbr/src/light_probe/mod.rs
+@@ -16,7 +16,7 @@ use bevy_image::Image;
+ use bevy_light::{
+     cluster::VisibleClusterableObjects, EnvironmentMapLight, IrradianceVolume, LightProbe,
+ };
+-use bevy_math::{Affine3A, FloatOrd, Mat4, Vec4};
++use bevy_math::{Affine3A, FloatOrd, Mat4, Vec3, Vec4};
+ use bevy_platform::collections::HashMap;
+ use bevy_render::{
+     extract_instances::ExtractInstancesPlugin,
+@@ -69,6 +69,22 @@ struct RenderLightProbe {
+     /// efficiently check for bounding box intersection.
+     light_from_world_transposed: [Vec4; 3],
+ 
++    /// The falloff region, specified as a fraction of the light probe's
++    /// bounding box.
++    ///
++    /// See the comments in [`LightProbe`] for more details.
++    falloff: Vec3,
++
++    /// The boundaries of the simulated space used for parallax correction,
++    /// specified as *half* extents in light probe space.
++    ///
++    /// If parallax correction is disabled in [`RenderLightProbe::flags`], this
++    /// field is ignored.
++    ///
++    /// See the comments in [`bevy_light::ParallaxCorrection::Custom`] for more
++    /// details.
++    parallax_correction_bounds: Vec3,
++
+     /// The index of the texture or textures in the appropriate binding array or
+     /// arrays.
+     ///
+@@ -155,6 +171,22 @@ where
+     // The transform from light probe space to world space.
+     world_from_light: Affine3A,
+ 
++    // The falloff region, specified as a fraction of the light probe's
++    // bounding box.
++    //
++    // See the comments in [`LightProbe`] for more details.
++    falloff: Vec3,
++
++    /// The boundaries of the simulated space used for parallax correction,
++    /// specified as *half* extents in light probe space.
++    ///
++    /// If parallax correction is disabled in [`RenderLightProbe::flags`], this
++    /// field is ignored.
++    ///
++    /// See the comments in [`bevy_light::ParallaxCorrection::Custom`] for more
++    /// details.
++    parallax_correction_bounds: Vec3,
++
+     // Scale factor applied to the diffuse and specular light generated by this
+     // reflection probe.
+     //
+@@ -279,7 +311,7 @@ pub trait LightProbeComponent: Send + Sync + Component + Sized {
+     /// component.
+     fn flags(
+         &self,
+-        query_components: <Self::QueryData as QueryData>::Item<'_, '_>,
++        query_components: &<Self::QueryData as QueryData>::Item<'_, '_>,
+     ) -> RenderLightProbeFlags;
+ 
+     /// Creates an instance of [`RenderViewLightProbes`] containing all the
+@@ -290,6 +322,28 @@ pub trait LightProbeComponent: Send + Sync + Component + Sized {
+         view_component: Option<&Self>,
+         image_assets: &RenderAssets<GpuImage>,
+     ) -> RenderViewLightProbes<Self>;
++
++    /// Given the matrix value of the `GlobalTransform` of the light probe,
++    /// returns the matrix that transforms world positions into light probe
++    /// space.
++    ///
++    /// The default implementation simply returns the matrix unchanged, but some
++    /// light probes may want to perform other transforms.
++    fn get_world_from_light_matrix(&self, original_world_from_light: &Affine3A) -> Affine3A {
++        *original_world_from_light
++    }
++
++    /// Returns the appropriate parallax correction bounds, as half extents in
++    /// light probe space, for this component.
++    ///
++    /// See the comments in [`bevy_light::ParallaxCorrection::Custom`] for more
++    /// details.
++    fn parallax_correction_bounds(
++        &self,
++        _query_components: &<Self::QueryData as QueryData>::Item<'_, '_>,
++    ) -> Vec3 {
++        Vec3::ZERO
++    }
+ }
+ 
+ /// The uniform struct extracted from [`EnvironmentMapLight`].
+@@ -381,9 +435,7 @@ fn gather_environment_map_uniform(
+ /// to views, performing frustum culling and distance sorting in the process.
+ fn gather_light_probes<C>(
+     image_assets: Res<RenderAssets<GpuImage>>,
+-    light_probe_query: Extract<
+-        Query<(Entity, &GlobalTransform, &C, C::QueryData), With<LightProbe>>,
+-    >,
++    light_probe_query: Extract<Query<(Entity, &GlobalTransform, &LightProbe, &C, C::QueryData)>>,
+     view_query: Extract<
+         Query<
+             (
+@@ -607,27 +659,32 @@ where
+     /// [`LightProbeInfo`]. This is done for every light probe in the scene
+     /// every frame.
+     fn new(
+-        (main_entity, light_probe_transform, environment_map, query_components): (
++        (main_entity, light_probe_transform, light_probe, environment_map, query_components): (
+             Entity,
+             &GlobalTransform,
++            &LightProbe,
+             &C,
+             <C::QueryData as QueryData>::Item<'_, '_>,
+         ),
+         image_assets: &RenderAssets<GpuImage>,
+     ) -> Option<LightProbeInfo<C>> {
+-        let light_from_world_transposed =
+-            Mat4::from(light_probe_transform.affine().inverse()).transpose();
++        let world_from_light =
++            environment_map.get_world_from_light_matrix(&light_probe_transform.affine());
++        let light_from_world_transposed = Mat4::from(world_from_light.inverse()).transpose();
+         environment_map.id(image_assets).map(|id| LightProbeInfo {
+             main_entity: main_entity.into(),
+-            world_from_light: light_probe_transform.affine(),
++            world_from_light,
+             light_from_world: [
+                 light_from_world_transposed.x_axis,
+                 light_from_world_transposed.y_axis,
+                 light_from_world_transposed.z_axis,
+             ],
++            falloff: light_probe.falloff,
++            parallax_correction_bounds: environment_map
++                .parallax_correction_bounds(&query_components),
+             asset_id: id,
+             intensity: environment_map.intensity(),
+-            flags: environment_map.flags(query_components),
++            flags: environment_map.flags(&query_components),
+         })
+     }
+ 
+@@ -707,6 +764,8 @@ where
+             // Write in the light probe data.
+             self.render_light_probes.push(RenderLightProbe {
+                 light_from_world_transposed: light_probe.light_from_world,
++                falloff: light_probe.falloff,
++                parallax_correction_bounds: light_probe.parallax_correction_bounds,
+                 texture_index: cubemap_index as i32,
+                 intensity: light_probe.intensity,
+                 flags: light_probe.flags.bits() as u32,
+@@ -724,6 +783,8 @@ where
+             main_entity: self.main_entity,
+             light_from_world: self.light_from_world,
+             world_from_light: self.world_from_light,
++            falloff: self.falloff,
++            parallax_correction_bounds: self.parallax_correction_bounds,
+             intensity: self.intensity,
+             flags: self.flags,
+             asset_id: self.asset_id.clone(),
+diff --git a/crates/bevy_pbr/src/render/mesh_view_types.wgsl b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+index c09948c2100dd..a02e2188560ed 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_types.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+@@ -132,6 +132,12 @@ struct LightProbe {
+     // This is stored as the transpose in order to save space in this structure.
+     // It'll be transposed in the `environment_map_light` function.
+     light_from_world_transposed: mat3x4<f32>,
++    // The falloff region, specified as a fraction of the light probe's
++    // bounding box.
++    falloff: vec3<f32>,
++    // The boundaries of the simulated space used for parallax correction,
++    // specified as *half* extents in light probe space.
++    parallax_correction_bounds: vec3<f32>,
+     cubemap_index: i32,
+     intensity: f32,
+     // Various flags that apply to this light probe.
+diff --git a/examples/3d/light_probe_blending.rs b/examples/3d/light_probe_blending.rs
+new file mode 100644
+index 0000000000000..b2656c1c32c1e
+--- /dev/null
++++ b/examples/3d/light_probe_blending.rs
+@@ -0,0 +1,693 @@
++//! Demonstrates blending between multiple reflection probes.
++//!
++//! This example shows a reflective sphere that moves between two rooms, each of
++//! which contains a reflection probe with a falloff range. Bevy performs a
++//! blend between the two reflection probes as the sphere moves.
++
++use std::f32::consts::{FRAC_PI_4, PI};
++
++use bevy::{
++    camera::Hdr,
++    camera_controller::free_camera::{self, FreeCamera, FreeCameraPlugin},
++    color::palettes::css::{CORNFLOWER_BLUE, CRIMSON, TAN, WHITE},
++    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
++    light::ParallaxCorrection,
++    math::ops::{atan2, cos, sin},
++    prelude::*,
++    window::{CursorGrabMode, CursorOptions},
++};
++
++use crate::widgets::{WidgetClickEvent, WidgetClickSender};
++
++#[path = "../helpers/widgets.rs"]
++mod widgets;
++
++/// The settings that the user has chosen.
++#[derive(Resource, Default)]
++struct AppStatus {
++    /// Whether the gizmos that show the boundaries of the light probe regions
++    /// are to be shown.
++    gizmos_enabled: GizmosEnabled,
++    /// Which object to show: either a reflective sphere or a reflective prism.
++    object_to_show: ObjectToShow,
++    /// Whether to use an orbital pan/zoom camera or a free camera.
++    camera_mode: CameraMode,
++}
++
++/// Whether the gizmos that show the boundaries of the light probe regions are
++/// to be shown.
++#[derive(Clone, Copy, Default, PartialEq)]
++enum GizmosEnabled {
++    /// The gizmos are shown.
++    #[default]
++    On,
++    /// The gizmos are hidden.
++    Off,
++}
++
++/// Which reflective object to show.
++#[derive(Clone, Copy, Default, PartialEq)]
++enum ObjectToShow {
++    /// A reflective sphere that moves between rooms.
++    #[default]
++    Sphere,
++    /// A reflective prism that is static and stretches across the length of the
++    /// two rooms.
++    Prism,
++}
++
++/// How the user can control the camera.
++#[derive(Clone, Copy, Default, PartialEq)]
++enum CameraMode {
++    /// The camera is a pan/zoom orbital camera controllable with dragging and
++    /// the mouse wheel.
++    #[default]
++    Orbit,
++    /// The camera is a free camera controllable by clicking and dragging and
++    /// using the WASDEQ controls.
++    Free,
++}
++
++/// A marker component for the reflective sphere.
++#[derive(Clone, Copy, Component, Debug)]
++struct ReflectiveSphere;
++
++/// A marker component for the reflective prism.
++#[derive(Clone, Copy, Component, Debug)]
++struct ReflectivePrism;
++
++/// A marker component for the help text at the top of the screen.
++#[derive(Clone, Copy, Component, Debug)]
++struct HelpText;
++
++/// The speed at which the sphere moves, as a ratio of the total distance it
++/// travels to seconds.
++///
++/// Specifically, the value of 0.3 means that it moves 3/10 of the way to the
++/// other side per second.
++const SPHERE_MOVEMENT_SPEED: f32 = 0.3;
++
++/// The side length of each room, in meters.
++const ROOM_SIDE_LENGTH: f32 = 10.0;
++
++/// The number of meters that separates the center of each room.
++const ROOM_SEPARATION: f32 = 11.0;
++
++/// The side length of the light probe cube, in meters.
++const LIGHT_PROBE_SIDE_LENGTH: f32 = 15.0;
++
++/// The distance over which the light probe fades out, expressed as a fraction
++/// of the side length of the probe.
++const LIGHT_PROBE_FALLOFF: f32 = 0.5;
++
++/// The side length of the simulated reflected area for each light probe,
++/// specified as a half-extent in light probe space.
++///
++/// We want this side length, in world space, to be half of the world-space room
++/// side length. Since the light probe is scaled by `LIGHT_PROBE_SIDE_LENGTH`,
++/// we divide the room side length by the light probe side length to get this
++/// value, and multiply by 0.5 to convert from a full extent to a half-extent.
++/// That way, when Bevy applies the `LIGHT_PROBE_SIDE_LENGTH` scale, the light
++/// probe side length factor cancels, and we're left with a parallax correction
++/// side length of `ROOM_SIDE_LENGTH` in world space.
++///
++/// A small epsilon value of 0.01 is added in order to ensure that the light
++/// probe parallax bounds encompass the entire room. Otherwise, unsightly
++/// Z-fighting can occur on the room walls.
++const LIGHT_PROBE_PARALLAX_CORRECTION_SIDE_LENGTH: f32 =
++    ROOM_SIDE_LENGTH / LIGHT_PROBE_SIDE_LENGTH * 0.5 + 0.01;
++
++/// The number of radians of inclination (pitch) that one pixel of mouse
++/// movement corresponds to.
++const CAMERA_ORBIT_SPEED_INCLINATION: f32 = 0.003;
++
++/// The number of radians of azumith (yaw) that one pixel of mouse movement
++/// corresponds to.
++const CAMERA_ORBIT_SPEED_AZIMUTH: f32 = 0.004;
++
++/// The number of meters that one line of mouse scroll corresponds to.
++const CAMERA_ZOOM_SPEED: f32 = 0.15;
++
++/// Information about the orbital pan/zoom camera.
++///
++/// These are in [spherical coordinates].
++///
++/// [spherical coordinates]: https://en.wikipedia.org/wiki/Spherical_coordinate_system
++#[derive(Component)]
++struct OrbitCamera {
++    /// The distance between the camera and the sphere, in meters.
++    radius: f32,
++    /// The camera latitude in radians, relative to the sphere.
++    inclination: f32,
++    /// The camera longitude in radians, relative to the sphere.
++    azimuth: f32,
++}
++
++/// The brightness of the light probe.
++const LIGHT_PROBE_INTENSITY: f32 = 500.0;
++
++/// The entry point.
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins.set(WindowPlugin {
++            primary_window: Some(Window {
++                title: "Bevy Light Probe Blending Example".into(),
++                ..default()
++            }),
++            ..default()
++        }))
++        .add_plugins(FreeCameraPlugin)
++        .init_resource::<AppStatus>()
++        .add_message::<WidgetClickEvent<GizmosEnabled>>()
++        .add_message::<WidgetClickEvent<ObjectToShow>>()
++        .add_message::<WidgetClickEvent<CameraMode>>()
++        .add_systems(Startup, setup)
++        .add_systems(Update, (move_sphere, orbit_camera).chain())
++        .add_systems(
++            Update,
++            (
++                widgets::handle_ui_interactions::<GizmosEnabled>,
++                handle_gizmos_enabled_change,
++            )
++                .chain(),
++        )
++        .add_systems(
++            Update,
++            (
++                widgets::handle_ui_interactions::<ObjectToShow>,
++                handle_object_to_show_change,
++            )
++                .chain(),
++        )
++        .add_systems(
++            Update,
++            (
++                widgets::handle_ui_interactions::<CameraMode>,
++                handle_camera_mode_change,
++            )
++                .chain()
++                .after(free_camera::run_freecamera_controller),
++        )
++        .add_systems(
++            Update,
++            update_radio_buttons
++                .after(widgets::handle_ui_interactions::<GizmosEnabled>)
++                .after(widgets::handle_ui_interactions::<ObjectToShow>)
++                .after(widgets::handle_ui_interactions::<CameraMode>),
++        )
++        .add_systems(Update, draw_gizmos)
++        .run();
++}
++
++/// Performs initial setup of the scene.
++fn setup(
++    mut commands: Commands,
++    asset_server: Res<AssetServer>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
++    mut gizmo_config_store: ResMut<GizmoConfigStore>,
++) {
++    adjust_gizmo_settings(&mut gizmo_config_store);
++
++    let reflective_material = create_reflective_material(&mut materials);
++
++    spawn_camera(&mut commands);
++    spawn_gltf_scene(&mut commands, &asset_server);
++    spawn_reflective_sphere(&mut commands, &mut meshes, reflective_material.clone());
++    spawn_reflective_prism(&mut commands, &mut meshes, reflective_material);
++    spawn_light_probes(&mut commands, &asset_server);
++    spawn_buttons(&mut commands);
++    spawn_help_text(&mut commands);
++}
++
++/// Adjusts the gizmo settings so that the gizmos appear on top of all other
++/// geometry.
++///
++/// If we didn't do this, then the rooms would cover up many of the gizmos.
++fn adjust_gizmo_settings(gizmo_config_store: &mut GizmoConfigStore) {
++    for (_, gizmo_config, _) in &mut gizmo_config_store.iter_mut() {
++        gizmo_config.depth_bias = -1.0;
++    }
++}
++
++/// Creates the perfectly-reflective material that the sphere and prism use.
++fn create_reflective_material(
++    materials: &mut Assets<StandardMaterial>,
++) -> Handle<StandardMaterial> {
++    materials.add(StandardMaterial {
++        base_color: WHITE.into(),
++        metallic: 1.0,
++        reflectance: 1.0,
++        perceptual_roughness: 0.0,
++        ..default()
++    })
++}
++
++/// Spawns the orbital pan/zoom camera.
++fn spawn_camera(commands: &mut Commands) {
++    commands.spawn((
++        Camera3d::default(),
++        Transform::IDENTITY,
++        Hdr,
++        OrbitCamera {
++            radius: 3.0,
++            inclination: 7.0 * FRAC_PI_4,
++            azimuth: FRAC_PI_4,
++        },
++    ));
++}
++
++/// Spawns the glTF scene that contains the two rooms.
++fn spawn_gltf_scene(commands: &mut Commands, asset_server: &AssetServer) {
++    commands.spawn(SceneRoot(asset_server.load(
++        GltfAssetLabel::Scene(0).from_asset(get_web_asset_url("two_rooms.glb")),
++    )));
++}
++
++/// Spawns the reflective sphere, creating its mesh in the process.
++fn spawn_reflective_sphere(
++    commands: &mut Commands,
++    meshes: &mut Assets<Mesh>,
++    material: Handle<StandardMaterial>,
++) {
++    // Create a mesh.
++    let sphere = meshes.add(Sphere::default().mesh().uv(32, 18));
++
++    // Spawn the sphere.
++    commands.spawn((
++        Mesh3d(sphere),
++        MeshMaterial3d(material),
++        Transform::IDENTITY,
++        ReflectiveSphere,
++    ));
++}
++
++/// Spawns the reflective prism, creating its mesh in the process.
++///
++/// The reflective prism starts invisible, but the user can toggle it on and off
++/// as desired.
++fn spawn_reflective_prism(
++    commands: &mut Commands,
++    meshes: &mut Assets<Mesh>,
++    material: Handle<StandardMaterial>,
++) {
++    // Create a mesh.
++    let cube = meshes.add(
++        Cuboid {
++            half_size: vec3(2.0, 1.0, 10.0),
++        }
++        .mesh()
++        .build()
++        // We use flat normals so that the surface appears flat, not curved.
++        .with_duplicated_vertices()
++        .with_computed_flat_normals(),
++    );
++
++    // Spawn the cube.
++    commands.spawn((
++        Mesh3d(cube),
++        MeshMaterial3d(material),
++        Transform::from_xyz(0.0, -4.0, -5.5),
++        ReflectivePrism,
++        Visibility::Hidden,
++    ));
++}
++
++/// Spawns the two light probes, one for each room.
++fn spawn_light_probes(commands: &mut Commands, asset_server: &AssetServer) {
++    // Spawn the first room's light probe.
++    commands.spawn((
++        LightProbe {
++            falloff: Vec3::splat(LIGHT_PROBE_FALLOFF),
++        },
++        EnvironmentMapLight {
++            diffuse_map: asset_server.load(get_web_asset_url("diffuse_room1.ktx2")),
++            specular_map: asset_server.load(get_web_asset_url("specular_room1.ktx2")),
++            intensity: LIGHT_PROBE_INTENSITY,
++            ..default()
++        },
++        Transform::from_scale(vec3(1.0, -1.0, 1.0) * LIGHT_PROBE_SIDE_LENGTH)
++            .with_rotation(Quat::from_rotation_x(PI)),
++        ParallaxCorrection::Custom(Vec3::splat(LIGHT_PROBE_PARALLAX_CORRECTION_SIDE_LENGTH)),
++    ));
++
++    // Spawn the second room's light probe.
++    commands.spawn((
++        LightProbe {
++            falloff: Vec3::splat(LIGHT_PROBE_FALLOFF),
++        },
++        EnvironmentMapLight {
++            diffuse_map: asset_server.load(get_web_asset_url("diffuse_room2.ktx2")),
++            specular_map: asset_server.load(get_web_asset_url("specular_room2.ktx2")),
++            intensity: LIGHT_PROBE_INTENSITY,
++            ..default()
++        },
++        Transform::from_scale(vec3(1.0, -1.0, 1.0) * LIGHT_PROBE_SIDE_LENGTH)
++            .with_rotation(Quat::from_rotation_x(PI))
++            .with_translation(vec3(0.0, 0.0, -ROOM_SEPARATION)),
++        ParallaxCorrection::Custom(Vec3::splat(LIGHT_PROBE_PARALLAX_CORRECTION_SIDE_LENGTH)),
++    ));
++}
++
++/// Spawns the radio buttons at the bottom of the screen.
++fn spawn_buttons(commands: &mut Commands) {
++    commands.spawn((
++        widgets::main_ui_node(),
++        children![
++            widgets::option_buttons(
++                "Gizmos",
++                &[(GizmosEnabled::On, "On"), (GizmosEnabled::Off, "Off"),]
++            ),
++            widgets::option_buttons(
++                "Object to Show",
++                &[
++                    (ObjectToShow::Sphere, "Sphere"),
++                    (ObjectToShow::Prism, "Prism"),
++                ]
++            ),
++            widgets::option_buttons(
++                "Camera Mode",
++                &[(CameraMode::Orbit, "Orbit"), (CameraMode::Free, "Free"),]
++            ),
++        ],
++    ));
++}
++
++/// Spawns the help text at the top of the screen.
++fn spawn_help_text(commands: &mut Commands) {
++    commands.spawn((
++        Text::new(""),
++        Node {
++            position_type: PositionType::Absolute,
++            top: px(12),
++            left: px(12),
++            ..default()
++        },
++        HelpText,
++    ));
++}
++
++/// Moves the sphere a bit every frame.
++fn move_sphere(mut spheres: Query<&mut Transform, With<ReflectiveSphere>>, time: Res<Time>) {
++    let Some(t) = SmoothStepCurve
++        .ping_pong()
++        .unwrap()
++        .forever()
++        .unwrap()
++        .sample(time.elapsed_secs() * SPHERE_MOVEMENT_SPEED)
++    else {
++        return;
++    };
++    for mut sphere_transform in &mut spheres {
++        sphere_transform.translation.z = -ROOM_SEPARATION * t;
++    }
++}
++
++/// Processes requests from the user to move the camera.
++fn orbit_camera(
++    mut cameras: Query<(&mut Transform, &mut OrbitCamera)>,
++    spheres: Query<&Transform, (With<ReflectiveSphere>, Without<OrbitCamera>)>,
++    mouse_buttons: Res<ButtonInput<MouseButton>>,
++    mouse_motion: Res<AccumulatedMouseMotion>,
++    mouse_scroll: Res<AccumulatedMouseScroll>,
++) {
++    // Grab the sphere transform.
++    let Some(sphere_transform) = spheres.iter().next() else {
++        return;
++    };
++
++    for (mut camera_transform, mut orbit_camera) in &mut cameras {
++        // Only pan if the left mouse button is pressed.
++        if mouse_buttons.pressed(MouseButton::Left) {
++            let delta = mouse_motion.delta;
++            orbit_camera.azimuth -= delta.x * CAMERA_ORBIT_SPEED_AZIMUTH;
++            orbit_camera.inclination += delta.y * CAMERA_ORBIT_SPEED_INCLINATION;
++        }
++
++        // Zooming doesn't require a mouse button press, as it uses the mouse
++        // wheel.
++        orbit_camera.radius =
++            (orbit_camera.radius - CAMERA_ZOOM_SPEED * mouse_scroll.delta.y).max(0.01);
++
++        // Calculate the new translation using the [spherical coordinates
++        // formula].
++        //
++        // [spherical coordinates formula]:
++        // https://en.wikipedia.org/wiki/Spherical_coordinate_system#Cartesian_coordinates
++        let new_translation = orbit_camera.radius
++            * vec3(
++                sin(orbit_camera.inclination) * cos(orbit_camera.azimuth),
++                cos(orbit_camera.inclination),
++                sin(orbit_camera.inclination) * sin(orbit_camera.azimuth),
++            );
++
++        // Write in the new transform.
++        *camera_transform =
++            Transform::from_translation(new_translation + sphere_transform.translation)
++                .looking_at(sphere_transform.translation, Vec3::Y);
++    }
++}
++
++/// A system that toggles gizmos on or off when the user clicks on one of the
++/// corresponding radio buttons.
++fn handle_gizmos_enabled_change(
++    mut help_text_query: Query<&mut Text, With<HelpText>>,
++    mut app_status: ResMut<AppStatus>,
++    mut messages: MessageReader<WidgetClickEvent<GizmosEnabled>>,
++) {
++    let mut any_changes = false;
++    for message in messages.read() {
++        app_status.gizmos_enabled = **message;
++        any_changes = true;
++    }
++
++    if any_changes {
++        set_help_text(&app_status, &mut help_text_query);
++    }
++}
++
++/// A system that toggles object visibility when the user clicks on one of the
++/// corresponding radio buttons.
++fn handle_object_to_show_change(
++    mut spheres_query: Query<&mut Visibility, (With<ReflectiveSphere>, Without<ReflectivePrism>)>,
++    mut prisms_query: Query<&mut Visibility, (With<ReflectivePrism>, Without<ReflectiveSphere>)>,
++    mut app_status: ResMut<AppStatus>,
++    mut messages: MessageReader<WidgetClickEvent<ObjectToShow>>,
++) {
++    for message in messages.read() {
++        app_status.object_to_show = **message;
++
++        for mut sphere_visibility in &mut spheres_query {
++            *sphere_visibility = match **message {
++                ObjectToShow::Sphere => Visibility::Inherited,
++                ObjectToShow::Prism => Visibility::Hidden,
++            }
++        }
++        for mut prism_visibility in &mut prisms_query {
++            *prism_visibility = match **message {
++                ObjectToShow::Sphere => Visibility::Hidden,
++                ObjectToShow::Prism => Visibility::Inherited,
++            }
++        }
++    }
++}
++
++/// A system that toggles the camera mode when the user clicks on one of the
++/// corresponding radio buttons.
++fn handle_camera_mode_change(
++    mut commands: Commands,
++    cameras_query: Query<(Entity, &Transform), With<Camera3d>>,
++    sphere_query: Query<&Transform, (With<ReflectiveSphere>, Without<Camera3d>)>,
++    mut help_text_query: Query<&mut Text, With<HelpText>>,
++    mut windows_query: Query<&mut CursorOptions>,
++    mut app_status: ResMut<AppStatus>,
++    mut messages: MessageReader<WidgetClickEvent<CameraMode>>,
++) {
++    let Some(sphere_transform) = sphere_query.iter().next() else {
++        return;
++    };
++
++    let mut any_changes = false;
++    for message in messages.read() {
++        app_status.camera_mode = **message;
++
++        match **message {
++            CameraMode::Orbit => {
++                for (camera_entity, camera_transform) in &cameras_query {
++                    // Convert from Cartesian coordinates back to spherical
++                    // coordinates.
++                    let relative_camera_position =
++                        camera_transform.translation - sphere_transform.translation;
++                    let radius = relative_camera_position.length();
++                    let inclination = atan2(
++                        relative_camera_position.xz().length() / radius,
++                        relative_camera_position.y / radius,
++                    );
++                    let azimuth = atan2(
++                        relative_camera_position.z * relative_camera_position.xz().length_recip(),
++                        relative_camera_position.x * relative_camera_position.xz().length_recip(),
++                    );
++
++                    commands
++                        .entity(camera_entity)
++                        .remove::<FreeCamera>()
++                        .insert(OrbitCamera {
++                            radius,
++                            inclination,
++                            azimuth,
++                        });
++                }
++            }
++
++            CameraMode::Free => {
++                for (camera_entity, _) in &cameras_query {
++                    commands
++                        .entity(camera_entity)
++                        .remove::<OrbitCamera>()
++                        .insert(FreeCamera::default());
++                }
++            }
++        }
++
++        any_changes = true;
++    }
++
++    if any_changes {
++        set_help_text(&app_status, &mut help_text_query);
++
++        // Reset the cursor grab mode, because the free camera controller may
++        // have enabled it, and we don't want the cursor to disappear.
++        for mut cursor_options in &mut windows_query {
++            cursor_options.grab_mode = CursorGrabMode::None;
++            cursor_options.visible = true;
++        }
++    }
++}
++
++/// A system that updates the radio buttons at the bottom of the screen to
++/// reflect whether gizmos are enabled or not.
++fn update_radio_buttons(
++    mut widgets_query: Query<(
++        Entity,
++        Option<&mut BackgroundColor>,
++        Has<Text>,
++        AnyOf<(
++            &WidgetClickSender<GizmosEnabled>,
++            &WidgetClickSender<ObjectToShow>,
++            &WidgetClickSender<CameraMode>,
++        )>,
++    )>,
++    app_status: Res<AppStatus>,
++    mut text_ui_writer: TextUiWriter,
++) {
++    for (
++        entity,
++        maybe_bg_color,
++        has_text,
++        (maybe_gizmos_enabled, maybe_object_to_show, maybe_camera_mode),
++    ) in &mut widgets_query
++    {
++        let selected = if let Some(sender) = maybe_gizmos_enabled {
++            app_status.gizmos_enabled == **sender
++        } else if let Some(sender) = maybe_object_to_show {
++            app_status.object_to_show == **sender
++        } else if let Some(sender) = maybe_camera_mode {
++            app_status.camera_mode == **sender
++        } else {
++            continue;
++        };
++
++        if let Some(mut bg_color) = maybe_bg_color {
++            widgets::update_ui_radio_button(&mut bg_color, selected);
++        }
++        if has_text {
++            widgets::update_ui_radio_button_text(entity, &mut text_ui_writer, selected);
++        }
++    }
++}
++
++/// Draws gizmos that show the boundaries of the various boxes associated with
++/// the light probes in the scene.
++fn draw_gizmos(
++    light_probes: Query<(&LightProbe, &ParallaxCorrection, &Transform)>,
++    app_status: Res<AppStatus>,
++    mut gizmos: Gizmos,
++) {
++    // If the user has gizmos disabled, bail.
++    if matches!(app_status.gizmos_enabled, GizmosEnabled::Off) {
++        return;
++    }
++
++    for (light_probe, parallax_correction, transform) in &light_probes {
++        // Draw light probe bounds.
++        gizmos.cube(*transform, TAN);
++
++        // Draw light probe falloff.
++        gizmos.cube(
++            Transform {
++                scale: transform.scale * (Vec3::ONE - light_probe.falloff),
++                ..*transform
++            },
++            CRIMSON,
++        );
++
++        // Draw light probe parallax correction bounds.
++        if let ParallaxCorrection::Custom(parallax_correction_bounds) = *parallax_correction {
++            gizmos.cube(
++                Transform {
++                    scale: transform.scale * parallax_correction_bounds,
++                    ..*transform
++                },
++                CORNFLOWER_BLUE,
++            );
++        }
++    }
++}
++
++/// Updates the help text at the top of the screen to reflect a change in camera
++/// or gizmo application settings.
++fn set_help_text(app_status: &AppStatus, help_text_query: &mut Query<&mut Text, With<HelpText>>) {
++    for mut ui_text in help_text_query {
++        let mut help_text = String::new();
++        match app_status.camera_mode {
++            CameraMode::Orbit => {
++                help_text.push_str(
++                    "Click and drag to orbit the camera\nUse the mouse wheel to zoom the camera\n",
++                );
++            }
++            CameraMode::Free => {
++                help_text.push_str(
++                    "Click and drag to rotate the camera\nUse WASDEQ to move the camera\n",
++                );
++            }
++        }
++
++        help_text.push('\n');
++
++        if matches!(app_status.gizmos_enabled, GizmosEnabled::On) {
++            help_text.push_str(
++                "\
++Gizmos:
++Tan: Light probe bounds
++Red: Light probe falloff bounds
++Blue: Parallax correction bounds",
++            );
++        }
++
++        *ui_text = Text::new(help_text);
++    }
++}
++
++/// Returns the GitHub download URL for the given asset.
++///
++/// The files are expected to be in the `light_probe_blending` directory in the
++/// [repository].
++///
++/// [repository]: https://github.com/bevyengine/bevy_asset_files
++fn get_web_asset_url(name: &str) -> String {
++    format!(
++        "https://raw.githubusercontent.com/bevyengine/bevy_asset_files/refs/heads/main/\
++light_probe_blending/{}",
++        name
++    )
++}
+diff --git a/examples/3d/pccm.rs b/examples/3d/pccm.rs
+index 52945e8a222dc..08f04c077268e 100644
+--- a/examples/3d/pccm.rs
++++ b/examples/3d/pccm.rs
+@@ -5,7 +5,7 @@ use core::f32;
+ use bevy::{
+     camera::Hdr,
+     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+-    light::NoParallaxCorrection,
++    light::ParallaxCorrection,
+     prelude::*,
+ };
+ 
+@@ -136,7 +136,7 @@ fn spawn_reflection_probe(commands: &mut Commands, asset_server: &AssetServer) {
+     let diffuse_map = asset_server.load(ENV_DIFFUSE_URL);
+     let specular_map = asset_server.load(ENV_SPECULAR_URL);
+     commands.spawn((
+-        LightProbe,
++        LightProbe::default(),
+         EnvironmentMapLight {
+             diffuse_map,
+             specular_map,
+@@ -180,17 +180,17 @@ fn handle_pccm_enable_change(
+         // selected.
+         app_status.pccm_enabled = **message;
+ 
+-        // Add or remove the `NoParallaxCorrection` component as appropriate.
++        // Add the appropriate variant of the `ParallaxCorrection` component.
+         match **message {
+             PccmEnableStatus::Enabled => {
+                 commands
+                     .entity(light_probe_entity)
+-                    .remove::<NoParallaxCorrection>();
++                    .insert(ParallaxCorrection::Auto);
+             }
+             PccmEnableStatus::Disabled => {
+                 commands
+                     .entity(light_probe_entity)
+-                    .insert(NoParallaxCorrection);
++                    .insert(ParallaxCorrection::None);
+             }
+         }
+     }
+diff --git a/examples/3d/reflection_probes.rs b/examples/3d/reflection_probes.rs
+index 0844de0ee9fb5..ee0904e647f18 100644
+--- a/examples/3d/reflection_probes.rs
++++ b/examples/3d/reflection_probes.rs
+@@ -13,7 +13,7 @@
+ use bevy::{
+     camera::{Exposure, Hdr},
+     core_pipeline::tonemapping::Tonemapping,
+-    light::{NoParallaxCorrection, Skybox},
++    light::{ParallaxCorrection, Skybox},
+     pbr::generate::generate_environment_map_light,
+     prelude::*,
+     render::render_resource::TextureUsages,
+@@ -153,7 +153,7 @@ fn spawn_sphere(
+ // Spawns the reflection probe.
+ fn spawn_reflection_probe(commands: &mut Commands, cubemaps: &Cubemaps) {
+     commands.spawn((
+-        LightProbe,
++        LightProbe::default(),
+         EnvironmentMapLight {
+             diffuse_map: cubemaps.diffuse_environment_map.clone(),
+             specular_map: cubemaps.specular_reflection_probe.clone(),
+@@ -164,7 +164,7 @@ fn spawn_reflection_probe(commands: &mut Commands, cubemaps: &Cubemaps) {
+         Transform::from_scale(Vec3::splat(2.0)),
+         // Disable parallax correction because the reflected scene is quite
+         // distant.
+-        NoParallaxCorrection,
++        ParallaxCorrection::None,
+     ));
+ }
+ 
+diff --git a/examples/README.md b/examples/README.md
+index 24157793b56de..47ccc436c0e8e 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -165,6 +165,7 @@ Example | Description
+ [Fog volumes](../examples/3d/fog_volumes.rs) | Demonstrates fog volumes
+ [Generate Custom Mesh](../examples/3d/generate_custom_mesh.rs) | Simple showcase of how to generate a custom mesh with a custom texture
+ [Irradiance Volumes](../examples/3d/irradiance_volumes.rs) | Demonstrates irradiance volumes
++[Light Probe Blending](../examples/3d/light_probe_blending.rs) | Demonstrates blending between multiple reflection probes
+ [Light Textures](../examples/3d/light_textures.rs) | Demonstrates light textures
+ [Lighting](../examples/3d/lighting.rs) | Illustrates various lighting options in a simple scene
+ [Lightmaps](../examples/3d/lightmaps.rs) | Rendering a scene with baked lightmaps

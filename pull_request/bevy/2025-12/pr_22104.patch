@@ -1,0 +1,1726 @@
+diff --git a/crates/bevy_asset/src/io/android.rs b/crates/bevy_asset/src/io/android.rs
+index fd6a71d219894..e57f3925b9f77 100644
+--- a/crates/bevy_asset/src/io/android.rs
++++ b/crates/bevy_asset/src/io/android.rs
+@@ -1,4 +1,7 @@
+-use crate::io::{get_meta_path, AssetReader, AssetReaderError, PathStream, Reader, VecReader};
++use crate::io::{
++    get_meta_path, AssetReader, AssetReaderError, PathStream, Reader, ReaderRequiredFeatures,
++    VecReader,
++};
+ use alloc::{borrow::ToOwned, boxed::Box, ffi::CString, vec::Vec};
+ use futures_lite::stream;
+ use std::path::Path;
+@@ -16,7 +19,11 @@ use std::path::Path;
+ pub struct AndroidAssetReader;
+ 
+ impl AssetReader for AndroidAssetReader {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        _required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         let asset_manager = bevy_android::ANDROID_APP
+             .get()
+             .expect("Bevy must be setup with the #[bevy_main] macro on Android")
+diff --git a/crates/bevy_asset/src/io/file/file_asset.rs b/crates/bevy_asset/src/io/file/file_asset.rs
+index 290891440c4e1..6e9b54ccdf7bb 100644
+--- a/crates/bevy_asset/src/io/file/file_asset.rs
++++ b/crates/bevy_asset/src/io/file/file_asset.rs
+@@ -1,40 +1,23 @@
+ use crate::io::{
+-    get_meta_path, AssetReader, AssetReaderError, AssetWriter, AssetWriterError, AsyncSeekForward,
+-    PathStream, Reader, Writer,
++    get_meta_path, AssetReader, AssetReaderError, AssetWriter, AssetWriterError, PathStream,
++    Reader, ReaderRequiredFeatures, Writer,
+ };
+ use async_fs::{read_dir, File};
+-use futures_io::AsyncSeek;
+ use futures_lite::StreamExt;
+ 
+ use alloc::{borrow::ToOwned, boxed::Box};
+-use core::{pin::Pin, task, task::Poll};
+ use std::path::Path;
+ 
+ use super::{FileAssetReader, FileAssetWriter};
+ 
+-impl AsyncSeekForward for File {
+-    fn poll_seek_forward(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut task::Context<'_>,
+-        offset: u64,
+-    ) -> Poll<futures_io::Result<u64>> {
+-        let offset: Result<i64, _> = offset.try_into();
+-
+-        if let Ok(offset) = offset {
+-            Pin::new(&mut self).poll_seek(cx, futures_io::SeekFrom::Current(offset))
+-        } else {
+-            Poll::Ready(Err(std::io::Error::new(
+-                std::io::ErrorKind::InvalidInput,
+-                "seek position is out of range",
+-            )))
+-        }
+-    }
+-}
+-
+ impl Reader for File {}
+ 
+ impl AssetReader for FileAssetReader {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        _required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         let full_path = self.root_path.join(path);
+         File::open(&full_path).await.map_err(|e| {
+             if e.kind() == std::io::ErrorKind::NotFound {
+diff --git a/crates/bevy_asset/src/io/file/sync_file_asset.rs b/crates/bevy_asset/src/io/file/sync_file_asset.rs
+index 7ad454860f20f..28bba3d8e0b2c 100644
+--- a/crates/bevy_asset/src/io/file/sync_file_asset.rs
++++ b/crates/bevy_asset/src/io/file/sync_file_asset.rs
+@@ -2,15 +2,15 @@ use futures_io::{AsyncRead, AsyncWrite};
+ use futures_lite::Stream;
+ 
+ use crate::io::{
+-    get_meta_path, AssetReader, AssetReaderError, AssetWriter, AssetWriterError, AsyncSeekForward,
+-    PathStream, Reader, Writer,
++    get_meta_path, AssetReader, AssetReaderError, AssetWriter, AssetWriterError, AsyncSeek,
++    PathStream, Reader, ReaderRequiredFeatures, Writer,
+ };
+ 
+ use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
+ use core::{pin::Pin, task::Poll};
+ use std::{
+     fs::{read_dir, File},
+-    io::{Read, Seek, Write},
++    io::{Read, Seek, SeekFrom, Write},
+     path::{Path, PathBuf},
+ };
+ 
+@@ -30,17 +30,13 @@ impl AsyncRead for FileReader {
+     }
+ }
+ 
+-impl AsyncSeekForward for FileReader {
+-    fn poll_seek_forward(
+-        self: Pin<&mut Self>,
++impl AsyncSeek for FileReader {
++    fn poll_seek(
++        mut self: Pin<&mut Self>,
+         _cx: &mut core::task::Context<'_>,
+-        offset: u64,
++        pos: SeekFrom,
+     ) -> Poll<std::io::Result<u64>> {
+-        let this = self.get_mut();
+-        let current = this.0.stream_position()?;
+-        let seek = this.0.seek(std::io::SeekFrom::Start(current + offset));
+-
+-        Poll::Ready(seek)
++        Poll::Ready(self.0.seek(pos))
+     }
+ }
+ 
+@@ -99,7 +95,11 @@ impl Stream for DirReader {
+ }
+ 
+ impl AssetReader for FileAssetReader {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        _required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         let full_path = self.root_path.join(path);
+         match File::open(&full_path) {
+             Ok(file) => Ok(FileReader(file)),
+diff --git a/crates/bevy_asset/src/io/gated.rs b/crates/bevy_asset/src/io/gated.rs
+index 6ce2b65b7cc2f..3bb0a10924956 100644
+--- a/crates/bevy_asset/src/io/gated.rs
++++ b/crates/bevy_asset/src/io/gated.rs
+@@ -1,4 +1,4 @@
+-use crate::io::{AssetReader, AssetReaderError, PathStream, Reader};
++use crate::io::{AssetReader, AssetReaderError, PathStream, Reader, ReaderRequiredFeatures};
+ use alloc::{boxed::Box, sync::Arc};
+ use async_channel::{Receiver, Sender};
+ use bevy_platform::{collections::HashMap, sync::RwLock};
+@@ -55,7 +55,11 @@ impl<R: AssetReader> GatedReader<R> {
+ }
+ 
+ impl<R: AssetReader> AssetReader for GatedReader<R> {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         let receiver = {
+             let mut gates = self.gates.write().unwrap_or_else(PoisonError::into_inner);
+             let gates = gates
+@@ -64,7 +68,7 @@ impl<R: AssetReader> AssetReader for GatedReader<R> {
+             gates.1.clone()
+         };
+         receiver.recv().await.unwrap();
+-        let result = self.reader.read(path).await?;
++        let result = self.reader.read(path, required_features).await?;
+         Ok(result)
+     }
+ 
+diff --git a/crates/bevy_asset/src/io/memory.rs b/crates/bevy_asset/src/io/memory.rs
+index 7bf69e570231a..dd0437af4c1d6 100644
+--- a/crates/bevy_asset/src/io/memory.rs
++++ b/crates/bevy_asset/src/io/memory.rs
+@@ -1,4 +1,7 @@
+-use crate::io::{AssetReader, AssetReaderError, AssetWriter, AssetWriterError, PathStream, Reader};
++use crate::io::{
++    AssetReader, AssetReaderError, AssetWriter, AssetWriterError, PathStream, Reader,
++    ReaderRequiredFeatures,
++};
+ use alloc::{borrow::ToOwned, boxed::Box, sync::Arc, vec, vec::Vec};
+ use bevy_platform::{
+     collections::HashMap,
+@@ -6,13 +9,13 @@ use bevy_platform::{
+ };
+ use core::{pin::Pin, task::Poll};
+ use futures_io::{AsyncRead, AsyncWrite};
+-use futures_lite::{ready, Stream};
++use futures_lite::Stream;
+ use std::{
+-    io::{Error, ErrorKind},
++    io::{Error, ErrorKind, SeekFrom},
+     path::{Path, PathBuf},
+ };
+ 
+-use super::AsyncSeekForward;
++use super::AsyncSeek;
+ 
+ #[derive(Default, Debug)]
+ struct DirInternal {
+@@ -314,41 +317,33 @@ struct DataReader {
+ 
+ impl AsyncRead for DataReader {
+     fn poll_read(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut core::task::Context<'_>,
++        self: Pin<&mut Self>,
++        _cx: &mut core::task::Context<'_>,
+         buf: &mut [u8],
+     ) -> Poll<futures_io::Result<usize>> {
+-        if self.bytes_read >= self.data.value().len() {
+-            Poll::Ready(Ok(0))
+-        } else {
+-            let n =
+-                ready!(Pin::new(&mut &self.data.value()[self.bytes_read..]).poll_read(cx, buf))?;
+-            self.bytes_read += n;
+-            Poll::Ready(Ok(n))
+-        }
++        // Get the mut borrow to avoid trying to borrow the pin itself multiple times.
++        let this = self.get_mut();
++        Poll::Ready(Ok(crate::io::slice_read(
++            this.data.value(),
++            &mut this.bytes_read,
++            buf,
++        )))
+     }
+ }
+ 
+-impl AsyncSeekForward for DataReader {
+-    fn poll_seek_forward(
+-        mut self: Pin<&mut Self>,
++impl AsyncSeek for DataReader {
++    fn poll_seek(
++        self: Pin<&mut Self>,
+         _cx: &mut core::task::Context<'_>,
+-        offset: u64,
++        pos: SeekFrom,
+     ) -> Poll<std::io::Result<u64>> {
+-        let result = self
+-            .bytes_read
+-            .try_into()
+-            .map(|bytes_read: u64| bytes_read + offset);
+-
+-        if let Ok(new_pos) = result {
+-            self.bytes_read = new_pos as _;
+-            Poll::Ready(Ok(new_pos as _))
+-        } else {
+-            Poll::Ready(Err(Error::new(
+-                ErrorKind::InvalidInput,
+-                "seek position is out of range",
+-            )))
+-        }
++        // Get the mut borrow to avoid trying to borrow the pin itself multiple times.
++        let this = self.get_mut();
++        Poll::Ready(crate::io::slice_seek(
++            this.data.value(),
++            &mut this.bytes_read,
++            pos,
++        ))
+     }
+ }
+ 
+@@ -357,21 +352,16 @@ impl Reader for DataReader {
+         &'a mut self,
+         buf: &'a mut Vec<u8>,
+     ) -> stackfuture::StackFuture<'a, std::io::Result<usize>, { super::STACK_FUTURE_SIZE }> {
+-        stackfuture::StackFuture::from(async {
+-            if self.bytes_read >= self.data.value().len() {
+-                Ok(0)
+-            } else {
+-                buf.extend_from_slice(&self.data.value()[self.bytes_read..]);
+-                let n = self.data.value().len() - self.bytes_read;
+-                self.bytes_read = self.data.value().len();
+-                Ok(n)
+-            }
+-        })
++        crate::io::read_to_end(self.data.value(), &mut self.bytes_read, buf)
+     }
+ }
+ 
+ impl AssetReader for MemoryAssetReader {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        _required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         self.root
+             .get_asset(path)
+             .map(|data| DataReader {
+diff --git a/crates/bevy_asset/src/io/mod.rs b/crates/bevy_asset/src/io/mod.rs
+index 778b96553f64b..220b0126b56c4 100644
+--- a/crates/bevy_asset/src/io/mod.rs
++++ b/crates/bevy_asset/src/io/mod.rs
+@@ -27,20 +27,27 @@ pub use source::*;
+ 
+ use alloc::{boxed::Box, sync::Arc, vec::Vec};
+ use bevy_tasks::{BoxedFuture, ConditionalSendFuture};
+-use core::future::Future;
+ use core::{
+     mem::size_of,
+     pin::Pin,
+     task::{Context, Poll},
+ };
+-use futures_io::{AsyncRead, AsyncWrite};
+-use futures_lite::{ready, Stream};
+-use std::path::{Path, PathBuf};
++use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
++use futures_lite::Stream;
++use std::{
++    io::SeekFrom,
++    path::{Path, PathBuf},
++};
+ use thiserror::Error;
+ 
+ /// Errors that occur while loading assets.
+ #[derive(Error, Debug, Clone)]
+ pub enum AssetReaderError {
++    #[error(
++        "A reader feature was required, but this AssetReader does not support that feature: {0}"
++    )]
++    UnsupportedFeature(#[from] UnsupportedReaderFeature),
++
+     /// Path not found.
+     #[error("Path not found: {}", _0.display())]
+     NotFound(PathBuf),
+@@ -61,6 +68,9 @@ impl PartialEq for AssetReaderError {
+     #[inline]
+     fn eq(&self, other: &Self) -> bool {
+         match (self, other) {
++            (Self::UnsupportedFeature(feature), Self::UnsupportedFeature(other_feature)) => {
++                feature == other_feature
++            }
+             (Self::NotFound(path), Self::NotFound(other_path)) => path == other_path,
+             (Self::Io(error), Self::Io(other_error)) => error.kind() == other_error.kind(),
+             (Self::HttpError(code), Self::HttpError(other_code)) => code == other_code,
+@@ -77,6 +87,43 @@ impl From<std::io::Error> for AssetReaderError {
+     }
+ }
+ 
++/// An error for when a particular feature in [`ReaderRequiredFeatures`] is not supported.
++#[derive(Error, Debug, Clone, PartialEq, Eq)]
++pub enum UnsupportedReaderFeature {
++    /// The caller requested to be able to seek any way (forward, backward, from start/end), but
++    /// this is not supported by the [`AssetReader`].
++    #[error("the reader cannot seek in any direction")]
++    AnySeek,
++}
++
++/// The required features for a `Reader` that an `AssetLoader` may use.
++///
++/// This allows the asset loader to communicate with the asset source what features of the reader it
++/// will use. This allows the asset source to return an error early (if a feature is unsupported),
++/// or use a different reader implementation based on the required features to optimize reading
++/// (e.g., using a simpler reader implementation if some features are not required).
++///
++/// These features **only** apply to the asset itself, and not any nested loads - those loaders will
++/// request their own required features.
++#[derive(Clone, Copy, Default)]
++pub struct ReaderRequiredFeatures {
++    /// The kind of seek that the reader needs to support.
++    pub seek: SeekKind,
++}
++
++/// The kind of seeking that the reader supports.
++#[derive(Clone, Copy, Default)]
++pub enum SeekKind {
++    /// The reader can only seek forward.
++    ///
++    /// Seeking forward is always required, since at the bare minimum, the reader could choose to
++    /// just read that many bytes and then drop them (effectively seeking forward).
++    #[default]
++    OnlyForward,
++    /// The reader can seek forward, backward, seek from the start, and seek from the end.
++    AnySeek,
++}
++
+ /// The maximum size of a future returned from [`Reader::read_to_end`].
+ /// This is large enough to fit ten references.
+ // Ideally this would be even smaller (ReadToEndFuture only needs space for two references based on its definition),
+@@ -86,85 +133,28 @@ pub const STACK_FUTURE_SIZE: usize = 10 * size_of::<&()>();
+ 
+ pub use stackfuture::StackFuture;
+ 
+-/// Asynchronously advances the cursor position by a specified number of bytes.
+-///
+-/// This trait is a simplified version of the [`futures_io::AsyncSeek`] trait, providing
+-/// support exclusively for the [`futures_io::SeekFrom::Current`] variant. It allows for relative
+-/// seeking from the current cursor position.
+-pub trait AsyncSeekForward {
+-    /// Attempts to asynchronously seek forward by a specified number of bytes from the current cursor position.
+-    ///
+-    /// Seeking beyond the end of the stream is allowed and the behavior for this case is defined by the implementation.
+-    /// The new position, relative to the beginning of the stream, should be returned upon successful completion
+-    /// of the seek operation.
+-    ///
+-    /// If the seek operation completes successfully,
+-    /// the new position relative to the beginning of the stream should be returned.
+-    ///
+-    /// # Implementation
+-    ///
+-    /// Implementations of this trait should handle [`Poll::Pending`] correctly, converting
+-    /// [`std::io::ErrorKind::WouldBlock`] errors into [`Poll::Pending`] to indicate that the operation is not
+-    /// yet complete and should be retried, and either internally retry or convert
+-    /// [`std::io::ErrorKind::Interrupted`] into another error kind.
+-    fn poll_seek_forward(
+-        self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
+-        offset: u64,
+-    ) -> Poll<futures_io::Result<u64>>;
+-}
+-
+-impl<T: ?Sized + AsyncSeekForward + Unpin> AsyncSeekForward for Box<T> {
+-    fn poll_seek_forward(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
+-        offset: u64,
+-    ) -> Poll<futures_io::Result<u64>> {
+-        Pin::new(&mut **self).poll_seek_forward(cx, offset)
+-    }
+-}
+-
+-/// Extension trait for [`AsyncSeekForward`].
+-pub trait AsyncSeekForwardExt: AsyncSeekForward {
+-    /// Seek by the provided `offset` in the forwards direction, using the [`AsyncSeekForward`] trait.
+-    fn seek_forward(&mut self, offset: u64) -> SeekForwardFuture<'_, Self>
+-    where
+-        Self: Unpin,
+-    {
+-        SeekForwardFuture {
+-            seeker: self,
+-            offset,
+-        }
+-    }
+-}
+-
+-impl<R: AsyncSeekForward + ?Sized> AsyncSeekForwardExt for R {}
+-
+-#[derive(Debug)]
+-#[must_use = "futures do nothing unless you `.await` or poll them"]
+-pub struct SeekForwardFuture<'a, S: Unpin + ?Sized> {
+-    seeker: &'a mut S,
+-    offset: u64,
+-}
+-
+-impl<S: Unpin + ?Sized> Unpin for SeekForwardFuture<'_, S> {}
+-
+-impl<S: AsyncSeekForward + Unpin + ?Sized> Future for SeekForwardFuture<'_, S> {
+-    type Output = futures_lite::io::Result<u64>;
+-
+-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-        let offset = self.offset;
+-        Pin::new(&mut *self.seeker).poll_seek_forward(cx, offset)
+-    }
+-}
+-
+ /// A type returned from [`AssetReader::read`], which is used to read the contents of a file
+ /// (or virtual file) corresponding to an asset.
+ ///
+-/// This is essentially a trait alias for types implementing [`AsyncRead`] and [`AsyncSeekForward`].
++/// This is essentially a trait alias for types implementing [`AsyncRead`] and [`AsyncSeek`].
+ /// The only reason a blanket implementation is not provided for applicable types is to allow
+ /// implementors to override the provided implementation of [`Reader::read_to_end`].
+-pub trait Reader: AsyncRead + AsyncSeekForward + Unpin + Send + Sync {
++///
++/// # Reader features
++///
++/// This trait includes super traits. However, this **does not** mean that your type needs to
++/// support every feature of those super traits. If the caller never uses that feature, then a dummy
++/// implementation that just returns an error is sufficient.
++///
++/// The caller can request a compatible [`Reader`] using [`ReaderRequiredFeatures`] (when using the
++/// [`AssetReader`] trait). This allows the caller to state which features of the reader it will
++/// use, avoiding cases where the caller uses a feature that the reader does not support.
++///
++/// For example, the caller may set [`ReaderRequiredFeatures::seek`] to
++/// [`SeekKind::AnySeek`] to indicate that they may seek backward, or from the start/end. A reader
++/// implementation may choose to support that, or may just detect those kinds of seeks and return an
++/// error.
++pub trait Reader: AsyncRead + AsyncSeek + Unpin + Send + Sync {
+     /// Reads the entire contents of this reader and appends them to a vec.
+     ///
+     /// # Note for implementors
+@@ -214,15 +204,37 @@ where
+ pub trait AssetReader: Send + Sync + 'static {
+     /// Returns a future to load the full file data at the provided path.
+     ///
++    /// # Required Features
++    ///
++    /// The `required_features` allows the caller to request that the returned reader implements
++    /// certain features, and consequently allows this trait to decide how to react to that request.
++    /// Namely, the implementor could:
++    ///
++    /// * Return an error if the caller requests an unsupported feature. This can give a nicer error
++    ///   message to make it clear that the caller (e.g., an asset loader) can't be used with this
++    ///   reader.
++    /// * Use a different implementation of a reader to ensure support of a feature (e.g., reading
++    ///   the entire asset into memory and then providing that buffer as a reader).
++    /// * Ignore the request and provide the regular reader anyway. Practically, if the caller never
++    ///   actually uses the feature, it's fine to continue using the reader. However the caller
++    ///   requesting a feature is a **strong signal** that they will use the given feature.
++    ///
++    /// The recommendation is to simply return an error for unsupported features. Callers can
++    /// generally work around this and have more understanding of their constraints. For example,
++    /// an asset loader may know that it will only load "small" assets, so reading the entire asset
++    /// into memory won't consume too much memory, and so it can use the regular [`AsyncRead`] API
++    /// to read the whole asset into memory. If this were done by this trait, the loader may
++    /// accidentally be allocating too much memory for a large asset without knowing it!
++    ///
+     /// # Note for implementors
+     /// The preferred style for implementing this method is an `async fn` returning an opaque type.
+     ///
+     /// ```no_run
+     /// # use std::path::Path;
+-    /// # use bevy_asset::{prelude::*, io::{AssetReader, PathStream, Reader, AssetReaderError}};
++    /// # use bevy_asset::{prelude::*, io::{AssetReader, PathStream, Reader, AssetReaderError, ReaderRequiredFeatures}};
+     /// # struct MyReader;
+     /// impl AssetReader for MyReader {
+-    ///     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    ///     async fn read<'a>(&'a self, path: &'a Path, required_features: ReaderRequiredFeatures) -> Result<impl Reader + 'a, AssetReaderError> {
+     ///         // ...
+     ///         # let val: Box<dyn Reader> = unimplemented!(); Ok(val)
+     ///     }
+@@ -233,7 +245,11 @@ pub trait AssetReader: Send + Sync + 'static {
+     ///     # async fn read_meta_bytes<'a>(&'a self, path: &'a Path) -> Result<Vec<u8>, AssetReaderError> { unimplemented!() }
+     /// }
+     /// ```
+-    fn read<'a>(&'a self, path: &'a Path) -> impl AssetReaderFuture<Value: Reader + 'a>;
++    fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        required_features: ReaderRequiredFeatures,
++    ) -> impl AssetReaderFuture<Value: Reader + 'a>;
+     /// Returns a future to load the full file data at the provided path.
+     fn read_meta<'a>(&'a self, path: &'a Path) -> impl AssetReaderFuture<Value: Reader + 'a>;
+     /// Returns an iterator of directory entry names at the provided path.
+@@ -268,6 +284,7 @@ pub trait ErasedAssetReader: Send + Sync + 'static {
+     fn read<'a>(
+         &'a self,
+         path: &'a Path,
++        required_features: ReaderRequiredFeatures,
+     ) -> BoxedFuture<'a, Result<Box<dyn Reader + 'a>, AssetReaderError>>;
+     /// Returns a future to load the full file data at the provided path.
+     fn read_meta<'a>(
+@@ -296,9 +313,10 @@ impl<T: AssetReader> ErasedAssetReader for T {
+     fn read<'a>(
+         &'a self,
+         path: &'a Path,
++        required_features: ReaderRequiredFeatures,
+     ) -> BoxedFuture<'a, Result<Box<dyn Reader + 'a>, AssetReaderError>> {
+-        Box::pin(async {
+-            let reader = Self::read(self, path).await?;
++        Box::pin(async move {
++            let reader = Self::read(self, path, required_features).await?;
+             Ok(Box::new(reader) as Box<dyn Reader>)
+         })
+     }
+@@ -638,40 +656,25 @@ impl VecReader {
+ 
+ impl AsyncRead for VecReader {
+     fn poll_read(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
+         buf: &mut [u8],
+     ) -> Poll<futures_io::Result<usize>> {
+-        if self.bytes_read >= self.bytes.len() {
+-            Poll::Ready(Ok(0))
+-        } else {
+-            let n = ready!(Pin::new(&mut &self.bytes[self.bytes_read..]).poll_read(cx, buf))?;
+-            self.bytes_read += n;
+-            Poll::Ready(Ok(n))
+-        }
++        // Get the mut borrow to avoid trying to borrow the pin itself multiple times.
++        let this = self.get_mut();
++        Poll::Ready(Ok(slice_read(&this.bytes, &mut this.bytes_read, buf)))
+     }
+ }
+ 
+-impl AsyncSeekForward for VecReader {
+-    fn poll_seek_forward(
+-        mut self: Pin<&mut Self>,
++impl AsyncSeek for VecReader {
++    fn poll_seek(
++        self: Pin<&mut Self>,
+         _cx: &mut Context<'_>,
+-        offset: u64,
++        pos: SeekFrom,
+     ) -> Poll<std::io::Result<u64>> {
+-        let result = self
+-            .bytes_read
+-            .try_into()
+-            .map(|bytes_read: u64| bytes_read + offset);
+-
+-        if let Ok(new_pos) = result {
+-            self.bytes_read = new_pos as _;
+-            Poll::Ready(Ok(new_pos as _))
+-        } else {
+-            Poll::Ready(Err(std::io::Error::new(
+-                std::io::ErrorKind::InvalidInput,
+-                "seek position is out of range",
+-            )))
+-        }
++        // Get the mut borrow to avoid trying to borrow the pin itself multiple times.
++        let this = self.get_mut();
++        Poll::Ready(slice_seek(&this.bytes, &mut this.bytes_read, pos))
+     }
+ }
+ 
+@@ -680,16 +683,7 @@ impl Reader for VecReader {
+         &'a mut self,
+         buf: &'a mut Vec<u8>,
+     ) -> StackFuture<'a, std::io::Result<usize>, STACK_FUTURE_SIZE> {
+-        StackFuture::from(async {
+-            if self.bytes_read >= self.bytes.len() {
+-                Ok(0)
+-            } else {
+-                buf.extend_from_slice(&self.bytes[self.bytes_read..]);
+-                let n = self.bytes.len() - self.bytes_read;
+-                self.bytes_read = self.bytes.len();
+-                Ok(n)
+-            }
+-        })
++        read_to_end(&self.bytes, &mut self.bytes_read, buf)
+     }
+ }
+ 
+@@ -712,40 +706,20 @@ impl<'a> SliceReader<'a> {
+ impl<'a> AsyncRead for SliceReader<'a> {
+     fn poll_read(
+         mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        _cx: &mut Context<'_>,
+         buf: &mut [u8],
+     ) -> Poll<std::io::Result<usize>> {
+-        if self.bytes_read >= self.bytes.len() {
+-            Poll::Ready(Ok(0))
+-        } else {
+-            let n = ready!(Pin::new(&mut &self.bytes[self.bytes_read..]).poll_read(cx, buf))?;
+-            self.bytes_read += n;
+-            Poll::Ready(Ok(n))
+-        }
++        Poll::Ready(Ok(slice_read(self.bytes, &mut self.bytes_read, buf)))
+     }
+ }
+ 
+-impl<'a> AsyncSeekForward for SliceReader<'a> {
+-    fn poll_seek_forward(
++impl<'a> AsyncSeek for SliceReader<'a> {
++    fn poll_seek(
+         mut self: Pin<&mut Self>,
+         _cx: &mut Context<'_>,
+-        offset: u64,
++        pos: SeekFrom,
+     ) -> Poll<std::io::Result<u64>> {
+-        let result = self
+-            .bytes_read
+-            .try_into()
+-            .map(|bytes_read: u64| bytes_read + offset);
+-
+-        if let Ok(new_pos) = result {
+-            self.bytes_read = new_pos as _;
+-
+-            Poll::Ready(Ok(new_pos as _))
+-        } else {
+-            Poll::Ready(Err(std::io::Error::new(
+-                std::io::ErrorKind::InvalidInput,
+-                "seek position is out of range",
+-            )))
+-        }
++        Poll::Ready(slice_seek(self.bytes, &mut self.bytes_read, pos))
+     }
+ }
+ 
+@@ -754,17 +728,70 @@ impl Reader for SliceReader<'_> {
+         &'a mut self,
+         buf: &'a mut Vec<u8>,
+     ) -> StackFuture<'a, std::io::Result<usize>, STACK_FUTURE_SIZE> {
+-        StackFuture::from(async {
+-            if self.bytes_read >= self.bytes.len() {
+-                Ok(0)
+-            } else {
+-                buf.extend_from_slice(&self.bytes[self.bytes_read..]);
+-                let n = self.bytes.len() - self.bytes_read;
+-                self.bytes_read = self.bytes.len();
+-                Ok(n)
+-            }
+-        })
+-    }
++        read_to_end(self.bytes, &mut self.bytes_read, buf)
++    }
++}
++
++/// Performs a read from the `slice` into `buf`.
++pub(crate) fn slice_read(slice: &[u8], bytes_read: &mut usize, buf: &mut [u8]) -> usize {
++    if *bytes_read >= slice.len() {
++        0
++    } else {
++        let n = std::io::Read::read(&mut &slice[(*bytes_read)..], buf).unwrap();
++        *bytes_read += n;
++        n
++    }
++}
++
++/// Performs a "seek" and updates the cursor of `bytes_read`. Returns the new byte position.
++pub(crate) fn slice_seek(
++    slice: &[u8],
++    bytes_read: &mut usize,
++    pos: SeekFrom,
++) -> std::io::Result<u64> {
++    let make_error = || {
++        Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            "seek position is out of range",
++        ))
++    };
++    let (origin, offset) = match pos {
++        SeekFrom::Current(offset) => (*bytes_read, Ok(offset)),
++        SeekFrom::Start(offset) => (0, offset.try_into()),
++        SeekFrom::End(offset) => (slice.len(), Ok(offset)),
++    };
++    let Ok(offset) = offset else {
++        return make_error();
++    };
++    let Ok(origin): Result<i64, _> = origin.try_into() else {
++        return make_error();
++    };
++    let Ok(new_pos) = (origin + offset).try_into() else {
++        return make_error();
++    };
++    *bytes_read = new_pos;
++    Ok(new_pos as _)
++}
++
++/// Copies bytes from source to dest, keeping track of where in the source it starts copying from.
++///
++/// This is effectively the impl for [`SliceReader::read_to_end`], but this is provided here so the
++/// lifetimes are only tied to the buffer and not the [`SliceReader`] itself.
++pub(crate) fn read_to_end<'a>(
++    source: &'a [u8],
++    bytes_read: &'a mut usize,
++    dest: &'a mut Vec<u8>,
++) -> StackFuture<'a, std::io::Result<usize>, STACK_FUTURE_SIZE> {
++    StackFuture::from(async {
++        if *bytes_read >= source.len() {
++            Ok(0)
++        } else {
++            dest.extend_from_slice(&source[*bytes_read..]);
++            let n = source.len() - *bytes_read;
++            *bytes_read = source.len();
++            Ok(n)
++        }
++    })
+ }
+ 
+ /// Appends `.meta` to the given path:
+diff --git a/crates/bevy_asset/src/io/processor_gated.rs b/crates/bevy_asset/src/io/processor_gated.rs
+index 0c5e147a6a3c7..47b11b34fdbb6 100644
+--- a/crates/bevy_asset/src/io/processor_gated.rs
++++ b/crates/bevy_asset/src/io/processor_gated.rs
+@@ -1,5 +1,7 @@
+ use crate::{
+-    io::{AssetReader, AssetReaderError, AssetSourceId, PathStream, Reader},
++    io::{
++        AssetReader, AssetReaderError, AssetSourceId, PathStream, Reader, ReaderRequiredFeatures,
++    },
+     processor::{ProcessStatus, ProcessingState},
+     AssetPath,
+ };
+@@ -7,10 +9,10 @@ use alloc::{borrow::ToOwned, boxed::Box, sync::Arc, vec::Vec};
+ use async_lock::RwLockReadGuardArc;
+ use core::{pin::Pin, task::Poll};
+ use futures_io::AsyncRead;
+-use std::path::Path;
++use std::{io::SeekFrom, path::Path};
+ use tracing::trace;
+ 
+-use super::{AsyncSeekForward, ErasedAssetReader};
++use super::{AsyncSeek, ErasedAssetReader};
+ 
+ /// An [`AssetReader`] that will prevent asset (and asset metadata) read futures from returning for a
+ /// given path until that path has been processed by [`AssetProcessor`].
+@@ -38,7 +40,11 @@ impl ProcessorGatedReader {
+ }
+ 
+ impl AssetReader for ProcessorGatedReader {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         let asset_path = AssetPath::from(path.to_path_buf()).with_source(self.source.clone());
+         trace!("Waiting for processing to finish before reading {asset_path}");
+         let process_result = self
+@@ -56,7 +62,7 @@ impl AssetReader for ProcessorGatedReader {
+             .processing_state
+             .get_transaction_lock(&asset_path)
+             .await?;
+-        let asset_reader = self.reader.read(path).await?;
++        let asset_reader = self.reader.read(path, required_features).await?;
+         let reader = TransactionLockedReader::new(asset_reader, lock);
+         Ok(reader)
+     }
+@@ -135,13 +141,13 @@ impl AsyncRead for TransactionLockedReader<'_> {
+     }
+ }
+ 
+-impl AsyncSeekForward for TransactionLockedReader<'_> {
+-    fn poll_seek_forward(
++impl AsyncSeek for TransactionLockedReader<'_> {
++    fn poll_seek(
+         mut self: Pin<&mut Self>,
+         cx: &mut core::task::Context<'_>,
+-        offset: u64,
++        pos: SeekFrom,
+     ) -> Poll<std::io::Result<u64>> {
+-        Pin::new(&mut self.reader).poll_seek_forward(cx, offset)
++        Pin::new(&mut self.reader).poll_seek(cx, pos)
+     }
+ }
+ 
+diff --git a/crates/bevy_asset/src/io/wasm.rs b/crates/bevy_asset/src/io/wasm.rs
+index cd8f66bdf415e..cc62017d67058 100644
+--- a/crates/bevy_asset/src/io/wasm.rs
++++ b/crates/bevy_asset/src/io/wasm.rs
+@@ -1,5 +1,6 @@
+ use crate::io::{
+-    get_meta_path, AssetReader, AssetReaderError, EmptyPathStream, PathStream, Reader, VecReader,
++    get_meta_path, AssetReader, AssetReaderError, EmptyPathStream, PathStream, Reader,
++    ReaderRequiredFeatures, VecReader,
+ };
+ use alloc::{borrow::ToOwned, boxed::Box, format};
+ use js_sys::{Uint8Array, JSON};
+@@ -92,7 +93,11 @@ impl HttpWasmAssetReader {
+ }
+ 
+ impl AssetReader for HttpWasmAssetReader {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        _required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         let path = self.root_path.join(path);
+         self.fetch_bytes(path).await
+     }
+diff --git a/crates/bevy_asset/src/io/web.rs b/crates/bevy_asset/src/io/web.rs
+index e6ec6d615bf3a..1f5aa0da9fdb9 100644
+--- a/crates/bevy_asset/src/io/web.rs
++++ b/crates/bevy_asset/src/io/web.rs
+@@ -1,7 +1,6 @@
+-#[cfg(any(feature = "http", feature = "https"))]
+-use crate::io::AssetSourceBuilder;
+-use crate::io::PathStream;
+-use crate::io::{AssetReader, AssetReaderError, Reader};
++use crate::io::{
++    AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, Reader, ReaderRequiredFeatures,
++};
+ use crate::{AssetApp, AssetPlugin};
+ use alloc::boxed::Box;
+ use bevy_app::{App, Plugin};
+@@ -194,6 +193,7 @@ impl AssetReader for WebAssetReader {
+     fn read<'a>(
+         &'a self,
+         path: &'a Path,
++        _required_features: ReaderRequiredFeatures,
+     ) -> impl ConditionalSendFuture<Output = Result<Box<dyn Reader>, AssetReaderError>> {
+         get(self.make_uri(path))
+     }
+diff --git a/crates/bevy_asset/src/lib.rs b/crates/bevy_asset/src/lib.rs
+index 4205f18212515..f72fe7e89febc 100644
+--- a/crates/bevy_asset/src/lib.rs
++++ b/crates/bevy_asset/src/lib.rs
+@@ -712,7 +712,7 @@ mod tests {
+             gated::{GateOpener, GatedReader},
+             memory::{Dir, MemoryAssetReader},
+             AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceEvent, AssetSourceId,
+-            AssetWatcher, Reader,
++            AssetWatcher, Reader, ReaderRequiredFeatures,
+         },
+         loader::{AssetLoader, LoadContext},
+         Asset, AssetApp, AssetEvent, AssetId, AssetLoadError, AssetLoadFailedEvent, AssetPath,
+@@ -868,7 +868,11 @@ mod tests {
+         ) -> Result<impl Reader + 'a, AssetReaderError> {
+             self.memory_reader.read_meta(path).await
+         }
+-        async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++        async fn read<'a>(
++            &'a self,
++            path: &'a Path,
++            required_features: ReaderRequiredFeatures,
++        ) -> Result<impl Reader + 'a, AssetReaderError> {
+             let attempt_number = {
+                 let mut attempt_counters = self.attempt_counters.lock().unwrap();
+                 if let Some(existing) = attempt_counters.get_mut(path) {
+@@ -896,7 +900,7 @@ mod tests {
+                 .await;
+             }
+ 
+-            self.memory_reader.read(path).await
++            self.memory_reader.read(path, required_features).await
+         }
+     }
+ 
+diff --git a/crates/bevy_asset/src/loader.rs b/crates/bevy_asset/src/loader.rs
+index 90da8ab9cc20e..65dde04dc4627 100644
+--- a/crates/bevy_asset/src/loader.rs
++++ b/crates/bevy_asset/src/loader.rs
+@@ -1,7 +1,10 @@
+ use crate::{
+-    io::{AssetReaderError, MissingAssetSourceError, MissingProcessedAssetReaderError, Reader},
++    io::{
++        AssetReaderError, MissingAssetSourceError, MissingProcessedAssetReaderError, Reader,
++        ReaderRequiredFeatures,
++    },
+     loader_builders::{Deferred, NestedLoader, StaticTyped},
+-    meta::{AssetHash, AssetMeta, AssetMetaDyn, ProcessedInfoMinimal, Settings},
++    meta::{AssetHash, AssetMeta, AssetMetaDyn, ProcessedInfo, ProcessedInfoMinimal, Settings},
+     path::AssetPath,
+     Asset, AssetIndex, AssetLoadError, AssetServer, AssetServerMode, Assets, ErasedAssetIndex,
+     Handle, UntypedHandle,
+@@ -44,6 +47,11 @@ pub trait AssetLoader: TypePath + Send + Sync + 'static {
+         load_context: &mut LoadContext,
+     ) -> impl ConditionalSendFuture<Output = Result<Self::Asset, Self::Error>>;
+ 
++    /// Returns the required features of the reader for this loader.
++    fn reader_required_features(_settings: &Self::Settings) -> ReaderRequiredFeatures {
++        ReaderRequiredFeatures::default()
++    }
++
+     /// Returns a list of extensions supported by this [`AssetLoader`], without the preceding dot.
+     /// Note that users of this [`AssetLoader`] may choose to load files with a non-matching extension.
+     fn extensions(&self) -> &[&str] {
+@@ -57,10 +65,13 @@ pub trait ErasedAssetLoader: Send + Sync + 'static {
+     fn load<'a>(
+         &'a self,
+         reader: &'a mut dyn Reader,
+-        meta: &'a dyn AssetMetaDyn,
++        settings: &'a dyn Settings,
+         load_context: LoadContext<'a>,
+     ) -> BoxedFuture<'a, Result<ErasedLoadedAsset, BevyError>>;
+ 
++    /// Returns the required features of the reader for this loader.
++    // Note: This takes &self just to be dyn compatible.
++    fn reader_required_features(&self, settings: &dyn Settings) -> ReaderRequiredFeatures;
+     /// Returns a list of extensions supported by this asset loader, without the preceding dot.
+     fn extensions(&self) -> &[&str];
+     /// Deserializes metadata from the input `meta` bytes into the appropriate type (erased as [`Box<dyn AssetMetaDyn>`]).
+@@ -85,13 +96,11 @@ where
+     fn load<'a>(
+         &'a self,
+         reader: &'a mut dyn Reader,
+-        meta: &'a dyn AssetMetaDyn,
++        settings: &'a dyn Settings,
+         mut load_context: LoadContext<'a>,
+     ) -> BoxedFuture<'a, Result<ErasedLoadedAsset, BevyError>> {
+         Box::pin(async move {
+-            let settings = meta
+-                .loader_settings()
+-                .expect("Loader settings should exist")
++            let settings = settings
+                 .downcast_ref::<L::Settings>()
+                 .expect("AssetLoader settings should match the loader type");
+             let asset = <L as AssetLoader>::load(self, reader, settings, &mut load_context)
+@@ -101,6 +110,13 @@ where
+         })
+     }
+ 
++    fn reader_required_features(&self, settings: &dyn Settings) -> ReaderRequiredFeatures {
++        let settings = settings
++            .downcast_ref::<L::Settings>()
++            .expect("AssetLoader settings should match the loader type");
++        <L as AssetLoader>::reader_required_features(settings)
++    }
++
+     fn extensions(&self) -> &[&str] {
+         <L as AssetLoader>::extensions(self)
+     }
+@@ -488,7 +504,9 @@ impl<'a> LoadContext<'a> {
+             AssetServerMode::Unprocessed => source.reader(),
+             AssetServerMode::Processed => source.processed_reader()?,
+         };
+-        let mut reader = asset_reader.read(path.path()).await?;
++        let mut reader = asset_reader
++            .read(path.path(), ReaderRequiredFeatures::default())
++            .await?;
+         let hash = if self.populate_hashes {
+             // NOTE: ensure meta is read while the asset bytes reader is still active to ensure transactionality
+             // See `ProcessorGatedReader` for more info
+@@ -534,9 +552,10 @@ impl<'a> LoadContext<'a> {
+     pub(crate) async fn load_direct_internal(
+         &mut self,
+         path: AssetPath<'static>,
+-        meta: &dyn AssetMetaDyn,
++        settings: &dyn Settings,
+         loader: &dyn ErasedAssetLoader,
+         reader: &mut dyn Reader,
++        processed_info: Option<&ProcessedInfo>,
+     ) -> Result<ErasedLoadedAsset, LoadDirectError> {
+         if self.asset_path == path {
+             return Err(LoadDirectError::RequestedSelfPath(
+@@ -545,9 +564,9 @@ impl<'a> LoadContext<'a> {
+         }
+         let loaded_asset = self
+             .asset_server
+-            .load_with_meta_loader_and_reader(
++            .load_with_settings_loader_and_reader(
+                 &path,
+-                meta,
++                settings,
+                 loader,
+                 reader,
+                 self.should_load_dependencies,
+@@ -558,8 +577,7 @@ impl<'a> LoadContext<'a> {
+                 dependency: path.clone(),
+                 error,
+             })?;
+-        let info = meta.processed_info().as_ref();
+-        let hash = info.map(|i| i.full_hash).unwrap_or_default();
++        let hash = processed_info.map(|i| i.full_hash).unwrap_or_default();
+         self.loader_dependencies.insert(path, hash);
+         Ok(loaded_asset)
+     }
+diff --git a/crates/bevy_asset/src/loader_builders.rs b/crates/bevy_asset/src/loader_builders.rs
+index a1f76f7d95f11..6132d6be0e2a9 100644
+--- a/crates/bevy_asset/src/loader_builders.rs
++++ b/crates/bevy_asset/src/loader_builders.rs
+@@ -470,7 +470,13 @@ impl<'builder, 'reader, T> NestedLoader<'_, '_, T, Immediate<'builder, 'reader>>
+ 
+         let asset = self
+             .load_context
+-            .load_direct_internal(path.clone(), meta.as_ref(), &*loader, reader.as_mut())
++            .load_direct_internal(
++                path.clone(),
++                meta.loader_settings().expect("meta corresponds to a load"),
++                &*loader,
++                reader.as_mut(),
++                meta.processed_info().as_ref(),
++            )
+             .await?;
+         Ok((loader, asset))
+     }
+diff --git a/crates/bevy_asset/src/meta.rs b/crates/bevy_asset/src/meta.rs
+index f78273d5bd672..bf51a3391d8a9 100644
+--- a/crates/bevy_asset/src/meta.rs
++++ b/crates/bevy_asset/src/meta.rs
+@@ -130,6 +130,8 @@ pub trait AssetMetaDyn: Downcast + Send + Sync {
+     fn loader_settings(&self) -> Option<&dyn Settings>;
+     /// Returns a mutable reference to the [`AssetLoader`] settings, if they exist.
+     fn loader_settings_mut(&mut self) -> Option<&mut dyn Settings>;
++    /// Returns a reference to the [`Process`] settings, if they exist.
++    fn process_settings(&self) -> Option<&dyn Settings>;
+     /// Serializes the internal [`AssetMeta`].
+     fn serialize(&self) -> Vec<u8>;
+     /// Returns a reference to the [`ProcessedInfo`] if it exists.
+@@ -153,6 +155,13 @@ impl<L: AssetLoader, P: Process> AssetMetaDyn for AssetMeta<L, P> {
+             None
+         }
+     }
++    fn process_settings(&self) -> Option<&dyn Settings> {
++        if let AssetAction::Process { settings, .. } = &self.asset {
++            Some(settings)
++        } else {
++            None
++        }
++    }
+     fn serialize(&self) -> Vec<u8> {
+         ron::ser::to_string_pretty(&self, PrettyConfig::default())
+             .expect("type is convertible to ron")
+@@ -185,7 +194,7 @@ impl Process for () {
+     async fn process(
+         &self,
+         _context: &mut bevy_asset::processor::ProcessContext<'_>,
+-        _meta: AssetMeta<(), Self>,
++        _settings: &Self::Settings,
+         _writer: &mut bevy_asset::io::Writer,
+     ) -> Result<(), bevy_asset::processor::ProcessError> {
+         unreachable!()
+@@ -214,6 +223,10 @@ impl AssetLoader for () {
+         unreachable!();
+     }
+ 
++    fn reader_required_features(_settings: &Self::Settings) -> crate::io::ReaderRequiredFeatures {
++        unreachable!();
++    }
++
+     fn extensions(&self) -> &[&str] {
+         unreachable!();
+     }
+diff --git a/crates/bevy_asset/src/processor/mod.rs b/crates/bevy_asset/src/processor/mod.rs
+index 14ab04a30d96e..565b234aeddb7 100644
+--- a/crates/bevy_asset/src/processor/mod.rs
++++ b/crates/bevy_asset/src/processor/mod.rs
+@@ -48,6 +48,7 @@ use crate::{
+     io::{
+         AssetReaderError, AssetSource, AssetSourceBuilders, AssetSourceEvent, AssetSourceId,
+         AssetSources, AssetWriterError, ErasedAssetReader, MissingAssetSourceError,
++        ReaderRequiredFeatures,
+     },
+     meta::{
+         get_asset_hash, get_full_asset_hash, AssetAction, AssetActionMinimal, AssetHash, AssetMeta,
+@@ -457,6 +458,7 @@ impl AssetProcessor {
+         let reader = source.reader();
+         match reader.read_meta_bytes(path.path()).await {
+             Ok(_) => return Err(WriteDefaultMetaError::MetaAlreadyExists),
++            Err(AssetReaderError::UnsupportedFeature(feature)) => panic!("reading the meta file never requests a feature, but the following feature is unsupported: {feature}"),
+             Err(AssetReaderError::NotFound(_)) => {
+                 // The meta file couldn't be found so just fall through.
+             }
+@@ -557,6 +559,10 @@ impl AssetProcessor {
+                     }
+                     Err(err) => {
+                         match err {
++                            // There is never a reason for a path check to return an
++                            // `UnsupportedFeature` error. This must be an incorrectly programmed
++                            // `AssetReader`, so just panic to make this clearly unsupported.
++                            AssetReaderError::UnsupportedFeature(feature) => panic!("checking whether a path is a file or folder resulted in unsupported feature: {feature}"),
+                             AssetReaderError::NotFound(_) => {
+                                 // if the path is not found, a processed version does not exist
+                             }
+@@ -628,6 +634,12 @@ impl AssetProcessor {
+                 }
+             }
+             Err(err) => match err {
++                // There is never a reason for a directory read to return an `UnsupportedFeature`
++                // error. This must be an incorrectly programmed `AssetReader`, so just panic to
++                // make this clearly unsupported.
++                AssetReaderError::UnsupportedFeature(feature) => {
++                    panic!("reading a directory resulted in unsupported feature: {feature}")
++                }
+                 AssetReaderError::NotFound(_err) => {
+                     // The processed folder does not exist. No need to update anything
+                 }
+@@ -1098,7 +1110,11 @@ impl AssetProcessor {
+         let new_hash = {
+             // Create a reader just for computing the hash. Keep this scoped here so that we drop it
+             // as soon as the hash is computed.
+-            let mut reader_for_hash = reader.read(path).await.map_err(reader_err)?;
++            let mut reader_for_hash = reader
++                .read(path, ReaderRequiredFeatures::default())
++                .await
++                .map_err(reader_err)?;
++
+             get_asset_hash(&meta_bytes, &mut reader_for_hash)
+                 .await
+                 .map_err(reader_err)?
+@@ -1133,16 +1149,6 @@ impl AssetProcessor {
+             }
+         }
+ 
+-        // Create a reader just for the actual process. Note: this means that we're performing two
+-        // reads for the same file (but we avoid having to load the whole file into memory). For
+-        // some sources (like local file systems), this is not a big deal, but for other sources
+-        // like an HTTP asset sources, this could be an entire additional download (if the asset
+-        // source doesn't do any caching). In practice, most sources being processed are likely to
+-        // be local, and processing in general is a publish-time operation, so it's not likely to be
+-        // too big a deal. If in the future, we decide we want to avoid this repeated read, we could
+-        // "ask" the asset source if it prefers avoiding repeated reads or not.
+-        let mut reader_for_process = reader.read(path).await.map_err(reader_err)?;
+-
+         // Note: this lock must remain alive until all processed asset and meta writes have finished (or failed)
+         // See ProcessedAssetInfo::file_transaction_lock docs for more info
+         let _transaction_lock = {
+@@ -1162,6 +1168,25 @@ impl AssetProcessor {
+         // TODO: this class of failure can be recovered via re-processing + smarter log validation that allows for duplicate transactions in the event of failures
+         self.log_begin_processing(asset_path).await;
+         if let Some(processor) = processor {
++            // Unwrap is ok since we have a processor, so the `AssetAction` must have been
++            // `AssetAction::Process` (which includes its settings).
++            let settings = source_meta.process_settings().unwrap();
++
++            let reader_features = processor.reader_required_features(settings)?;
++            // Create a reader just for the actual process. Note: this means that we're performing
++            // two reads for the same file (but we avoid having to load the whole file into memory).
++            // For some sources (like local file systems), this is not a big deal, but for other
++            // sources like an HTTP asset sources, this could be an entire additional download (if
++            // the asset source doesn't do any caching). In practice, most sources being processed
++            // are likely to be local, and processing in general is a publish-time operation, so
++            // it's not likely to be too big a deal. If in the future, we decide we want to avoid
++            // this repeated read, we could "ask" the asset source if it prefers avoiding repeated
++            // reads or not.
++            let reader_for_process = reader
++                .read(path, reader_features)
++                .await
++                .map_err(reader_err)?;
++
+             let mut writer = processed_writer.write(path).await.map_err(writer_err)?;
+             let mut processed_meta = {
+                 let mut context = ProcessContext::new(
+@@ -1171,7 +1196,7 @@ impl AssetProcessor {
+                     &mut new_processed_info,
+                 );
+                 processor
+-                    .process(&mut context, source_meta, &mut *writer)
++                    .process(&mut context, settings, &mut *writer)
+                     .await?
+             };
+ 
+@@ -1199,8 +1224,13 @@ impl AssetProcessor {
+                 .await
+                 .map_err(writer_err)?;
+         } else {
++            // See the reasoning for processing why it's ok to do a second read here.
++            let mut reader_for_copy = reader
++                .read(path, ReaderRequiredFeatures::default())
++                .await
++                .map_err(reader_err)?;
+             let mut writer = processed_writer.write(path).await.map_err(writer_err)?;
+-            futures_lite::io::copy(&mut reader_for_process, &mut writer)
++            futures_lite::io::copy(&mut reader_for_copy, &mut writer)
+                 .await
+                 .map_err(|err| ProcessError::AssetWriterError {
+                     path: asset_path.clone_owned(),
+@@ -1486,23 +1516,17 @@ impl<T: Process> Process for InstrumentedAssetProcessor<T> {
+     fn process(
+         &self,
+         context: &mut ProcessContext,
+-        meta: AssetMeta<(), Self>,
++        settings: &Self::Settings,
+         writer: &mut crate::io::Writer,
+     ) -> impl ConditionalSendFuture<
+         Output = Result<<Self::OutputLoader as crate::AssetLoader>::Settings, ProcessError>,
+     > {
+-        // Change the processor type for the `AssetMeta`, which works because we share the `Settings` type.
+-        let meta = AssetMeta {
+-            meta_format_version: meta.meta_format_version,
+-            processed_info: meta.processed_info,
+-            asset: meta.asset,
+-        };
+         let span = info_span!(
+             "asset processing",
+             processor = T::type_path(),
+             asset = context.path().to_string(),
+         );
+-        self.0.process(context, meta, writer).instrument(span)
++        self.0.process(context, settings, writer).instrument(span)
+     }
+ }
+ 
+diff --git a/crates/bevy_asset/src/processor/process.rs b/crates/bevy_asset/src/processor/process.rs
+index 0c38d25e40f74..d4398af78c540 100644
+--- a/crates/bevy_asset/src/processor/process.rs
++++ b/crates/bevy_asset/src/processor/process.rs
+@@ -1,7 +1,8 @@
+ use crate::{
+     io::{
+         AssetReaderError, AssetWriterError, MissingAssetWriterError,
+-        MissingProcessedAssetReaderError, MissingProcessedAssetWriterError, Reader, Writer,
++        MissingProcessedAssetReaderError, MissingProcessedAssetWriterError, Reader,
++        ReaderRequiredFeatures, Writer,
+     },
+     meta::{AssetAction, AssetMeta, AssetMetaDyn, ProcessDependencyInfo, ProcessedInfo, Settings},
+     processor::AssetProcessor,
+@@ -37,11 +38,16 @@ pub trait Process: TypePath + Send + Sync + Sized + 'static {
+     fn process(
+         &self,
+         context: &mut ProcessContext,
+-        meta: AssetMeta<(), Self>,
++        settings: &Self::Settings,
+         writer: &mut Writer,
+     ) -> impl ConditionalSendFuture<
+         Output = Result<<Self::OutputLoader as AssetLoader>::Settings, ProcessError>,
+     >;
++
++    /// Gets the features of the reader required to process the asset.
++    fn reader_required_features(_settings: &Self::Settings) -> ReaderRequiredFeatures {
++        ReaderRequiredFeatures::default()
++    }
+ }
+ 
+ /// A flexible [`Process`] implementation that loads the source [`Asset`] using the `L` [`AssetLoader`], then transforms
+@@ -181,18 +187,13 @@ where
+     async fn process(
+         &self,
+         context: &mut ProcessContext<'_>,
+-        meta: AssetMeta<(), Self>,
++        settings: &Self::Settings,
+         writer: &mut Writer,
+     ) -> Result<<Self::OutputLoader as AssetLoader>::Settings, ProcessError> {
+-        let AssetAction::Process { settings, .. } = meta.asset else {
+-            return Err(ProcessError::WrongMetaType);
+-        };
+-        let loader_meta = AssetMeta::<Loader, ()>::new(AssetAction::Load {
+-            loader: Loader::type_path().to_string(),
+-            settings: settings.loader_settings,
+-        });
+         let pre_transformed_asset = TransformedAsset::<Loader::Asset>::from_loaded(
+-            context.load_source_asset(loader_meta).await?,
++            context
++                .load_source_asset::<Loader>(&settings.loader_settings)
++                .await?,
+         )
+         .unwrap();
+ 
+@@ -212,6 +213,10 @@ where
+             .map_err(|error| ProcessError::AssetSaveError(error.into()))?;
+         Ok(output_settings)
+     }
++
++    fn reader_required_features(settings: &Self::Settings) -> ReaderRequiredFeatures {
++        Loader::reader_required_features(&settings.loader_settings)
++    }
+ }
+ 
+ /// A type-erased variant of [`Process`] that enables interacting with processor implementations without knowing
+@@ -221,9 +226,19 @@ pub trait ErasedProcessor: Send + Sync {
+     fn process<'a>(
+         &'a self,
+         context: &'a mut ProcessContext,
+-        meta: Box<dyn AssetMetaDyn>,
++        settings: &'a dyn Settings,
+         writer: &'a mut Writer,
+     ) -> BoxedFuture<'a, Result<Box<dyn AssetMetaDyn>, ProcessError>>;
++    /// Type-erased variant of [`Process::reader_required_features`].
++    // Note: This takes &self just to be dyn compatible.
++    #[expect(
++        clippy::result_large_err,
++        reason = "this is only an error here because this isn't a future"
++    )]
++    fn reader_required_features(
++        &self,
++        settings: &dyn Settings,
++    ) -> Result<ReaderRequiredFeatures, ProcessError>;
+     /// Deserialized `meta` as type-erased [`AssetMeta`], operating under the assumption that it matches the meta
+     /// for the underlying [`Process`] impl.
+     fn deserialize_meta(&self, meta: &[u8]) -> Result<Box<dyn AssetMetaDyn>, DeserializeMetaError>;
+@@ -235,14 +250,12 @@ impl<P: Process> ErasedProcessor for P {
+     fn process<'a>(
+         &'a self,
+         context: &'a mut ProcessContext,
+-        meta: Box<dyn AssetMetaDyn>,
++        settings: &'a dyn Settings,
+         writer: &'a mut Writer,
+     ) -> BoxedFuture<'a, Result<Box<dyn AssetMetaDyn>, ProcessError>> {
+         Box::pin(async move {
+-            let meta = meta
+-                .downcast::<AssetMeta<(), P>>()
+-                .map_err(|_e| ProcessError::WrongMetaType)?;
+-            let loader_settings = <P as Process>::process(self, context, *meta, writer).await?;
++            let settings = settings.downcast_ref().ok_or(ProcessError::WrongMetaType)?;
++            let loader_settings = <P as Process>::process(self, context, settings, writer).await?;
+             let output_meta: Box<dyn AssetMetaDyn> =
+                 Box::new(AssetMeta::<P::OutputLoader, ()>::new(AssetAction::Load {
+                     loader: P::OutputLoader::type_path().to_string(),
+@@ -252,6 +265,14 @@ impl<P: Process> ErasedProcessor for P {
+         })
+     }
+ 
++    fn reader_required_features(
++        &self,
++        settings: &dyn Settings,
++    ) -> Result<ReaderRequiredFeatures, ProcessError> {
++        let settings = settings.downcast_ref().ok_or(ProcessError::WrongMetaType)?;
++        Ok(P::reader_required_features(settings))
++    }
++
+     fn deserialize_meta(&self, meta: &[u8]) -> Result<Box<dyn AssetMetaDyn>, DeserializeMetaError> {
+         let meta: AssetMeta<(), P> = ron::de::from_bytes(meta)?;
+         Ok(Box::new(meta))
+@@ -312,15 +333,15 @@ impl<'a> ProcessContext<'a> {
+     /// current asset.
+     pub async fn load_source_asset<L: AssetLoader>(
+         &mut self,
+-        meta: AssetMeta<L, ()>,
++        settings: &L::Settings,
+     ) -> Result<ErasedLoadedAsset, AssetLoadError> {
+         let server = &self.processor.server;
+         let loader_name = L::type_path();
+         let loader = server.get_asset_loader_with_type_name(loader_name).await?;
+         let loaded_asset = server
+-            .load_with_meta_loader_and_reader(
++            .load_with_settings_loader_and_reader(
+                 self.path,
+-                &meta,
++                settings,
+                 &*loader,
+                 &mut self.reader,
+                 false,
+diff --git a/crates/bevy_asset/src/processor/tests.rs b/crates/bevy_asset/src/processor/tests.rs
+index d7c2ec3e772a4..b639623959bdd 100644
+--- a/crates/bevy_asset/src/processor/tests.rs
++++ b/crates/bevy_asset/src/processor/tests.rs
+@@ -26,9 +26,8 @@ use crate::{
+     io::{
+         memory::{Dir, MemoryAssetReader, MemoryAssetWriter},
+         AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceBuilders, AssetSourceEvent,
+-        AssetSourceId, AssetWatcher, PathStream, Reader,
++        AssetSourceId, AssetWatcher, PathStream, Reader, ReaderRequiredFeatures,
+     },
+-    meta::AssetMeta,
+     processor::{
+         AssetProcessor, GetProcessorError, LoadTransformAndSave, LogEntry, Process, ProcessContext,
+         ProcessError, ProcessorState, ProcessorTransactionLog, ProcessorTransactionLogFactory,
+@@ -49,7 +48,7 @@ impl<T: TypePath + 'static> Process for MyProcessor<T> {
+     async fn process(
+         &self,
+         _context: &mut ProcessContext<'_>,
+-        _meta: AssetMeta<(), Self>,
++        _settings: &Self::Settings,
+         _writer: &mut crate::io::Writer,
+     ) -> Result<(), ProcessError> {
+         Ok(())
+@@ -196,9 +195,13 @@ impl<R: AssetReader> LockGatedReader<R> {
+ }
+ 
+ impl<R: AssetReader> AssetReader for LockGatedReader<R> {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         let _guard = self.gate.read().await;
+-        self.reader.read(path).await
++        self.reader.read(path, required_features).await
+     }
+ 
+     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+diff --git a/crates/bevy_asset/src/server/loaders.rs b/crates/bevy_asset/src/server/loaders.rs
+index 11e9d83c5af0d..6e0aeb1c58a11 100644
+--- a/crates/bevy_asset/src/server/loaders.rs
++++ b/crates/bevy_asset/src/server/loaders.rs
+@@ -15,6 +15,7 @@ use tracing::warn;
+ 
+ #[cfg(feature = "trace")]
+ use {
++    crate::io::ReaderRequiredFeatures,
+     alloc::string::ToString,
+     bevy_tasks::ConditionalSendFuture,
+     tracing::{info_span, instrument::Instrument},
+@@ -337,6 +338,10 @@ impl<T: AssetLoader> AssetLoader for InstrumentedAssetLoader<T> {
+         self.0.load(reader, settings, load_context).instrument(span)
+     }
+ 
++    fn reader_required_features(settings: &Self::Settings) -> ReaderRequiredFeatures {
++        T::reader_required_features(settings)
++    }
++
+     fn extensions(&self) -> &[&str] {
+         self.0.extensions()
+     }
+diff --git a/crates/bevy_asset/src/server/mod.rs b/crates/bevy_asset/src/server/mod.rs
+index 559ca73f5d4bf..84ed337bcec43 100644
+--- a/crates/bevy_asset/src/server/mod.rs
++++ b/crates/bevy_asset/src/server/mod.rs
+@@ -826,9 +826,9 @@ impl AssetServer {
+         };
+ 
+         match self
+-            .load_with_meta_loader_and_reader(
++            .load_with_settings_loader_and_reader(
+                 &base_path,
+-                meta.as_ref(),
++                meta.loader_settings().expect("meta is set to Load"),
+                 &*loader,
+                 &mut *reader,
+                 true,
+@@ -1427,24 +1427,31 @@ impl AssetServer {
+         AssetLoadError,
+     > {
+         let source = self.get_source(asset_path.source())?;
+-        // NOTE: We grab the asset byte reader first to ensure this is transactional for AssetReaders like ProcessorGatedReader
+-        // The asset byte reader will "lock" the processed asset, preventing writes for the duration of the lock.
+-        // Then the meta reader, if meta exists, will correspond to the meta for the current "version" of the asset.
+-        // See ProcessedAssetInfo::file_transaction_lock for more context
+         let asset_reader = match self.data.mode {
+             AssetServerMode::Unprocessed => source.reader(),
+             AssetServerMode::Processed => source.processed_reader()?,
+         };
+-        let reader = asset_reader.read(asset_path.path()).await?;
+         let read_meta = match &self.data.meta_check {
+             AssetMetaCheck::Always => true,
+             AssetMetaCheck::Paths(paths) => paths.contains(asset_path),
+             AssetMetaCheck::Never => false,
+         };
+ 
+-        if read_meta {
+-            match asset_reader.read_meta_bytes(asset_path.path()).await {
+-                Ok(meta_bytes) => {
++        // Scope the meta reader up here. This allows the reader to be "transactional": for sources
++        // that want to lock the asset before reading it (e.g., with a RwLock), this allows the meta
++        // reader to take the RwLock, and since it overlaps with the asset reader, the asset reader
++        // can "take over" the RwLock before the meta reader gets dropped.
++        let mut meta_reader;
++
++        let (meta, loader) = if read_meta {
++            match asset_reader.read_meta(asset_path.path()).await {
++                Ok(new_meta_reader) => {
++                    meta_reader = new_meta_reader;
++                    let mut meta_bytes = vec![];
++                    meta_reader
++                        .read_to_end(&mut meta_bytes)
++                        .await
++                        .map_err(|err| AssetLoadError::AssetReaderError(err.into()))?;
+                     // TODO: this isn't fully minimal yet. we only need the loader
+                     let minimal: AssetMetaMinimal =
+                         ron::de::from_bytes(&meta_bytes).map_err(|e| {
+@@ -1474,7 +1481,7 @@ impl AssetServer {
+                         }
+                     })?;
+ 
+-                    Ok((meta, loader, reader))
++                    (meta, loader)
+                 }
+                 Err(AssetReaderError::NotFound(_)) => {
+                     // TODO: Handle error transformation
+@@ -1493,9 +1500,9 @@ impl AssetServer {
+                     let loader = loader.ok_or_else(error)?.get().await.map_err(|_| error())?;
+ 
+                     let meta = loader.default_meta();
+-                    Ok((meta, loader, reader))
++                    (meta, loader)
+                 }
+-                Err(err) => Err(err.into()),
++                Err(err) => return Err(err.into()),
+             }
+         } else {
+             let loader = {
+@@ -1513,14 +1520,20 @@ impl AssetServer {
+             let loader = loader.ok_or_else(error)?.get().await.map_err(|_| error())?;
+ 
+             let meta = loader.default_meta();
+-            Ok((meta, loader, reader))
+-        }
++            (meta, loader)
++        };
++        let required_features =
++            loader.reader_required_features(meta.loader_settings().expect("meta specifies load"));
++        let reader = asset_reader
++            .read(asset_path.path(), required_features)
++            .await?;
++        Ok((meta, loader, reader))
+     }
+ 
+-    pub(crate) async fn load_with_meta_loader_and_reader(
++    pub(crate) async fn load_with_settings_loader_and_reader(
+         &self,
+         asset_path: &AssetPath<'_>,
+-        meta: &dyn AssetMetaDyn,
++        settings: &dyn Settings,
+         loader: &dyn ErasedAssetLoader,
+         reader: &mut dyn Reader,
+         load_dependencies: bool,
+@@ -1530,7 +1543,7 @@ impl AssetServer {
+         let asset_path = asset_path.clone_owned();
+         let load_context =
+             LoadContext::new(self, asset_path.clone(), load_dependencies, populate_hashes);
+-        AssertUnwindSafe(loader.load(reader, meta, load_context))
++        AssertUnwindSafe(loader.load(reader, settings, load_context))
+             .catch_unwind()
+             .await
+             .map_err(|_| AssetLoadError::AssetLoaderPanic {
+@@ -1700,6 +1713,7 @@ impl AssetServer {
+         let reader = source.reader();
+         match reader.read_meta_bytes(path.path()).await {
+             Ok(_) => return Err(WriteDefaultMetaError::MetaAlreadyExists),
++            Err(AssetReaderError::UnsupportedFeature(feature)) => panic!("reading the meta file never requests a feature, but the following feature is unsupported: {feature}"),
+             Err(AssetReaderError::NotFound(_)) => {
+                 // The meta file couldn't be found so just fall through.
+             }
+diff --git a/examples/asset/custom_asset_reader.rs b/examples/asset/custom_asset_reader.rs
+index d95abb6a6b650..a2422bac3329c 100644
+--- a/examples/asset/custom_asset_reader.rs
++++ b/examples/asset/custom_asset_reader.rs
+@@ -5,7 +5,7 @@
+ use bevy::{
+     asset::io::{
+         AssetReader, AssetReaderError, AssetSource, AssetSourceBuilder, AssetSourceId,
+-        ErasedAssetReader, PathStream, Reader,
++        ErasedAssetReader, PathStream, Reader, ReaderRequiredFeatures,
+     },
+     prelude::*,
+ };
+@@ -15,9 +15,13 @@ use std::path::Path;
+ struct CustomAssetReader(Box<dyn ErasedAssetReader>);
+ 
+ impl AssetReader for CustomAssetReader {
+-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
+         info!("Reading {}", path.display());
+-        self.0.read(path).await
++        self.0.read(path, required_features).await
+     }
+     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+         self.0.read_meta(path).await
+diff --git a/release-content/migration-guides/reader_required_features.md b/release-content/migration-guides/reader_required_features.md
+new file mode 100644
+index 0000000000000..c9fda72f2986c
+--- /dev/null
++++ b/release-content/migration-guides/reader_required_features.md
+@@ -0,0 +1,40 @@
++---
++title: The `AssetReader` trait now takes a `ReaderRequiredFeatures` argument.
++pull_requests: []
++---
++
++The `AssetReader::read` method now takes an additional `ReaderRequiredFeatures` argument. If
++previously you had:
++
++```rust
++struct MyAssetReader;
++
++impl AssetReader for MyAssetReader {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
++        todo!()
++    }
++
++    // more stuff...
++}
++```
++
++Change this to:
++
++```rust
++struct MyAssetReader;
++
++impl AssetReader for MyAssetReader {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        _required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader + 'a, AssetReaderError> {
++        todo!()
++    }
++
++    // more stuff...
++}
++```
+diff --git a/release-content/migration-guides/readers_impl_async_seek.md b/release-content/migration-guides/readers_impl_async_seek.md
+new file mode 100644
+index 0000000000000..d2957efc6a220
+--- /dev/null
++++ b/release-content/migration-guides/readers_impl_async_seek.md
+@@ -0,0 +1,53 @@
++---
++title: Implementations of `Reader` now must implement `AsyncSeek`, and `AsyncSeekForward` is deleted.
++pull_requests: []
++---
++
++The `Reader` trait no longer requires implementing `AsyncSeekForward` and instead requires
++implementing `AsyncSeek`. Each reader will have its own unique implementation so implementing this
++will be case specific. The simplest implementation is to simply reject these seeking cases like so:
++
++```rust
++impl AsyncSeek for MyReader {
++    fn poll_seek(
++        self: Pin<&mut Self>,
++        _cx: &mut core::task::Context<'_>,
++        pos: SeekFrom,
++    ) -> Poll<std::io::Result<u64>> {
++        let forward = match pos {
++            SeekFrom::Current(curr) if curr >= 0 => curr as u64,
++            _ => return std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "invalid seek mode",
++            ),
++        };
++
++        // Do whatever your previous `AsyncSeekForward` implementation did...
++    }
++}
++```
++
++In addition, the `AssetReader` trait now includes a `ReaderRequiredFeatures` argument which can be
++used to return an error early for invalid requests. For example:
++
++```rust
++impl AssetReader for MyAssetReader {
++    async fn read<'a>(
++        &'a self,
++        path: &'a Path,
++        required_features: ReaderRequiredFeatures,
++    ) -> Result<impl Reader, AssetReaderError> {
++        match required_features.seek {
++            SeekKind::Forward => {}
++            SeekKind::AnySeek => return Err(UnsupportedReaderFeature::AnySeek),
++        }
++
++        // Do whatever your previous `AssetReader` implementation did, like...
++        Ok(MyReader)
++    }
++}
++```
++
++Since we now just use the `AsyncSeek` trait, we've deleted the `AsyncSeekForward` trait. Users of
++this trait can migrate by calling the `AsyncSeek::poll_seek` method with
++`SeekFrom::Current(offset)`, or the `AsyncSeekExt::seek` method.
+diff --git a/release-content/release-notes/optional_asset_reader_seek.md b/release-content/release-notes/optional_asset_reader_seek.md
+new file mode 100644
+index 0000000000000..cd92446174289
+--- /dev/null
++++ b/release-content/release-notes/optional_asset_reader_seek.md
+@@ -0,0 +1,25 @@
++---
++title: The `AssetReader` trait can now (optionally) support seeking any direction.
++authors: ["@andriyDev"]
++pull_requests: []
++---
++
++In Bevy 0.15, we replaced the `AsyncSeek` super trait on `Reader` with `AsyncSeekForward`. This
++allowed our `Reader` trait to apply to more cases (e.g., it could allow cases like an HTTP request,
++which may not support seeking backwards). However, it also meant that we could no longer use seeking
++fully where it was available.
++
++To resolve this issue, we now allow `AssetLoader`s to provide a `ReaderRequiredFeatures` to the
++`AssetReader`. The `AssetReader` can then choose how to handle those required features. For example,
++it can return an error to indicate that the feature is not supported, or it can choose to use a
++different `Reader` implementation to fallback in order to continue to support the feature.
++
++This allowed us to bring back the "requirement" the `Reader: AsyncSeek`, but with a more relaxed
++policy: the `Reader` may choose to avoid supporting certain features (corresponding to fields in
++`ReaderRequiredFeatures`).
++
++Our general recommendation is that if your `Reader` implementation does not support a feature, make
++your `AssetReader` just return an error for that feature. Usually, an `AssetLoader` can implement a
++fallback itself (e.g., reading all the data into memory and then loading from that), and loaders can
++be selected using `.meta` files (allowing for fine-grained opt-in in these cases). However if there
++is some reasonable implementation you can provide (even if not optimal), feel free to provide one!
