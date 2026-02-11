@@ -1,0 +1,144 @@
+diff --git a/crates/bevy_platform/Cargo.toml b/crates/bevy_platform/Cargo.toml
+index d1af7a805be4f..ecfffdc105e02 100644
+--- a/crates/bevy_platform/Cargo.toml
++++ b/crates/bevy_platform/Cargo.toml
+@@ -97,6 +97,14 @@ spin = { version = "0.10.0", default-features = false, features = [
+ [target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
+ portable-atomic-util = { version = "0.2.4", default-features = false }
+ 
++[target.'cfg(windows)'.dependencies]
++windows-sys = { version = ">= 0.59.0", features = [
++  "Win32_UI_Shell",
++  "Win32_Foundation",
++  "Win32_Globalization",
++  "Win32_System_Com",
++] }
++
+ [lints]
+ workspace = true
+ 
+diff --git a/crates/bevy_platform/src/dirs/linux.rs b/crates/bevy_platform/src/dirs/linux.rs
+new file mode 100644
+index 0000000000000..c5cce1461c214
+--- /dev/null
++++ b/crates/bevy_platform/src/dirs/linux.rs
+@@ -0,0 +1,7 @@
++use std::{env::home_dir, path::PathBuf};
++
++/// Returns the path to the directory used for application settings.
++pub fn preferences_dir() -> Option<PathBuf> {
++    // TODO: Support XDG_CONFIG
++    home_dir().map(|home| home.join(".config"))
++}
+diff --git a/crates/bevy_platform/src/dirs/macos.rs b/crates/bevy_platform/src/dirs/macos.rs
+new file mode 100644
+index 0000000000000..31eb77dbdd6bf
+--- /dev/null
++++ b/crates/bevy_platform/src/dirs/macos.rs
+@@ -0,0 +1,6 @@
++use std::{env::home_dir, path::PathBuf};
++
++/// Returns the path to the directory used for application settings.
++pub fn preferences_dir() -> Option<PathBuf> {
++    home_dir().map(|home| home.join("Library/Preferences"))
++}
+diff --git a/crates/bevy_platform/src/dirs/mod.rs b/crates/bevy_platform/src/dirs/mod.rs
+new file mode 100644
+index 0000000000000..a4b2a9d2331f2
+--- /dev/null
++++ b/crates/bevy_platform/src/dirs/mod.rs
+@@ -0,0 +1,28 @@
++//! APIs that return the location of standard user directories.
++
++// Modeled after https://github.com/dirs-dev/dirs-sys-rs/
++
++#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
++use std::path::PathBuf;
++
++#[cfg(target_os = "windows")]
++mod windows;
++#[cfg(target_os = "windows")]
++pub use windows::preferences_dir;
++
++#[cfg(target_os = "macos")]
++mod macos;
++#[cfg(target_os = "macos")]
++pub use macos::preferences_dir;
++
++#[cfg(target_os = "linux")]
++mod linux;
++#[cfg(target_os = "linux")]
++pub use linux::preferences_dir;
++
++/// Returns the path to the directory used for application settings. This version
++/// always returns `None`.
++#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
++pub fn preferences_dir() -> Option<PathBuf> {
++    None
++}
+diff --git a/crates/bevy_platform/src/dirs/windows.rs b/crates/bevy_platform/src/dirs/windows.rs
+new file mode 100644
+index 0000000000000..983ef26b7e3c4
+--- /dev/null
++++ b/crates/bevy_platform/src/dirs/windows.rs
+@@ -0,0 +1,33 @@
++extern crate windows_sys as windows;
++use std::ffi::{c_void, OsString};
++use std::os::windows::ffi::OsStringExt;
++use std::path::PathBuf;
++use std::slice;
++use windows::Win32::UI::Shell;
++
++/// Returns the path to the directory used for application settings.
++// From https://github.com/dirs-dev/dirs-sys-rs/blob/main/src/lib.rs
++#[allow(unsafe_code)]
++fn known_folder(folder_id: windows::core::GUID) -> Option<PathBuf> {
++    // SAFETY: SHGetKnownFolderPath allocates path_ptr which must be freed with CoTaskMemFree.
++    unsafe {
++        let mut path_ptr: windows::core::PWSTR = std::ptr::null_mut();
++        let result =
++            Shell::SHGetKnownFolderPath(&folder_id, 0, std::ptr::null_mut(), &mut path_ptr);
++        if result == 0 {
++            let len = windows::Win32::Globalization::lstrlenW(path_ptr) as usize;
++            let path = slice::from_raw_parts(path_ptr, len);
++            let ostr: OsString = OsStringExt::from_wide(path);
++            windows::Win32::System::Com::CoTaskMemFree(path_ptr as *const c_void);
++            Some(PathBuf::from(ostr))
++        } else {
++            windows::Win32::System::Com::CoTaskMemFree(path_ptr as *const c_void);
++            None
++        }
++    }
++}
++
++/// Returns the path to the directory used for application settings.
++pub fn preferences_dir() -> Option<PathBuf> {
++    known_folder(Shell::FOLDERID_LocalAppData)
++}
+diff --git a/crates/bevy_platform/src/lib.rs b/crates/bevy_platform/src/lib.rs
+index b4ff694f1187f..3422bcd0b1607 100644
+--- a/crates/bevy_platform/src/lib.rs
++++ b/crates/bevy_platform/src/lib.rs
+@@ -11,6 +11,8 @@
+ 
+ cfg::std! {
+     extern crate std;
++
++    pub mod dirs;
+ }
+ 
+ cfg::alloc! {
+diff --git a/release-content/release-notes/platform_dirs.md b/release-content/release-notes/platform_dirs.md
+new file mode 100644
+index 0000000000000..26a424da9acc0
+--- /dev/null
++++ b/release-content/release-notes/platform_dirs.md
+@@ -0,0 +1,8 @@
++---
++title: "bevy_platform standard directories"
++authors: ["@viridia"]
++pull_requests: [22891]
++---
++
++The `dirs` module in `bevy_platform` provides the location of standard directories in the
++filesystem. Currently this includes the directory for storing application preferences.
