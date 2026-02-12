@@ -1,0 +1,173 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 5ae0e23c51da1..680a16549dc94 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -423,6 +423,9 @@ statically-linked-dxc = ["bevy_internal/statically-linked-dxc"]
+ # Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
+ raw_vulkan_init = ["bevy_internal/raw_vulkan_init"]
+ 
++# Pre-populate buffer labels with buffer types for debugging.
++type_label_buffers = ["bevy_internal/type_label_buffers"]
++
+ # Tracing support, saving a file in Chrome Tracing format
+ trace_chrome = ["trace", "bevy_internal/trace_chrome"]
+ 
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index fe79735efa976..5d123bf5a11fe 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -65,6 +65,9 @@ statically-linked-dxc = ["bevy_render/statically-linked-dxc"]
+ # Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
+ raw_vulkan_init = ["bevy_render/raw_vulkan_init"]
+ 
++# Pre-populate buffer labels with buffer types for debugging.
++type_label_buffers = ["bevy_render/type_label_buffers"]
++
+ # Include tonemapping LUT KTX2 files.
+ tonemapping_luts = [
+   "bevy_core_pipeline?/tonemapping_luts",
+@@ -438,7 +441,7 @@ gestures = ["bevy_input/gestures"]
+ 
+ hotpatching = ["bevy_app/hotpatching", "bevy_ecs/hotpatching"]
+ 
+-debug = ["bevy_utils/debug", "bevy_ecs/debug"]
++debug = ["bevy_utils/debug", "bevy_ecs/debug", "bevy_render/debug"]
+ 
+ screenrecording = ["bevy_dev_tools/screenrecording"]
+ 
+diff --git a/crates/bevy_render/Cargo.toml b/crates/bevy_render/Cargo.toml
+index 1578e72c28089..4afda4814030c 100644
+--- a/crates/bevy_render/Cargo.toml
++++ b/crates/bevy_render/Cargo.toml
+@@ -45,6 +45,10 @@ webgpu = ["wgpu/webgpu"]
+ vulkan-portability = ["wgpu/vulkan-portability"]
+ gles = ["wgpu/gles"]
+ detailed_trace = []
++# Pre-populate buffer labels with buffer types for debugging.
++type_label_buffers = []
++# Enables collecting extra information for debugging.
++debug = ["type_label_buffers"]
+ ## Adds serialization support through `serde`.
+ serialize = ["bevy_mesh/serialize"]
+ 
+diff --git a/crates/bevy_render/src/render_resource/buffer_vec.rs b/crates/bevy_render/src/render_resource/buffer_vec.rs
+index 59461c16518a0..62eb53c81bfd5 100644
+--- a/crates/bevy_render/src/render_resource/buffer_vec.rs
++++ b/crates/bevy_render/src/render_resource/buffer_vec.rs
+@@ -158,7 +158,7 @@ impl<T: NoUninit> RawBufferVec<T> {
+         if capacity > self.capacity || (self.changed && size > 0) {
+             self.capacity = capacity;
+             self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+-                label: self.label.as_deref(),
++                label: make_buffer_label::<Self>(&self.label),
+                 size: size as BufferAddress,
+                 usage: BufferUsages::COPY_DST | self.buffer_usage,
+                 mapped_at_creation: false,
+@@ -406,7 +406,7 @@ where
+         self.capacity = capacity;
+         let size = u64::from(T::min_size()) as usize * capacity;
+         self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+-            label: self.label.as_deref(),
++            label: make_buffer_label::<Self>(&self.label),
+             size: size as BufferAddress,
+             usage: BufferUsages::COPY_DST | self.buffer_usage,
+             mapped_at_creation: false,
+@@ -590,7 +590,7 @@ where
+         self.capacity = capacity;
+         let size = self.item_size * capacity;
+         self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+-            label: self.label.as_deref(),
++            label: make_buffer_label::<Self>(&self.label),
+             size: size as BufferAddress,
+             usage: BufferUsages::COPY_DST | self.buffer_usage,
+             mapped_at_creation: false,
+@@ -620,3 +620,12 @@ pub enum WriteBufferRangeError {
+     #[error("there are no values to upload")]
+     NoValuesToUpload,
+ }
++
++#[inline]
++pub(crate) fn make_buffer_label<'a, T>(label: &'a Option<String>) -> Option<&'a str> {
++    #[cfg(feature = "type_label_buffers")]
++    if label.is_none() {
++        return Some(core::any::type_name::<T>());
++    }
++    label.as_deref()
++}
+diff --git a/crates/bevy_render/src/render_resource/storage_buffer.rs b/crates/bevy_render/src/render_resource/storage_buffer.rs
+index dd76f46a9c1c4..8798c1d7573c0 100644
+--- a/crates/bevy_render/src/render_resource/storage_buffer.rs
++++ b/crates/bevy_render/src/render_resource/storage_buffer.rs
+@@ -1,7 +1,10 @@
+ use core::marker::PhantomData;
+ 
+ use super::Buffer;
+-use crate::renderer::{RenderDevice, RenderQueue};
++use crate::{
++    render_resource::make_buffer_label,
++    renderer::{RenderDevice, RenderQueue},
++};
+ use encase::{
+     internal::WriteInto, DynamicStorageBuffer as DynamicStorageBufferWrapper, ShaderType,
+     StorageBuffer as StorageBufferWrapper,
+@@ -133,7 +136,7 @@ impl<T: ShaderType + WriteInto> StorageBuffer<T> {
+ 
+         if capacity < size || self.changed {
+             self.buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+-                label: self.label.as_deref(),
++                label: make_buffer_label::<Self>(&self.label),
+                 usage: self.buffer_usage,
+                 contents: self.scratch.as_ref(),
+             }));
+@@ -258,7 +261,7 @@ impl<T: ShaderType + WriteInto> DynamicStorageBuffer<T> {
+ 
+         if capacity < size || (self.changed && size > 0) {
+             self.buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+-                label: self.label.as_deref(),
++                label: make_buffer_label::<Self>(&self.label),
+                 usage: self.buffer_usage,
+                 contents: self.scratch.as_ref(),
+             }));
+diff --git a/crates/bevy_render/src/render_resource/uniform_buffer.rs b/crates/bevy_render/src/render_resource/uniform_buffer.rs
+index 0fe93506eaa3f..67110c9215468 100644
+--- a/crates/bevy_render/src/render_resource/uniform_buffer.rs
++++ b/crates/bevy_render/src/render_resource/uniform_buffer.rs
+@@ -1,7 +1,7 @@
+ use core::{marker::PhantomData, num::NonZero};
+ 
+ use crate::{
+-    render_resource::Buffer,
++    render_resource::{make_buffer_label, Buffer},
+     renderer::{RenderDevice, RenderQueue},
+ };
+ use encase::{
+@@ -131,7 +131,7 @@ impl<T: ShaderType + WriteInto> UniformBuffer<T> {
+ 
+         if self.changed || self.buffer.is_none() {
+             self.buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+-                label: self.label.as_deref(),
++                label: make_buffer_label::<Self>(&self.label),
+                 usage: self.buffer_usage,
+                 contents: self.scratch.as_ref(),
+             }));
+@@ -296,7 +296,7 @@ impl<T: ShaderType + WriteInto> DynamicUniformBuffer<T> {
+ 
+         if capacity < size || (self.changed && size > 0) {
+             let buffer = device.create_buffer(&BufferDescriptor {
+-                label: self.label.as_deref(),
++                label: make_buffer_label::<Self>(&self.label),
+                 usage: self.buffer_usage,
+                 size,
+                 mapped_at_creation: false,
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index bb01076e0ca28..2edf520c5e254 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -189,6 +189,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
+ |trace_tracy|Tracing support, exposing a port for Tracy|
+ |trace_tracy_memory|Tracing support, with memory profiling, exposing a port for Tracy|
+ |track_location|Enables source location tracking for change detection and spawning/despawning, which can assist with debugging|
++|type_label_buffers|Pre-populate buffer labels with buffer types for debugging.|
+ |ui_picking|Provides an implementation for picking UI|
+ |vorbis|OGG/VORBIS audio format support|
+ |wav|WAV audio format support|

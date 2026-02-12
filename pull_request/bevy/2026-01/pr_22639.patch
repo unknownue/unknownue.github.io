@@ -1,0 +1,248 @@
+diff --git a/benches/benches/bevy_ecs/main.rs b/benches/benches/bevy_ecs/main.rs
+index 59b4c1fd7326a..406c7418ce239 100644
+--- a/benches/benches/bevy_ecs/main.rs
++++ b/benches/benches/bevy_ecs/main.rs
+@@ -32,3 +32,80 @@ criterion_main!(
+     world::benches,
+     param::benches,
+ );
++
++mod world_builder {
++    use bevy_ecs::world::World;
++    use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
++
++    /// This builder generates a "hot"/realistic [`World`].
++    ///
++    /// Using [`World::new`] creates a "cold" world.
++    /// That is, the world has a fresh entity allocator, no registered components, and generally no accumulated entropy.
++    /// When a cold world is used in a benchmark, much of what is benched is registration and caching costs,
++    /// and what is not benched is the cost of the accumulated entropy in world storage, entity allocators, etc.
++    ///
++    /// Use this in benches that are meant to reflect realistic, common, non-startup scenarios (Ex: spawn scenes, query entities, etc).
++    /// Prefer [`World::new`] when creating benches for start-up costs (Ex: component registration, table creation time, etc).
++    ///
++    /// Note that this does have a performance cost over [`World::new`], so this should not be used in a benchmark's routine, only in its setup.
++    ///
++    /// Which parts of the world are sped up is highly configurable in the interest of doing the minimal work to warm up a world for a particular benchmark.
++    /// (For example, despawn benches wouldn't benefit from warming up world storage.)
++    pub struct WorldBuilder {
++        world: World,
++        rng: SmallRng,
++        max_expected_entities: u32,
++    }
++
++    impl WorldBuilder {
++        /// Starts the builder.
++        pub fn new() -> Self {
++            Self {
++                world: World::new(),
++                rng: SmallRng::seed_from_u64(2039482342342),
++                max_expected_entities: 10_000,
++            }
++        }
++
++        /// Sets the maximum expected entities that will interact with the world.
++        /// By default this is `10_000`.
++        pub fn with_max_expected_entities(mut self, max_expected_entities: u32) -> Self {
++            self.max_expected_entities = max_expected_entities;
++            self
++        }
++
++        /// Warms up the entity allocator to give out arbitrary entity ids instead of sequential ones.
++        /// This also pre-allocates room in `Entities`.
++        pub fn warm_up_entity_allocator(mut self) -> Self {
++            // allocate
++            let mut entities = Vec::new();
++            entities.reserve_exact(self.max_expected_entities as usize);
++            entities.extend(
++                self.world
++                    .entity_allocator()
++                    .alloc_many(self.max_expected_entities),
++            );
++
++            // Spawn the high index to warm up `Entities`.
++            let Some(high_index) = entities.last_mut() else {
++                // There were no expected entities.
++                return self;
++            };
++            self.world.spawn_empty_at(*high_index).unwrap();
++            *high_index = self.world.try_despawn_no_free(*high_index).unwrap();
++
++            // free
++            entities.shuffle(&mut self.rng);
++            entities
++                .drain(..)
++                .for_each(|e| self.world.entity_allocator_mut().free(e));
++
++            self
++        }
++
++        /// Finishes the builder to get the warmed up world.
++        pub fn build(self) -> World {
++            self.world
++        }
++    }
++}
+diff --git a/benches/benches/bevy_ecs/world/commands.rs b/benches/benches/bevy_ecs/world/commands.rs
+index 4836a243ebd9b..fdd9d93a4eb9a 100644
+--- a/benches/benches/bevy_ecs/world/commands.rs
++++ b/benches/benches/bevy_ecs/world/commands.rs
+@@ -7,6 +7,8 @@ use bevy_ecs::{
+ };
+ use criterion::Criterion;
+ 
++use crate::world_builder::WorldBuilder;
++
+ #[derive(Component)]
+ struct A;
+ #[derive(Component)]
+@@ -38,7 +40,10 @@ pub fn spawn_commands(criterion: &mut Criterion) {
+ 
+     for entity_count in [100, 1_000, 10_000] {
+         group.bench_function(format!("{entity_count}_entities"), |bencher| {
+-            let mut world = World::default();
++            let mut world = WorldBuilder::new()
++                .with_max_expected_entities(entity_count)
++                .warm_up_entity_allocator()
++                .build();
+             let mut command_queue = CommandQueue::default();
+ 
+             bencher.iter(|| {
+@@ -69,7 +74,10 @@ pub fn nonempty_spawn_commands(criterion: &mut Criterion) {
+ 
+     for entity_count in [100, 1_000, 10_000] {
+         group.bench_function(format!("{entity_count}_entities"), |bencher| {
+-            let mut world = World::default();
++            let mut world = WorldBuilder::new()
++                .with_max_expected_entities(entity_count)
++                .warm_up_entity_allocator()
++                .build();
+             let mut command_queue = CommandQueue::default();
+ 
+             bencher.iter(|| {
+@@ -100,7 +108,10 @@ pub fn insert_commands(criterion: &mut Criterion) {
+ 
+     let entity_count = 10_000;
+     group.bench_function("insert", |bencher| {
+-        let mut world = World::default();
++        let mut world = WorldBuilder::new()
++            .with_max_expected_entities(entity_count)
++            .warm_up_entity_allocator()
++            .build();
+         let mut command_queue = CommandQueue::default();
+         let mut entities = Vec::new();
+         for _ in 0..entity_count {
+@@ -118,7 +129,10 @@ pub fn insert_commands(criterion: &mut Criterion) {
+         });
+     });
+     group.bench_function("insert_batch", |bencher| {
+-        let mut world = World::default();
++        let mut world = WorldBuilder::new()
++            .with_max_expected_entities(entity_count)
++            .warm_up_entity_allocator()
++            .build();
+         let mut command_queue = CommandQueue::default();
+         let mut entities = Vec::new();
+         for _ in 0..entity_count {
+@@ -127,7 +141,7 @@ pub fn insert_commands(criterion: &mut Criterion) {
+ 
+         bencher.iter(|| {
+             let mut commands = Commands::new(&mut command_queue, &world);
+-            let mut values = Vec::with_capacity(entity_count);
++            let mut values = Vec::with_capacity(entity_count as usize);
+             for entity in &entities {
+                 values.push((*entity, (Matrix::default(), Vec3::default())));
+             }
+diff --git a/benches/benches/bevy_ecs/world/despawn.rs b/benches/benches/bevy_ecs/world/despawn.rs
+index 892b791314d4f..86098a99672c6 100644
+--- a/benches/benches/bevy_ecs/world/despawn.rs
++++ b/benches/benches/bevy_ecs/world/despawn.rs
+@@ -2,6 +2,8 @@ use bevy_ecs::prelude::*;
+ use criterion::{BatchSize, Criterion};
+ use glam::*;
+ 
++use crate::world_builder::WorldBuilder;
++
+ #[derive(Component)]
+ struct A(Mat4);
+ #[derive(Component)]
+@@ -16,7 +18,10 @@ pub fn world_despawn(criterion: &mut Criterion) {
+         group.bench_function(format!("{entity_count}_entities"), |bencher| {
+             bencher.iter_batched_ref(
+                 || {
+-                    let mut world = World::default();
++                    let mut world = WorldBuilder::new()
++                        .with_max_expected_entities(entity_count)
++                        .warm_up_entity_allocator()
++                        .build();
+                     let entities: Vec<Entity> = world
+                         .spawn_batch(
+                             (0..entity_count).map(|_| (A(Mat4::default()), B(Vec4::default()))),
+diff --git a/benches/benches/bevy_ecs/world/despawn_recursive.rs b/benches/benches/bevy_ecs/world/despawn_recursive.rs
+index f63c1a510b97a..f6da7b4ae3b53 100644
+--- a/benches/benches/bevy_ecs/world/despawn_recursive.rs
++++ b/benches/benches/bevy_ecs/world/despawn_recursive.rs
+@@ -2,6 +2,8 @@ use bevy_ecs::prelude::*;
+ use criterion::{BatchSize, Criterion};
+ use glam::*;
+ 
++use crate::world_builder::WorldBuilder;
++
+ #[derive(Component)]
+ struct A(Mat4);
+ #[derive(Component)]
+@@ -16,7 +18,10 @@ pub fn world_despawn_recursive(criterion: &mut Criterion) {
+         group.bench_function(format!("{entity_count}_entities"), |bencher| {
+             bencher.iter_batched_ref(
+                 || {
+-                    let mut world = World::default();
++                    let mut world = WorldBuilder::new()
++                        .with_max_expected_entities(entity_count)
++                        .warm_up_entity_allocator()
++                        .build();
+                     let parent_ents = (0..entity_count)
+                         .map(|_| {
+                             world
+diff --git a/benches/benches/bevy_ecs/world/spawn.rs b/benches/benches/bevy_ecs/world/spawn.rs
+index 45ba2f3aa0d93..b1ecffc62d12c 100644
+--- a/benches/benches/bevy_ecs/world/spawn.rs
++++ b/benches/benches/bevy_ecs/world/spawn.rs
+@@ -2,6 +2,8 @@ use bevy_ecs::prelude::*;
+ use criterion::Criterion;
+ use glam::*;
+ 
++use crate::world_builder::WorldBuilder;
++
+ #[derive(Component, Clone)]
+ struct A(Mat4);
+ #[derive(Component, Clone)]
+@@ -14,7 +16,10 @@ pub fn world_spawn(criterion: &mut Criterion) {
+ 
+     for entity_count in [1, 100, 10_000] {
+         group.bench_function(format!("{entity_count}_entities"), |bencher| {
+-            let mut world = World::default();
++            let mut world = WorldBuilder::new()
++                .with_max_expected_entities(entity_count)
++                .warm_up_entity_allocator()
++                .build();
+             bencher.iter(|| {
+                 for _ in 0..entity_count {
+                     world.spawn((A(Mat4::default()), B(Vec4::default())));
+@@ -33,12 +38,15 @@ pub fn world_spawn_batch(criterion: &mut Criterion) {
+ 
+     for batch_count in [1, 100, 1000, 10_000] {
+         group.bench_function(format!("{batch_count}_entities"), |bencher| {
+-            let mut world = World::default();
++            let mut world = WorldBuilder::new()
++                .with_max_expected_entities(batch_count)
++                .warm_up_entity_allocator()
++                .build();
+             bencher.iter(|| {
+                 for _ in 0..(10_000 / batch_count) {
+                     world.spawn_batch(std::iter::repeat_n(
+                         (A(Mat4::default()), B(Vec4::default())),
+-                        batch_count,
++                        batch_count as usize,
+                     ));
+                 }
+             });

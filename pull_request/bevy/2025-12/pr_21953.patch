@@ -1,0 +1,112 @@
+diff --git a/crates/bevy_solari/src/realtime/restir_di.wgsl b/crates/bevy_solari/src/realtime/restir_di.wgsl
+index b31f70f49963e..e7492f3c47ff3 100644
+--- a/crates/bevy_solari/src/realtime/restir_di.wgsl
++++ b/crates/bevy_solari/src/realtime/restir_di.wgsl
+@@ -179,15 +179,19 @@ fn load_temporal_reservoir_inner(temporal_pixel_id: vec2<u32>, depth: f32, world
+ }
+ 
+ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<f32>, world_normal: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+-    let spatial_pixel_id = get_neighbor_pixel_id(pixel_id, rng);
++    for (var i = 0u; i < 5u; i++) {
++        let spatial_pixel_id = get_neighbor_pixel_id(pixel_id, rng);
+ 
+-    let spatial_depth = textureLoad(depth_buffer, spatial_pixel_id, 0);
+-    let spatial_surface = gpixel_resolve(textureLoad(gbuffer, spatial_pixel_id, 0), spatial_depth, spatial_pixel_id, view.main_pass_viewport.zw, view.world_from_clip);
+-    if pixel_dissimilar(depth, world_position, spatial_surface.world_position, world_normal, spatial_surface.world_normal, view) {
+-        return empty_reservoir();
++        let spatial_depth = textureLoad(depth_buffer, spatial_pixel_id, 0);
++        let spatial_surface = gpixel_resolve(textureLoad(gbuffer, spatial_pixel_id, 0), spatial_depth, spatial_pixel_id, view.main_pass_viewport.zw, view.world_from_clip);
++        if pixel_dissimilar(depth, world_position, spatial_surface.world_position, world_normal, spatial_surface.world_normal, view) {
++            continue;
++        }
++
++        return load_reservoir_b(spatial_pixel_id);
+     }
+ 
+-    return load_reservoir_b(spatial_pixel_id);
++    return empty_reservoir();
+ }
+ 
+ fn get_neighbor_pixel_id(center_pixel_id: vec2<u32>, rng: ptr<function, u32>) -> vec2<u32> {
+diff --git a/crates/bevy_solari/src/realtime/restir_gi.wgsl b/crates/bevy_solari/src/realtime/restir_gi.wgsl
+index b0bbfa90ba421..a6355517af5c2 100644
+--- a/crates/bevy_solari/src/realtime/restir_gi.wgsl
++++ b/crates/bevy_solari/src/realtime/restir_gi.wgsl
+@@ -152,21 +152,25 @@ fn load_temporal_reservoir_inner(temporal_pixel_id: vec2<u32>, depth: f32, world
+ }
+ 
+ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<f32>, world_normal: vec3<f32>, rng: ptr<function, u32>) -> NeighborInfo {
+-    let spatial_pixel_id = get_neighbor_pixel_id(pixel_id, rng);
++    for (var i = 0u; i < 5u; i++) {
++        let spatial_pixel_id = get_neighbor_pixel_id(pixel_id, rng);
+ 
+-    let spatial_depth = textureLoad(depth_buffer, spatial_pixel_id, 0);
+-    let spatial_surface = gpixel_resolve(textureLoad(gbuffer, spatial_pixel_id, 0), spatial_depth, spatial_pixel_id, view.main_pass_viewport.zw, view.world_from_clip);
+-    let spatial_diffuse_brdf = spatial_surface.material.base_color / PI;
+-    if pixel_dissimilar(depth, world_position, spatial_surface.world_position, world_normal, spatial_surface.world_normal, view) {
+-        return NeighborInfo(empty_reservoir(), spatial_surface.world_position, spatial_surface.world_normal, spatial_diffuse_brdf);
+-    }
++        let spatial_depth = textureLoad(depth_buffer, spatial_pixel_id, 0);
++        let spatial_surface = gpixel_resolve(textureLoad(gbuffer, spatial_pixel_id, 0), spatial_depth, spatial_pixel_id, view.main_pass_viewport.zw, view.world_from_clip);
++        let spatial_diffuse_brdf = spatial_surface.material.base_color / PI;
++        if pixel_dissimilar(depth, world_position, spatial_surface.world_position, world_normal, spatial_surface.world_normal, view) {
++            continue;
++        }
++
++        let spatial_pixel_index = spatial_pixel_id.x + spatial_pixel_id.y * u32(view.main_pass_viewport.z);
++        var spatial_reservoir = gi_reservoirs_b[spatial_pixel_index];
+ 
+-    let spatial_pixel_index = spatial_pixel_id.x + spatial_pixel_id.y * u32(view.main_pass_viewport.z);
+-    var spatial_reservoir = gi_reservoirs_b[spatial_pixel_index];
++        spatial_reservoir.radiance *= trace_point_visibility(world_position, spatial_reservoir.sample_point_world_position);
+ 
+-    spatial_reservoir.radiance *= trace_point_visibility(world_position, spatial_reservoir.sample_point_world_position);
++        return NeighborInfo(spatial_reservoir, spatial_surface.world_position, spatial_surface.world_normal, spatial_diffuse_brdf);
++    }
+ 
+-    return NeighborInfo(spatial_reservoir, spatial_surface.world_position, spatial_surface.world_normal, spatial_diffuse_brdf);
++    return NeighborInfo(empty_reservoir(), world_position, world_normal, vec3(0.0));
+ }
+ 
+ fn get_neighbor_pixel_id(center_pixel_id: vec2<u32>, rng: ptr<function, u32>) -> vec2<u32> {
+diff --git a/crates/bevy_solari/src/realtime/world_cache_query.wgsl b/crates/bevy_solari/src/realtime/world_cache_query.wgsl
+index 64a7d67fdd4ee..cafefffac58a8 100644
+--- a/crates/bevy_solari/src/realtime/world_cache_query.wgsl
++++ b/crates/bevy_solari/src/realtime/world_cache_query.wgsl
+@@ -47,12 +47,13 @@ struct WorldCacheGeometryData {
+ 
+ #ifndef WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER
+ fn query_world_cache(world_position: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+-    let cell_size = get_cell_size(world_position, view_position);
++    var cell_size = get_cell_size(world_position, view_position);
+ 
+     // https://tomclabault.github.io/blog/2025/regir, jitter_world_position_tangent_plane
+     let TBN = orthonormalize(world_normal);
+     let offset = (rand_vec2f(rng) * 2.0 - 1.0) * cell_size * 0.5;
+     let jittered_position = world_position + offset.x * TBN[0] + offset.y * TBN[1];
++    cell_size = get_cell_size(jittered_position, view_position);
+ 
+     let world_position_quantized = bitcast<vec3<u32>>(quantize_position(jittered_position, cell_size));
+     let world_normal_quantized = bitcast<vec3<u32>>(quantize_normal(world_normal));
+@@ -121,7 +122,7 @@ fn compute_checksum(world_position: vec3<u32>, world_normal: vec3<u32>) -> u32 {
+     key = iqint_hash(key + world_normal.x);
+     key = iqint_hash(key + world_normal.y);
+     key = iqint_hash(key + world_normal.z);
+-    return key;
++    return max(key, 1u); // 0u is reserved for WORLD_CACHE_EMPTY_CELL
+ }
+ 
+ fn pcg_hash(input: u32) -> u32 {
+diff --git a/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl b/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
+index 8b1e875fc5423..4d5ec4584db33 100644
+--- a/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
++++ b/crates/bevy_solari/src/scene/raytracing_scene_bindings.wgsl
+@@ -83,7 +83,7 @@ const LIGHT_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
+ @group(0) @binding(10) var<storage> directional_lights: array<DirectionalLight>;
+ @group(0) @binding(11) var<storage> previous_frame_light_id_translations: array<u32>;
+ 
+-const RAY_T_MIN = 0.01f;
++const RAY_T_MIN = 0.001f;
+ const RAY_T_MAX = 100000.0f;
+ 
+ const RAY_NO_CULL = 0xFFu;

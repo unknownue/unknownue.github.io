@@ -1,0 +1,938 @@
+diff --git a/crates/bevy_render/macros/src/specializer.rs b/crates/bevy_render/macros/src/specializer.rs
+index d755c73736863..b5dd56eeb5c3a 100644
+--- a/crates/bevy_render/macros/src/specializer.rs
++++ b/crates/bevy_render/macros/src/specializer.rs
+@@ -20,8 +20,6 @@ const SPECIALIZE_ALL_IDENT: &str = "all";
+ const KEY_ATTR_IDENT: &str = "key";
+ const KEY_DEFAULT_IDENT: &str = "default";
+ 
+-const BASE_DESCRIPTOR_ATTR_IDENT: &str = "base_descriptor";
+-
+ enum SpecializeImplTargets {
+     All,
+     Specific(Vec<Path>),
+@@ -87,7 +85,6 @@ struct FieldInfo {
+     ty: Type,
+     member: Member,
+     key: Key,
+-    use_base_descriptor: bool,
+ }
+ 
+ impl FieldInfo {
+@@ -117,15 +114,6 @@ impl FieldInfo {
+             parse_quote!(#ty: #specialize_path::Specializer<#target_path>)
+         }
+     }
+-
+-    fn get_base_descriptor_predicate(
+-        &self,
+-        specialize_path: &Path,
+-        target_path: &Path,
+-    ) -> WherePredicate {
+-        let ty = &self.ty;
+-        parse_quote!(#ty: #specialize_path::GetBaseDescriptor<#target_path>)
+-    }
+ }
+ 
+ fn get_field_info(
+@@ -151,12 +139,8 @@ fn get_field_info(
+ 
+         let mut use_key_field = true;
+         let mut key = Key::Index(key_index);
+-        let mut use_base_descriptor = false;
+         for attr in &field.attrs {
+             match &attr.meta {
+-                Meta::Path(path) if path.is_ident(&BASE_DESCRIPTOR_ATTR_IDENT) => {
+-                    use_base_descriptor = true;
+-                }
+                 Meta::List(MetaList { path, tokens, .. }) if path.is_ident(&KEY_ATTR_IDENT) => {
+                     let owned_tokens = tokens.clone().into();
+                     let Ok(parsed_key) = syn::parse::<Key>(owned_tokens) else {
+@@ -190,7 +174,6 @@ fn get_field_info(
+             ty: field_ty,
+             member: field_member,
+             key,
+-            use_base_descriptor,
+         });
+     }
+ 
+@@ -261,41 +244,18 @@ pub fn impl_specializer(input: TokenStream) -> TokenStream {
+         })
+         .collect();
+ 
+-    let base_descriptor_fields = field_info
+-        .iter()
+-        .filter(|field| field.use_base_descriptor)
+-        .collect::<Vec<_>>();
+-
+-    if base_descriptor_fields.len() > 1 {
+-        return syn::Error::new(
+-            Span::call_site(),
+-            "Too many #[base_descriptor] attributes found. It must be present on exactly one field",
+-        )
+-        .into_compile_error()
+-        .into();
+-    }
+-
+-    let base_descriptor_field = base_descriptor_fields.first().copied();
+-
+     match targets {
+-        SpecializeImplTargets::All => {
+-            let specialize_impl = impl_specialize_all(
+-                &specialize_path,
+-                &ecs_path,
+-                &ast,
+-                &field_info,
+-                &key_patterns,
+-                &key_tuple_idents,
+-            );
+-            let get_base_descriptor_impl = base_descriptor_field
+-                .map(|field_info| impl_get_base_descriptor_all(&specialize_path, &ast, field_info))
+-                .unwrap_or_default();
+-            [specialize_impl, get_base_descriptor_impl]
+-                .into_iter()
+-                .collect()
+-        }
+-        SpecializeImplTargets::Specific(targets) => {
+-            let specialize_impls = targets.iter().map(|target| {
++        SpecializeImplTargets::All => impl_specialize_all(
++            &specialize_path,
++            &ecs_path,
++            &ast,
++            &field_info,
++            &key_patterns,
++            &key_tuple_idents,
++        ),
++        SpecializeImplTargets::Specific(targets) => targets
++            .iter()
++            .map(|target| {
+                 impl_specialize_specific(
+                     &specialize_path,
+                     &ecs_path,
+@@ -305,14 +265,8 @@ pub fn impl_specializer(input: TokenStream) -> TokenStream {
+                     &key_patterns,
+                     &key_tuple_idents,
+                 )
+-            });
+-            let get_base_descriptor_impls = targets.iter().filter_map(|target| {
+-                base_descriptor_field.map(|field_info| {
+-                    impl_get_base_descriptor_specific(&specialize_path, &ast, field_info, target)
+-                })
+-            });
+-            specialize_impls.chain(get_base_descriptor_impls).collect()
+-        }
++            })
++            .collect(),
+     }
+ }
+ 
+@@ -406,56 +360,6 @@ fn impl_specialize_specific(
+     })
+ }
+ 
+-fn impl_get_base_descriptor_specific(
+-    specialize_path: &Path,
+-    ast: &DeriveInput,
+-    base_descriptor_field_info: &FieldInfo,
+-    target_path: &Path,
+-) -> TokenStream {
+-    let struct_name = &ast.ident;
+-    let (impl_generics, type_generics, where_clause) = &ast.generics.split_for_impl();
+-    let field_ty = &base_descriptor_field_info.ty;
+-    let field_member = &base_descriptor_field_info.member;
+-    TokenStream::from(quote!(
+-        impl #impl_generics #specialize_path::GetBaseDescriptor<#target_path> for #struct_name #type_generics #where_clause {
+-            fn get_base_descriptor(&self) -> <#target_path as #specialize_path::Specializable>::Descriptor {
+-                <#field_ty as #specialize_path::GetBaseDescriptor<#target_path>>::get_base_descriptor(&self.#field_member)
+-            }
+-        }
+-    ))
+-}
+-
+-fn impl_get_base_descriptor_all(
+-    specialize_path: &Path,
+-    ast: &DeriveInput,
+-    base_descriptor_field_info: &FieldInfo,
+-) -> TokenStream {
+-    let target_path = Path::from(format_ident!("T"));
+-    let struct_name = &ast.ident;
+-    let mut generics = ast.generics.clone();
+-    generics.params.insert(
+-        0,
+-        parse_quote!(#target_path: #specialize_path::Specializable),
+-    );
+-
+-    let where_clause = generics.make_where_clause();
+-    where_clause.predicates.push(
+-        base_descriptor_field_info.get_base_descriptor_predicate(specialize_path, &target_path),
+-    );
+-
+-    let (_, type_generics, _) = ast.generics.split_for_impl();
+-    let (impl_generics, _, where_clause) = &generics.split_for_impl();
+-    let field_ty = &base_descriptor_field_info.ty;
+-    let field_member = &base_descriptor_field_info.member;
+-    TokenStream::from(quote! {
+-        impl #impl_generics #specialize_path::GetBaseDescriptor<#target_path> for #struct_name #type_generics #where_clause {
+-            fn get_base_descriptor(&self) -> <#target_path as #specialize_path::Specializable>::Descriptor {
+-                <#field_ty as #specialize_path::GetBaseDescriptor<#target_path>>::get_base_descriptor(&self.#field_member)
+-            }
+-        }
+-    })
+-}
+-
+ pub fn impl_specializer_key(input: TokenStream) -> TokenStream {
+     let bevy_render_path: Path = crate::bevy_render_path();
+     let specialize_path = {
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index bf13c491ea96d..0d37e99e053e9 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -97,6 +97,7 @@ use render_asset::{
+     extract_render_asset_bytes_per_frame, reset_render_asset_bytes_per_frame,
+     RenderAssetBytesPerFrame, RenderAssetBytesPerFrameLimiter,
+ };
++use render_resource::init_empty_bind_group_layout;
+ use renderer::{RenderAdapter, RenderDevice, RenderQueue};
+ use settings::RenderResources;
+ use sync_world::{
+@@ -467,6 +468,8 @@ impl Plugin for RenderPlugin {
+                     Render,
+                     reset_render_asset_bytes_per_frame.in_set(RenderSystems::Cleanup),
+                 );
++
++            render_app.add_systems(RenderStartup, init_empty_bind_group_layout);
+         }
+ 
+         app.register_type::<alpha::AlphaMode>()
+diff --git a/crates/bevy_render/src/render_resource/bind_group_layout.rs b/crates/bevy_render/src/render_resource/bind_group_layout.rs
+index 86f09cde0c11f..1ad9f70713b3f 100644
+--- a/crates/bevy_render/src/render_resource/bind_group_layout.rs
++++ b/crates/bevy_render/src/render_resource/bind_group_layout.rs
+@@ -1,5 +1,6 @@
+-use crate::define_atomic_id;
+-use crate::WgpuWrapper;
++use crate::{define_atomic_id, renderer::RenderDevice, WgpuWrapper};
++use bevy_ecs::system::Res;
++use bevy_platform::sync::OnceLock;
+ use core::ops::Deref;
+ 
+ define_atomic_id!(BindGroupLayoutId);
+@@ -62,3 +63,19 @@ impl Deref for BindGroupLayout {
+         &self.value
+     }
+ }
++
++static EMPTY_BIND_GROUP_LAYOUT: OnceLock<BindGroupLayout> = OnceLock::new();
++
++pub(crate) fn init_empty_bind_group_layout(render_device: Res<RenderDevice>) {
++    let layout = render_device.create_bind_group_layout(Some("empty_bind_group_layout"), &[]);
++    EMPTY_BIND_GROUP_LAYOUT
++        .set(layout)
++        .expect("init_empty_bind_group_layout was called more than once");
++}
++
++pub fn empty_bind_group_layout() -> BindGroupLayout {
++    EMPTY_BIND_GROUP_LAYOUT
++        .get()
++        .expect("init_empty_bind_group_layout was not called")
++        .clone()
++}
+diff --git a/crates/bevy_render/src/render_resource/pipeline.rs b/crates/bevy_render/src/render_resource/pipeline.rs
+index 5f626e13e515a..ccd4337e684f5 100644
+--- a/crates/bevy_render/src/render_resource/pipeline.rs
++++ b/crates/bevy_render/src/render_resource/pipeline.rs
+@@ -1,4 +1,4 @@
+-use super::ShaderDefVal;
++use super::{empty_bind_group_layout, ShaderDefVal};
+ use crate::mesh::VertexBufferLayout;
+ use crate::WgpuWrapper;
+ use crate::{
+@@ -7,7 +7,9 @@ use crate::{
+ };
+ use alloc::borrow::Cow;
+ use bevy_asset::Handle;
++use core::iter;
+ use core::ops::Deref;
++use thiserror::Error;
+ use wgpu::{
+     ColorTargetState, DepthStencilState, MultisampleState, PrimitiveState, PushConstantRange,
+ };
+@@ -112,6 +114,20 @@ pub struct RenderPipelineDescriptor {
+     pub zero_initialize_workgroup_memory: bool,
+ }
+ 
++#[derive(Copy, Clone, Debug, Error)]
++#[error("RenderPipelineDescriptor has no FragmentState configured")]
++pub struct NoFragmentStateError;
++
++impl RenderPipelineDescriptor {
++    pub fn fragment_mut(&mut self) -> Result<&mut FragmentState, NoFragmentStateError> {
++        self.fragment.as_mut().ok_or(NoFragmentStateError)
++    }
++
++    pub fn set_layout(&mut self, index: usize, layout: BindGroupLayout) {
++        filling_set_at(&mut self.layout, index, empty_bind_group_layout(), layout);
++    }
++}
++
+ #[derive(Clone, Debug, Eq, PartialEq, Default)]
+ pub struct VertexState {
+     /// The compiled shader module for this stage.
+@@ -137,6 +153,12 @@ pub struct FragmentState {
+     pub targets: Vec<Option<ColorTargetState>>,
+ }
+ 
++impl FragmentState {
++    pub fn set_target(&mut self, index: usize, target: ColorTargetState) {
++        filling_set_at(&mut self.targets, index, None, Some(target));
++    }
++}
++
+ /// Describes a compute pipeline.
+ #[derive(Clone, Debug, PartialEq, Eq, Default)]
+ pub struct ComputePipelineDescriptor {
+@@ -153,3 +175,11 @@ pub struct ComputePipelineDescriptor {
+     /// If this is false, reading from workgroup variables before writing to them will result in garbage values.
+     pub zero_initialize_workgroup_memory: bool,
+ }
++
++// utility function to set a value at the specified index, extending with
++// a filler value if the index is out of bounds.
++fn filling_set_at<T: Clone>(vec: &mut Vec<T>, index: usize, filler: T, value: T) {
++    let num_to_fill = (index + 1).saturating_sub(vec.len());
++    vec.extend(iter::repeat_n(filler, num_to_fill));
++    vec[index] = value;
++}
+diff --git a/crates/bevy_render/src/render_resource/specializer.rs b/crates/bevy_render/src/render_resource/specializer.rs
+index d7a2f3aca1a03..7f2d12dac5bcb 100644
+--- a/crates/bevy_render/src/render_resource/specializer.rs
++++ b/crates/bevy_render/src/render_resource/specializer.rs
+@@ -2,11 +2,7 @@ use super::{
+     CachedComputePipelineId, CachedRenderPipelineId, ComputePipeline, ComputePipelineDescriptor,
+     PipelineCache, RenderPipeline, RenderPipelineDescriptor,
+ };
+-use bevy_ecs::{
+-    error::BevyError,
+-    resource::Resource,
+-    world::{FromWorld, World},
+-};
++use bevy_ecs::error::BevyError;
+ use bevy_platform::{
+     collections::{
+         hash_map::{Entry, VacantEntry},
+@@ -205,7 +201,7 @@ pub trait Specializer<T: Specializable>: Send + Sync + 'static {
+ /// To address this, during specialization keys are processed into a [canonical]
+ /// (or "standard") form that represents the actual descriptor that was produced.
+ /// In the previous example, that would be the final `VertexBufferLayout` contained
+-/// by the pipeline descriptor. This new key is used by [`SpecializedCache`] to
++/// by the pipeline descriptor. This new key is used by [`Variants`] to
+ /// perform additional checks for duplicates, but only if required. If a key is
+ /// canonical from the start, then there's no need.
+ ///
+@@ -260,113 +256,21 @@ macro_rules! impl_specialization_key_tuple {
+ // TODO: How to we fake_variadics this?
+ all_tuples!(impl_specialization_key_tuple, 0, 12, T);
+ 
+-/// Defines a specializer that can also provide a "base descriptor".
+-///
+-/// In order to be composable, [`Specializer`] implementers don't create full
+-/// descriptors, only transform them. However, [`SpecializedCache`]s need a
+-/// "base descriptor" at creation time in order to have something for the
+-/// [`Specializer`] to work off of. This trait allows [`SpecializedCache`]
+-/// to impl [`FromWorld`] for [`Specializer`]s that also satisfy [`FromWorld`]
+-/// and [`GetBaseDescriptor`].
+-///
+-/// This trait can be also derived with `#[derive(Specializer)]`, by marking
+-/// a field with `#[base_descriptor]` to use its [`GetBaseDescriptor`] implementation.
+-///
+-/// Example:
+-/// ```rust
+-/// # use bevy_ecs::error::BevyError;
+-/// # use bevy_render::render_resource::Specializer;
+-/// # use bevy_render::render_resource::GetBaseDescriptor;
+-/// # use bevy_render::render_resource::SpecializerKey;
+-/// # use bevy_render::render_resource::RenderPipeline;
+-/// # use bevy_render::render_resource::RenderPipelineDescriptor;
+-/// struct A;
+-/// struct B;
+-///
+-/// impl Specializer<RenderPipeline> for A {
+-/// #   type Key = ();
+-/// #
+-/// #   fn specialize(
+-/// #       &self,
+-/// #       key: (),
+-/// #       _descriptor: &mut RenderPipelineDescriptor
+-/// #   ) -> Result<(), BevyError> {
+-/// #       Ok(key)
+-/// #   }
+-///     // ...
+-/// }
+-///
+-/// impl Specializer<RenderPipeline> for B {
+-/// #   type Key = ();
+-/// #
+-/// #   fn specialize(
+-/// #       &self,
+-/// #       key: (),
+-/// #       _descriptor: &mut RenderPipelineDescriptor
+-/// #   ) -> Result<(), BevyError> {
+-/// #       Ok(key)
+-/// #   }
+-///     // ...
+-/// }
+-///
+-/// impl GetBaseDescriptor<RenderPipeline> for B {
+-///     fn get_base_descriptor(&self) -> RenderPipelineDescriptor {
+-/// #       todo!()
+-///         // ...
+-///     }
+-/// }
+-///
+-///
+-/// #[derive(Specializer)]
+-/// #[specialize(RenderPipeline)]
+-/// struct C {
+-///     a: A,
+-///     #[base_descriptor]
+-///     b: B,
+-/// }
+-///
+-/// /*
+-/// The generated implementation:
+-/// impl GetBaseDescriptor for C {
+-///     fn get_base_descriptor(&self) -> RenderPipelineDescriptor {
+-///         self.b.base_descriptor()
+-///     }
+-/// }
+-/// */
+-/// ```
+-pub trait GetBaseDescriptor<T: Specializable>: Specializer<T> {
+-    fn get_base_descriptor(&self) -> T::Descriptor;
+-}
+-
+-pub type SpecializerFn<T, S> =
+-    fn(<S as Specializer<T>>::Key, &mut <T as Specializable>::Descriptor) -> Result<(), BevyError>;
+-
+-/// A cache for specializable resources. For a given key type the resulting
+-/// resource will only be created if it is missing, retrieving it from the
+-/// cache otherwise.
+-#[derive(Resource)]
+-pub struct SpecializedCache<T: Specializable, S: Specializer<T>> {
++/// A cache for variants of a resource type created by a specializer.
++/// At most one resource will be created for each key.
++pub struct Variants<T: Specializable, S: Specializer<T>> {
+     specializer: S,
+-    user_specializer: Option<SpecializerFn<T, S>>,
+     base_descriptor: T::Descriptor,
+     primary_cache: HashMap<S::Key, T::CachedId>,
+     secondary_cache: HashMap<Canonical<S::Key>, T::CachedId>,
+ }
+ 
+-impl<T: Specializable, S: Specializer<T>> SpecializedCache<T, S> {
+-    /// Creates a new [`SpecializedCache`] from a [`Specializer`],
+-    /// an optional "user specializer", and a base descriptor. The
+-    /// user specializer is applied after the [`Specializer`], with
+-    /// the same key.
++impl<T: Specializable, S: Specializer<T>> Variants<T, S> {
++    /// Creates a new [`Variants`] from a [`Specializer`] and a base descriptor.
+     #[inline]
+-    pub fn new(
+-        specializer: S,
+-        user_specializer: Option<SpecializerFn<T, S>>,
+-        base_descriptor: T::Descriptor,
+-    ) -> Self {
++    pub fn new(specializer: S, base_descriptor: T::Descriptor) -> Self {
+         Self {
+             specializer,
+-            user_specializer,
+             base_descriptor,
+             primary_cache: Default::default(),
+             secondary_cache: Default::default(),
+@@ -385,7 +289,6 @@ impl<T: Specializable, S: Specializer<T>> SpecializedCache<T, S> {
+             Entry::Occupied(entry) => Ok(entry.get().clone()),
+             Entry::Vacant(entry) => Self::specialize_slow(
+                 &self.specializer,
+-                self.user_specializer,
+                 self.base_descriptor.clone(),
+                 pipeline_cache,
+                 key,
+@@ -398,7 +301,6 @@ impl<T: Specializable, S: Specializer<T>> SpecializedCache<T, S> {
+     #[cold]
+     fn specialize_slow(
+         specializer: &S,
+-        user_specializer: Option<SpecializerFn<T, S>>,
+         base_descriptor: T::Descriptor,
+         pipeline_cache: &PipelineCache,
+         key: S::Key,
+@@ -408,10 +310,6 @@ impl<T: Specializable, S: Specializer<T>> SpecializedCache<T, S> {
+         let mut descriptor = base_descriptor.clone();
+         let canonical_key = specializer.specialize(key.clone(), &mut descriptor)?;
+ 
+-        if let Some(user_specializer) = user_specializer {
+-            (user_specializer)(key, &mut descriptor)?;
+-        }
+-
+         // if the whole key is canonical, the secondary cache isn't needed.
+         if <S::Key as SpecializerKey>::IS_CANONICAL {
+             return Ok(primary_entry
+@@ -447,19 +345,3 @@ impl<T: Specializable, S: Specializer<T>> SpecializedCache<T, S> {
+         Ok(id)
+     }
+ }
+-
+-/// [`SpecializedCache`] implements [`FromWorld`] for [`Specializer`]s
+-/// that also satisfy [`FromWorld`] and [`GetBaseDescriptor`]. This will
+-/// create a [`SpecializedCache`] with no user specializer, and the base
+-/// descriptor take from the specializer's [`GetBaseDescriptor`] implementation.
+-impl<T, S> FromWorld for SpecializedCache<T, S>
+-where
+-    T: Specializable,
+-    S: FromWorld + Specializer<T> + GetBaseDescriptor<T>,
+-{
+-    fn from_world(world: &mut World) -> Self {
+-        let specializer = S::from_world(world);
+-        let base_descriptor = specializer.get_base_descriptor();
+-        Self::new(specializer, None, base_descriptor)
+-    }
+-}
+diff --git a/examples/shader_advanced/custom_phase_item.rs b/examples/shader_advanced/custom_phase_item.rs
+index fd8dc063d02d2..9d97aab12cdb3 100644
+--- a/examples/shader_advanced/custom_phase_item.rs
++++ b/examples/shader_advanced/custom_phase_item.rs
+@@ -25,10 +25,10 @@ use bevy::{
+         },
+         render_resource::{
+             BufferUsages, Canonical, ColorTargetState, ColorWrites, CompareFunction,
+-            DepthStencilState, FragmentState, GetBaseDescriptor, IndexFormat, PipelineCache,
+-            RawBufferVec, RenderPipeline, RenderPipelineDescriptor, SpecializedCache, Specializer,
+-            SpecializerKey, TextureFormat, VertexAttribute, VertexBufferLayout, VertexFormat,
+-            VertexState, VertexStepMode,
++            DepthStencilState, FragmentState, IndexFormat, PipelineCache, RawBufferVec,
++            RenderPipeline, RenderPipelineDescriptor, Specializer, SpecializerKey, TextureFormat,
++            Variants, VertexAttribute, VertexBufferLayout, VertexFormat, VertexState,
++            VertexStepMode,
+         },
+         renderer::{RenderDevice, RenderQueue},
+         view::{self, ExtractedView, RenderVisibleEntities, VisibilityClass},
+@@ -165,9 +165,8 @@ fn main() {
+         .add_systems(Startup, setup);
+ 
+     // We make sure to add these to the render app, not the main app.
+-    app.get_sub_app_mut(RenderApp)
+-        .unwrap()
+-        .init_resource::<SpecializedCache<RenderPipeline, CustomPhaseSpecializer>>()
++    app.sub_app_mut(RenderApp)
++        .init_resource::<CustomPhasePipeline>()
+         .add_render_command::<Opaque3d, DrawCustomPhaseItemCommands>()
+         .add_systems(
+             Render,
+@@ -212,9 +211,9 @@ fn prepare_custom_phase_item_buffers(mut commands: Commands) {
+ /// the opaque render phases of each view.
+ fn queue_custom_phase_item(
+     pipeline_cache: Res<PipelineCache>,
++    mut pipeline: ResMut<CustomPhasePipeline>,
+     mut opaque_render_phases: ResMut<ViewBinnedRenderPhases<Opaque3d>>,
+     opaque_draw_functions: Res<DrawFunctions<Opaque3d>>,
+-    mut specializer: ResMut<SpecializedCache<RenderPipeline, CustomPhaseSpecializer>>,
+     views: Query<(&ExtractedView, &RenderVisibleEntities, &Msaa)>,
+     mut next_tick: Local<Tick>,
+ ) {
+@@ -237,7 +236,9 @@ fn queue_custom_phase_item(
+             // some per-view settings, such as whether the view is HDR, but for
+             // simplicity's sake we simply hard-code the view's characteristics,
+             // with the exception of number of MSAA samples.
+-            let Ok(pipeline_id) = specializer.specialize(&pipeline_cache, CustomPhaseKey(*msaa))
++            let Ok(pipeline_id) = pipeline
++                .variants
++                .specialize(&pipeline_cache, CustomPhaseKey(*msaa))
+             else {
+                 continue;
+             };
+@@ -275,44 +276,23 @@ fn queue_custom_phase_item(
+     }
+ }
+ 
+-/// Holds a reference to our shader.
+-///
+-/// This is loaded at app creation time.
+-struct CustomPhaseSpecializer {
+-    shader: Handle<Shader>,
++struct CustomPhaseSpecializer;
++
++#[derive(Resource)]
++struct CustomPhasePipeline {
++    /// the `variants` collection holds onto the shader handle through the base descriptor
++    variants: Variants<RenderPipeline, CustomPhaseSpecializer>,
+ }
+ 
+-impl FromWorld for CustomPhaseSpecializer {
++impl FromWorld for CustomPhasePipeline {
+     fn from_world(world: &mut World) -> Self {
+         let asset_server = world.resource::<AssetServer>();
+-        Self {
+-            shader: asset_server.load("shaders/custom_phase_item.wgsl"),
+-        }
+-    }
+-}
+-
+-#[derive(Copy, Clone, PartialEq, Eq, Hash, SpecializerKey)]
+-struct CustomPhaseKey(Msaa);
+-
+-impl Specializer<RenderPipeline> for CustomPhaseSpecializer {
+-    type Key = CustomPhaseKey;
+-
+-    fn specialize(
+-        &self,
+-        key: Self::Key,
+-        descriptor: &mut RenderPipelineDescriptor,
+-    ) -> Result<Canonical<Self::Key>, BevyError> {
+-        descriptor.multisample.count = key.0.samples();
+-        Ok(key)
+-    }
+-}
++        let shader = asset_server.load("shaders/custom_phase_item.wgsl");
+ 
+-impl GetBaseDescriptor<RenderPipeline> for CustomPhaseSpecializer {
+-    fn get_base_descriptor(&self) -> RenderPipelineDescriptor {
+-        RenderPipelineDescriptor {
++        let base_descriptor = RenderPipelineDescriptor {
+             label: Some("custom render pipeline".into()),
+             vertex: VertexState {
+-                shader: self.shader.clone(),
++                shader: shader.clone(),
+                 buffers: vec![VertexBufferLayout {
+                     array_stride: size_of::<Vertex>() as u64,
+                     step_mode: VertexStepMode::Vertex,
+@@ -333,7 +313,7 @@ impl GetBaseDescriptor<RenderPipeline> for CustomPhaseSpecializer {
+                 ..default()
+             },
+             fragment: Some(FragmentState {
+-                shader: self.shader.clone(),
++                shader: shader.clone(),
+                 targets: vec![Some(ColorTargetState {
+                     // Ordinarily, you'd want to check whether the view has the
+                     // HDR format and substitute the appropriate texture format
+@@ -354,7 +334,27 @@ impl GetBaseDescriptor<RenderPipeline> for CustomPhaseSpecializer {
+                 bias: default(),
+             }),
+             ..default()
+-        }
++        };
++
++        let variants = Variants::new(CustomPhaseSpecializer, base_descriptor);
++
++        Self { variants }
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, Hash, SpecializerKey)]
++struct CustomPhaseKey(Msaa);
++
++impl Specializer<RenderPipeline> for CustomPhaseSpecializer {
++    type Key = CustomPhaseKey;
++
++    fn specialize(
++        &self,
++        key: Self::Key,
++        descriptor: &mut RenderPipelineDescriptor,
++    ) -> Result<Canonical<Self::Key>, BevyError> {
++        descriptor.multisample.count = key.0.samples();
++        Ok(key)
+     }
+ }
+ 
+diff --git a/release-content/migration-guides/composable_specialization.md b/release-content/migration-guides/composable_specialization.md
+index f87beef8cbbdb..a9af89ed32bdb 100644
+--- a/release-content/migration-guides/composable_specialization.md
++++ b/release-content/migration-guides/composable_specialization.md
+@@ -4,9 +4,9 @@ pull_requests: [17373]
+ ---
+ 
+ The existing pipeline specialization APIs (`SpecializedRenderPipeline` etc.) have
+-been replaced with a single `Specializer` trait and `SpecializedCache` collection:
++been replaced with a single `Specializer` trait and `Variants` collection:
+ 
+-```rs
++```rust
+ pub trait Specializer<T: Specializable>: Send + Sync + 'static {
+     type Key: SpecializerKey;
+     fn specialize(
+@@ -16,23 +16,58 @@ pub trait Specializer<T: Specializable>: Send + Sync + 'static {
+     ) -> Result<Canonical<Self::Key>, BevyError>;
+ }
+ 
+-pub struct SpecializedCache<T: Specializable, S: Specializer<T>>{ ... };
++pub struct Variants<T: Specializable, S: Specializer<T>>{ ... };
+ ```
+ 
+-The main difference is the change from *producing* a pipeline descriptor to
+-*mutating* one based on a key. The "base descriptor" that the `SpecializedCache`
+-passes to the `Specializer` can either be specified manually with `Specializer::new`
+-or by implementing `GetBaseDescriptor`. There's also a new trait for specialization
+-keys, `SpecializeKey`, that can be derived with the included macro in most cases.
++For more info on specialization, see the docs for `bevy_render::render_resources::Specializer`
+ 
+-Composing multiple different specializers together with the `derive(Specializer)`
+-macro can be a lot more powerful (see the `Specialize` docs), but migrating
+-individual specializers is fairly simple. All static parts of the pipeline
+-should be specified in the base descriptor, while the `Specializer` impl
+-should mutate the key as little as necessary to match the key.
++## Mutation and Base Descriptors
+ 
+-```rs
++The main difference between the old and new trait is that instead of
++*producing* a pipeline descriptor, `Specializer`s *mutate* existing descriptors
++based on a key. As such, `Variants::new` takes in a "base descriptor"
++to act as the template from which the specializer creates pipeline variants.
++
++When migrating, the "static" parts of the pipeline (that don't depend
++on the key) should become part of the base descriptor, while the specializer
++itself should only change the parts demanded by the key. In the full example
++below, instead of creating the entire pipeline descriptor the specializer
++only changes the msaa sample count and the bind group layout.
++
++## Composing Specializers
++
++`Specializer`s can also be *composed* with the included derive macro to combine
++their effects! This is a great way to encapsulate and reuse specialization logic,
++though the rest of this guide will focus on migrating "standalone" specializers.
++
++```rust
++pub struct MsaaSpecializer {...}
++impl Specialize<RenderPipeline> for MsaaSpecializer {...}
++
++pub struct MeshLayoutSpecializer {...}
++impl Specialize<RenderPipeline> for MeshLayoutSpecializer {...}
++
++#[derive(Specializer)]
++#[specialize(RenderPipeline)]
+ pub struct MySpecializer {
++    msaa: MsaaSpecializer,
++    mesh_layout: MeshLayoutSpecializer,
++}
++```
++
++## Misc Changes
++
++The analogue of `SpecializedRenderPipelines`, `Variants`, is no longer a
++Bevy `Resource`. Instead, the cache should be stored in a user-created `Resource`
++(shown below) or even in a `Component` depending on the use case.
++
++## Full Migration Example
++
++Before:
++
++```rust
++#[derive(Resource)]
++pub struct MyPipeline {
+     layout: BindGroupLayout,
+     layout_msaa: BindGroupLayout,
+     vertex: Handle<Shader>,
+@@ -41,65 +76,129 @@ pub struct MySpecializer {
+ 
+ // before
+ #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+-// after
+-#[derive(Clone, Copy, PartialEq, Eq, Hash, SpecializerKey)]
+-
+-pub struct MyKey {
+-    blend_state: BlendState,
++pub struct MyPipelineKey {
+     msaa: Msaa,
+ }
+ 
+-impl FromWorld for MySpecializer {
+-    fn from_world(&mut World) -> Self {
+-        ...
++impl FromWorld for MyPipeline {
++    fn from_world(world: &mut World) -> Self {
++        let render_device = world.resource::<RenderDevice>();
++        let asset_server = world.resource::<AssetServer>();
++
++        let layout = render_device.create_bind_group_layout(...);
++        let layout_msaa = render_device.create_bind_group_layout(...);
++
++        let vertex = asset_server.load("vertex.wgsl");
++        let fragment = asset_server.load("fragment.wgsl");
++        
++        Self {
++            layout,
++            layout_msaa,
++            vertex,
++            fragment,
++        }
+     }
+ }
+ 
+-// before
+-impl SpecializedRenderPipeline for MySpecializer {
+-    type Key = MyKey;
++impl SpecializedRenderPipeline for MyPipeline {
++    type Key = MyPipelineKey;
+ 
+     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+         RenderPipelineDescriptor {
+             label: Some("my_pipeline".into()),
+             layout: vec![
+-                if key.msaa.samples() > 0 {
++                if key.msaa.samples() > 1 {
+                     self.layout_msaa.clone()
+                 } else { 
+                     self.layout.clone() 
+                 }
+             ],
+-            push_constant_ranges: vec![],
+             vertex: VertexState {
+                 shader: self.vertex.clone(),
+-                shader_defs: vec![],
+-                entry_point: "vertex".into(),
+-                buffers: vec![],
++                ..default()
+             },
+-            primitive: Default::default(),
+-            depth_stencil: None,
+             multisample: MultisampleState {
+                 count: key.msaa.samples(),
+-                ..Default::default()
++                ..default()
+             },
+             fragment: Some(FragmentState {
+                 shader: self.fragment.clone(),
+-                shader_defs: vec![],
+-                entry_point: "fragment".into(),
+                 targets: vec![Some(ColorTargetState {
+                     format: TextureFormat::Rgba8Unorm,
+-                    blend: Some(key.blend_state),
++                    blend: None,
+                     write_mask: ColorWrites::all(),
+                 })],
++                ..default()
+             }),
+-            zero_initialize_workgroup_memory: false,
++            ..default()
+         },
+     }
+ }
+ 
+-app.init_resource::<SpecializedRenderPipelines<MySpecializer>>();
++render_app
++    .init_resource::<MyPipeline>();
++    .init_resource::<SpecializedRenderPipelines<MySpecializer>>();
++```
++
++After:
++
++```rust
++#[derive(Resource)]
++pub struct MyPipeline {
++    // the base_descriptor and specializer each hold onto the static
++    // wgpu resources (layout, shader handles), so we don't need
++    // explicit fields for them here. However, real-world cases
++    // may still need to expose them as fields to create bind groups
++    // from, for example.
++    variants: Variants<RenderPipeline, MySpecializer>,
++}
++
++pub struct MySpecializer {
++    layout: BindGroupLayout,
++    layout_msaa: BindGroupLayout,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Hash, SpecializerKey)]
++pub struct MyPipelineKey {
++    msaa: Msaa,
++}
++
++impl FromWorld for MyPipeline {
++    fn from_world(world: &mut World) -> Self {
++        let render_device = world.resource::<RenderDevice>();
++        let asset_server = world.resource::<AssetServer>();
++
++        let layout = render_device.create_bind_group_layout(...);
++        let layout_msaa = render_device.create_bind_group_layout(...);
++
++        let vertex = asset_server.load("vertex.wgsl");
++        let fragment = asset_server.load("fragment.wgsl");
++
++        let base_descriptor = RenderPipelineDescriptor {
++            label: Some("my_pipeline".into()),
++            vertex: VertexState {
++                shader: vertex.clone(),
++                ..default()
++            },
++            fragment: Some(FragmentState {
++                shader: fragment.clone(),
++                ..default()
++            }),
++            ..default()
++        },
++
++        let variants = Variants::new(
++            MySpecializer {
++                layout: layout.clone(),
++                layout_msaa: layout_msaa.clone(),
++            },
++            base_descriptor,
++        );
++        
++        Self { variants }
++    }
++}
+ 
+-// after
+ impl Specializer<RenderPipeline> for MySpecializer {
+     type Key = MyKey;
+ 
+@@ -109,45 +208,19 @@ impl Specializer<RenderPipeline> for MySpecializer {
+         descriptor: &mut RenderPipeline,
+     ) -> Result<Canonical<Self::Key>, BevyError> {
+         descriptor.multisample.count = key.msaa.samples();
+-        descriptor.layout[0] = if key.msaa.samples() > 0 {
++
++        let layout = if key.msaa.samples() > 1 { 
+             self.layout_msaa.clone()
+         } else {
+             self.layout.clone()
+         };
+-        descriptor.fragment.targets[0].as_mut().unwrap().blend_mode = key.blend_state;
++
++        descriptor.set_layout(0, layout);
++
+         Ok(key)
+     }
+ }
+ 
+-impl GetBaseDescriptor for MySpecializer {
+-    fn get_base_descriptor(&self) -> RenderPipelineDescriptor {
+-        RenderPipelineDescriptor {
+-            label: Some("my_pipeline".into()),
+-            layout: vec![self.layout.clone()],
+-            push_constant_ranges: vec![],
+-            vertex: VertexState {
+-                shader: self.vertex.clone(),
+-                shader_defs: vec![],
+-                entry_point: "vertex".into(),
+-                buffers: vec![],
+-            },
+-            primitive: Default::default(),
+-            depth_stencil: None,
+-            multisample: MultiSampleState::default(),
+-            fragment: Some(FragmentState {
+-                shader: self.fragment.clone(),
+-                shader_defs: vec![],
+-                entry_point: "fragment".into(),
+-                targets: vec![Some(ColorTargetState {
+-                    format: TextureFormat::Rgba8Unorm,
+-                    blend: None,
+-                    write_mask: ColorWrites::all(),
+-                })],
+-            }),
+-            zero_initialize_workgroup_memory: false,
+-        },
+-    }
+-}
++render_app.init_resource::<MyPipeline>();
+ 
+-app.init_resource::<SpecializedCache<RenderPipeline, MySpecializer>>();
+ ```

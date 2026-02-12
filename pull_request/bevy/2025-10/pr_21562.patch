@@ -1,0 +1,1418 @@
+diff --git a/crates/bevy_ecs/src/change_detection.rs b/crates/bevy_ecs/src/change_detection.rs
+index 12d89b464cf5d..25aed579f2807 100644
+--- a/crates/bevy_ecs/src/change_detection.rs
++++ b/crates/bevy_ecs/src/change_detection.rs
+@@ -1,7 +1,7 @@
+ //! Types that detect when their internal data mutate.
+ 
+ use crate::{
+-    component::{Tick, TickCells},
++    component::{ComponentTickCells, Tick},
+     ptr::PtrMut,
+     resource::Resource,
+ };
+@@ -365,7 +365,7 @@ macro_rules! change_detection_impl {
+ 
+             #[inline]
+             fn changed_by(&self) -> MaybeLocation {
+-                self.changed_by.copied()
++                self.ticks.changed_by.copied()
+             }
+         }
+ 
+@@ -396,7 +396,7 @@ macro_rules! change_detection_mut_impl {
+             #[track_caller]
+             fn set_changed(&mut self) {
+                 *self.ticks.changed = self.ticks.this_run;
+-                self.changed_by.assign(MaybeLocation::caller());
++                self.ticks.changed_by.assign(MaybeLocation::caller());
+             }
+ 
+             #[inline]
+@@ -404,14 +404,14 @@ macro_rules! change_detection_mut_impl {
+             fn set_added(&mut self) {
+                 *self.ticks.changed = self.ticks.this_run;
+                 *self.ticks.added = self.ticks.this_run;
+-                self.changed_by.assign(MaybeLocation::caller());
++                self.ticks.changed_by.assign(MaybeLocation::caller());
+             }
+ 
+             #[inline]
+             #[track_caller]
+             fn set_last_changed(&mut self, last_changed: Tick) {
+                 *self.ticks.changed = last_changed;
+-                self.changed_by.assign(MaybeLocation::caller());
++                self.ticks.changed_by.assign(MaybeLocation::caller());
+             }
+ 
+             #[inline]
+@@ -419,7 +419,7 @@ macro_rules! change_detection_mut_impl {
+             fn set_last_added(&mut self, last_added: Tick) {
+                 *self.ticks.added = last_added;
+                 *self.ticks.changed = last_added;
+-                self.changed_by.assign(MaybeLocation::caller());
++                self.ticks.changed_by.assign(MaybeLocation::caller());
+             }
+ 
+             #[inline]
+@@ -433,7 +433,7 @@ macro_rules! change_detection_mut_impl {
+             #[track_caller]
+             fn deref_mut(&mut self) -> &mut Self::Target {
+                 self.set_changed();
+-                self.changed_by.assign(MaybeLocation::caller());
++                self.ticks.changed_by.assign(MaybeLocation::caller());
+                 self.value
+             }
+         }
+@@ -465,13 +465,13 @@ macro_rules! impl_methods {
+             pub fn reborrow(&mut self) -> Mut<'_, $target> {
+                 Mut {
+                     value: self.value,
+-                    ticks: TicksMut {
++                    ticks: ComponentTicksMut {
+                         added: self.ticks.added,
+                         changed: self.ticks.changed,
++                        changed_by: self.ticks.changed_by.as_deref_mut(),
+                         last_run: self.ticks.last_run,
+                         this_run: self.ticks.this_run,
+                     },
+-                    changed_by: self.changed_by.as_deref_mut(),
+                 }
+             }
+ 
+@@ -501,7 +501,6 @@ macro_rules! impl_methods {
+                 Mut {
+                     value: f(self.value),
+                     ticks: self.ticks,
+-                    changed_by: self.changed_by,
+                 }
+             }
+ 
+@@ -514,7 +513,6 @@ macro_rules! impl_methods {
+                 value.map(|value| Mut {
+                     value,
+                     ticks: self.ticks,
+-                    changed_by: self.changed_by,
+                 })
+             }
+ 
+@@ -527,7 +525,6 @@ macro_rules! impl_methods {
+                 value.map(|value| Mut {
+                     value,
+                     ticks: self.ticks,
+-                    changed_by: self.changed_by,
+                 })
+             }
+ 
+@@ -558,20 +555,23 @@ macro_rules! impl_debug {
+     };
+ }
+ 
++/// Used by immutable query parameters (such as [`Ref`] and [`Res`])
++/// to store immutable access to the [`Tick`]s of a single component or resource.
+ #[derive(Clone)]
+-pub(crate) struct Ticks<'w> {
++pub(crate) struct ComponentTicksRef<'w> {
+     pub(crate) added: &'w Tick,
+     pub(crate) changed: &'w Tick,
++    pub(crate) changed_by: MaybeLocation<&'w &'static Location<'static>>,
+     pub(crate) last_run: Tick,
+     pub(crate) this_run: Tick,
+ }
+ 
+-impl<'w> Ticks<'w> {
++impl<'w> ComponentTicksRef<'w> {
+     /// # Safety
+-    /// This should never alias the underlying ticks with a mutable one such as `TicksMut`.
++    /// This should never alias the underlying ticks with a mutable one such as `ComponentTicksMut`.
+     #[inline]
+     pub(crate) unsafe fn from_tick_cells(
+-        cells: TickCells<'w>,
++        cells: ComponentTickCells<'w>,
+         last_run: Tick,
+         this_run: Tick,
+     ) -> Self {
+@@ -580,25 +580,30 @@ impl<'w> Ticks<'w> {
+             added: unsafe { cells.added.deref() },
+             // SAFETY: Caller ensures there is no mutable access to the cell.
+             changed: unsafe { cells.changed.deref() },
++            // SAFETY: Caller ensures there is no mutable access to the cell.
++            changed_by: unsafe { cells.changed_by.map(|changed_by| changed_by.deref()) },
+             last_run,
+             this_run,
+         }
+     }
+ }
+ 
+-pub(crate) struct TicksMut<'w> {
++/// Used by mutable query parameters (such as [`Mut`] and [`ResMut`])
++/// to store mutable access to the [`Tick`]s of a single component or resource.
++pub(crate) struct ComponentTicksMut<'w> {
+     pub(crate) added: &'w mut Tick,
+     pub(crate) changed: &'w mut Tick,
++    pub(crate) changed_by: MaybeLocation<&'w mut &'static Location<'static>>,
+     pub(crate) last_run: Tick,
+     pub(crate) this_run: Tick,
+ }
+ 
+-impl<'w> TicksMut<'w> {
++impl<'w> ComponentTicksMut<'w> {
+     /// # Safety
+     /// This should never alias the underlying ticks. All access must be unique.
+     #[inline]
+     pub(crate) unsafe fn from_tick_cells(
+-        cells: TickCells<'w>,
++        cells: ComponentTickCells<'w>,
+         last_run: Tick,
+         this_run: Tick,
+     ) -> Self {
+@@ -607,17 +612,20 @@ impl<'w> TicksMut<'w> {
+             added: unsafe { cells.added.deref_mut() },
+             // SAFETY: Caller ensures there is no alias to the cell.
+             changed: unsafe { cells.changed.deref_mut() },
++            // SAFETY: Caller ensures there is no alias to the cell.
++            changed_by: unsafe { cells.changed_by.map(|changed_by| changed_by.deref_mut()) },
+             last_run,
+             this_run,
+         }
+     }
+ }
+ 
+-impl<'w> From<TicksMut<'w>> for Ticks<'w> {
+-    fn from(ticks: TicksMut<'w>) -> Self {
+-        Ticks {
++impl<'w> From<ComponentTicksMut<'w>> for ComponentTicksRef<'w> {
++    fn from(ticks: ComponentTicksMut<'w>) -> Self {
++        ComponentTicksRef {
+             added: ticks.added,
+             changed: ticks.changed,
++            changed_by: ticks.changed_by.map(|changed_by| &*changed_by),
+             last_run: ticks.last_run,
+             this_run: ticks.this_run,
+         }
+@@ -636,8 +644,7 @@ impl<'w> From<TicksMut<'w>> for Ticks<'w> {
+ /// Use [`Option<Res<T>>`] instead if the resource might not always exist.
+ pub struct Res<'w, T: ?Sized + Resource> {
+     pub(crate) value: &'w T,
+-    pub(crate) ticks: Ticks<'w>,
+-    pub(crate) changed_by: MaybeLocation<&'w &'static Location<'static>>,
++    pub(crate) ticks: ComponentTicksRef<'w>,
+ }
+ 
+ impl<'w, T: Resource> Res<'w, T> {
+@@ -653,7 +660,6 @@ impl<'w, T: Resource> Res<'w, T> {
+         Self {
+             value: this.value,
+             ticks: this.ticks.clone(),
+-            changed_by: this.changed_by,
+         }
+     }
+ 
+@@ -670,7 +676,6 @@ impl<'w, T: Resource> From<ResMut<'w, T>> for Res<'w, T> {
+         Self {
+             value: res.value,
+             ticks: res.ticks.into(),
+-            changed_by: res.changed_by.map(|changed_by| &*changed_by),
+         }
+     }
+ }
+@@ -682,7 +687,6 @@ impl<'w, T: Resource> From<Res<'w, T>> for Ref<'w, T> {
+         Self {
+             value: res.value,
+             ticks: res.ticks,
+-            changed_by: res.changed_by,
+         }
+     }
+ }
+@@ -713,8 +717,7 @@ impl_debug!(Res<'w, T>, Resource);
+ /// Use [`Option<ResMut<T>>`] instead if the resource might not always exist.
+ pub struct ResMut<'w, T: ?Sized + Resource> {
+     pub(crate) value: &'w mut T,
+-    pub(crate) ticks: TicksMut<'w>,
+-    pub(crate) changed_by: MaybeLocation<&'w mut &'static Location<'static>>,
++    pub(crate) ticks: ComponentTicksMut<'w>,
+ }
+ 
+ impl<'w, 'a, T: Resource> IntoIterator for &'a ResMut<'w, T>
+@@ -754,7 +757,34 @@ impl<'w, T: Resource> From<ResMut<'w, T>> for Mut<'w, T> {
+         Mut {
+             value: other.value,
+             ticks: other.ticks,
+-            changed_by: other.changed_by,
++        }
++    }
++}
++
++/// Shared borrow of a non-[`Send`] resource.
++///
++/// Only [`Send`] resources may be accessed with the [`Res`] [`SystemParam`](crate::system::SystemParam). In case that the
++/// resource does not implement `Send`, this `SystemParam` wrapper can be used. This will instruct
++/// the scheduler to instead run the system on the main thread so that it doesn't send the resource
++/// over to another thread.
++///
++/// This [`SystemParam`](crate::system::SystemParam) fails validation if the non-send resource doesn't exist.
++/// This will cause a panic, but can be configured to do nothing or warn once.
++///
++/// Use [`Option<NonSend<T>>`] instead if the resource might not always exist.
++pub struct NonSend<'w, T: ?Sized + 'static> {
++    pub(crate) value: &'w T,
++    pub(crate) ticks: ComponentTicksRef<'w>,
++}
++
++change_detection_impl!(NonSend<'w, T>, T,);
++impl_debug!(NonSend<'w, T>,);
++
++impl<'w, T> From<NonSendMut<'w, T>> for NonSend<'w, T> {
++    fn from(other: NonSendMut<'w, T>) -> Self {
++        Self {
++            value: other.value,
++            ticks: other.ticks.into(),
+         }
+     }
+ }
+@@ -772,8 +802,7 @@ impl<'w, T: Resource> From<ResMut<'w, T>> for Mut<'w, T> {
+ /// Use [`Option<NonSendMut<T>>`] instead if the resource might not always exist.
+ pub struct NonSendMut<'w, T: ?Sized + 'static> {
+     pub(crate) value: &'w mut T,
+-    pub(crate) ticks: TicksMut<'w>,
+-    pub(crate) changed_by: MaybeLocation<&'w mut &'static Location<'static>>,
++    pub(crate) ticks: ComponentTicksMut<'w>,
+ }
+ 
+ change_detection_impl!(NonSendMut<'w, T>, T,);
+@@ -788,7 +817,6 @@ impl<'w, T: 'static> From<NonSendMut<'w, T>> for Mut<'w, T> {
+         Mut {
+             value: other.value,
+             ticks: other.ticks,
+-            changed_by: other.changed_by,
+         }
+     }
+ }
+@@ -819,8 +847,7 @@ impl<'w, T: 'static> From<NonSendMut<'w, T>> for Mut<'w, T> {
+ /// ```
+ pub struct Ref<'w, T: ?Sized> {
+     pub(crate) value: &'w T,
+-    pub(crate) ticks: Ticks<'w>,
+-    pub(crate) changed_by: MaybeLocation<&'w &'static Location<'static>>,
++    pub(crate) ticks: ComponentTicksRef<'w>,
+ }
+ 
+ impl<'w, T: ?Sized> Ref<'w, T> {
+@@ -837,7 +864,6 @@ impl<'w, T: ?Sized> Ref<'w, T> {
+         Ref {
+             value: f(self.value),
+             ticks: self.ticks,
+-            changed_by: self.changed_by,
+         }
+     }
+ 
+@@ -862,13 +888,13 @@ impl<'w, T: ?Sized> Ref<'w, T> {
+     ) -> Ref<'w, T> {
+         Ref {
+             value,
+-            ticks: Ticks {
++            ticks: ComponentTicksRef {
+                 added,
+                 changed,
++                changed_by: caller,
+                 last_run,
+                 this_run,
+             },
+-            changed_by: caller,
+         }
+     }
+ 
+@@ -934,8 +960,7 @@ impl_debug!(Ref<'w, T>,);
+ /// ```
+ pub struct Mut<'w, T: ?Sized> {
+     pub(crate) value: &'w mut T,
+-    pub(crate) ticks: TicksMut<'w>,
+-    pub(crate) changed_by: MaybeLocation<&'w mut &'static Location<'static>>,
++    pub(crate) ticks: ComponentTicksMut<'w>,
+ }
+ 
+ impl<'w, T: ?Sized> Mut<'w, T> {
+@@ -964,13 +989,13 @@ impl<'w, T: ?Sized> Mut<'w, T> {
+     ) -> Self {
+         Self {
+             value,
+-            ticks: TicksMut {
++            ticks: ComponentTicksMut {
+                 added,
+                 changed: last_changed,
++                changed_by: caller,
+                 last_run,
+                 this_run,
+             },
+-            changed_by: caller,
+         }
+     }
+ 
+@@ -989,7 +1014,6 @@ impl<'w, T: ?Sized> From<Mut<'w, T>> for Ref<'w, T> {
+         Self {
+             value: mut_ref.value,
+             ticks: mut_ref.ticks.into(),
+-            changed_by: mut_ref.changed_by.map(|changed_by| &*changed_by),
+         }
+     }
+ }
+@@ -1034,8 +1058,7 @@ impl_debug!(Mut<'w, T>,);
+ /// or are defined outside of rust this can be used.
+ pub struct MutUntyped<'w> {
+     pub(crate) value: PtrMut<'w>,
+-    pub(crate) ticks: TicksMut<'w>,
+-    pub(crate) changed_by: MaybeLocation<&'w mut &'static Location<'static>>,
++    pub(crate) ticks: ComponentTicksMut<'w>,
+ }
+ 
+ impl<'w> MutUntyped<'w> {
+@@ -1054,13 +1077,13 @@ impl<'w> MutUntyped<'w> {
+     pub fn reborrow(&mut self) -> MutUntyped<'_> {
+         MutUntyped {
+             value: self.value.reborrow(),
+-            ticks: TicksMut {
++            ticks: ComponentTicksMut {
+                 added: self.ticks.added,
+                 changed: self.ticks.changed,
++                changed_by: self.ticks.changed_by.as_deref_mut(),
+                 last_run: self.ticks.last_run,
+                 this_run: self.ticks.this_run,
+             },
+-            changed_by: self.changed_by.as_deref_mut(),
+         }
+     }
+ 
+@@ -1111,7 +1134,6 @@ impl<'w> MutUntyped<'w> {
+         Mut {
+             value: f(self.value),
+             ticks: self.ticks,
+-            changed_by: self.changed_by,
+         }
+     }
+ 
+@@ -1124,8 +1146,6 @@ impl<'w> MutUntyped<'w> {
+             // SAFETY: `value` is `Aligned` and caller ensures the pointee type is `T`.
+             value: unsafe { self.value.deref_mut() },
+             ticks: self.ticks,
+-            // SAFETY: `caller` is `Aligned`.
+-            changed_by: self.changed_by,
+         }
+     }
+ }
+@@ -1152,7 +1172,7 @@ impl<'w> DetectChanges for MutUntyped<'w> {
+ 
+     #[inline]
+     fn changed_by(&self) -> MaybeLocation {
+-        self.changed_by.copied()
++        self.ticks.changed_by.copied()
+     }
+ 
+     #[inline]
+@@ -1168,7 +1188,7 @@ impl<'w> DetectChangesMut for MutUntyped<'w> {
+     #[track_caller]
+     fn set_changed(&mut self) {
+         *self.ticks.changed = self.ticks.this_run;
+-        self.changed_by.assign(MaybeLocation::caller());
++        self.ticks.changed_by.assign(MaybeLocation::caller());
+     }
+ 
+     #[inline]
+@@ -1176,14 +1196,14 @@ impl<'w> DetectChangesMut for MutUntyped<'w> {
+     fn set_added(&mut self) {
+         *self.ticks.changed = self.ticks.this_run;
+         *self.ticks.added = self.ticks.this_run;
+-        self.changed_by.assign(MaybeLocation::caller());
++        self.ticks.changed_by.assign(MaybeLocation::caller());
+     }
+ 
+     #[inline]
+     #[track_caller]
+     fn set_last_changed(&mut self, last_changed: Tick) {
+         *self.ticks.changed = last_changed;
+-        self.changed_by.assign(MaybeLocation::caller());
++        self.ticks.changed_by.assign(MaybeLocation::caller());
+     }
+ 
+     #[inline]
+@@ -1191,7 +1211,7 @@ impl<'w> DetectChangesMut for MutUntyped<'w> {
+     fn set_last_added(&mut self, last_added: Tick) {
+         *self.ticks.added = last_added;
+         *self.ticks.changed = last_added;
+-        self.changed_by.assign(MaybeLocation::caller());
++        self.ticks.changed_by.assign(MaybeLocation::caller());
+     }
+ 
+     #[inline]
+@@ -1214,7 +1234,6 @@ impl<'w, T> From<Mut<'w, T>> for MutUntyped<'w> {
+         MutUntyped {
+             value: value.value.into(),
+             ticks: value.ticks,
+-            changed_by: value.changed_by,
+         }
+     }
+ }
+@@ -1512,7 +1531,7 @@ mod tests {
+ 
+     use crate::{
+         change_detection::{
+-            MaybeLocation, Mut, NonSendMut, Ref, ResMut, TicksMut, CHECK_TICK_THRESHOLD,
++            ComponentTicksMut, MaybeLocation, Mut, NonSendMut, Ref, ResMut, CHECK_TICK_THRESHOLD,
+             MAX_CHANGE_AGE,
+         },
+         component::{Component, ComponentTicks, Tick},
+@@ -1632,19 +1651,19 @@ mod tests {
+             added: Tick::new(1),
+             changed: Tick::new(2),
+         };
+-        let ticks = TicksMut {
++        let mut caller = MaybeLocation::caller();
++        let ticks = ComponentTicksMut {
+             added: &mut component_ticks.added,
+             changed: &mut component_ticks.changed,
++            changed_by: caller.as_mut(),
+             last_run: Tick::new(3),
+             this_run: Tick::new(4),
+         };
+         let mut res = R {};
+-        let mut caller = MaybeLocation::caller();
+ 
+         let res_mut = ResMut {
+             value: &mut res,
+             ticks,
+-            changed_by: caller.as_mut(),
+         };
+ 
+         let into_mut: Mut<R> = res_mut.into();
+@@ -1682,19 +1701,19 @@ mod tests {
+             added: Tick::new(1),
+             changed: Tick::new(2),
+         };
+-        let ticks = TicksMut {
++        let mut caller = MaybeLocation::caller();
++        let ticks = ComponentTicksMut {
+             added: &mut component_ticks.added,
+             changed: &mut component_ticks.changed,
++            changed_by: caller.as_mut(),
+             last_run: Tick::new(3),
+             this_run: Tick::new(4),
+         };
+         let mut res = R {};
+-        let mut caller = MaybeLocation::caller();
+ 
+         let non_send_mut = NonSendMut {
+             value: &mut res,
+             ticks,
+-            changed_by: caller.as_mut(),
+         };
+ 
+         let into_mut: Mut<R> = non_send_mut.into();
+@@ -1715,20 +1734,20 @@ mod tests {
+             added: Tick::new(1),
+             changed: Tick::new(2),
+         };
+-        let ticks = TicksMut {
++        let mut caller = MaybeLocation::caller();
++        let ticks = ComponentTicksMut {
+             added: &mut component_ticks.added,
+             changed: &mut component_ticks.changed,
++            changed_by: caller.as_mut(),
+             last_run,
+             this_run,
+         };
+ 
+         let mut outer = Outer(0);
+-        let mut caller = MaybeLocation::caller();
+ 
+         let ptr = Mut {
+             value: &mut outer,
+             ticks,
+-            changed_by: caller.as_mut(),
+         };
+         assert!(!ptr.is_changed());
+ 
+@@ -1803,20 +1822,20 @@ mod tests {
+             added: Tick::new(1),
+             changed: Tick::new(2),
+         };
+-        let ticks = TicksMut {
++        let mut caller = MaybeLocation::caller();
++        let ticks = ComponentTicksMut {
+             added: &mut component_ticks.added,
+             changed: &mut component_ticks.changed,
++            changed_by: caller.as_mut(),
+             last_run,
+             this_run,
+         };
+ 
+         let mut value: i32 = 5;
+-        let mut caller = MaybeLocation::caller();
+ 
+         let value = MutUntyped {
+             value: PtrMut::from(&mut value),
+             ticks,
+-            changed_by: caller.as_mut(),
+         };
+ 
+         let reflect_from_ptr = <ReflectFromPtr as FromType<i32>>::from_type();
+@@ -1839,19 +1858,19 @@ mod tests {
+             added: Tick::new(1),
+             changed: Tick::new(2),
+         };
+-        let ticks = TicksMut {
++        let mut caller = MaybeLocation::caller();
++        let ticks = ComponentTicksMut {
+             added: &mut component_ticks.added,
+             changed: &mut component_ticks.changed,
++            changed_by: caller.as_mut(),
+             last_run: Tick::new(3),
+             this_run: Tick::new(4),
+         };
+         let mut c = C {};
+-        let mut caller = MaybeLocation::caller();
+ 
+         let mut_typed = Mut {
+             value: &mut c,
+             ticks,
+-            changed_by: caller.as_mut(),
+         };
+ 
+         let into_mut: MutUntyped = mut_typed.into();
+diff --git a/crates/bevy_ecs/src/component/tick.rs b/crates/bevy_ecs/src/component/tick.rs
+index b02259637f4fa..ae1186d37e4fa 100644
+--- a/crates/bevy_ecs/src/component/tick.rs
++++ b/crates/bevy_ecs/src/component/tick.rs
+@@ -1,10 +1,9 @@
+ use bevy_ecs_macros::Event;
+-use bevy_ptr::UnsafeCellDeref;
+ #[cfg(feature = "bevy_reflect")]
+ use bevy_reflect::Reflect;
+-use core::cell::UnsafeCell;
++use core::{cell::UnsafeCell, panic::Location};
+ 
+-use crate::change_detection::MAX_CHANGE_AGE;
++use crate::change_detection::{MaybeLocation, MAX_CHANGE_AGE};
+ 
+ /// A value that tracks when a system ran relative to other systems.
+ /// This is used to power change detection.
+@@ -121,27 +120,15 @@ impl CheckChangeTicks {
+     }
+ }
+ 
+-/// Interior-mutable access to the [`Tick`]s for a single component or resource.
++/// Interior-mutable access to the [`Tick`]s of a single component or resource.
+ #[derive(Copy, Clone, Debug)]
+-pub struct TickCells<'a> {
++pub struct ComponentTickCells<'a> {
+     /// The tick indicating when the value was added to the world.
+     pub added: &'a UnsafeCell<Tick>,
+     /// The tick indicating the last time the value was modified.
+     pub changed: &'a UnsafeCell<Tick>,
+-}
+-
+-impl<'a> TickCells<'a> {
+-    /// # Safety
+-    /// All cells contained within must uphold the safety invariants of [`UnsafeCellDeref::read`].
+-    #[inline]
+-    pub(crate) unsafe fn read(&self) -> ComponentTicks {
+-        ComponentTicks {
+-            // SAFETY: The callers uphold the invariants for `read`.
+-            added: unsafe { self.added.read() },
+-            // SAFETY: The callers uphold the invariants for `read`.
+-            changed: unsafe { self.changed.read() },
+-        }
+-    }
++    /// The calling location that last modified the value.
++    pub changed_by: MaybeLocation<&'a UnsafeCell<&'static Location<'static>>>,
+ }
+ 
+ /// Records when a component or resource was added and when it was last mutably dereferenced (or added).
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 7b1ff2387f1d4..2afa8631d86b6 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     archetype::{Archetype, Archetypes},
+     bundle::Bundle,
+-    change_detection::{MaybeLocation, Ticks, TicksMut},
++    change_detection::{ComponentTicksMut, ComponentTicksRef, MaybeLocation},
+     component::{Component, ComponentId, Components, Mutable, StorageType, Tick},
+     entity::{Entities, Entity, EntityLocation},
+     query::{Access, DebugCheckedUnwrap, FilteredAccess, WorldQuery},
+@@ -1801,18 +1801,18 @@ unsafe impl<'__w, T: Component> QueryData for Ref<'__w, T> {
+ 
+                 Ref {
+                     value: component.deref(),
+-                    ticks: Ticks {
++                    ticks: ComponentTicksRef {
+                         added: added.deref(),
+                         changed: changed.deref(),
++                        changed_by: caller.map(|caller| caller.deref()),
+                         this_run: fetch.this_run,
+                         last_run: fetch.last_run,
+                     },
+-                    changed_by: caller.map(|caller| caller.deref()),
+                 }
+             },
+             |sparse_set| {
+                 // SAFETY: The caller ensures `entity` is in range and has the component.
+-                let (component, ticks, caller) = unsafe {
++                let (component, ticks) = unsafe {
+                     sparse_set
+                         .debug_checked_unwrap()
+                         .get_with_ticks(entity)
+@@ -1821,8 +1821,11 @@ unsafe impl<'__w, T: Component> QueryData for Ref<'__w, T> {
+ 
+                 Ref {
+                     value: component.deref(),
+-                    ticks: Ticks::from_tick_cells(ticks, fetch.last_run, fetch.this_run),
+-                    changed_by: caller.map(|caller| caller.deref()),
++                    ticks: ComponentTicksRef::from_tick_cells(
++                        ticks,
++                        fetch.last_run,
++                        fetch.this_run,
++                    ),
+                 }
+             },
+         )
+@@ -2007,18 +2010,18 @@ unsafe impl<'__w, T: Component<Mutability = Mutable>> QueryData for &'__w mut T
+ 
+                 Mut {
+                     value: component.deref_mut(),
+-                    ticks: TicksMut {
++                    ticks: ComponentTicksMut {
+                         added: added.deref_mut(),
+                         changed: changed.deref_mut(),
++                        changed_by: caller.map(|caller| caller.deref_mut()),
+                         this_run: fetch.this_run,
+                         last_run: fetch.last_run,
+                     },
+-                    changed_by: caller.map(|caller| caller.deref_mut()),
+                 }
+             },
+             |sparse_set| {
+                 // SAFETY: The caller ensures `entity` is in range and has the component.
+-                let (component, ticks, caller) = unsafe {
++                let (component, ticks) = unsafe {
+                     sparse_set
+                         .debug_checked_unwrap()
+                         .get_with_ticks(entity)
+@@ -2027,8 +2030,11 @@ unsafe impl<'__w, T: Component<Mutability = Mutable>> QueryData for &'__w mut T
+ 
+                 Mut {
+                     value: component.assert_unique().deref_mut(),
+-                    ticks: TicksMut::from_tick_cells(ticks, fetch.last_run, fetch.this_run),
+-                    changed_by: caller.map(|caller| caller.deref_mut()),
++                    ticks: ComponentTicksMut::from_tick_cells(
++                        ticks,
++                        fetch.last_run,
++                        fetch.this_run,
++                    ),
+                 }
+             },
+         )
+diff --git a/crates/bevy_ecs/src/storage/resource.rs b/crates/bevy_ecs/src/storage/resource.rs
+index 093d12a2ea2ae..18c7bb7666e65 100644
+--- a/crates/bevy_ecs/src/storage/resource.rs
++++ b/crates/bevy_ecs/src/storage/resource.rs
+@@ -1,6 +1,8 @@
+ use crate::{
+-    change_detection::{MaybeLocation, MutUntyped, TicksMut},
+-    component::{CheckChangeTicks, ComponentId, ComponentTicks, Components, Tick, TickCells},
++    change_detection::{ComponentTicksMut, MaybeLocation, MutUntyped},
++    component::{
++        CheckChangeTicks, ComponentId, ComponentTickCells, ComponentTicks, Components, Tick,
++    },
+     storage::{blob_array::BlobArray, SparseSet},
+ };
+ use bevy_ptr::{OwningPtr, Ptr, UnsafeCellDeref};
+@@ -124,23 +126,17 @@ impl<const SEND: bool> ResourceData<SEND> {
+     /// If `SEND` is false, this will panic if a value is present and is not accessed from the
+     /// original thread it was inserted in.
+     #[inline]
+-    pub(crate) fn get_with_ticks(
+-        &self,
+-    ) -> Option<(
+-        Ptr<'_>,
+-        TickCells<'_>,
+-        MaybeLocation<&UnsafeCell<&'static Location<'static>>>,
+-    )> {
++    pub(crate) fn get_with_ticks(&self) -> Option<(Ptr<'_>, ComponentTickCells<'_>)> {
+         self.is_present().then(|| {
+             self.validate_access();
+             (
+                 // SAFETY: We've already checked if a value is present, and there should only be one.
+                 unsafe { self.data.get_unchecked(Self::ROW) },
+-                TickCells {
++                ComponentTickCells {
+                     added: &self.added_ticks,
+                     changed: &self.changed_ticks,
++                    changed_by: self.changed_by.as_ref(),
+                 },
+-                self.changed_by.as_ref(),
+             )
+         })
+     }
+@@ -151,14 +147,12 @@ impl<const SEND: bool> ResourceData<SEND> {
+     /// If `SEND` is false, this will panic if a value is present and is not accessed from the
+     /// original thread it was inserted in.
+     pub(crate) fn get_mut(&mut self, last_run: Tick, this_run: Tick) -> Option<MutUntyped<'_>> {
+-        let (ptr, ticks, caller) = self.get_with_ticks()?;
++        let (ptr, ticks) = self.get_with_ticks()?;
+         Some(MutUntyped {
+             // SAFETY: We have exclusive access to the underlying storage.
+             value: unsafe { ptr.assert_unique() },
+             // SAFETY: We have exclusive access to the underlying storage.
+-            ticks: unsafe { TicksMut::from_tick_cells(ticks, last_run, this_run) },
+-            // SAFETY: We have exclusive access to the underlying storage.
+-            changed_by: unsafe { caller.map(|caller| caller.deref_mut()) },
++            ticks: unsafe { ComponentTicksMut::from_tick_cells(ticks, last_run, this_run) },
+         })
+     }
+ 
+diff --git a/crates/bevy_ecs/src/storage/sparse_set.rs b/crates/bevy_ecs/src/storage/sparse_set.rs
+index f1a7900e675fb..f273af1eec0b9 100644
+--- a/crates/bevy_ecs/src/storage/sparse_set.rs
++++ b/crates/bevy_ecs/src/storage/sparse_set.rs
+@@ -1,6 +1,8 @@
+ use crate::{
+     change_detection::MaybeLocation,
+-    component::{CheckChangeTicks, ComponentId, ComponentInfo, ComponentTicks, Tick, TickCells},
++    component::{
++        CheckChangeTicks, ComponentId, ComponentInfo, ComponentTickCells, ComponentTicks, Tick,
++    },
+     entity::{Entity, EntityRow},
+     query::DebugCheckedUnwrap,
+     storage::{AbortOnPanic, Column, TableRow, VecExtensions},
+@@ -252,14 +254,7 @@ impl ComponentSparseSet {
+     ///
+     /// Returns `None` if `entity` does not have a component in the sparse set.
+     #[inline]
+-    pub fn get_with_ticks(
+-        &self,
+-        entity: Entity,
+-    ) -> Option<(
+-        Ptr<'_>,
+-        TickCells<'_>,
+-        MaybeLocation<&UnsafeCell<&'static Location<'static>>>,
+-    )> {
++    pub fn get_with_ticks(&self, entity: Entity) -> Option<(Ptr<'_>, ComponentTickCells<'_>)> {
+         let dense_index = *self.sparse.get(entity.row())?;
+         #[cfg(debug_assertions)]
+         assert_eq!(entity, self.entities[dense_index.index()]);
+@@ -267,11 +262,11 @@ impl ComponentSparseSet {
+         unsafe {
+             Some((
+                 self.dense.get_data_unchecked(dense_index),
+-                TickCells {
++                ComponentTickCells {
+                     added: self.dense.get_added_tick_unchecked(dense_index),
+                     changed: self.dense.get_changed_tick_unchecked(dense_index),
++                    changed_by: self.dense.get_changed_by_unchecked(dense_index),
+                 },
+-                self.dense.get_changed_by_unchecked(dense_index),
+             ))
+         }
+     }
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index 8af9361ec068d..07be989a82d6e 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -1,9 +1,9 @@
+-pub use crate::change_detection::{NonSendMut, Res, ResMut};
++pub use crate::change_detection::{NonSend, NonSendMut, Res, ResMut};
+ use crate::{
+     archetype::Archetypes,
+     bundle::Bundles,
+-    change_detection::{MaybeLocation, Ticks, TicksMut},
+-    component::{ComponentId, ComponentTicks, Components, Tick},
++    change_detection::{ComponentTicksMut, ComponentTicksRef},
++    component::{ComponentId, Components, Tick},
+     entity::Entities,
+     query::{
+         Access, FilteredAccess, FilteredAccessSet, QueryData, QueryFilter, QuerySingleError,
+@@ -17,11 +17,7 @@ use crate::{
+         FromWorld, World,
+     },
+ };
+-use alloc::{
+-    borrow::{Cow, ToOwned},
+-    boxed::Box,
+-    vec::Vec,
+-};
++use alloc::{borrow::Cow, boxed::Box, vec::Vec};
+ pub use bevy_ecs_macros::SystemParam;
+ use bevy_platform::cell::SyncCell;
+ use bevy_ptr::UnsafeCellDeref;
+@@ -31,7 +27,6 @@ use core::{
+     fmt::{Debug, Display},
+     marker::PhantomData,
+     ops::{Deref, DerefMut},
+-    panic::Location,
+ };
+ use thiserror::Error;
+ 
+@@ -806,25 +801,24 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+         world: UnsafeWorldCell<'w>,
+         change_tick: Tick,
+     ) -> Self::Item<'w, 's> {
+-        let (ptr, ticks, caller) =
+-            world
+-                .get_resource_with_ticks(component_id)
+-                .unwrap_or_else(|| {
+-                    panic!(
+-                        "Resource requested by {} does not exist: {}",
+-                        system_meta.name,
+-                        DebugName::type_name::<T>()
+-                    );
+-                });
++        let (ptr, ticks) = world
++            .get_resource_with_ticks(component_id)
++            .unwrap_or_else(|| {
++                panic!(
++                    "Resource requested by {} does not exist: {}",
++                    system_meta.name,
++                    DebugName::type_name::<T>()
++                );
++            });
+         Res {
+             value: ptr.deref(),
+-            ticks: Ticks {
++            ticks: ComponentTicksRef {
+                 added: ticks.added.deref(),
+                 changed: ticks.changed.deref(),
++                changed_by: ticks.changed_by.map(|changed_by| changed_by.deref()),
+                 last_run: system_meta.last_run,
+                 this_run: change_tick,
+             },
+-            changed_by: caller.map(|caller| caller.deref()),
+         }
+     }
+ }
+@@ -896,13 +890,13 @@ unsafe impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
+             });
+         ResMut {
+             value: value.value.deref_mut::<T>(),
+-            ticks: TicksMut {
++            ticks: ComponentTicksMut {
+                 added: value.ticks.added,
+                 changed: value.ticks.changed,
++                changed_by: value.ticks.changed_by,
+                 last_run: system_meta.last_run,
+                 this_run: change_tick,
+             },
+-            changed_by: value.changed_by,
+         }
+     }
+ }
+@@ -1349,77 +1343,9 @@ unsafe impl SystemParam for NonSendMarker {
+ // SAFETY: Does not read any world state
+ unsafe impl ReadOnlySystemParam for NonSendMarker {}
+ 
+-/// Shared borrow of a non-[`Send`] resource.
+-///
+-/// Only `Send` resources may be accessed with the [`Res`] [`SystemParam`]. In case that the
+-/// resource does not implement `Send`, this `SystemParam` wrapper can be used. This will instruct
+-/// the scheduler to instead run the system on the main thread so that it doesn't send the resource
+-/// over to another thread.
+-///
+-/// This [`SystemParam`] fails validation if non-send resource doesn't exist.
+-/// This will cause a panic, but can be configured to do nothing or warn once.
+-///
+-/// Use [`Option<NonSend<T>>`] instead if the resource might not always exist.
+-pub struct NonSend<'w, T: 'static> {
+-    pub(crate) value: &'w T,
+-    ticks: ComponentTicks,
+-    last_run: Tick,
+-    this_run: Tick,
+-    changed_by: MaybeLocation<&'w &'static Location<'static>>,
+-}
+-
+ // SAFETY: Only reads a single World non-send resource
+ unsafe impl<'w, T> ReadOnlySystemParam for NonSend<'w, T> {}
+ 
+-impl<'w, T> Debug for NonSend<'w, T>
+-where
+-    T: Debug,
+-{
+-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        f.debug_tuple("NonSend").field(&self.value).finish()
+-    }
+-}
+-
+-impl<'w, T: 'static> NonSend<'w, T> {
+-    /// Returns `true` if the resource was added after the system last ran.
+-    pub fn is_added(&self) -> bool {
+-        self.ticks.is_added(self.last_run, self.this_run)
+-    }
+-
+-    /// Returns `true` if the resource was added or mutably dereferenced after the system last ran.
+-    pub fn is_changed(&self) -> bool {
+-        self.ticks.is_changed(self.last_run, self.this_run)
+-    }
+-
+-    /// The location that last caused this to change.
+-    pub fn changed_by(&self) -> MaybeLocation {
+-        self.changed_by.copied()
+-    }
+-}
+-
+-impl<'w, T> Deref for NonSend<'w, T> {
+-    type Target = T;
+-
+-    fn deref(&self) -> &Self::Target {
+-        self.value
+-    }
+-}
+-
+-impl<'a, T> From<NonSendMut<'a, T>> for NonSend<'a, T> {
+-    fn from(nsm: NonSendMut<'a, T>) -> Self {
+-        Self {
+-            value: nsm.value,
+-            ticks: ComponentTicks {
+-                added: nsm.ticks.added.to_owned(),
+-                changed: nsm.ticks.changed.to_owned(),
+-            },
+-            this_run: nsm.ticks.this_run,
+-            last_run: nsm.ticks.last_run,
+-            changed_by: nsm.changed_by.map(|changed_by| &*changed_by),
+-        }
+-    }
+-}
+-
+ // SAFETY: NonSendComponentId access is applied to SystemMeta. If this
+ // NonSend conflicts with any prior access, a panic will occur.
+ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+@@ -1475,23 +1401,18 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+         world: UnsafeWorldCell<'w>,
+         change_tick: Tick,
+     ) -> Self::Item<'w, 's> {
+-        let (ptr, ticks, caller) =
+-            world
+-                .get_non_send_with_ticks(component_id)
+-                .unwrap_or_else(|| {
+-                    panic!(
+-                        "Non-send resource requested by {} does not exist: {}",
+-                        system_meta.name,
+-                        DebugName::type_name::<T>()
+-                    )
+-                });
+-
++        let (ptr, ticks) = world
++            .get_non_send_with_ticks(component_id)
++            .unwrap_or_else(|| {
++                panic!(
++                    "Non-send resource requested by {} does not exist: {}",
++                    system_meta.name,
++                    DebugName::type_name::<T>()
++                );
++            });
+         NonSend {
+             value: ptr.deref(),
+-            ticks: ticks.read(),
+-            last_run: system_meta.last_run,
+-            this_run: change_tick,
+-            changed_by: caller.map(|caller| caller.deref()),
++            ticks: ComponentTicksRef::from_tick_cells(ticks, system_meta.last_run, change_tick),
+         }
+     }
+ }
+@@ -1554,20 +1475,18 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+         world: UnsafeWorldCell<'w>,
+         change_tick: Tick,
+     ) -> Self::Item<'w, 's> {
+-        let (ptr, ticks, caller) =
+-            world
+-                .get_non_send_with_ticks(component_id)
+-                .unwrap_or_else(|| {
+-                    panic!(
+-                        "Non-send resource requested by {} does not exist: {}",
+-                        system_meta.name,
+-                        DebugName::type_name::<T>()
+-                    );
+-                });
++        let (ptr, ticks) = world
++            .get_non_send_with_ticks(component_id)
++            .unwrap_or_else(|| {
++                panic!(
++                    "Non-send resource requested by {} does not exist: {}",
++                    system_meta.name,
++                    DebugName::type_name::<T>()
++                );
++            });
+         NonSendMut {
+             value: ptr.assert_unique().deref_mut(),
+-            ticks: TicksMut::from_tick_cells(ticks, system_meta.last_run, change_tick),
+-            changed_by: caller.map(|caller| caller.deref_mut()),
++            ticks: ComponentTicksMut::from_tick_cells(ticks, system_meta.last_run, change_tick),
+         }
+     }
+ }
+diff --git a/crates/bevy_ecs/src/world/filtered_resource.rs b/crates/bevy_ecs/src/world/filtered_resource.rs
+index 668b45257ed32..698955ce9067a 100644
+--- a/crates/bevy_ecs/src/world/filtered_resource.rs
++++ b/crates/bevy_ecs/src/world/filtered_resource.rs
+@@ -1,11 +1,11 @@
+ use crate::{
+-    change_detection::{Mut, MutUntyped, Ref, Ticks, TicksMut},
++    change_detection::{ComponentTicksMut, ComponentTicksRef, Mut, MutUntyped, Ref},
+     component::{ComponentId, Tick},
+     query::Access,
+     resource::Resource,
+     world::{unsafe_world_cell::UnsafeWorldCell, World},
+ };
+-use bevy_ptr::{Ptr, UnsafeCellDeref};
++use bevy_ptr::Ptr;
+ 
+ use super::error::ResourceFetchError;
+ 
+@@ -164,16 +164,16 @@ impl<'w, 's> FilteredResources<'w, 's> {
+         }
+ 
+         // SAFETY: We have read access to this resource
+-        let (value, ticks, caller) = unsafe { self.world.get_resource_with_ticks(component_id) }
++        let (value, ticks) = unsafe { self.world.get_resource_with_ticks(component_id) }
+             .ok_or(ResourceFetchError::DoesNotExist(component_id))?;
+ 
+         Ok(Ref {
+             // SAFETY: `component_id` was obtained from the type ID of `R`.
+             value: unsafe { value.deref() },
+             // SAFETY: We have read access to the resource, so no mutable reference can exist.
+-            ticks: unsafe { Ticks::from_tick_cells(ticks, self.last_run, self.this_run) },
+-            // SAFETY: We have read access to the resource, so no mutable reference can exist.
+-            changed_by: unsafe { caller.map(|caller| caller.deref()) },
++            ticks: unsafe {
++                ComponentTicksRef::from_tick_cells(ticks, self.last_run, self.this_run)
++            },
+         })
+     }
+ 
+@@ -494,16 +494,16 @@ impl<'w, 's> FilteredResourcesMut<'w, 's> {
+         }
+ 
+         // SAFETY: We have read access to this resource
+-        let (value, ticks, caller) = unsafe { self.world.get_resource_with_ticks(component_id) }
++        let (value, ticks) = unsafe { self.world.get_resource_with_ticks(component_id) }
+             .ok_or(ResourceFetchError::DoesNotExist(component_id))?;
+ 
+         Ok(MutUntyped {
+             // SAFETY: We have exclusive access to the underlying storage.
+             value: unsafe { value.assert_unique() },
+             // SAFETY: We have exclusive access to the underlying storage.
+-            ticks: unsafe { TicksMut::from_tick_cells(ticks, self.last_run, self.this_run) },
+-            // SAFETY: We have exclusive access to the underlying storage.
+-            changed_by: unsafe { caller.map(|caller| caller.deref_mut()) },
++            ticks: unsafe {
++                ComponentTicksMut::from_tick_cells(ticks, self.last_run, self.this_run)
++            },
+         })
+     }
+ }
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 024c127aab8b2..5d71c44dbe6ba 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -35,7 +35,7 @@ use crate::{
+         Bundle, BundleId, BundleInfo, BundleInserter, BundleSpawner, Bundles, InsertMode,
+         NoBundleEffect,
+     },
+-    change_detection::{MaybeLocation, MutUntyped, TicksMut},
++    change_detection::{ComponentTicksMut, MaybeLocation, MutUntyped},
+     component::{
+         CheckChangeTicks, Component, ComponentDescriptor, ComponentId, ComponentIds, ComponentInfo,
+         ComponentTicks, Components, ComponentsQueuedRegistrator, ComponentsRegistrator, Mutable,
+@@ -63,7 +63,7 @@ use crate::{
+ };
+ use alloc::{boxed::Box, vec::Vec};
+ use bevy_platform::sync::atomic::{AtomicU32, Ordering};
+-use bevy_ptr::{move_as_ptr, MovingPtr, OwningPtr, Ptr, UnsafeCellDeref};
++use bevy_ptr::{move_as_ptr, MovingPtr, OwningPtr, Ptr};
+ use bevy_utils::prelude::DebugName;
+ use core::{any::TypeId, fmt};
+ use log::warn;
+@@ -2615,13 +2615,13 @@ impl World {
+         let mut value = unsafe { ptr.read::<R>() };
+         let value_mut = Mut {
+             value: &mut value,
+-            ticks: TicksMut {
++            ticks: ComponentTicksMut {
+                 added: &mut ticks.added,
+                 changed: &mut ticks.changed,
++                changed_by: caller.as_mut(),
+                 last_run: last_change_tick,
+                 this_run: change_tick,
+             },
+-            changed_by: caller.as_mut(),
+         };
+         let result = f(self, value_mut);
+         assert!(!self.contains_resource::<R>(),
+@@ -3360,13 +3360,13 @@ impl World {
+                         .get_info(component_id)
+                         .debug_checked_unwrap()
+                 };
+-                let (ptr, ticks, caller) = data.get_with_ticks()?;
++                let (ptr, ticks) = data.get_with_ticks()?;
+ 
+                 // SAFETY:
+-                // - We have exclusive access to the world, so no other code can be aliasing the `TickCells`
+-                // - We only hold one `TicksMut` at a time, and we let go of it before getting the next one
++                // - We have exclusive access to the world, so no other code can be aliasing the `ComponentTickCells`
++                // - We only hold one `ComponentTicksMut` at a time, and we let go of it before getting the next one
+                 let ticks = unsafe {
+-                    TicksMut::from_tick_cells(
++                    ComponentTicksMut::from_tick_cells(
+                         ticks,
+                         self.last_change_tick(),
+                         self.read_change_tick(),
+@@ -3379,10 +3379,6 @@ impl World {
+                     // - We iterate one resource at a time, and we let go of each `PtrMut` before getting the next one
+                     value: unsafe { ptr.assert_unique() },
+                     ticks,
+-                    // SAFETY:
+-                    // - We have exclusive access to the world, so no other code can be aliasing the `Ptr`
+-                    // - We iterate one resource at a time, and we let go of each `PtrMut` before getting the next one
+-                    changed_by: unsafe { caller.map(|caller| caller.deref_mut()) },
+                 };
+ 
+                 Some((component_info, mut_untyped))
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index 16b7a863b4442..2b70ce587992c 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -4,8 +4,10 @@ use super::{Mut, Ref, World, WorldId};
+ use crate::{
+     archetype::{Archetype, Archetypes},
+     bundle::Bundles,
+-    change_detection::{MaybeLocation, MutUntyped, Ticks, TicksMut},
+-    component::{ComponentId, ComponentTicks, Components, Mutable, StorageType, Tick, TickCells},
++    change_detection::{ComponentTicksMut, ComponentTicksRef, MaybeLocation, MutUntyped},
++    component::{
++        ComponentId, ComponentTickCells, ComponentTicks, Components, Mutable, StorageType, Tick,
++    },
+     entity::{ContainsEntity, Entities, Entity, EntityDoesNotExistError, EntityLocation},
+     error::{DefaultErrorHandler, ErrorHandler},
+     lifecycle::RemovedComponentMessages,
+@@ -17,8 +19,8 @@ use crate::{
+     world::RawCommandQueue,
+ };
+ use bevy_platform::sync::atomic::Ordering;
+-use bevy_ptr::{Ptr, UnsafeCellDeref};
+-use core::{any::TypeId, cell::UnsafeCell, fmt::Debug, marker::PhantomData, panic::Location, ptr};
++use bevy_ptr::Ptr;
++use core::{any::TypeId, cell::UnsafeCell, fmt::Debug, marker::PhantomData, ptr};
+ use thiserror::Error;
+ 
+ /// Variant of the [`World`] where resource and component accesses take `&self`, and the responsibility to avoid
+@@ -423,23 +425,17 @@ impl<'w> UnsafeWorldCell<'w> {
+ 
+         // SAFETY: caller ensures `self` has permission to access the resource
+         // caller also ensures that no mutable reference to the resource exists
+-        let (ptr, ticks, caller) = unsafe { self.get_resource_with_ticks(component_id)? };
++        let (ptr, ticks) = unsafe { self.get_resource_with_ticks(component_id)? };
+ 
+         // SAFETY: `component_id` was obtained from the type ID of `R`
+         let value = unsafe { ptr.deref::<R>() };
+ 
+         // SAFETY: caller ensures that no mutable reference to the resource exists
+-        let ticks =
+-            unsafe { Ticks::from_tick_cells(ticks, self.last_change_tick(), self.change_tick()) };
+-
+-        // SAFETY: caller ensures that no mutable reference to the resource exists
+-        let caller = caller.map(|caller| unsafe { caller.deref() });
++        let ticks = unsafe {
++            ComponentTicksRef::from_tick_cells(ticks, self.last_change_tick(), self.change_tick())
++        };
+ 
+-        Some(Ref {
+-            value,
+-            ticks,
+-            changed_by: caller,
+-        })
++        Some(Ref { value, ticks })
+     }
+ 
+     /// Gets a pointer to the resource with the id [`ComponentId`] if it exists.
+@@ -544,7 +540,7 @@ impl<'w> UnsafeWorldCell<'w> {
+         self.assert_allows_mutable_access();
+         // SAFETY: we only access data that the caller has ensured is unaliased and `self`
+         //  has permission to access.
+-        let (ptr, ticks, caller) = unsafe { self.storages() }
++        let (ptr, ticks) = unsafe { self.storages() }
+             .resources
+             .get(component_id)?
+             .get_with_ticks()?;
+@@ -553,7 +549,7 @@ impl<'w> UnsafeWorldCell<'w> {
+         // - index is in-bounds because the column is initialized and non-empty
+         // - the caller promises that no other reference to the ticks of the same row can exist at the same time
+         let ticks = unsafe {
+-            TicksMut::from_tick_cells(ticks, self.last_change_tick(), self.change_tick())
++            ComponentTicksMut::from_tick_cells(ticks, self.last_change_tick(), self.change_tick())
+         };
+ 
+         Some(MutUntyped {
+@@ -562,10 +558,6 @@ impl<'w> UnsafeWorldCell<'w> {
+             // - caller ensures that the resource is unaliased
+             value: unsafe { ptr.assert_unique() },
+             ticks,
+-            // SAFETY:
+-            // - caller ensures that `self` has permission to access the resource
+-            // - caller ensures that the resource is unaliased
+-            changed_by: unsafe { caller.map(|caller| caller.deref_mut()) },
+         })
+     }
+ 
+@@ -612,7 +604,7 @@ impl<'w> UnsafeWorldCell<'w> {
+         let change_tick = self.change_tick();
+         // SAFETY: we only access data that the caller has ensured is unaliased and `self`
+         //  has permission to access.
+-        let (ptr, ticks, caller) = unsafe { self.storages() }
++        let (ptr, ticks) = unsafe { self.storages() }
+             .non_send_resources
+             .get(component_id)?
+             .get_with_ticks()?;
+@@ -621,14 +613,12 @@ impl<'w> UnsafeWorldCell<'w> {
+             // SAFETY: This function has exclusive access to the world so nothing aliases `ticks`.
+             // - index is in-bounds because the column is initialized and non-empty
+             // - no other reference to the ticks of the same row can exist at the same time
+-            unsafe { TicksMut::from_tick_cells(ticks, self.last_change_tick(), change_tick) };
++            unsafe { ComponentTicksMut::from_tick_cells(ticks, self.last_change_tick(), change_tick) };
+ 
+         Some(MutUntyped {
+             // SAFETY: This function has exclusive access to the world so nothing aliases `ptr`.
+             value: unsafe { ptr.assert_unique() },
+             ticks,
+-            // SAFETY: This function has exclusive access to the world
+-            changed_by: unsafe { caller.map(|caller| caller.deref_mut()) },
+         })
+     }
+ 
+@@ -641,11 +631,7 @@ impl<'w> UnsafeWorldCell<'w> {
+     pub(crate) unsafe fn get_resource_with_ticks(
+         self,
+         component_id: ComponentId,
+-    ) -> Option<(
+-        Ptr<'w>,
+-        TickCells<'w>,
+-        MaybeLocation<&'w UnsafeCell<&'static Location<'static>>>,
+-    )> {
++    ) -> Option<(Ptr<'w>, ComponentTickCells<'w>)> {
+         // SAFETY:
+         // - caller ensures there is no `&mut World`
+         // - caller ensures there are no mutable borrows of this resource
+@@ -668,11 +654,7 @@ impl<'w> UnsafeWorldCell<'w> {
+     pub(crate) unsafe fn get_non_send_with_ticks(
+         self,
+         component_id: ComponentId,
+-    ) -> Option<(
+-        Ptr<'w>,
+-        TickCells<'w>,
+-        MaybeLocation<&'w UnsafeCell<&'static Location<'static>>>,
+-    )> {
++    ) -> Option<(Ptr<'w>, ComponentTickCells<'w>)> {
+         // SAFETY:
+         // - caller ensures there is no `&mut World`
+         // - caller ensures there are no mutable borrows of this resource
+@@ -866,11 +848,10 @@ impl<'w> UnsafeEntityCell<'w> {
+                 self.entity,
+                 self.location,
+             )
+-            .map(|(value, cells, caller)| Ref {
++            .map(|(value, cells)| Ref {
+                 // SAFETY: returned component is of type T
+                 value: value.deref::<T>(),
+-                ticks: Ticks::from_tick_cells(cells, last_change_tick, change_tick),
+-                changed_by: caller.map(|caller| caller.deref()),
++                ticks: ComponentTicksRef::from_tick_cells(cells, last_change_tick, change_tick),
+             })
+         }
+     }
+@@ -982,11 +963,10 @@ impl<'w> UnsafeEntityCell<'w> {
+                 self.entity,
+                 self.location,
+             )
+-            .map(|(value, cells, caller)| Mut {
++            .map(|(value, cells)| Mut {
+                 // SAFETY: returned component is of type T
+                 value: value.assert_unique().deref_mut::<T>(),
+-                ticks: TicksMut::from_tick_cells(cells, last_change_tick, change_tick),
+-                changed_by: caller.map(|caller| caller.deref_mut()),
++                ticks: ComponentTicksMut::from_tick_cells(cells, last_change_tick, change_tick),
+             })
+         }
+     }
+@@ -1103,11 +1083,10 @@ impl<'w> UnsafeEntityCell<'w> {
+                 self.entity,
+                 self.location,
+             )
+-            .map(|(value, cells, caller)| MutUntyped {
++            .map(|(value, cells)| MutUntyped {
+                 // SAFETY: world access validated by caller and ties world lifetime to `MutUntyped` lifetime
+                 value: value.assert_unique(),
+-                ticks: TicksMut::from_tick_cells(cells, self.last_run, self.this_run),
+-                changed_by: caller.map(|caller| caller.deref_mut()),
++                ticks: ComponentTicksMut::from_tick_cells(cells, self.last_run, self.this_run),
+             })
+             .ok_or(GetEntityMutByIdError::ComponentNotFound)
+         }
+@@ -1147,11 +1126,10 @@ impl<'w> UnsafeEntityCell<'w> {
+                 self.entity,
+                 self.location,
+             )
+-            .map(|(value, cells, caller)| MutUntyped {
++            .map(|(value, cells)| MutUntyped {
+                 // SAFETY: world access validated by caller and ties world lifetime to `MutUntyped` lifetime
+                 value: value.assert_unique(),
+-                ticks: TicksMut::from_tick_cells(cells, self.last_run, self.this_run),
+-                changed_by: caller.map(|caller| caller.deref_mut()),
++                ticks: ComponentTicksMut::from_tick_cells(cells, self.last_run, self.this_run),
+             })
+             .ok_or(GetEntityMutByIdError::ComponentNotFound)
+         }
+@@ -1257,11 +1235,7 @@ unsafe fn get_component_and_ticks(
+     storage_type: StorageType,
+     entity: Entity,
+     location: EntityLocation,
+-) -> Option<(
+-    Ptr<'_>,
+-    TickCells<'_>,
+-    MaybeLocation<&UnsafeCell<&'static Location<'static>>>,
+-)> {
++) -> Option<(Ptr<'_>, ComponentTickCells<'_>)> {
+     match storage_type {
+         StorageType::Table => {
+             let table = world.fetch_table(location)?;
+@@ -1269,17 +1243,17 @@ unsafe fn get_component_and_ticks(
+             // SAFETY: archetypes only store valid table_rows and caller ensure aliasing rules
+             Some((
+                 table.get_component(component_id, location.table_row)?,
+-                TickCells {
++                ComponentTickCells {
+                     added: table
+                         .get_added_tick(component_id, location.table_row)
+                         .debug_checked_unwrap(),
+                     changed: table
+                         .get_changed_tick(component_id, location.table_row)
+                         .debug_checked_unwrap(),
++                    changed_by: table
++                        .get_changed_by(component_id, location.table_row)
++                        .map(|changed_by| changed_by.debug_checked_unwrap()),
+                 },
+-                table
+-                    .get_changed_by(component_id, location.table_row)
+-                    .map(|changed_by| changed_by.debug_checked_unwrap()),
+             ))
+         }
+         StorageType::SparseSet => world.fetch_sparse_set(component_id)?.get_with_ticks(entity),
+diff --git a/release-content/migration-guides/change_detection_refactors.md b/release-content/migration-guides/change_detection_refactors.md
+new file mode 100644
+index 0000000000000..baa6e60f304ab
+--- /dev/null
++++ b/release-content/migration-guides/change_detection_refactors.md
+@@ -0,0 +1,7 @@
++---
++title: "Tick-related refactors"
++pull_requests: [21562]
++---
++
++- `TickCells` is now `ComponentTickCells`.
++- `ComponentSparseSet::get_with_ticks` now returns `Option<(Ptr, ComponentTickCells)>` instead of `Option<(Ptr, TickCells, MaybeLocation)>`.

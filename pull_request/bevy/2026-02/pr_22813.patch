@@ -1,0 +1,584 @@
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 5bf505f814937..0e535fddb23a2 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -297,6 +297,7 @@ impl Plugin for MaterialsPlugin {
+                 .init_resource::<RenderMaterialInstances>()
+                 .init_resource::<MaterialBindGroupAllocators>()
+                 .add_render_command::<Shadow, DrawPrepass>()
++                .add_render_command::<Shadow, DrawDepthOnlyPrepass>()
+                 .add_render_command::<Transparent3d, DrawMaterial>()
+                 .add_render_command::<Opaque3d, DrawMaterial>()
+                 .add_render_command::<AlphaMask3d, DrawMaterial>()
+@@ -1408,6 +1409,8 @@ pub struct MainPassTransparentDrawFunction;
+ pub struct PrepassOpaqueDrawFunction;
+ #[derive(DrawFunctionLabel, Debug, Hash, PartialEq, Eq, Clone, Default)]
+ pub struct PrepassAlphaMaskDrawFunction;
++#[derive(DrawFunctionLabel, Debug, Hash, PartialEq, Eq, Clone, Default)]
++pub struct PrepassOpaqueDepthOnlyDrawFunction;
+ 
+ #[derive(DrawFunctionLabel, Debug, Hash, PartialEq, Eq, Clone, Default)]
+ pub struct DeferredOpaqueDrawFunction;
+@@ -1416,6 +1419,8 @@ pub struct DeferredAlphaMaskDrawFunction;
+ 
+ #[derive(DrawFunctionLabel, Debug, Hash, PartialEq, Eq, Clone, Default)]
+ pub struct ShadowsDrawFunction;
++#[derive(DrawFunctionLabel, Debug, Hash, PartialEq, Eq, Clone, Default)]
++pub struct ShadowsDepthOnlyDrawFunction;
+ 
+ /// A resource that maps each untyped material ID to its binding.
+ ///
+@@ -1611,11 +1616,15 @@ where
+         let draw_transparent_pbr = transparent_draw_functions.read().id::<DrawMaterial>();
+         let draw_opaque_prepass = opaque_prepass_draw_functions.read().id::<DrawPrepass>();
+         let draw_alpha_mask_prepass = alpha_mask_prepass_draw_functions.read().id::<DrawPrepass>();
++        let draw_opaque_prepass_depth_only = opaque_prepass_draw_functions
++            .read()
++            .id::<DrawDepthOnlyPrepass>();
+         let draw_opaque_deferred = opaque_deferred_draw_functions.read().id::<DrawPrepass>();
+         let draw_alpha_mask_deferred = alpha_mask_deferred_draw_functions
+             .read()
+             .id::<DrawPrepass>();
+         let draw_shadows = shadow_draw_functions.read().id::<DrawPrepass>();
++        let draw_shadows_depth_only = shadow_draw_functions.read().id::<DrawDepthOnlyPrepass>();
+ 
+         let draw_functions = SmallVec::from_iter([
+             (MainPassOpaqueDrawFunction.intern(), draw_opaque_pbr),
+@@ -1633,12 +1642,20 @@ where
+                 PrepassAlphaMaskDrawFunction.intern(),
+                 draw_alpha_mask_prepass,
+             ),
++            (
++                PrepassOpaqueDepthOnlyDrawFunction.intern(),
++                draw_opaque_prepass_depth_only,
++            ),
+             (DeferredOpaqueDrawFunction.intern(), draw_opaque_deferred),
+             (
+                 DeferredAlphaMaskDrawFunction.intern(),
+                 draw_alpha_mask_deferred,
+             ),
+             (ShadowsDrawFunction.intern(), draw_shadows),
++            (
++                ShadowsDepthOnlyDrawFunction.intern(),
++                draw_shadows_depth_only,
++            ),
+         ]);
+ 
+         let render_method = match material.opaque_render_method() {
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 810b2cf1710e6..2017929cd2900 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -6,9 +6,10 @@ use crate::{
+     setup_morph_and_skinning_defs, skin, DeferredAlphaMaskDrawFunction, DeferredFragmentShader,
+     DeferredOpaqueDrawFunction, DeferredVertexShader, DrawMesh, EntitySpecializationTicks,
+     MaterialPipeline, MeshLayouts, MeshPipeline, MeshPipelineKey, PreparedMaterial,
+-    PrepassAlphaMaskDrawFunction, PrepassFragmentShader, PrepassOpaqueDrawFunction,
+-    PrepassVertexShader, RenderLightmaps, RenderMaterialInstances, RenderMeshInstanceFlags,
+-    RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup, ShadowView,
++    PrepassAlphaMaskDrawFunction, PrepassFragmentShader, PrepassOpaqueDepthOnlyDrawFunction,
++    PrepassOpaqueDrawFunction, PrepassVertexShader, RenderLightmaps, RenderMaterialInstances,
++    RenderMeshInstanceFlags, RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup,
++    ShadowView,
+ };
+ use bevy_app::{App, Plugin, PreUpdate};
+ use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+@@ -160,6 +161,7 @@ impl Plugin for PrepassPlugin {
+             .init_resource::<ViewKeyPrepassCache>()
+             .init_resource::<SpecializedPrepassMaterialPipelineCache>()
+             .add_render_command::<Opaque3dPrepass, DrawPrepass>()
++            .add_render_command::<Opaque3dPrepass, DrawDepthOnlyPrepass>()
+             .add_render_command::<AlphaMask3dPrepass, DrawPrepass>()
+             .add_render_command::<Opaque3dDeferred, DrawPrepass>()
+             .add_render_command::<AlphaMask3dDeferred, DrawPrepass>()
+@@ -374,6 +376,10 @@ impl SpecializedMeshPipeline for PrepassPipelineSpecializer {
+     }
+ }
+ 
++fn is_depth_only_opaque_prepass(mesh_key: MeshPipelineKey) -> bool {
++    mesh_key.intersection(MeshPipelineKey::ALL_PREPASS_BITS) == MeshPipelineKey::DEPTH_PREPASS
++}
++
+ impl PrepassPipeline {
+     fn specialize(
+         &self,
+@@ -402,15 +408,21 @@ impl PrepassPipeline {
+             "MATERIAL_BIND_GROUP".into(),
+             crate::MATERIAL_BIND_GROUP_INDEX as u32,
+         ));
+-        // NOTE: Eventually, it would be nice to only add this when the shaders are overloaded by the Material.
+-        // The main limitation right now is that bind group order is hardcoded in shaders.
+-        bind_group_layouts.push(
+-            material_properties
+-                .material_layout
+-                .as_ref()
+-                .unwrap()
+-                .clone(),
+-        );
++        // For directional light shadow map views, use unclipped depth via either the native GPU feature,
++        // or emulated by setting depth in the fragment shader for GPUs that don't support it natively.
++        let emulate_unclipped_depth = mesh_key.contains(MeshPipelineKey::UNCLIPPED_DEPTH_ORTHO)
++            && !self.depth_clip_control_supported;
++        if is_depth_only_opaque_prepass(mesh_key) && !emulate_unclipped_depth {
++            bind_group_layouts.push(self.empty_layout.clone());
++        } else {
++            bind_group_layouts.push(
++                material_properties
++                    .material_layout
++                    .as_ref()
++                    .unwrap()
++                    .clone(),
++            );
++        }
+         #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+         shader_defs.push("WEBGL2".into());
+         shader_defs.push("VERTEX_OUTPUT_INSTANCE_INDEX".into());
+@@ -431,10 +443,6 @@ impl PrepassPipeline {
+             shader_defs.push("VERTEX_POSITIONS".into());
+             vertex_attributes.push(Mesh::ATTRIBUTE_POSITION.at_shader_location(0));
+         }
+-        // For directional light shadow map views, use unclipped depth via either the native GPU feature,
+-        // or emulated by setting depth in the fragment shader for GPUs that don't support it natively.
+-        let emulate_unclipped_depth = mesh_key.contains(MeshPipelineKey::UNCLIPPED_DEPTH_ORTHO)
+-            && !self.depth_clip_control_supported;
+         if emulate_unclipped_depth {
+             shader_defs.push("UNCLIPPED_DEPTH_ORTHO_EMULATION".into());
+             // PERF: This line forces the "prepass fragment shader" to always run in
+@@ -766,9 +774,9 @@ pub struct SpecializedPrepassMaterialPipelineCache {
+ /// well as the last time it was changed.
+ #[derive(Deref, DerefMut, Default)]
+ pub struct SpecializedPrepassMaterialViewPipelineCache {
+-    // material entity -> (tick, pipeline_id)
++    // material entity -> (tick, pipeline_id, draw_function)
+     #[deref]
+-    map: MainEntityHashMap<(Tick, CachedRenderPipelineId)>,
++    map: MainEntityHashMap<(Tick, CachedRenderPipelineId, DrawFunctionId)>,
+ }
+ 
+ #[derive(Resource, Deref, DerefMut, Default, Clone)]
+@@ -929,7 +937,7 @@ pub(crate) fn specialize_prepass_material_meshes(
+                     .system_tick;
+                 let last_specialized_tick = view_specialized_material_pipeline_cache
+                     .and_then(|cache| cache.get(visible_entity))
+-                    .map(|(tick, _)| *tick);
++                    .map(|(tick, _, _)| *tick);
+                 let needs_specialization = last_specialized_tick.is_none_or(|tick| {
+                     view_tick.is_newer_than(tick, this_run)
+                         || entity_tick.is_newer_than(tick, this_run)
+@@ -1034,6 +1042,10 @@ pub(crate) fn specialize_prepass_material_meshes(
+         }
+     }
+ 
++    let depth_clip_control_supported = world
++        .resource::<PrepassPipeline>()
++        .depth_clip_control_supported;
++
+     for item in work_items.drain(..) {
+         let Some(prepass_specialize) = item.properties.prepass_specialize else {
+             continue;
+@@ -1045,13 +1057,46 @@ pub(crate) fn specialize_prepass_material_meshes(
+             material_key: item.properties.material_key.clone(),
+         };
+ 
++        let emulate_unclipped_depth = item
++            .mesh_key
++            .contains(MeshPipelineKey::UNCLIPPED_DEPTH_ORTHO)
++            && !depth_clip_control_supported;
++        let deferred = item.mesh_key.contains(MeshPipelineKey::DEFERRED_PREPASS);
++        let draw_function = match item.properties.render_phase_type {
++            RenderPhaseType::Opaque => {
++                if deferred {
++                    item.properties
++                        .get_draw_function(DeferredOpaqueDrawFunction)
++                } else if is_depth_only_opaque_prepass(item.mesh_key) && !emulate_unclipped_depth {
++                    item.properties
++                        .get_draw_function(PrepassOpaqueDepthOnlyDrawFunction)
++                } else {
++                    item.properties.get_draw_function(PrepassOpaqueDrawFunction)
++                }
++            }
++            RenderPhaseType::AlphaMask => {
++                if deferred {
++                    item.properties
++                        .get_draw_function(DeferredAlphaMaskDrawFunction)
++                } else {
++                    item.properties
++                        .get_draw_function(PrepassAlphaMaskDrawFunction)
++                }
++            }
++            RenderPhaseType::Transmissive | RenderPhaseType::Transparent => continue,
++        };
++
++        let Some(draw_function) = draw_function else {
++            continue;
++        };
++
+         match prepass_specialize(world, key, &item.layout, &item.properties) {
+             Ok(pipeline_id) => {
+                 world
+                     .resource_mut::<SpecializedPrepassMaterialPipelineCache>()
+                     .entry(item.retained_view_entity)
+                     .or_default()
+-                    .insert(item.visible_entity, (this_run, pipeline_id));
++                    .insert(item.visible_entity, (this_run, pipeline_id, draw_function));
+             }
+             Err(err) => error!("{}", err),
+         }
+@@ -1113,7 +1158,7 @@ pub fn queue_prepass_material_meshes(
+         }
+ 
+         for (render_entity, visible_entity) in visible_entities.iter::<Mesh3d>() {
+-            let Some((current_change_tick, pipeline_id)) =
++            let Some(&(current_change_tick, pipeline_id, draw_function)) =
+                 view_specialized_material_pipeline_cache.get(visible_entity)
+             else {
+                 continue;
+@@ -1121,13 +1166,13 @@ pub fn queue_prepass_material_meshes(
+ 
+             // Skip the entity if it's cached in a bin and up to date.
+             if opaque_phase.as_mut().is_some_and(|phase| {
+-                phase.validate_cached_entity(*visible_entity, *current_change_tick)
++                phase.validate_cached_entity(*visible_entity, current_change_tick)
+             }) || alpha_mask_phase.as_mut().is_some_and(|phase| {
+-                phase.validate_cached_entity(*visible_entity, *current_change_tick)
++                phase.validate_cached_entity(*visible_entity, current_change_tick)
+             }) || opaque_deferred_phase.as_mut().is_some_and(|phase| {
+-                phase.validate_cached_entity(*visible_entity, *current_change_tick)
++                phase.validate_cached_entity(*visible_entity, current_change_tick)
+             }) || alpha_mask_deferred_phase.as_mut().is_some_and(|phase| {
+-                phase.validate_cached_entity(*visible_entity, *current_change_tick)
++                phase.validate_cached_entity(*visible_entity, current_change_tick)
+             }) {
+                 continue;
+             }
+@@ -1154,16 +1199,10 @@ pub fn queue_prepass_material_meshes(
+             match material.properties.render_phase_type {
+                 RenderPhaseType::Opaque => {
+                     if deferred {
+-                        let Some(draw_function) = material
+-                            .properties
+-                            .get_draw_function(DeferredOpaqueDrawFunction)
+-                        else {
+-                            continue;
+-                        };
+                         opaque_deferred_phase.as_mut().unwrap().add(
+                             OpaqueNoLightmap3dBatchSetKey {
+                                 draw_function,
+-                                pipeline: *pipeline_id,
++                                pipeline: pipeline_id,
+                                 material_bind_group_index: Some(material.binding.group.0),
+                                 vertex_slab: vertex_slab.unwrap_or_default(),
+                                 index_slab,
+@@ -1177,22 +1216,23 @@ pub fn queue_prepass_material_meshes(
+                                 mesh_instance.should_batch(),
+                                 &gpu_preprocessing_support,
+                             ),
+-                            *current_change_tick,
++                            current_change_tick,
+                         );
+                     } else if let Some(opaque_phase) = opaque_phase.as_mut() {
+-                        let (vertex_slab, index_slab) =
+-                            mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+-                        let Some(draw_function) = material
++                        let depth_only_draw_function = material
+                             .properties
+-                            .get_draw_function(PrepassOpaqueDrawFunction)
+-                        else {
+-                            continue;
+-                        };
++                            .get_draw_function(PrepassOpaqueDepthOnlyDrawFunction);
++                        let material_bind_group_index =
++                            if Some(draw_function) == depth_only_draw_function {
++                                None
++                            } else {
++                                Some(material.binding.group.0)
++                            };
+                         opaque_phase.add(
+                             OpaqueNoLightmap3dBatchSetKey {
+                                 draw_function,
+-                                pipeline: *pipeline_id,
+-                                material_bind_group_index: Some(material.binding.group.0),
++                                pipeline: pipeline_id,
++                                material_bind_group_index,
+                                 vertex_slab: vertex_slab.unwrap_or_default(),
+                                 index_slab,
+                             },
+@@ -1205,70 +1245,50 @@ pub fn queue_prepass_material_meshes(
+                                 mesh_instance.should_batch(),
+                                 &gpu_preprocessing_support,
+                             ),
+-                            *current_change_tick,
++                            current_change_tick,
+                         );
+                     }
+                 }
+                 RenderPhaseType::AlphaMask => {
+                     if deferred {
+-                        let (vertex_slab, index_slab) =
+-                            mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+-                        let Some(draw_function) = material
+-                            .properties
+-                            .get_draw_function(DeferredAlphaMaskDrawFunction)
+-                        else {
+-                            continue;
+-                        };
+-                        let batch_set_key = OpaqueNoLightmap3dBatchSetKey {
+-                            draw_function,
+-                            pipeline: *pipeline_id,
+-                            material_bind_group_index: Some(material.binding.group.0),
+-                            vertex_slab: vertex_slab.unwrap_or_default(),
+-                            index_slab,
+-                        };
+-                        let bin_key = OpaqueNoLightmap3dBinKey {
+-                            asset_id: mesh_instance.mesh_asset_id.into(),
+-                        };
+                         alpha_mask_deferred_phase.as_mut().unwrap().add(
+-                            batch_set_key,
+-                            bin_key,
++                            OpaqueNoLightmap3dBatchSetKey {
++                                draw_function,
++                                pipeline: pipeline_id,
++                                material_bind_group_index: Some(material.binding.group.0),
++                                vertex_slab: vertex_slab.unwrap_or_default(),
++                                index_slab,
++                            },
++                            OpaqueNoLightmap3dBinKey {
++                                asset_id: mesh_instance.mesh_asset_id.into(),
++                            },
+                             (*render_entity, *visible_entity),
+                             mesh_instance.current_uniform_index,
+                             BinnedRenderPhaseType::mesh(
+                                 mesh_instance.should_batch(),
+                                 &gpu_preprocessing_support,
+                             ),
+-                            *current_change_tick,
++                            current_change_tick,
+                         );
+                     } else if let Some(alpha_mask_phase) = alpha_mask_phase.as_mut() {
+-                        let (vertex_slab, index_slab) =
+-                            mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+-                        let Some(draw_function) = material
+-                            .properties
+-                            .get_draw_function(PrepassAlphaMaskDrawFunction)
+-                        else {
+-                            continue;
+-                        };
+-                        let batch_set_key = OpaqueNoLightmap3dBatchSetKey {
+-                            draw_function,
+-                            pipeline: *pipeline_id,
+-                            material_bind_group_index: Some(material.binding.group.0),
+-                            vertex_slab: vertex_slab.unwrap_or_default(),
+-                            index_slab,
+-                        };
+-                        let bin_key = OpaqueNoLightmap3dBinKey {
+-                            asset_id: mesh_instance.mesh_asset_id.into(),
+-                        };
+                         alpha_mask_phase.add(
+-                            batch_set_key,
+-                            bin_key,
++                            OpaqueNoLightmap3dBatchSetKey {
++                                draw_function,
++                                pipeline: pipeline_id,
++                                material_bind_group_index: Some(material.binding.group.0),
++                                vertex_slab: vertex_slab.unwrap_or_default(),
++                                index_slab,
++                            },
++                            OpaqueNoLightmap3dBinKey {
++                                asset_id: mesh_instance.mesh_asset_id.into(),
++                            },
+                             (*render_entity, *visible_entity),
+                             mesh_instance.current_uniform_index,
+                             BinnedRenderPhaseType::mesh(
+                                 mesh_instance.should_batch(),
+                                 &gpu_preprocessing_support,
+                             ),
+-                            *current_change_tick,
++                            current_change_tick,
+                         );
+                     }
+                 }
+@@ -1345,6 +1365,26 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetPrepassViewEmptyBindG
+     }
+ }
+ 
++pub struct SetPrepassEmptyMaterialBindGroup<const I: usize>;
++impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetPrepassEmptyMaterialBindGroup<I> {
++    type Param = SRes<PrepassViewBindGroup>;
++    type ViewQuery = ();
++    type ItemQuery = ();
++
++    #[inline]
++    fn render<'w>(
++        _item: &P,
++        _view: (),
++        _entity: Option<()>,
++        prepass_view_bind_group: SystemParamItem<'w, '_, Self::Param>,
++        pass: &mut TrackedRenderPass<'w>,
++    ) -> RenderCommandResult {
++        let prepass_view_bind_group = prepass_view_bind_group.into_inner();
++        pass.set_bind_group(I, &prepass_view_bind_group.empty_bind_group, &[]);
++        RenderCommandResult::Success
++    }
++}
++
+ pub type DrawPrepass = (
+     SetItemPipeline,
+     SetPrepassViewBindGroup<0>,
+@@ -1353,3 +1393,12 @@ pub type DrawPrepass = (
+     SetMaterialBindGroup<3>,
+     DrawMesh,
+ );
++
++pub type DrawDepthOnlyPrepass = (
++    SetItemPipeline,
++    SetPrepassViewBindGroup<0>,
++    SetPrepassViewEmptyBindGroup<1>,
++    SetMeshBindGroup<2>,
++    SetPrepassEmptyMaterialBindGroup<3>,
++    DrawMesh,
++);
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 8e71c31be081c..56c45fae27b85 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -1746,7 +1746,7 @@ pub struct SpecializedShadowMaterialPipelineCache {
+ #[derive(Deref, DerefMut, Default)]
+ pub struct SpecializedShadowMaterialViewPipelineCache {
+     #[deref]
+-    map: MainEntityHashMap<(Tick, CachedRenderPipelineId)>,
++    map: MainEntityHashMap<(Tick, CachedRenderPipelineId, DrawFunctionId)>,
+ }
+ 
+ pub fn check_views_lights_need_specialization(
+@@ -1920,7 +1920,7 @@ pub(crate) fn specialize_shadows(
+                     let entity_tick = entity_specialization_ticks.get(&visible_entity).unwrap();
+                     let last_specialized_tick = view_specialized_material_pipeline_cache
+                         .and_then(|cache| cache.get(&visible_entity))
+-                        .map(|(tick, _)| *tick);
++                        .map(|(tick, _, _)| *tick);
+                     let needs_specialization = last_specialized_tick.is_none_or(|tick| {
+                         view_tick.is_newer_than(tick, this_run)
+                             || entity_tick.system_tick.is_newer_than(tick, this_run)
+@@ -1982,6 +1982,10 @@ pub(crate) fn specialize_shadows(
+         }
+     }
+ 
++    let depth_clip_control_supported = world
++        .resource::<PrepassPipeline>()
++        .depth_clip_control_supported;
++
+     for item in work_items.drain(..) {
+         let Some(prepass_specialize) = item.properties.prepass_specialize else {
+             continue;
+@@ -1993,13 +1997,32 @@ pub(crate) fn specialize_shadows(
+             material_key: item.properties.material_key.clone(),
+         };
+ 
++        let emulate_unclipped_depth = item
++            .mesh_key
++            .contains(MeshPipelineKey::UNCLIPPED_DEPTH_ORTHO)
++            && !depth_clip_control_supported;
++        let is_depth_only_opaque = !item
++            .mesh_key
++            .intersects(MeshPipelineKey::MAY_DISCARD | MeshPipelineKey::PREPASS_READS_MATERIAL)
++            && !emulate_unclipped_depth;
++        let draw_function = if is_depth_only_opaque {
++            item.properties
++                .get_draw_function(ShadowsDepthOnlyDrawFunction)
++        } else {
++            item.properties.get_draw_function(ShadowsDrawFunction)
++        };
++
++        let Some(draw_function) = draw_function else {
++            continue;
++        };
++
+         match prepass_specialize(world, key, &item.layout, &item.properties) {
+             Ok(pipeline_id) => {
+                 world
+                     .resource_mut::<SpecializedShadowMaterialPipelineCache>()
+                     .entry(item.retained_view_entity)
+                     .or_default()
+-                    .insert(item.visible_entity, (this_run, pipeline_id));
++                    .insert(item.visible_entity, (this_run, pipeline_id, draw_function));
+             }
+             Err(err) => error!("{}", err),
+         }
+@@ -2075,7 +2098,7 @@ pub fn queue_shadows(
+             };
+ 
+             for (entity, main_entity) in visible_entities.iter().copied() {
+-                let Some((current_change_tick, pipeline_id)) =
++                let Some(&(current_change_tick, pipeline_id, draw_function)) =
+                     view_specialized_material_pipeline_cache.get(&main_entity)
+                 else {
+                     continue;
+@@ -2105,7 +2128,7 @@ pub fn queue_shadows(
+                 }
+ 
+                 // Skip the entity if it's cached in a bin and up to date.
+-                if shadow_phase.validate_cached_entity(main_entity, *current_change_tick) {
++                if shadow_phase.validate_cached_entity(main_entity, current_change_tick) {
+                     continue;
+                 }
+ 
+@@ -2116,19 +2139,23 @@ pub fn queue_shadows(
+                 let Some(material) = render_materials.get(material_instance.asset_id) else {
+                     continue;
+                 };
+-                let Some(draw_function) =
+-                    material.properties.get_draw_function(ShadowsDrawFunction)
+-                else {
+-                    continue;
++
++                let depth_only_draw_function = material
++                    .properties
++                    .get_draw_function(ShadowsDepthOnlyDrawFunction);
++                let material_bind_group_index = if Some(draw_function) == depth_only_draw_function {
++                    None
++                } else {
++                    Some(material.binding.group.0)
+                 };
+ 
+                 let (vertex_slab, index_slab) =
+                     mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+ 
+                 let batch_set_key = ShadowBatchSetKey {
+-                    pipeline: *pipeline_id,
++                    pipeline: pipeline_id,
+                     draw_function,
+-                    material_bind_group_index: Some(material.binding.group.0),
++                    material_bind_group_index,
+                     vertex_slab: vertex_slab.unwrap_or_default(),
+                     index_slab,
+                 };
+@@ -2144,7 +2171,7 @@ pub fn queue_shadows(
+                         mesh_instance.should_batch(),
+                         &gpu_preprocessing_support,
+                     ),
+-                    *current_change_tick,
++                    current_change_tick,
+                 );
+             }
+         }
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index c1070711d03bf..a5049403ad8a0 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -2292,7 +2292,15 @@ bitflags::bitflags! {
+         const DISTANCE_FOG                      = 1 << 21;
+         const ATMOSPHERE                        = 1 << 22;
+         const INVERT_CULLING                    = 1 << 23;
+-        const LAST_FLAG                         = Self::INVERT_CULLING.bits();
++        const PREPASS_READS_MATERIAL            = 1 << 24;
++        const LAST_FLAG                         = Self::PREPASS_READS_MATERIAL.bits();
++
++        const ALL_PREPASS_BITS                  = Self::DEPTH_PREPASS.bits()
++                                                | Self::NORMAL_PREPASS.bits()
++                                                | Self::DEFERRED_PREPASS.bits()
++                                                | Self::MOTION_VECTOR_PREPASS.bits()
++                                                | Self::MAY_DISCARD.bits()
++                                                | Self::PREPASS_READS_MATERIAL.bits();
+ 
+         // Bitfields
+         const MSAA_RESERVED_BITS                = Self::MSAA_MASK_BITS << Self::MSAA_SHIFT_BITS;

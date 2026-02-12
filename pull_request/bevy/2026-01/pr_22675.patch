@@ -1,0 +1,345 @@
+diff --git a/crates/bevy_app/src/hierarchy.rs b/crates/bevy_app/src/hierarchy.rs
+new file mode 100644
+index 0000000000000..4dbb6deb15fda
+--- /dev/null
++++ b/crates/bevy_app/src/hierarchy.rs
+@@ -0,0 +1,137 @@
++use core::marker::PhantomData;
++
++use bevy_ecs::{
++    change_detection::MaybeLocation,
++    component::Component,
++    entity::Entity,
++    hierarchy::ChildOf,
++    intern::Interned,
++    lifecycle::Insert,
++    message::{Message, MessageReader, MessageWriter},
++    name::Name,
++    observer::On,
++    query::{With, Without},
++    schedule::{common_conditions::on_message, IntoScheduleConfigs, ScheduleLabel, SystemSet},
++    system::Query,
++};
++use bevy_platform::prelude::format;
++use bevy_utils::prelude::DebugName;
++use log::warn;
++
++use crate::{Last, Plugin};
++
++/// A plugin that verifies that [`Component`] `C` has parents that also have that component.
++pub struct ValidateParentHasComponentPlugin<C: Component> {
++    schedule: Interned<dyn ScheduleLabel>,
++    marker: PhantomData<fn() -> C>,
++}
++
++impl<C: Component> Default for ValidateParentHasComponentPlugin<C> {
++    fn default() -> Self {
++        Self::in_schedule(Last)
++    }
++}
++
++impl<C: Component> ValidateParentHasComponentPlugin<C> {
++    /// Creates an instance of this plugin that inserts systems in the provided schedule.
++    pub fn in_schedule(label: impl ScheduleLabel) -> Self {
++        Self {
++            schedule: label.intern(),
++            marker: PhantomData,
++        }
++    }
++}
++
++impl<C: Component> Plugin for ValidateParentHasComponentPlugin<C> {
++    fn build(&self, app: &mut crate::App) {
++        app.add_message::<CheckParentHasComponent<C>>()
++            .add_observer(validate_parent_has_component::<C>)
++            .add_systems(
++                self.schedule,
++                check_parent_has_component::<C>
++                    .run_if(on_message::<CheckParentHasComponent<C>>)
++                    .in_set(ValidateParentHasComponentSystems),
++            );
++    }
++}
++
++/// System set for systems added by [`ValidateParentHasComponentPlugin`].
++#[derive(SystemSet, PartialEq, Eq, Hash, Debug, Clone)]
++pub struct ValidateParentHasComponentSystems;
++
++/// An `Insert` observer that when run, will validate that the parent of a given entity contains
++/// component `C`. If the parent does not contain `C`, a warning will be logged later in the frame.
++fn validate_parent_has_component<C: Component>(
++    event: On<Insert, C>,
++    child: Query<&ChildOf>,
++    with_component: Query<(), With<C>>,
++    mut writer: MessageWriter<CheckParentHasComponent<C>>,
++) {
++    let Ok(child_of) = child.get(event.entity) else {
++        return;
++    };
++    if with_component.contains(child_of.parent()) {
++        return;
++    }
++    // This entity may be configured incorrectly, or the parent may just not have been populated
++    // yet. Send a message to check again later.
++    writer.write(CheckParentHasComponent::<C> {
++        entity: event.entity,
++        caller: event.caller(),
++        marker: PhantomData,
++    });
++}
++
++/// A message to indicate that this entity should be checked if its parent has a component.
++///
++/// While we initially check when emitting these messages, we want to do a second check later on in
++/// case the parent eventually gets populated.
++#[derive(Message)]
++struct CheckParentHasComponent<C: Component> {
++    /// The entity
++    entity: Entity,
++    caller: MaybeLocation,
++    marker: PhantomData<fn() -> C>,
++}
++
++/// System to handle "check parent" messages and log out any entities that still violate the
++/// component hierarchy.
++fn check_parent_has_component<C: Component>(
++    mut messages: MessageReader<CheckParentHasComponent<C>>,
++    children: Query<(&ChildOf, Option<&Name>), With<C>>,
++    components: Query<Option<&Name>, Without<C>>,
++) {
++    for CheckParentHasComponent {
++        entity,
++        caller,
++        marker: _,
++    } in messages.read()
++    {
++        let Ok((child_of, name)) = children.get(*entity) else {
++            // Either the entity has been despawned, no longer has `C`, or is no longer a child. In
++            // any case, we can say that this situation is no longer relevant.
++            continue;
++        };
++        let parent = child_of.0;
++        let Ok(parent_name) = components.get(parent) else {
++            // This can only fail if the parent now has the `C` component. If the parent was
++            // despawned, the child entity would also be despawned.
++            continue;
++        };
++        let debug_name = DebugName::type_name::<C>();
++        warn!(
++            "warning[B0004]: {}{name} with the {ty_name} component has a parent ({parent_name}) without {ty_name}.\n\
++            This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004",
++            caller.map(|c| format!("{c}: ")).unwrap_or_default(),
++            ty_name = debug_name.shortname(),
++            name = name.map_or_else(
++                || format!("Entity {entity}"),
++                |s| format!("The {s} entity")
++            ),
++            parent_name = parent_name.map_or_else(
++                || format!("{parent} entity"),
++                |s| format!("the {s} entity")
++            ),
++        );
++    }
++}
+diff --git a/crates/bevy_app/src/lib.rs b/crates/bevy_app/src/lib.rs
+index c626c6c73e838..6d5e020dfc12c 100644
+--- a/crates/bevy_app/src/lib.rs
++++ b/crates/bevy_app/src/lib.rs
+@@ -24,6 +24,7 @@ extern crate alloc;
+ extern crate self as bevy_app;
+ 
+ mod app;
++mod hierarchy;
+ mod main_schedule;
+ mod panic_handler;
+ mod plugin;
+@@ -39,6 +40,7 @@ mod terminal_ctrl_c_handler;
+ pub mod hotpatch;
+ 
+ pub use app::*;
++pub use hierarchy::*;
+ pub use main_schedule::*;
+ pub use panic_handler::*;
+ pub use plugin::*;
+diff --git a/crates/bevy_camera/src/visibility/mod.rs b/crates/bevy_camera/src/visibility/mod.rs
+index f8c0faa3f73db..8a70096f53c7f 100644
+--- a/crates/bevy_camera/src/visibility/mod.rs
++++ b/crates/bevy_camera/src/visibility/mod.rs
+@@ -10,10 +10,10 @@ use derive_more::derive::{Deref, DerefMut};
+ pub use range::*;
+ pub use render_layers::*;
+ 
+-use bevy_app::{Plugin, PostUpdate};
++use bevy_app::{Plugin, PostUpdate, ValidateParentHasComponentPlugin};
+ use bevy_asset::prelude::AssetChanged;
+ use bevy_asset::{AssetEventSystems, Assets};
+-use bevy_ecs::{hierarchy::validate_parent_has_component, prelude::*};
++use bevy_ecs::prelude::*;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_transform::{components::GlobalTransform, TransformSystems};
+ use bevy_utils::{Parallel, TypeIdMap};
+@@ -113,7 +113,6 @@ impl PartialEq<&Visibility> for Visibility {
+ /// [`VisibilityPropagate`]: VisibilitySystems::VisibilityPropagate
+ #[derive(Component, Deref, Debug, Default, Clone, Copy, Reflect, PartialEq, Eq)]
+ #[reflect(Component, Default, Debug, PartialEq, Clone)]
+-#[component(on_insert = validate_parent_has_component::<Self>)]
+ pub struct InheritedVisibility(bool);
+ 
+ impl InheritedVisibility {
+@@ -394,7 +393,8 @@ impl Plugin for VisibilityPlugin {
+     fn build(&self, app: &mut bevy_app::App) {
+         use VisibilitySystems::*;
+ 
+-        app.register_required_components::<Mesh3d, Visibility>()
++        app.add_plugins(ValidateParentHasComponentPlugin::<InheritedVisibility>::default())
++            .register_required_components::<Mesh3d, Visibility>()
+             .register_required_components::<Mesh3d, VisibilityClass>()
+             .register_required_components::<Mesh2d, Visibility>()
+             .register_required_components::<Mesh2d, VisibilityClass>()
+diff --git a/crates/bevy_ecs/src/hierarchy.rs b/crates/bevy_ecs/src/hierarchy.rs
+index 7abf918201e4b..89a1a2e725a6e 100644
+--- a/crates/bevy_ecs/src/hierarchy.rs
++++ b/crates/bevy_ecs/src/hierarchy.rs
+@@ -12,21 +12,17 @@ use crate::{
+     bundle::Bundle,
+     component::Component,
+     entity::Entity,
+-    lifecycle::HookContext,
+-    name::Name,
+     relationship::{RelatedSpawner, RelatedSpawnerCommands},
+     system::EntityCommands,
+-    world::{DeferredWorld, EntityWorldMut, FromWorld, World},
++    world::{EntityWorldMut, FromWorld, World},
+ };
+-use alloc::{format, vec::Vec};
++use alloc::vec::Vec;
+ #[cfg(feature = "bevy_reflect")]
+ use bevy_reflect::std_traits::ReflectDefault;
+ #[cfg(all(feature = "serialize", feature = "bevy_reflect"))]
+ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
+-use bevy_utils::prelude::DebugName;
+ use core::ops::Deref;
+ use core::slice;
+-use log::warn;
+ 
+ /// Stores the parent entity of this child entity with this component.
+ ///
+@@ -490,41 +486,6 @@ impl<'a> EntityCommands<'a> {
+     }
+ }
+ 
+-/// An `on_insert` component hook that when run, will validate that the parent of a given entity
+-/// contains component `C`. This will print a warning if the parent does not contain `C`.
+-pub fn validate_parent_has_component<C: Component>(
+-    world: DeferredWorld,
+-    HookContext { entity, caller, .. }: HookContext,
+-) {
+-    let entity_ref = world.entity(entity);
+-    let Some(child_of) = entity_ref.get::<ChildOf>() else {
+-        return;
+-    };
+-    let parent = child_of.parent();
+-    let maybe_parent_ref = world.get_entity(parent);
+-    if let Ok(parent_ref) = maybe_parent_ref
+-        && !parent_ref.contains::<C>()
+-    {
+-        let name = entity_ref.get::<Name>();
+-        let debug_name = DebugName::type_name::<C>();
+-        let parent_name = parent_ref.get::<Name>();
+-        warn!(
+-            "warning[B0004]: {}{name} with the {ty_name} component has a parent ({parent_name}) without {ty_name}.\n\
+-            This will cause inconsistent behaviors! See: https://bevy.org/learn/errors/b0004",
+-            caller.map(|c| format!("{c}: ")).unwrap_or_default(),
+-            ty_name = debug_name.shortname(),
+-            name = name.map_or_else(
+-                || format!("Entity {entity}"),
+-                |s| format!("The {s} entity")
+-            ),
+-            parent_name = parent_name.map_or_else(
+-                || format!("{parent} entity"),
+-                |s| format!("the {s} entity")
+-            ),
+-        );
+-    }
+-}
+-
+ /// Returns a [`SpawnRelatedBundle`] that will insert the [`Children`] component, spawn a [`SpawnableList`] of entities with given bundles that
+ /// relate to the [`Children`] entity via the [`ChildOf`] component, and reserve space in the [`Children`] for each spawned entity.
+ ///
+diff --git a/crates/bevy_transform/src/components/global_transform.rs b/crates/bevy_transform/src/components/global_transform.rs
+index cd7db6ef71b09..d97d843011244 100644
+--- a/crates/bevy_transform/src/components/global_transform.rs
++++ b/crates/bevy_transform/src/components/global_transform.rs
+@@ -8,7 +8,7 @@ use derive_more::derive::From;
+ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
+ 
+ #[cfg(feature = "bevy-support")]
+-use bevy_ecs::{component::Component, hierarchy::validate_parent_has_component};
++use bevy_ecs::component::Component;
+ 
+ #[cfg(feature = "bevy_reflect")]
+ use {
+@@ -47,11 +47,7 @@ use {
+ /// [transform_example]: https://github.com/bevyengine/bevy/blob/latest/examples/transforms/transform.rs
+ #[derive(Debug, PartialEq, Clone, Copy, From)]
+ #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+-#[cfg_attr(
+-    feature = "bevy-support",
+-    derive(Component),
+-    component(on_insert = validate_parent_has_component::<GlobalTransform>)
+-)]
++#[cfg_attr(feature = "bevy-support", derive(Component))]
+ #[cfg_attr(
+     feature = "bevy_reflect",
+     derive(Reflect),
+diff --git a/crates/bevy_transform/src/plugins.rs b/crates/bevy_transform/src/plugins.rs
+index 3881d93c56a3e..50473ecf9ee8e 100644
+--- a/crates/bevy_transform/src/plugins.rs
++++ b/crates/bevy_transform/src/plugins.rs
+@@ -1,14 +1,17 @@
+-use crate::systems::{
+-    mark_dirty_trees, propagate_parent_transforms, sync_simple_transforms,
+-    StaticTransformOptimizations,
++use crate::{
++    prelude::GlobalTransform,
++    systems::{
++        mark_dirty_trees, propagate_parent_transforms, sync_simple_transforms,
++        StaticTransformOptimizations,
++    },
+ };
+-use bevy_app::{App, Plugin, PostStartup, PostUpdate};
++use bevy_app::{App, Plugin, PostStartup, PostUpdate, ValidateParentHasComponentPlugin};
+ use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
+ 
+ /// Set enum for the systems relating to transform propagation
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+ pub enum TransformSystems {
+-    /// Propagates changes in transform to children's [`GlobalTransform`](crate::components::GlobalTransform)
++    /// Propagates changes in transform to children's [`GlobalTransform`]
+     Propagate,
+ }
+ 
+@@ -18,7 +21,8 @@ pub struct TransformPlugin;
+ 
+ impl Plugin for TransformPlugin {
+     fn build(&self, app: &mut App) {
+-        app.init_resource::<StaticTransformOptimizations>()
++        app.add_plugins(ValidateParentHasComponentPlugin::<GlobalTransform>::default())
++            .init_resource::<StaticTransformOptimizations>()
+             // add transform systems to startup so the first update is "correct"
+             .add_systems(
+                 PostStartup,
+diff --git a/release-content/migration-guides/validate_parent_has_component_is_now_a_plugin.md b/release-content/migration-guides/validate_parent_has_component_is_now_a_plugin.md
+new file mode 100644
+index 0000000000000..cf7fa0dd926af
+--- /dev/null
++++ b/release-content/migration-guides/validate_parent_has_component_is_now_a_plugin.md
+@@ -0,0 +1,8 @@
++---
++title: The `validate_parent_has_component` is superseded by `ValidateParentHasComponentPlugin`
++pull_requests: [22675]
++---
++
++The `validate_parent_has_component` insert hook has been replaced by a plugin:
++`ValidateParentHasComponentPlugin`. This uses an observer, a resource, and a system to achieve a
++more robust (and less spurious) warning for invalid configuration of entities.

@@ -1,0 +1,97 @@
+diff --git a/crates/bevy_sprite/src/text2d.rs b/crates/bevy_sprite/src/text2d.rs
+index 3f8d604656679..6e59bc4cd3ff0 100644
+--- a/crates/bevy_sprite/src/text2d.rs
++++ b/crates/bevy_sprite/src/text2d.rs
+@@ -253,7 +253,7 @@ pub fn update_text2d_layout(
+                 &mut font_system,
+                 *hinting,
+             ) {
+-                Err(TextError::NoSuchFont) => {
++                Err(TextError::NoSuchFont | TextError::DegenerateScaleFactor) => {
+                     // There was an error processing the text layout.
+                     // Add this entity to the queue and reprocess it in the following frame
+                     reprocess_queue.insert(entity);
+@@ -294,7 +294,8 @@ pub fn update_text2d_layout(
+                 | TextError::FailedToGetGlyphImage(_)
+                 | TextError::MissingAtlasLayout
+                 | TextError::MissingAtlasTexture
+-                | TextError::InconsistentAtlasState),
++                | TextError::InconsistentAtlasState
++                | TextError::DegenerateScaleFactor),
+             ) => {
+                 panic!("Fatal error when processing text: {e}.");
+             }
+diff --git a/crates/bevy_text/src/error.rs b/crates/bevy_text/src/error.rs
+index 9835756877151..3572db2c233e7 100644
+--- a/crates/bevy_text/src/error.rs
++++ b/crates/bevy_text/src/error.rs
+@@ -23,4 +23,7 @@ pub enum TextError {
+     /// Failed to find glyph in atlas after it was added
+     #[error("failed to find glyph in atlas after it was added")]
+     InconsistentAtlasState,
++    #[error("scale factor <= 0")]
++    /// Text cannot be rendered for a scale factor <= zero.
++    DegenerateScaleFactor,
+ }
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index dce105f4a79da..270d08ee08fad 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -94,8 +94,17 @@ impl TextPipeline {
+         font_system: &mut CosmicFontSystem,
+         hinting: FontHinting,
+     ) -> Result<(), TextError> {
++        computed.entities.clear();
+         computed.needs_rerender = false;
+ 
++        if scale_factor <= 0.0 {
++            once!(warn!(
++                "Text scale factor is <= 0.0. No text will be displayed.",
++            ));
++
++            return Err(TextError::DegenerateScaleFactor);
++        }
++
+         let font_system = &mut font_system.0;
+ 
+         // Collect span information into a vec. This is necessary because font loading requires mut access
+@@ -110,8 +119,6 @@ impl TextPipeline {
+                 )
+                 .collect();
+ 
+-        computed.entities.clear();
+-
+         let result = {
+             for (span_index, (entity, depth, span, text_font, color, line_height)) in
+                 text_spans.enumerate()
+@@ -148,7 +155,7 @@ impl TextPipeline {
+                 let face_info = FontFaceInfo { family_name };
+ 
+                 // Save spans that aren't zero-sized.
+-                if scale_factor <= 0.0 || text_font.font_size <= 0.0 {
++                if text_font.font_size <= 0.0 {
+                     once!(warn!(
+                         "Text span {entity} has a font size <= 0.0. Nothing will be displayed.",
+                     ));
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index cfb10b16118ba..d2b335aa2b0b0 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -298,7 +298,7 @@ pub fn measure_text_system(
+                 text_flags.needs_measure_fn = false;
+                 text_flags.needs_recompute = true;
+             }
+-            Err(TextError::NoSuchFont) => {
++            Err(TextError::NoSuchFont | TextError::DegenerateScaleFactor) => {
+                 // Try again next frame
+                 text_flags.needs_measure_fn = true;
+             }
+@@ -364,7 +364,7 @@ pub fn text_system(
+                 physical_node_size,
+                 block.justify,
+             ) {
+-                Err(TextError::NoSuchFont) => {
++                Err(TextError::NoSuchFont | TextError::DegenerateScaleFactor) => {
+                     // There was an error processing the text layout, try again next frame
+                     text_flags.needs_recompute = true;
+                 }

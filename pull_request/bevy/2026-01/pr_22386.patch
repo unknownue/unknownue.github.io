@@ -1,0 +1,164 @@
+diff --git a/crates/bevy_sprite/src/text2d.rs b/crates/bevy_sprite/src/text2d.rs
+index 6e59bc4cd3ff0..6544b021f8937 100644
+--- a/crates/bevy_sprite/src/text2d.rs
++++ b/crates/bevy_sprite/src/text2d.rs
+@@ -404,6 +404,19 @@ mod tests {
+             |bytes: &[u8], _path: String| { Font::try_from_bytes(bytes.to_vec()).unwrap() }
+         );
+ 
++        let world = app.world_mut();
++
++        let mut fonts = world.resource_mut::<Assets<Font>>();
++
++        let font = fonts.get_mut(bevy_asset::AssetId::default()).unwrap();
++        font.family_name = "Fira Mono".into();
++        let data = font.data.as_ref().clone();
++
++        app.world_mut()
++            .resource_mut::<CosmicFontSystem>()
++            .db_mut()
++            .load_font_data(data);
++
+         let entity = app.world_mut().spawn(Text2d::new(FIRST_TEXT)).id();
+ 
+         (app, entity)
+diff --git a/crates/bevy_text/src/font.rs b/crates/bevy_text/src/font.rs
+index de60aec1f2c7b..fdfb100da7f95 100644
+--- a/crates/bevy_text/src/font.rs
++++ b/crates/bevy_text/src/font.rs
+@@ -11,6 +11,7 @@ use cosmic_text::fontdb::ID;
+ use cosmic_text::skrifa::raw::ReadError;
+ use cosmic_text::skrifa::FontRef;
+ use smallvec::SmallVec;
++use smol_str::SmolStr;
+ 
+ use crate::ComputedTextBlock;
+ use crate::CosmicFontSystem;
+@@ -33,6 +34,9 @@ pub struct Font {
+     pub data: Arc<Vec<u8>>,
+     /// Ids for fonts in font file
+     pub ids: SmallVec<[ID; 8]>,
++    /// Font family name.
++    /// If the font file is a collection with multiple families, the first family name from the last font is used.
++    pub family_name: SmolStr,
+ }
+ 
+ impl Font {
+@@ -42,6 +46,7 @@ impl Font {
+         Ok(Self {
+             data: Arc::new(font_data),
+             ids: SmallVec::new(),
++            family_name: SmolStr::default(),
+         })
+     }
+ }
+@@ -65,6 +70,15 @@ pub fn load_font_assets_into_fontdb_system(
+                 .load_font_source(cosmic_text::fontdb::Source::Binary(data))
+                 .into_iter()
+                 .collect();
++            // TODO: it is assumed this is the right font face
++            font.family_name = font_system
++                .db()
++                .face(*font.ids.last().unwrap())
++                .unwrap()
++                .families[0]
++                .0
++                .as_str()
++                .into();
+             new_fonts_added = true;
+         }
+     }
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index 270d08ee08fad..093ef8ed3c3bf 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -1,6 +1,4 @@
+-use alloc::sync::Arc;
+-
+-use bevy_asset::{AssetId, Assets};
++use bevy_asset::Assets;
+ use bevy_color::Color;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+@@ -10,7 +8,6 @@ use bevy_ecs::{
+ use bevy_image::prelude::*;
+ use bevy_log::{once, warn};
+ use bevy_math::{Rect, UVec2, Vec2};
+-use bevy_platform::collections::HashMap;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use smol_str::SmolStr;
+ 
+@@ -19,7 +16,7 @@ use crate::{
+     FontAtlasKey, FontAtlasSet, FontHinting, FontSmoothing, FontSource, Justify, LineBreak,
+     LineHeight, PositionedGlyph, TextBounds, TextEntity, TextFont, TextLayout,
+ };
+-use cosmic_text::{fontdb::ID, Attrs, Buffer, Family, Metrics, Shaping, Wrap};
++use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Wrap};
+ 
+ /// A wrapper resource around a [`cosmic_text::FontSystem`]
+ ///
+@@ -64,8 +61,6 @@ pub struct FontFaceInfo {
+ /// See the [crate-level documentation](crate) for more information.
+ #[derive(Default, Resource)]
+ pub struct TextPipeline {
+-    /// Identifies a font [`ID`] by its [`Font`] [`Asset`](bevy_asset::Asset).
+-    pub map_handle_to_font_id: HashMap<AssetId<Font>, (ID, Arc<str>)>,
+     /// Buffered vec for collecting spans.
+     ///
+     /// See [this dark magic](https://users.rust-lang.org/t/how-to-cache-a-vectors-capacity/94478/10).
+@@ -133,21 +128,11 @@ impl TextPipeline {
+                 let family_name: SmolStr = match &text_font.font {
+                     FontSource::Handle(handle) => {
+                         // Return early if a font is not loaded yet.
+-                        let font = fonts.get(handle.id()).ok_or(TextError::NoSuchFont)?;
+-                        let data = Arc::clone(&font.data);
+-                        let ids = font_system
+-                            .db_mut()
+-                            .load_font_source(cosmic_text::fontdb::Source::Binary(data));
+-
+-                        // TODO: it is assumed this is the right font face
+-                        font_system
+-                            .db()
+-                            .face(*ids.last().unwrap())
+-                            .unwrap()
+-                            .families[0]
+-                            .0
+-                            .as_str()
+-                            .into()
++                        fonts
++                            .get(handle.id())
++                            .ok_or(TextError::NoSuchFont)?
++                            .family_name
++                            .clone()
+                     }
+                     FontSource::Family(family) => family.clone(),
+                 };
+@@ -287,14 +272,6 @@ impl TextPipeline {
+         })
+     }
+ 
+-    /// Returns the [`cosmic_text::fontdb::ID`] for a given [`Font`] asset.
+-    pub fn get_font_id(&self, asset_id: AssetId<Font>) -> Option<ID> {
+-        self.map_handle_to_font_id
+-            .get(&asset_id)
+-            .cloned()
+-            .map(|(id, _)| id)
+-    }
+-
+     /// Update [`TextLayoutInfo`] with the new [`PositionedGlyph`] layout.
+     pub fn update_text_layout_info(
+         &mut self,
+diff --git a/release-content/migration-guides/map_handle_to_font_id-and-get_font_id-removed-from-TextPipeline.md b/release-content/migration-guides/map_handle_to_font_id-and-get_font_id-removed-from-TextPipeline.md
+new file mode 100644
+index 0000000000000..1707750c858c3
+--- /dev/null
++++ b/release-content/migration-guides/map_handle_to_font_id-and-get_font_id-removed-from-TextPipeline.md
+@@ -0,0 +1,8 @@
++---
++title: "`map_handle_to_font_id` and `get_font_id` have been removed from `TextPipeline`"
++pull_requests: [22385]
++---
++
++`map_handle_to_font_id` and `get_font_id` have been removed from `TextPipeline`.
++
++The `ID` and family name of `Font` assets can be retrieved from the asset itself.

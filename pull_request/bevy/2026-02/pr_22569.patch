@@ -1,0 +1,1111 @@
+diff --git a/crates/bevy_gltf/Cargo.toml b/crates/bevy_gltf/Cargo.toml
+index 562cb721d5c83..6431d544de98d 100644
+--- a/crates/bevy_gltf/Cargo.toml
++++ b/crates/bevy_gltf/Cargo.toml
+@@ -9,12 +9,10 @@ license = "MIT OR Apache-2.0"
+ keywords = ["bevy"]
+ 
+ [features]
+-pbr_transmission_textures = ["bevy_pbr/pbr_transmission_textures"]
+-pbr_multi_layer_material_textures = [
+-  "bevy_pbr/pbr_multi_layer_material_textures",
+-]
+-pbr_anisotropy_texture = ["bevy_pbr/pbr_anisotropy_texture"]
+-pbr_specular_textures = ["bevy_pbr/pbr_specular_textures"]
++pbr_transmission_textures = []
++pbr_multi_layer_material_textures = []
++pbr_anisotropy_texture = []
++pbr_specular_textures = []
+ 
+ [dependencies]
+ # bevy
+@@ -29,8 +27,10 @@ bevy_image = { path = "../bevy_image", version = "0.19.0-dev" }
+ bevy_light = { path = "../bevy_light", version = "0.19.0-dev" }
+ bevy_camera = { path = "../bevy_camera", version = "0.19.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.19.0-dev" }
+-bevy_mesh = { path = "../bevy_mesh", version = "0.19.0-dev" }
+-bevy_pbr = { path = "../bevy_pbr", version = "0.19.0-dev" }
++bevy_mesh = { path = "../bevy_mesh", version = "0.19.0-dev", features = [
++  "morph",
++  "bevy_mikktspace",
++] }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.19.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.19.0-dev" }
+ bevy_material = { path = "../bevy_material", version = "0.19.0-dev" }
+@@ -66,6 +66,7 @@ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0.140"
+ smallvec = { version = "1", default-features = false }
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
++wgpu-types = { version = "28", default-features = false }
+ 
+ [dev-dependencies]
+ bevy_log = { path = "../bevy_log", version = "0.19.0-dev" }
+diff --git a/crates/bevy_gltf/src/assets.rs b/crates/bevy_gltf/src/assets.rs
+index bfc920ebcea1f..62cea475f226f 100644
+--- a/crates/bevy_gltf/src/assets.rs
++++ b/crates/bevy_gltf/src/assets.rs
+@@ -7,12 +7,11 @@ use bevy_animation::AnimationClip;
+ use bevy_asset::{Asset, Handle};
+ use bevy_ecs::{component::Component, reflect::ReflectComponent};
+ use bevy_mesh::{skinning::SkinnedMeshInverseBindposes, Mesh};
+-use bevy_pbr::StandardMaterial;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{prelude::ReflectDefault, Reflect, TypePath};
+ use bevy_scene::Scene;
+ 
+-use crate::GltfAssetLabel;
++use crate::{GltfAssetLabel, GltfMaterial};
+ 
+ /// Representation of a loaded glTF file.
+ #[derive(Asset, Debug, TypePath)]
+@@ -26,9 +25,9 @@ pub struct Gltf {
+     /// Named meshes loaded from the glTF file.
+     pub named_meshes: HashMap<Box<str>, Handle<GltfMesh>>,
+     /// All materials loaded from the glTF file.
+-    pub materials: Vec<Handle<StandardMaterial>>,
++    pub materials: Vec<Handle<GltfMaterial>>,
+     /// Named materials loaded from the glTF file.
+-    pub named_materials: HashMap<Box<str>, Handle<StandardMaterial>>,
++    pub named_materials: HashMap<Box<str>, Handle<GltfMaterial>>,
+     /// All nodes loaded from the glTF file.
+     pub nodes: Vec<Handle<GltfNode>>,
+     /// Named nodes loaded from the glTF file.
+@@ -158,7 +157,7 @@ impl GltfNode {
+     }
+ }
+ 
+-/// Part of a [`GltfMesh`] that consists of a [`Mesh`], an optional [`StandardMaterial`] and [`GltfExtras`].
++/// Part of a [`GltfMesh`] that consists of a [`Mesh`], an optional [`GltfMaterial`] and [`GltfExtras`].
+ ///
+ /// See [the relevant glTF specification section](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#reference-mesh-primitive).
+ #[derive(Asset, Debug, Clone, TypePath)]
+@@ -172,7 +171,7 @@ pub struct GltfPrimitive {
+     /// Topology to be rendered.
+     pub mesh: Handle<Mesh>,
+     /// Material to apply to the `mesh`.
+-    pub material: Option<Handle<StandardMaterial>>,
++    pub material: Option<Handle<GltfMaterial>>,
+     /// Additional data.
+     pub extras: Option<GltfExtras>,
+     /// Additional data of the `material`.
+@@ -185,7 +184,7 @@ impl GltfPrimitive {
+         gltf_mesh: &gltf::Mesh,
+         gltf_primitive: &gltf::Primitive,
+         mesh: Handle<Mesh>,
+-        material: Option<Handle<StandardMaterial>>,
++        material: Option<Handle<GltfMaterial>>,
+         extras: Option<GltfExtras>,
+         material_extras: Option<GltfExtras>,
+     ) -> Self {
+diff --git a/crates/bevy_gltf/src/label.rs b/crates/bevy_gltf/src/label.rs
+index b74d5ab2d6631..a1e6d900c3ee9 100644
+--- a/crates/bevy_gltf/src/label.rs
++++ b/crates/bevy_gltf/src/label.rs
+@@ -54,7 +54,7 @@ pub enum GltfAssetLabel {
+     },
+     /// `Texture{}`: glTF Texture as a Bevy [`Image`](bevy_image::prelude::Image)
+     Texture(usize),
+-    /// `Material{}`: glTF Material as a Bevy [`StandardMaterial`](bevy_pbr::StandardMaterial)
++    /// `Material{}`: glTF Material as Bevy [`GltfMaterial`](crate::GltfMaterial)
+     Material {
+         /// Index of this material
+         index: usize,
+@@ -62,8 +62,7 @@ pub enum GltfAssetLabel {
+         /// useful if it is used with negative scale
+         is_scale_inverted: bool,
+     },
+-    /// `DefaultMaterial`: glTF's default Material as a
+-    /// Bevy [`StandardMaterial`](bevy_pbr::StandardMaterial)
++    /// `DefaultMaterial`: glTF's default Material
+     DefaultMaterial,
+     /// `Animation{}`: glTF Animation as Bevy [`AnimationClip`](bevy_animation::AnimationClip)
+     Animation(usize),
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index 895bdb6f8b752..8e143a130e2b6 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -131,6 +131,7 @@ mod assets;
+ pub mod convert_coordinates;
+ mod label;
+ mod loader;
++mod material;
+ mod vertex_attributes;
+ 
+ extern crate alloc;
+@@ -158,7 +159,13 @@ pub mod prelude {
+ 
+ use crate::{convert_coordinates::GltfConvertCoordinates, extensions::GltfExtensionHandlers};
+ 
+-pub use {assets::*, label::GltfAssetLabel, loader::*};
++pub use {assets::*, label::GltfAssetLabel, loader::*, material::GltfMaterial};
++
++/// Re-exports for GLTF
++pub mod gltf {
++    #[doc(hidden)]
++    pub use gltf::{Animation, Gltf, Material, Mesh, Primitive, Scene, Texture};
++}
+ 
+ // Has to store an Arc<Mutex<...>> as there is no other way to mutate fields of asset loaders.
+ /// Stores default [`ImageSamplerDescriptor`] in main world.
+@@ -265,6 +272,7 @@ impl Plugin for GltfPlugin {
+             .init_asset::<GltfPrimitive>()
+             .init_asset::<GltfMesh>()
+             .init_asset::<GltfSkin>()
++            .init_asset::<GltfMaterial>()
+             .preregister_asset_loader::<GltfLoader>(&["gltf", "glb"])
+             .init_resource::<GltfExtensionHandlers>();
+     }
+diff --git a/crates/bevy_gltf/src/loader/extensions/khr_materials_anisotropy.rs b/crates/bevy_gltf/src/loader/extensions/khr_materials_anisotropy.rs
+index a3d2752a880e0..2c0c4999429f7 100644
+--- a/crates/bevy_gltf/src/loader/extensions/khr_materials_anisotropy.rs
++++ b/crates/bevy_gltf/src/loader/extensions/khr_materials_anisotropy.rs
+@@ -6,7 +6,7 @@ use gltf::Material;
+ use serde_json::Value;
+ 
+ #[cfg(feature = "pbr_anisotropy_texture")]
+-use {crate::loader::gltf_ext::material::parse_material_extension_texture, bevy_pbr::UvChannel};
++use {crate::loader::gltf_ext::material::parse_material_extension_texture, bevy_mesh::UvChannel};
+ 
+ /// Parsed data from the `KHR_materials_anisotropy` extension.
+ ///
+diff --git a/crates/bevy_gltf/src/loader/extensions/khr_materials_clearcoat.rs b/crates/bevy_gltf/src/loader/extensions/khr_materials_clearcoat.rs
+index cb9386c1c270c..9278593e9b19a 100644
+--- a/crates/bevy_gltf/src/loader/extensions/khr_materials_clearcoat.rs
++++ b/crates/bevy_gltf/src/loader/extensions/khr_materials_clearcoat.rs
+@@ -6,7 +6,7 @@ use gltf::Material;
+ use serde_json::Value;
+ 
+ #[cfg(feature = "pbr_multi_layer_material_textures")]
+-use {crate::loader::gltf_ext::material::parse_material_extension_texture, bevy_pbr::UvChannel};
++use {crate::loader::gltf_ext::material::parse_material_extension_texture, bevy_mesh::UvChannel};
+ 
+ /// Parsed data from the `KHR_materials_clearcoat` extension.
+ ///
+diff --git a/crates/bevy_gltf/src/loader/extensions/khr_materials_specular.rs b/crates/bevy_gltf/src/loader/extensions/khr_materials_specular.rs
+index 10e6e03f10924..c0309ad5efcb6 100644
+--- a/crates/bevy_gltf/src/loader/extensions/khr_materials_specular.rs
++++ b/crates/bevy_gltf/src/loader/extensions/khr_materials_specular.rs
+@@ -6,7 +6,7 @@ use gltf::Material;
+ use serde_json::Value;
+ 
+ #[cfg(feature = "pbr_specular_textures")]
+-use {crate::loader::gltf_ext::material::parse_material_extension_texture, bevy_pbr::UvChannel};
++use {crate::loader::gltf_ext::material::parse_material_extension_texture, bevy_mesh::UvChannel};
+ 
+ /// Parsed data from the `KHR_materials_specular` extension.
+ ///
+@@ -19,7 +19,7 @@ use {crate::loader::gltf_ext::material::parse_material_extension_texture, bevy_p
+ /// `KHR_materials_specular` specification requirement that stems from the fact
+ /// that glTF is specified in terms of a specular strength model, not the
+ /// reflectance model that Filament and Bevy use. A workaround, which is noted
+-/// in the [`StandardMaterial`](bevy_pbr::StandardMaterial) documentation, is to set the reflectance value
++/// in the [`StandardMaterial`](https://docs.rs/bevy/latest/bevy/pbr/struct.StandardMaterial.html) documentation, is to set the reflectance value
+ /// to 2.0, which spreads the specular map range from [0.0, 1.0] as normal.
+ ///
+ /// See the specification:
+diff --git a/crates/bevy_gltf/src/loader/extensions/mod.rs b/crates/bevy_gltf/src/loader/extensions/mod.rs
+index 370b767f723b1..f33e4c1b08ad5 100644
+--- a/crates/bevy_gltf/src/loader/extensions/mod.rs
++++ b/crates/bevy_gltf/src/loader/extensions/mod.rs
+@@ -13,7 +13,6 @@ use bevy_ecs::{
+     resource::Resource,
+     world::{EntityWorldMut, World},
+ };
+-use bevy_pbr::StandardMaterial;
+ use gltf::Node;
+ 
+ #[cfg(feature = "bevy_animation")]
+@@ -22,7 +21,7 @@ use {
+     bevy_platform::collections::{HashMap, HashSet},
+ };
+ 
+-use crate::GltfMesh;
++use crate::{GltfMaterial, GltfMesh};
+ 
+ pub(crate) use self::{
+     khr_materials_anisotropy::AnisotropyExtension, khr_materials_clearcoat::ClearcoatExtension,
+@@ -114,7 +113,9 @@ pub trait GltfExtensionHandler: Send + Sync {
+         &mut self,
+         load_context: &mut LoadContext<'_>,
+         gltf_material: &gltf::Material,
+-        material: Handle<StandardMaterial>,
++        material: Handle<GltfMaterial>,
++        material_asset: &GltfMaterial,
++        material_label: &str,
+     ) {
+     }
+ 
+@@ -145,6 +146,7 @@ pub trait GltfExtensionHandler: Send + Sync {
+         mesh: &gltf::Mesh,
+         material: &gltf::Material,
+         entity: &mut EntityWorldMut,
++        material_label: &str,
+     ) {
+     }
+ 
+diff --git a/crates/bevy_gltf/src/loader/gltf_ext/material.rs b/crates/bevy_gltf/src/loader/gltf_ext/material.rs
+index 2dcc710acdf93..c1ea240995796 100644
+--- a/crates/bevy_gltf/src/loader/gltf_ext/material.rs
++++ b/crates/bevy_gltf/src/loader/gltf_ext/material.rs
+@@ -1,6 +1,6 @@
+ use bevy_material::AlphaMode;
+ use bevy_math::Affine2;
+-use bevy_pbr::UvChannel;
++use bevy_mesh::UvChannel;
+ 
+ use gltf::{json::texture::Info, Material};
+ 
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index bb5b9ade2e077..ac9af452a6e0e 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -27,14 +27,13 @@ use bevy_image::{
+ };
+ use bevy_light::{DirectionalLight, PointLight, SpotLight};
+ use bevy_math::{Mat4, Vec3};
++#[cfg(feature = "pbr_transmission_textures")]
++use bevy_mesh::UvChannel;
+ use bevy_mesh::{
+     morph::{MeshMorphWeights, MorphAttributes, MorphTargetImage, MorphWeights},
+     skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+     Indices, Mesh, Mesh3d, MeshVertexAttribute, PrimitiveTopology,
+ };
+-#[cfg(feature = "pbr_transmission_textures")]
+-use bevy_pbr::UvChannel;
+-use bevy_pbr::{MeshMaterial3d, StandardMaterial, MAX_JOINTS};
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_reflect::TypePath;
+ use bevy_render::render_resource::Face;
+@@ -57,8 +56,8 @@ use tracing::{error, info_span, warn};
+ 
+ use crate::{
+     convert_coordinates::ConvertCoordinates as _, vertex_attributes::convert_attribute, Gltf,
+-    GltfAssetLabel, GltfExtras, GltfMaterialExtras, GltfMaterialName, GltfMeshExtras, GltfMeshName,
+-    GltfNode, GltfSceneExtras, GltfSkin, GltfSkinnedMeshBoundsPolicy,
++    GltfAssetLabel, GltfExtras, GltfMaterial, GltfMaterialExtras, GltfMaterialName, GltfMeshExtras,
++    GltfMeshName, GltfNode, GltfSceneExtras, GltfSkin, GltfSkinnedMeshBoundsPolicy,
+ };
+ 
+ #[cfg(feature = "bevy_animation")]
+@@ -78,6 +77,9 @@ use self::{
+ };
+ use crate::convert_coordinates::GltfConvertCoordinates;
+ 
++/// Must match [`MAX_JOINTS`](https://docs.rs/bevy/latest/bevy/pbr/constant.MAX_JOINTS.html)
++pub const MAX_JOINTS: usize = 256;
++
+ /// An error that occurs when loading a glTF file.
+ #[derive(Error, Debug)]
+ pub enum GltfError {
+@@ -667,22 +669,27 @@ impl GltfLoader {
+         if !settings.load_materials.is_empty() {
+             // NOTE: materials must be loaded after textures because image load() calls will happen before load_with_settings, preventing is_srgb from being set properly
+             for material in gltf.materials() {
+-                let handle = {
+-                    let (label, material) = load_material(
+-                        &material,
+-                        &texture_handles,
+-                        false,
+-                        load_context.path().clone(),
+-                    );
+-                    load_context.add_labeled_asset(label, material)
+-                };
++                let (label, gltf_material) = load_material(
++                    &material,
++                    &texture_handles,
++                    false,
++                    load_context.path().clone(),
++                );
++                let handle = load_context.add_labeled_asset(label.clone(), gltf_material.clone());
++
+                 if let Some(name) = material.name() {
+                     named_materials.insert(name.into(), handle.clone());
+                 }
+ 
+                 // let extensions handle material data
+                 for extension in extensions.iter_mut() {
+-                    extension.on_material(load_context, &material, handle.clone());
++                    extension.on_material(
++                        load_context,
++                        &material,
++                        handle.clone(),
++                        &gltf_material,
++                        &label.clone(),
++                    );
+                 }
+ 
+                 materials.push(handle);
+@@ -1199,16 +1206,13 @@ async fn load_image<'a, 'b>(
+     }
+ }
+ 
+-/// Loads a glTF material as a bevy [`StandardMaterial`] and returns the label and material.
+-// Note: this function intentionally **does not** take a `LoadContext` and insert the asset here,
+-// since we don't use the `LoadContext` otherwise, and this prevents accidentally using the context
+-// without `labeled_asset_scope`.
++/// Loads a glTF material as a bevy [`GltfMaterial`] and returns the label and material.
+ fn load_material(
+     material: &Material,
+     textures: &[Handle<Image>],
+     is_scale_inverted: bool,
+     asset_path: AssetPath<'_>,
+-) -> (String, StandardMaterial) {
++) -> (String, GltfMaterial) {
+     let pbr = material.pbr_metallic_roughness();
+ 
+     // TODO: handle missing label handle errors here?
+@@ -1367,7 +1371,7 @@ fn load_material(
+     let base_emissive = LinearRgba::rgb(emissive[0], emissive[1], emissive[2]);
+     let emissive = base_emissive * material.emissive_strength().unwrap_or(1.0);
+ 
+-    let standard_material = StandardMaterial {
++    let gltf_material = GltfMaterial {
+         base_color: Color::linear_rgba(color[0], color[1], color[2], color[3]),
+         base_color_channel,
+         base_color_texture,
+@@ -1446,12 +1450,11 @@ fn load_material(
+         specular_tint_channel: specular.specular_color_channel,
+         #[cfg(feature = "pbr_specular_textures")]
+         specular_tint_texture: specular.specular_color_texture,
+-        ..Default::default()
+     };
+ 
+     (
+         material_label(material, is_scale_inverted).to_string(),
+-        standard_material,
++        gltf_material,
+     )
+ }
+ 
+@@ -1579,7 +1582,8 @@ fn load_node(
+             // append primitives
+             for primitive in mesh.primitives() {
+                 let material = primitive.material();
+-                let material_label = material_label(&material, is_scale_inverted).to_string();
++                let mat_label = material_label(&material, is_scale_inverted);
++                let material_label = mat_label.to_string();
+ 
+                 // This will make sure we load the default material now since it would not have been
+                 // added when iterating over all the gltf materials (since the default material is
+@@ -1594,6 +1598,7 @@ fn load_node(
+                         is_scale_inverted,
+                         load_context.path().clone(),
+                     );
++                    // TODO: maybe move this into `load_material` ?
+                     load_context.add_labeled_asset(label, material);
+                 }
+ 
+@@ -1611,9 +1616,7 @@ fn load_node(
+                 let mut mesh_entity = parent.spawn((
+                     // TODO: handle missing label handle errors here?
+                     Mesh3d(load_context.get_label_handle(primitive_label.to_string())),
+-                    MeshMaterial3d::<StandardMaterial>(
+-                        load_context.get_label_handle(&material_label),
+-                    ),
++                    // TODO: could add the `GltfMaterial` here
+                     mesh_entity_transform,
+                 ));
+ 
+@@ -1704,6 +1707,7 @@ fn load_node(
+                         &mesh,
+                         &material,
+                         &mut mesh_entity,
++                        &mat_label.to_string(),
+                     );
+                 }
+             }
+@@ -2028,21 +2032,20 @@ struct MorphTargetNames {
+ mod test {
+     use std::path::Path;
+ 
+-    use crate::{Gltf, GltfAssetLabel, GltfNode, GltfSkin};
++    use crate::{Gltf, GltfAssetLabel, GltfMaterial, GltfNode, GltfSkin};
+     use bevy_app::{App, TaskPoolPlugin};
+     use bevy_asset::{
+         io::{
+             memory::{Dir, MemoryAssetReader},
+             AssetSourceBuilder, AssetSourceId,
+         },
+-        AssetApp, AssetLoader, AssetPlugin, AssetServer, Assets, Handle, LoadState,
++        AssetApp, AssetLoader, AssetPlugin, AssetServer, Assets, Handle, LoadContext, LoadState,
+     };
+     use bevy_ecs::{resource::Resource, world::World};
+     use bevy_image::{Image, ImageLoaderSettings};
+     use bevy_log::LogPlugin;
+     use bevy_mesh::skinning::SkinnedMeshInverseBindposes;
+     use bevy_mesh::MeshPlugin;
+-    use bevy_pbr::StandardMaterial;
+     use bevy_reflect::TypePath;
+     use bevy_scene::ScenePlugin;
+ 
+@@ -2534,7 +2537,7 @@ mod test {
+     fn reads_images_in_custom_asset_source() {
+         let (mut app, dir) = test_app_custom_asset_source();
+ 
+-        app.init_asset::<StandardMaterial>();
++        app.init_asset::<GltfMaterial>();
+ 
+         // Note: We need the material here since otherwise we don't store the texture handle, which
+         // can result in the image getting dropped leading to the gltf never being loaded with
+@@ -2592,7 +2595,7 @@ mod test {
+                 &self,
+                 _reader: &mut dyn bevy_asset::io::Reader,
+                 _settings: &Self::Settings,
+-                _load_context: &mut bevy_asset::LoadContext<'_>,
++                _load_context: &mut LoadContext<'_>,
+             ) -> Result<Self::Asset, Self::Error> {
+                 Ok(Image::default())
+             }
+diff --git a/crates/bevy_gltf/src/material.rs b/crates/bevy_gltf/src/material.rs
+new file mode 100644
+index 0000000000000..724bad7edf13d
+--- /dev/null
++++ b/crates/bevy_gltf/src/material.rs
+@@ -0,0 +1,266 @@
++use bevy_asset::{Asset, Handle};
++use bevy_color::{Color, LinearRgba};
++use bevy_image::Image;
++use bevy_material::AlphaMode;
++use bevy_math::Affine2;
++use bevy_mesh::UvChannel;
++use bevy_reflect::TypePath;
++use wgpu_types::Face;
++
++/// Data to build a Gltf Material
++///
++/// See [`StandardMaterial`](https://docs.rs/bevy/latest/bevy/pbr/struct.StandardMaterial.html) for details
++#[derive(Asset, Debug, Clone, TypePath)]
++pub struct GltfMaterial {
++    /// The color of the surface of the material before lighting.
++    pub base_color: Color,
++
++    /// The UV channel to use for the [`GltfMaterial::base_color_texture`].
++    pub base_color_channel: UvChannel,
++
++    /// The texture component of the material's color before lighting.
++    pub base_color_texture: Option<Handle<Image>>,
++
++    /// Color the material "emits" to the camera.
++    pub emissive: LinearRgba,
++
++    /// The UV channel to use for the [`GltfMaterial::emissive_texture`].
++    pub emissive_channel: UvChannel,
++
++    /// The emissive map, multiplies pixels with [`GltfMaterial::emissive`]
++    /// to get the final "emitting" color of a surface.
++    pub emissive_texture: Option<Handle<Image>>,
++
++    /// Linear perceptual roughness.
++    pub perceptual_roughness: f32,
++
++    /// How "metallic" the material appears, within `[0.0, 1.0]`.
++    pub metallic: f32,
++
++    /// The UV channel to use for the [`GltfMaterial::metallic_roughness_texture`].
++    pub metallic_roughness_channel: UvChannel,
++
++    /// Metallic and roughness maps, stored as a single texture.
++    pub metallic_roughness_texture: Option<Handle<Image>>,
++
++    /// Specular intensity for non-metals on a linear scale of `[0.0, 1.0]`.
++    pub reflectance: f32,
++
++    /// The UV channel to use for the [`GltfMaterial::specular_texture`].
++    #[cfg(feature = "pbr_specular_textures")]
++    pub specular_channel: UvChannel,
++
++    /// A map that specifies reflectance for non-metallic materials.
++    #[cfg(feature = "pbr_specular_textures")]
++    pub specular_texture: Option<Handle<Image>>,
++
++    /// A color with which to modulate the [`GltfMaterial::reflectance`] for
++    /// non-metals.
++    pub specular_tint: Color,
++
++    /// The UV channel to use for the
++    /// [`GltfMaterial::specular_tint_texture`].
++    #[cfg(feature = "pbr_specular_textures")]
++    pub specular_tint_channel: UvChannel,
++
++    /// A map that specifies color adjustment to be applied to the specular
++    /// reflection for non-metallic materials.
++    #[cfg(feature = "pbr_specular_textures")]
++    pub specular_tint_texture: Option<Handle<Image>>,
++
++    /// The amount of light transmitted _specularly_ through the material (i.e. via refraction).
++    pub specular_transmission: f32,
++
++    /// The UV channel to use for the [`GltfMaterial::specular_transmission_texture`].
++    #[cfg(feature = "pbr_transmission_textures")]
++    pub specular_transmission_channel: UvChannel,
++
++    /// A map that modulates specular transmission via its red channel. Multiplied by [`GltfMaterial::specular_transmission`]
++    /// to obtain the final result.
++    #[cfg(feature = "pbr_transmission_textures")]
++    pub specular_transmission_texture: Option<Handle<Image>>,
++
++    /// Thickness of the volume beneath the material surface.
++    pub thickness: f32,
++    #[cfg(feature = "pbr_transmission_textures")]
++
++    /// The UV channel to use for the [`GltfMaterial::thickness_texture`].
++    pub thickness_channel: UvChannel,
++
++    /// A map that modulates thickness via its green channel. Multiplied by [`GltfMaterial::thickness`]
++    /// to obtain the final result.
++    #[cfg(feature = "pbr_transmission_textures")]
++    pub thickness_texture: Option<Handle<Image>>,
++
++    /// The [index of refraction](https://en.wikipedia.org/wiki/Refractive_index) of the material.
++    pub ior: f32,
++
++    /// How far, on average, light travels through the volume beneath the material's
++    /// surface before being absorbed.
++    pub attenuation_distance: f32,
++
++    /// The resulting (non-absorbed) color after white light travels through the attenuation distance.
++    pub attenuation_color: Color,
++
++    /// The UV channel to use for the [`GltfMaterial::normal_map_texture`].
++    pub normal_map_channel: UvChannel,
++
++    /// Used to fake the lighting of bumps and dents on a material.
++    pub normal_map_texture: Option<Handle<Image>>,
++
++    /// The UV channel to use for the [`GltfMaterial::occlusion_texture`].
++    pub occlusion_channel: UvChannel,
++
++    /// Specifies the level of exposure to ambient light.
++    pub occlusion_texture: Option<Handle<Image>>,
++
++    /// An extra thin translucent layer on top of the main PBR layer. This is
++    /// typically used for painted surfaces.
++    pub clearcoat: f32,
++
++    /// The roughness of the clearcoat material. This is specified in exactly
++    /// the same way as the [`GltfMaterial::perceptual_roughness`].
++    pub clearcoat_perceptual_roughness: f32,
++
++    /// The UV channel to use for the [`GltfMaterial::clearcoat_texture`].
++    #[cfg(feature = "pbr_multi_layer_material_textures")]
++    pub clearcoat_channel: UvChannel,
++
++    /// An image texture that specifies the strength of the clearcoat layer in
++    /// the red channel. Values sampled from this texture are multiplied by the
++    /// main [`GltfMaterial::clearcoat`] factor.
++    #[cfg(feature = "pbr_multi_layer_material_textures")]
++    pub clearcoat_texture: Option<Handle<Image>>,
++
++    /// The UV channel to use for the [`GltfMaterial::clearcoat_roughness_texture`].
++    #[cfg(feature = "pbr_multi_layer_material_textures")]
++    pub clearcoat_roughness_channel: UvChannel,
++
++    /// An image texture that specifies the roughness of the clearcoat level in
++    /// the green channel. Values from this texture are multiplied by the main
++    /// [`GltfMaterial::clearcoat_perceptual_roughness`] factor.
++    #[cfg(feature = "pbr_multi_layer_material_textures")]
++    pub clearcoat_roughness_texture: Option<Handle<Image>>,
++
++    /// The UV channel to use for the [`GltfMaterial::clearcoat_normal_texture`].
++    #[cfg(feature = "pbr_multi_layer_material_textures")]
++    pub clearcoat_normal_channel: UvChannel,
++
++    /// An image texture that specifies a normal map that is to be applied to
++    /// the clearcoat layer. This can be used to simulate, for example,
++    /// scratches on an outer layer of varnish. Normal maps are in the same
++    /// format as [`GltfMaterial::normal_map_texture`].
++    #[cfg(feature = "pbr_multi_layer_material_textures")]
++    pub clearcoat_normal_texture: Option<Handle<Image>>,
++
++    /// Increases the roughness along a specific direction, so that the specular
++    /// highlight will be stretched instead of being a circular lobe.
++    pub anisotropy_strength: f32,
++
++    /// The direction of increased roughness, in radians relative to the mesh
++    /// tangent.
++    pub anisotropy_rotation: f32,
++
++    /// The UV channel to use for the [`GltfMaterial::anisotropy_texture`].
++    #[cfg(feature = "pbr_anisotropy_texture")]
++    pub anisotropy_channel: UvChannel,
++
++    /// An image texture that allows the
++    /// [`GltfMaterial::anisotropy_strength`] and
++    /// [`GltfMaterial::anisotropy_rotation`] to vary across the mesh.
++    #[cfg(feature = "pbr_anisotropy_texture")]
++    pub anisotropy_texture: Option<Handle<Image>>,
++
++    /// Support two-sided lighting by automatically flipping the normals for "back" faces
++    /// within the PBR lighting shader.
++    pub double_sided: bool,
++
++    /// Support two-sided lighting by automatically flipping the normals for "back" faces
++    /// within the PBR lighting shader.
++    pub cull_mode: Option<Face>,
++
++    /// Whether to apply only the base color to this material.
++    pub unlit: bool,
++
++    /// How to apply the alpha channel of the `base_color_texture`.
++    pub alpha_mode: AlphaMode,
++
++    /// The transform applied to the UVs corresponding to `ATTRIBUTE_UV_0` on the mesh before sampling. Default is identity.
++    pub uv_transform: Affine2,
++}
++
++impl Default for GltfMaterial {
++    fn default() -> Self {
++        GltfMaterial {
++            // White because it gets multiplied with texture values if someone uses
++            // a texture.
++            base_color: Color::WHITE,
++            base_color_channel: UvChannel::Uv0,
++            base_color_texture: None,
++            emissive: LinearRgba::BLACK,
++            emissive_channel: UvChannel::Uv0,
++            emissive_texture: None,
++            // Matches Blender's default roughness.
++            perceptual_roughness: 0.5,
++            // Metallic should generally be set to 0.0 or 1.0.
++            metallic: 0.0,
++            metallic_roughness_channel: UvChannel::Uv0,
++            metallic_roughness_texture: None,
++            // Minimum real-world reflectance is 2%, most materials between 2-5%
++            // Expressed in a linear scale and equivalent to 4% reflectance see
++            // <https://google.github.io/filament/Material%20Properties.pdf>
++            reflectance: 0.5,
++            specular_transmission: 0.0,
++            #[cfg(feature = "pbr_transmission_textures")]
++            specular_transmission_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_transmission_textures")]
++            specular_transmission_texture: None,
++            thickness: 0.0,
++            #[cfg(feature = "pbr_transmission_textures")]
++            thickness_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_transmission_textures")]
++            thickness_texture: None,
++            ior: 1.5,
++            attenuation_color: Color::WHITE,
++            attenuation_distance: f32::INFINITY,
++            occlusion_channel: UvChannel::Uv0,
++            occlusion_texture: None,
++            normal_map_channel: UvChannel::Uv0,
++            normal_map_texture: None,
++            #[cfg(feature = "pbr_specular_textures")]
++            specular_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_specular_textures")]
++            specular_texture: None,
++            specular_tint: Color::WHITE,
++            #[cfg(feature = "pbr_specular_textures")]
++            specular_tint_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_specular_textures")]
++            specular_tint_texture: None,
++            clearcoat: 0.0,
++            clearcoat_perceptual_roughness: 0.5,
++            #[cfg(feature = "pbr_multi_layer_material_textures")]
++            clearcoat_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_multi_layer_material_textures")]
++            clearcoat_texture: None,
++            #[cfg(feature = "pbr_multi_layer_material_textures")]
++            clearcoat_roughness_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_multi_layer_material_textures")]
++            clearcoat_roughness_texture: None,
++            #[cfg(feature = "pbr_multi_layer_material_textures")]
++            clearcoat_normal_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_multi_layer_material_textures")]
++            clearcoat_normal_texture: None,
++            anisotropy_strength: 0.0,
++            anisotropy_rotation: 0.0,
++            #[cfg(feature = "pbr_anisotropy_texture")]
++            anisotropy_channel: UvChannel::Uv0,
++            #[cfg(feature = "pbr_anisotropy_texture")]
++            anisotropy_texture: None,
++            double_sided: false,
++            cull_mode: Some(Face::Back),
++            unlit: false,
++            alpha_mode: AlphaMode::Opaque,
++            uv_transform: Affine2::IDENTITY,
++        }
++    }
++}
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 25fe37c361b53..de0042c867d57 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -246,6 +246,7 @@ bevy_anti_alias = ["dep:bevy_anti_alias", "bevy_core_pipeline"]
+ bevy_post_process = ["dep:bevy_post_process", "bevy_core_pipeline"]
+ bevy_pbr = [
+   "dep:bevy_pbr",
++  "bevy_gltf",
+   "bevy_light",
+   "bevy_material",
+   "bevy_core_pipeline",
+@@ -262,7 +263,7 @@ bevy_ui_render = ["dep:bevy_ui_render", "bevy_sprite_render", "bevy_ui"]
+ bevy_solari = ["dep:bevy_solari", "bevy_pbr"]
+ bevy_gizmos = ["dep:bevy_gizmos", "bevy_camera", "bevy_light?/bevy_gizmos"]
+ bevy_gizmos_render = ["dep:bevy_gizmos_render", "bevy_gizmos"]
+-bevy_gltf = ["dep:bevy_gltf", "bevy_scene", "bevy_pbr"]
++bevy_gltf = ["dep:bevy_gltf", "bevy_scene"]
+ 
+ # Used to disable code that is unsupported when Bevy is dynamically linked
+ dynamic_linking = ["bevy_diagnostic/dynamic_linking"]
+diff --git a/crates/bevy_internal/src/default_plugins.rs b/crates/bevy_internal/src/default_plugins.rs
+index eb5831069f3ba..0f75594b7bf91 100644
+--- a/crates/bevy_internal/src/default_plugins.rs
++++ b/crates/bevy_internal/src/default_plugins.rs
+@@ -65,12 +65,10 @@ plugin_group! {
+         bevy_ui:::UiPlugin,
+         #[cfg(feature = "bevy_ui_render")]
+         bevy_ui_render:::UiRenderPlugin,
+-        #[cfg(feature = "bevy_pbr")]
+-        bevy_pbr:::PbrPlugin,
+-        // NOTE: Load this after renderer initialization so that it knows about the supported
+-        // compressed texture formats.
+         #[cfg(feature = "bevy_gltf")]
+         bevy_gltf:::GltfPlugin,
++        #[cfg(feature = "bevy_pbr")]
++        bevy_pbr:::PbrPlugin,
+         #[cfg(feature = "bevy_audio")]
+         bevy_audio:::AudioPlugin,
+         #[cfg(feature = "bevy_gilrs")]
+diff --git a/crates/bevy_mesh/src/mesh.rs b/crates/bevy_mesh/src/mesh.rs
+index abf7c45299afb..77e1aa4344efc 100644
+--- a/crates/bevy_mesh/src/mesh.rs
++++ b/crates/bevy_mesh/src/mesh.rs
+@@ -18,7 +18,7 @@ use bevy_asset::{Asset, RenderAssetUsages};
+ use bevy_image::Image;
+ use bevy_math::{bounding::Aabb3d, primitives::Triangle3d, *};
+ use bevy_platform::collections::{hash_map, HashMap};
+-use bevy_reflect::Reflect;
++use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bytemuck::cast_slice;
+ use core::hash::{Hash, Hasher};
+ use core::ptr;
+@@ -2491,6 +2491,19 @@ impl Mesh {
+     }
+ }
+ 
++/// An enum to define which UV attribute to use for a texture.
++///
++/// It only supports two UV attributes, [`Mesh::ATTRIBUTE_UV_0`] and
++/// [`Mesh::ATTRIBUTE_UV_1`].
++/// The default is [`UvChannel::Uv0`].
++#[derive(Reflect, Default, Debug, Clone, PartialEq, Eq)]
++#[reflect(Default, Debug, Clone, PartialEq)]
++pub enum UvChannel {
++    #[default]
++    Uv0,
++    Uv1,
++}
++
+ /// Correctly scales and renormalizes an already normalized `normal` by the scale determined by its reciprocal `scale_recip`
+ pub(crate) fn scale_normal(normal: Vec3, scale_recip: Vec3) -> Vec3 {
+     // This is basically just `normal * scale_recip` but with the added rule that `0. * anything == 0.`
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index 397d7e4aa1dd3..b37eebfb9cfa2 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -11,11 +11,13 @@ keywords = ["bevy"]
+ [features]
+ webgl = ["bevy_light/webgl"]
+ webgpu = ["bevy_light/webgpu"]
+-pbr_transmission_textures = []
+-pbr_multi_layer_material_textures = []
+-pbr_anisotropy_texture = []
++pbr_transmission_textures = ["bevy_gltf/pbr_transmission_textures"]
++pbr_multi_layer_material_textures = [
++  "bevy_gltf/pbr_multi_layer_material_textures",
++]
++pbr_anisotropy_texture = ["bevy_gltf/pbr_anisotropy_texture"]
++pbr_specular_textures = ["bevy_gltf/pbr_specular_textures"]
+ experimental_pbr_pcss = ["bevy_light/experimental_pbr_pcss"]
+-pbr_specular_textures = []
+ pbr_clustered_decals = []
+ pbr_light_textures = []
+ bluenoise_texture = ["bevy_image/ktx2", "bevy_image/zstd"]
+@@ -41,6 +43,7 @@ bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.19.0-dev" }
+ bevy_derive = { path = "../bevy_derive", version = "0.19.0-dev" }
+ bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.19.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.19.0-dev" }
++bevy_gltf = { path = "../bevy_gltf", version = "0.19.0-dev" }
+ bevy_light = { path = "../bevy_light", version = "0.19.0-dev" }
+ bevy_log = { path = "../bevy_log", version = "0.19.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.19.0-dev" }
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index 72a9623fb7504..4b792e25bb064 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -28,6 +28,7 @@ mod atmosphere;
+ mod cluster;
+ mod components;
+ pub mod contact_shadows;
++use bevy_gltf::extensions::{GltfExtensionHandler, GltfExtensionHandlers};
+ pub use contact_shadows::{
+     ContactShadows, ContactShadowsBuffer, ContactShadowsPlugin, ContactShadowsUniform,
+     ViewContactShadowsUniformOffset,
+@@ -55,6 +56,8 @@ mod volumetric_fog;
+ use bevy_color::{Color, LinearRgba};
+ 
+ pub use atmosphere::*;
++use bevy_asset::LoadContext;
++use bevy_gltf::{gltf, GltfMaterial};
+ use bevy_light::{AmbientLight, DirectionalLight, PointLight, ShadowFilteringMethod, SpotLight};
+ use bevy_shader::{load_shader_library, ShaderRef};
+ pub use cluster::*;
+@@ -137,6 +140,8 @@ pub struct PbrPlugin {
+     pub use_gpu_instance_buffer_builder: bool,
+     /// Debugging flags that can optionally be set when constructing the renderer.
+     pub debug_flags: RenderDebugFlags,
++    /// Renders GLTFs with PBR.
++    pub gltf_render_enabled: bool,
+ }
+ 
+ impl Default for PbrPlugin {
+@@ -146,6 +151,7 @@ impl Default for PbrPlugin {
+             add_default_deferred_lighting_plugin: true,
+             use_gpu_instance_buffer_builder: true,
+             debug_flags: RenderDebugFlags::default(),
++            gltf_render_enabled: true,
+         }
+     }
+ }
+@@ -219,6 +225,25 @@ impl Plugin for PbrPlugin {
+             ))
+             .add_plugins((ScatteringMediumPlugin, AtmospherePlugin));
+ 
++        if self.gltf_render_enabled {
++            #[cfg(target_family = "wasm")]
++            bevy_tasks::block_on(async {
++                app.world_mut()
++                    .resource_mut::<GltfExtensionHandlers>()
++                    .0
++                    .write()
++                    .await
++                    .push(Box::new(GltfExtensionHandlerPbr))
++            });
++
++            #[cfg(not(target_family = "wasm"))]
++            app.world_mut()
++                .resource_mut::<GltfExtensionHandlers>()
++                .0
++                .write_blocking()
++                .push(Box::new(GltfExtensionHandlerPbr));
++        }
++
+         if self.add_default_deferred_lighting_plugin {
+             app.add_plugins(DeferredPbrLightingPlugin);
+         }
+@@ -355,3 +380,86 @@ pub fn stbn_placeholder() -> Image {
+         copy_on_resize: false,
+     }
+ }
++
++fn standard_material_from_gltf_material(material: &GltfMaterial) -> StandardMaterial {
++    StandardMaterial {
++        base_color: material.base_color,
++        base_color_channel: material.base_color_channel.clone(),
++        base_color_texture: material.base_color_texture.clone(),
++        emissive: material.emissive,
++        emissive_channel: material.emissive_channel.clone(),
++        emissive_texture: material.emissive_texture.clone(),
++        perceptual_roughness: material.perceptual_roughness,
++        metallic: material.metallic,
++        metallic_roughness_channel: material.metallic_roughness_channel.clone(),
++        metallic_roughness_texture: material.metallic_roughness_texture.clone(),
++        reflectance: material.reflectance,
++        specular_tint: material.specular_tint,
++        specular_transmission: material.specular_transmission,
++        #[cfg(feature = "pbr_transmission_textures")]
++        specular_transmission_channel: material.specular_transmission_channel.clone(),
++        #[cfg(feature = "pbr_transmission_textures")]
++        specular_transmission_texture: material.specular_transmission_texture.clone(),
++        thickness: material.thickness,
++        #[cfg(feature = "pbr_transmission_textures")]
++        thickness_channel: material.thickness_channel.clone(),
++        #[cfg(feature = "pbr_transmission_textures")]
++        thickness_texture: material.thickness_texture.clone(),
++        ior: material.ior,
++        attenuation_distance: material.attenuation_distance,
++        attenuation_color: material.attenuation_color,
++        normal_map_channel: material.normal_map_channel.clone(),
++        normal_map_texture: material.normal_map_texture.clone(),
++        occlusion_channel: material.occlusion_channel.clone(),
++        occlusion_texture: material.occlusion_texture.clone(),
++        clearcoat: material.clearcoat,
++        clearcoat_perceptual_roughness: material.clearcoat_perceptual_roughness,
++        anisotropy_strength: material.anisotropy_strength,
++        anisotropy_rotation: material.anisotropy_rotation,
++        double_sided: material.double_sided,
++        cull_mode: material.cull_mode,
++        unlit: material.unlit,
++        alpha_mode: material.alpha_mode,
++        uv_transform: material.uv_transform,
++        ..Default::default()
++    }
++}
++
++#[derive(Default, Clone)]
++struct GltfExtensionHandlerPbr;
++
++impl GltfExtensionHandler for GltfExtensionHandlerPbr {
++    fn dyn_clone(&self) -> Box<dyn GltfExtensionHandler> {
++        Box::new((*self).clone())
++    }
++
++    fn on_material(
++        &mut self,
++        load_context: &mut LoadContext<'_>,
++        _gltf_material: &gltf::Material,
++        _material: Handle<GltfMaterial>,
++        material_asset: &GltfMaterial,
++        material_label: &str,
++    ) {
++        let std_label = format!("{:?}#std", material_label);
++
++        let _t = load_context.labeled_asset_scope::<_, ()>(std_label, |_load_context| {
++            Ok(standard_material_from_gltf_material(material_asset))
++        });
++    }
++
++    fn on_spawn_mesh_and_material(
++        &mut self,
++        load_context: &mut LoadContext<'_>,
++        _primitive: &gltf::Primitive,
++        _mesh: &gltf::Mesh,
++        _material: &gltf::Material,
++        entity: &mut EntityWorldMut,
++        material_label: &str,
++    ) {
++        let std_label = format!("{:?}#std", material_label);
++        let handle = load_context.get_label_handle::<StandardMaterial>(std_label);
++
++        entity.insert(MeshMaterial3d(handle));
++    }
++}
+diff --git a/crates/bevy_pbr/src/pbr_material.rs b/crates/bevy_pbr/src/pbr_material.rs
+index a95d701ae2d2a..09e59bd05e39d 100644
+--- a/crates/bevy_pbr/src/pbr_material.rs
++++ b/crates/bevy_pbr/src/pbr_material.rs
+@@ -2,27 +2,13 @@ use bevy_asset::Asset;
+ use bevy_color::{Alpha, ColorToComponents};
+ use bevy_material::OpaqueRendererMethod;
+ use bevy_math::{Affine2, Affine3, Mat2, Mat3, Vec2, Vec3, Vec4};
+-use bevy_mesh::MeshVertexBufferLayoutRef;
++use bevy_mesh::{MeshVertexBufferLayoutRef, UvChannel};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{render_asset::RenderAssets, render_resource::*, texture::GpuImage};
+ use bitflags::bitflags;
+ 
+ use crate::{deferred::DEFAULT_PBR_DEFERRED_LIGHTING_PASS_ID, *};
+ 
+-/// An enum to define which UV attribute to use for a texture.
+-///
+-/// It is used for every texture in the [`StandardMaterial`].
+-/// It only supports two UV attributes, [`bevy_mesh::Mesh::ATTRIBUTE_UV_0`] and
+-/// [`bevy_mesh::Mesh::ATTRIBUTE_UV_1`].
+-/// The default is [`UvChannel::Uv0`].
+-#[derive(Reflect, Default, Debug, Clone, PartialEq, Eq)]
+-#[reflect(Default, Debug, Clone, PartialEq)]
+-pub enum UvChannel {
+-    #[default]
+-    Uv0,
+-    Uv1,
+-}
+-
+ /// A material with "standard" properties used in PBR lighting.
+ /// Standard property values with pictures here:
+ /// <https://google.github.io/filament/notes/material_properties.html>.
+diff --git a/examples/gltf/gltf_extension_mesh_2d.rs b/examples/gltf/gltf_extension_mesh_2d.rs
+index c5b3a5e340342..11cdd792b6bf7 100644
+--- a/examples/gltf/gltf_extension_mesh_2d.rs
++++ b/examples/gltf/gltf_extension_mesh_2d.rs
+@@ -2,9 +2,12 @@
+ 
+ use bevy::{
+     asset::LoadContext,
+-    gltf::extensions::{GltfExtensionHandler, GltfExtensionHandlers},
+-    gltf::GltfPlugin,
++    gltf::{
++        extensions::{GltfExtensionHandler, GltfExtensionHandlers},
++        GltfPlugin,
++    },
+     mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef},
++    pbr::PbrPlugin,
+     prelude::*,
+     reflect::TypePath,
+     render::render_resource::*,
+@@ -31,14 +34,19 @@ fn main() {
+             ..default()
+         })
+         .add_plugins((
+-            DefaultPlugins.set(
+-                GltfPlugin::default()
+-                    // Map a custom glTF attribute name to a `MeshVertexAttribute`.
+-                    // The glTF file used here has an attribute name with *two*
+-                    // underscores: __BARYCENTRIC
+-                    // One is stripped to do the comparison here.
+-                    .add_custom_vertex_attribute("_BARYCENTRIC", ATTRIBUTE_BARYCENTRIC),
+-            ),
++            DefaultPlugins
++                .set(
++                    GltfPlugin::default()
++                        // Map a custom glTF attribute name to a `MeshVertexAttribute`.
++                        // The glTF file used here has an attribute name with *two*
++                        // underscores: __BARYCENTRIC
++                        // One is stripped to do the comparison here.
++                        .add_custom_vertex_attribute("_BARYCENTRIC", ATTRIBUTE_BARYCENTRIC),
++                )
++                .set(PbrPlugin {
++                    gltf_render_enabled: false,
++                    ..Default::default()
++                }),
+             GltfToMesh2dPlugin,
+         ))
+         .add_systems(Startup, setup)
+@@ -95,15 +103,14 @@ impl GltfExtensionHandler for GltfExtensionHandlerToMesh2d {
+         _mesh: &gltf::Mesh,
+         _material: &gltf::Material,
+         entity: &mut EntityWorldMut,
++        _material_label: &str,
+     ) {
+-        if let Some(mesh3d) = entity.get::<Mesh3d>()
+-            && let Some(_) = entity.get::<MeshMaterial3d<StandardMaterial>>()
+-        {
++        if let Some(mesh3d) = entity.get::<Mesh3d>() {
+             let material_handle =
+                 load_context.add_labeled_asset("AColorMaterial".to_string(), CustomMaterial {});
+             let mesh_handle = mesh3d.0.clone();
+             entity
+-                .remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>)>()
++                .remove::<Mesh3d>()
+                 .insert((Mesh2d(mesh_handle), MeshMaterial2d(material_handle.clone())));
+         }
+     }
+diff --git a/release-content/migration-guides/gltf_pbr.md b/release-content/migration-guides/gltf_pbr.md
+new file mode 100644
+index 0000000000000..cdcbbaf20abc6
+--- /dev/null
++++ b/release-content/migration-guides/gltf_pbr.md
+@@ -0,0 +1,22 @@
++---
++title: "Invert `bevy_gltf` dependency with `bevy_pbr`"
++pull_requests: [22569]
++---
++
++Previously, `bevy_gltf` depended on `bevy_pbr`. This meant scene definition was tightly coupled to rendering. This dependency has been inverted, to allow `bevy_gltf` to function without any of the rendering stack present.
++
++You can disable PBR rendering by initializing `PbrPlugin` as so:
++
++```rs
++PbrPlugin {
++    gltf_render_enabled: false,
++    ..Default::default()
++}
++```
++
++`GltfExtensionHandler` trait's methods have been updated:
++
++- `on_material` passes in the `material_asset : &GltfMaterial` and `material_label: &str`
++- `on_spawn_mesh_and_material` also passes in the `material_label: &str`
++
++`UvChannel` has moved from `bevy_pbr` to `bevy_mesh`.

@@ -1,0 +1,225 @@
+diff --git a/crates/bevy_camera/src/visibility/mod.rs b/crates/bevy_camera/src/visibility/mod.rs
+index 76d3f3db02122..9a4d496693823 100644
+--- a/crates/bevy_camera/src/visibility/mod.rs
++++ b/crates/bevy_camera/src/visibility/mod.rs
+@@ -11,7 +11,8 @@ pub use range::*;
+ pub use render_layers::*;
+ 
+ use bevy_app::{Plugin, PostUpdate};
+-use bevy_asset::Assets;
++use bevy_asset::prelude::AssetChanged;
++use bevy_asset::{AssetEventSystems, Assets};
+ use bevy_ecs::{hierarchy::validate_parent_has_component, prelude::*};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_transform::{components::GlobalTransform, TransformSystems};
+@@ -351,12 +352,7 @@ impl Plugin for VisibilityPlugin {
+             .register_required_components::<Mesh2d, VisibilityClass>()
+             .configure_sets(
+                 PostUpdate,
+-                (
+-                    CalculateBounds
+-                        .ambiguous_with(mark_3d_meshes_as_changed_if_their_assets_changed),
+-                    UpdateFrusta,
+-                    VisibilityPropagate,
+-                )
++                (UpdateFrusta, VisibilityPropagate)
+                     .before(CheckVisibility)
+                     .after(TransformSystems::Propagate),
+             )
+@@ -364,6 +360,15 @@ impl Plugin for VisibilityPlugin {
+                 PostUpdate,
+                 MarkNewlyHiddenEntitiesInvisible.after(CheckVisibility),
+             )
++            .configure_sets(
++                PostUpdate,
++                (CalculateBounds)
++                    .before(CheckVisibility)
++                    .after(TransformSystems::Propagate)
++                    .after(AssetEventSystems)
++                    .ambiguous_with(CalculateBounds)
++                    .ambiguous_with(mark_3d_meshes_as_changed_if_their_assets_changed),
++            )
+             .init_resource::<PreviousVisibleEntities>()
+             .add_systems(
+                 PostUpdate,
+@@ -384,6 +389,14 @@ impl Plugin for VisibilityPlugin {
+     }
+ }
+ 
++/// Add this component to an entity to prevent its `AABB` from being automatically recomputed.
++///
++/// This is useful if entities are already spawned with a correct `Aabb` component, or you have
++/// many entities and want to avoid the cost of table scans searching for entities that need to have
++/// their AABB recomputed.
++#[derive(Component, Clone, Debug, Default, Reflect)]
++pub struct NoAutoAabb;
++
+ /// Computes and adds an [`Aabb`] component to entities with a
+ /// [`Mesh3d`] component and without a [`NoFrustumCulling`] component.
+ ///
+@@ -391,15 +404,38 @@ impl Plugin for VisibilityPlugin {
+ pub fn calculate_bounds(
+     mut commands: Commands,
+     meshes: Res<Assets<Mesh>>,
+-    without_aabb: Query<(Entity, &Mesh3d), (Without<Aabb>, Without<NoFrustumCulling>)>,
++    new_aabb: Query<
++        (Entity, &Mesh3d),
++        (
++            Without<Aabb>,
++            Without<NoFrustumCulling>,
++            Without<NoAutoAabb>,
++        ),
++    >,
++    mut update_aabb: Query<
++        (&Mesh3d, &mut Aabb),
++        (
++            Or<(AssetChanged<Mesh3d>, Changed<Mesh3d>)>,
++            Without<NoFrustumCulling>,
++            Without<NoAutoAabb>,
++        ),
++    >,
+ ) {
+-    for (entity, mesh_handle) in &without_aabb {
++    for (entity, mesh_handle) in &new_aabb {
+         if let Some(mesh) = meshes.get(mesh_handle)
+             && let Some(aabb) = mesh.compute_aabb()
+         {
+             commands.entity(entity).try_insert(aabb);
+         }
+     }
++
++    update_aabb
++        .par_iter_mut()
++        .for_each(|(mesh_handle, mut old_aabb)| {
++            if let Some(aabb) = meshes.get(mesh_handle).and_then(MeshAabb::compute_aabb) {
++                *old_aabb = aabb;
++            }
++        });
+ }
+ 
+ /// Updates [`Frustum`].
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index a2a5d594d0b79..5c6e9fa755021 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -52,8 +52,11 @@ pub use text2d::*;
+ pub use texture_slice::*;
+ 
+ use bevy_app::prelude::*;
++use bevy_asset::prelude::AssetChanged;
++use bevy_camera::visibility::NoAutoAabb;
+ use bevy_ecs::prelude::*;
+ use bevy_image::{Image, TextureAtlasLayout, TextureAtlasPlugin};
++use bevy_math::Vec2;
+ 
+ /// Adds support for 2D sprites.
+ #[derive(Default)]
+@@ -107,24 +110,62 @@ pub fn calculate_bounds_2d(
+     meshes: Res<Assets<Mesh>>,
+     images: Res<Assets<Image>>,
+     atlases: Res<Assets<TextureAtlasLayout>>,
+-    meshes_without_aabb: Query<(Entity, &Mesh2d), (Without<Aabb>, Without<NoFrustumCulling>)>,
+-    sprites_to_recalculate_aabb: Query<
++    new_mesh_aabb: Query<
++        (Entity, &Mesh2d),
++        (
++            Without<Aabb>,
++            Without<NoFrustumCulling>,
++            Without<NoAutoAabb>,
++        ),
++    >,
++    mut update_mesh_aabb: Query<
++        (&Mesh2d, &mut Aabb),
++        (
++            Or<(AssetChanged<Mesh2d>, Changed<Mesh2d>)>,
++            Without<NoFrustumCulling>,
++            Without<NoAutoAabb>,
++            Without<Sprite>, // disjoint mutable query
++        ),
++    >,
++    new_sprite_aabb: Query<
+         (Entity, &Sprite, &Anchor),
+         (
+-            Or<(Without<Aabb>, Changed<Sprite>, Changed<Anchor>)>,
++            Without<Aabb>,
+             Without<NoFrustumCulling>,
++            Without<NoAutoAabb>,
++        ),
++    >,
++    mut update_sprite_aabb: Query<
++        (&Sprite, &mut Aabb, &Anchor),
++        (
++            Or<(Changed<Sprite>, Changed<Anchor>)>,
++            Without<NoFrustumCulling>,
++            Without<NoAutoAabb>,
++            Without<Mesh2d>, // disjoint mutable query
+         ),
+     >,
+ ) {
+-    for (entity, mesh_handle) in &meshes_without_aabb {
+-        if let Some(mesh) = meshes.get(&mesh_handle.0)
++    // New meshes require inserting a component
++    for (entity, mesh_handle) in &new_mesh_aabb {
++        if let Some(mesh) = meshes.get(mesh_handle)
+             && let Some(aabb) = mesh.compute_aabb()
+         {
+             commands.entity(entity).try_insert(aabb);
+         }
+     }
+-    for (entity, sprite, anchor) in &sprites_to_recalculate_aabb {
+-        if let Some(size) = sprite
++
++    // Updated meshes can take the fast path with parallel component mutation
++    update_mesh_aabb
++        .par_iter_mut()
++        .for_each(|(mesh_handle, mut aabb)| {
++            if let Some(new_aabb) = meshes.get(mesh_handle).and_then(MeshAabb::compute_aabb) {
++                aabb.set_if_neq(new_aabb);
++            }
++        });
++
++    // Sprite helper
++    let sprite_size = |sprite: &Sprite| -> Option<Vec2> {
++        sprite
+             .custom_size
+             .or_else(|| sprite.rect.map(|rect| rect.size()))
+             .or_else(|| match &sprite.texture_atlas {
+@@ -135,14 +176,31 @@ pub fn calculate_bounds_2d(
+                     .texture_rect(&atlases)
+                     .map(|rect| rect.size().as_vec2()),
+             })
+-        {
+-            let aabb = Aabb {
+-                center: (-anchor.as_vec() * size).extend(0.0).into(),
+-                half_extents: (0.5 * size).extend(0.0).into(),
+-            };
+-            commands.entity(entity).try_insert(aabb);
+-        }
++    };
++
++    // New sprites require inserting a component
++    for (size, (entity, anchor)) in new_sprite_aabb
++        .iter()
++        .filter_map(|(entity, sprite, anchor)| sprite_size(sprite).zip(Some((entity, anchor))))
++    {
++        let aabb = Aabb {
++            center: (-anchor.as_vec() * size).extend(0.0).into(),
++            half_extents: (0.5 * size).extend(0.0).into(),
++        };
++        commands.entity(entity).try_insert(aabb);
+     }
++
++    // Updated sprites can take the fast path with parallel component mutation
++    update_sprite_aabb
++        .par_iter_mut()
++        .for_each(|(sprite, mut aabb, anchor)| {
++            if let Some(size) = sprite_size(sprite) {
++                aabb.set_if_neq(Aabb {
++                    center: (-anchor.as_vec() * size).extend(0.0).into(),
++                    half_extents: (0.5 * size).extend(0.0).into(),
++                });
++            }
++        });
+ }
+ 
+ #[cfg(test)]
