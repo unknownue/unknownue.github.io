@@ -1,0 +1,227 @@
+diff --git a/crates/bevy_sprite_render/src/render/mod.rs b/crates/bevy_sprite_render/src/render/mod.rs
+index 8bcbba16048e9..583c8ad9dfe7d 100644
+--- a/crates/bevy_sprite_render/src/render/mod.rs
++++ b/crates/bevy_sprite_render/src/render/mod.rs
+@@ -630,7 +630,7 @@ pub fn prepare_sprite_image_bind_groups(
+         let mut current_batch = None;
+         let mut batch_item_index = 0;
+         let mut batch_image_size = Vec2::ZERO;
+-        let mut batch_image_handle = AssetId::invalid();
++        let mut batch_image_handle = None;
+ 
+         // Iterate through the phase items and detect when successive sprites that can be batched.
+         // Spawn an entity with a `SpriteBatch` component for each possible batch.
+@@ -646,20 +646,21 @@ pub fn prepare_sprite_image_bind_groups(
+                 // If there is a phase item that is not a sprite, then we must start a new
+                 // batch to draw the other phase item(s) and to respect draw order. This can be
+                 // done by invalidating the batch_image_handle
+-                batch_image_handle = AssetId::invalid();
++                batch_image_handle = None;
+                 continue;
+             };
+ 
+-            if batch_image_handle != extracted_sprite.image_handle_id {
++            if batch_image_handle != Some(extracted_sprite.image_handle_id) {
+                 let Some(gpu_image) = gpu_images.get(extracted_sprite.image_handle_id) else {
+                     continue;
+                 };
+ 
+                 batch_image_size = gpu_image.size_2d().as_vec2();
+-                batch_image_handle = extracted_sprite.image_handle_id;
++                let image_handle = extracted_sprite.image_handle_id;
++                batch_image_handle = Some(image_handle);
+                 image_bind_groups
+                     .values
+-                    .entry(batch_image_handle)
++                    .entry(image_handle)
+                     .or_insert_with(|| {
+                         render_device.create_bind_group(
+                             "sprite_material_bind_group",
+@@ -674,7 +675,7 @@ pub fn prepare_sprite_image_bind_groups(
+                 batch_item_index = item_index;
+                 current_batch = Some(batches.entry((*retained_view, item.entity())).insert(
+                     SpriteBatch {
+-                        image_handle_id: batch_image_handle,
++                        image_handle_id: image_handle,
+                         range: index..index,
+                     },
+                 ));
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index fee505ee9ac04..360748b40521f 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -1415,7 +1415,7 @@ pub fn prepare_uinodes(
+ 
+         for ui_phase in phases.values_mut() {
+             let mut batch_item_index = 0;
+-            let mut batch_image_handle = AssetId::invalid();
++            let mut batch_image_handle = None;
+ 
+             for item_index in 0..ui_phase.items.len() {
+                 let item = &mut ui_phase.items[item_index];
+@@ -1424,21 +1424,21 @@ pub fn prepare_uinodes(
+                     .get(item.index)
+                     .filter(|n| item.entity() == n.render_entity)
+                 else {
+-                    batch_image_handle = AssetId::invalid();
++                    batch_image_handle = None;
+                     continue;
+                 };
+ 
+                 let mut existing_batch = batches.last_mut();
+ 
+-                if batch_image_handle == AssetId::invalid()
++                if batch_image_handle.is_none()
+                     || existing_batch.is_none()
+-                    || (batch_image_handle != AssetId::default()
++                    || (batch_image_handle != Some(AssetId::default())
+                         && extracted_uinode.image != AssetId::default()
+-                        && batch_image_handle != extracted_uinode.image)
++                        && batch_image_handle != Some(extracted_uinode.image))
+                 {
+                     if let Some(gpu_image) = gpu_images.get(extracted_uinode.image) {
+                         batch_item_index = item_index;
+-                        batch_image_handle = extracted_uinode.image;
++                        batch_image_handle = Some(extracted_uinode.image);
+ 
+                         let new_batch = UiBatch {
+                             range: vertices_index..vertices_index,
+@@ -1449,7 +1449,7 @@ pub fn prepare_uinodes(
+ 
+                         image_bind_groups
+                             .values
+-                            .entry(batch_image_handle)
++                            .entry(extracted_uinode.image)
+                             .or_insert_with(|| {
+                                 render_device.create_bind_group(
+                                     "ui_material_bind_group",
+@@ -1466,18 +1466,18 @@ pub fn prepare_uinodes(
+                     } else {
+                         continue;
+                     }
+-                } else if batch_image_handle == AssetId::default()
++                } else if batch_image_handle == Some(AssetId::default())
+                     && extracted_uinode.image != AssetId::default()
+                 {
+                     if let Some(ref mut existing_batch) = existing_batch
+                         && let Some(gpu_image) = gpu_images.get(extracted_uinode.image)
+                     {
+-                        batch_image_handle = extracted_uinode.image;
++                        batch_image_handle = Some(extracted_uinode.image);
+                         existing_batch.1.image = extracted_uinode.image;
+ 
+                         image_bind_groups
+                             .values
+-                            .entry(batch_image_handle)
++                            .entry(extracted_uinode.image)
+                             .or_insert_with(|| {
+                                 render_device.create_bind_group(
+                                     "ui_material_bind_group",
+diff --git a/crates/bevy_ui_render/src/ui_material_pipeline.rs b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+index 7937a4246ccca..85f6e14916cfa 100644
+--- a/crates/bevy_ui_render/src/ui_material_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_material_pipeline.rs
+@@ -405,7 +405,7 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
+ 
+         for ui_phase in phases.values_mut() {
+             let mut batch_item_index = 0;
+-            let mut batch_shader_handle = AssetId::invalid();
++            let mut batch_shader_handle = None;
+ 
+             for item_index in 0..ui_phase.items.len() {
+                 let item = &mut ui_phase.items[item_index];
+@@ -416,11 +416,11 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
+                 {
+                     let mut existing_batch = batches
+                         .last_mut()
+-                        .filter(|_| batch_shader_handle == extracted_uinode.material);
++                        .filter(|_| batch_shader_handle == Some(extracted_uinode.material));
+ 
+                     if existing_batch.is_none() {
+                         batch_item_index = item_index;
+-                        batch_shader_handle = extracted_uinode.material;
++                        batch_shader_handle = Some(extracted_uinode.material);
+ 
+                         let new_batch = UiMaterialBatch {
+                             range: index..index,
+@@ -531,7 +531,7 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
+                     existing_batch.unwrap().1.range.end = index;
+                     ui_phase.items[batch_item_index].batch_range_mut().end += 1;
+                 } else {
+-                    batch_shader_handle = AssetId::invalid();
++                    batch_shader_handle = None;
+                 }
+             }
+         }
+diff --git a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+index ecd7f2512ce49..50f32b9d009ea 100644
+--- a/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
++++ b/crates/bevy_ui_render/src/ui_texture_slice_pipeline.rs
+@@ -397,7 +397,7 @@ pub fn prepare_ui_slices(
+ 
+         for ui_phase in phases.values_mut() {
+             let mut batch_item_index = 0;
+-            let mut batch_image_handle = AssetId::invalid();
++            let mut batch_image_handle = None;
+             let mut batch_image_size = Vec2::ZERO;
+ 
+             for item_index in 0..ui_phase.items.len() {
+@@ -409,15 +409,15 @@ pub fn prepare_ui_slices(
+                 {
+                     let mut existing_batch = batches.last_mut();
+ 
+-                    if batch_image_handle == AssetId::invalid()
++                    if batch_image_handle.is_none()
+                         || existing_batch.is_none()
+-                        || (batch_image_handle != AssetId::default()
++                        || (batch_image_handle != Some(AssetId::default())
+                             && texture_slices.image != AssetId::default()
+-                            && batch_image_handle != texture_slices.image)
++                            && batch_image_handle != Some(texture_slices.image))
+                     {
+                         if let Some(gpu_image) = gpu_images.get(texture_slices.image) {
+                             batch_item_index = item_index;
+-                            batch_image_handle = texture_slices.image;
++                            batch_image_handle = Some(texture_slices.image);
+                             batch_image_size = gpu_image.size_2d().as_vec2();
+ 
+                             let new_batch = UiTextureSlicerBatch {
+@@ -429,7 +429,7 @@ pub fn prepare_ui_slices(
+ 
+                             image_bind_groups
+                                 .values
+-                                .entry(batch_image_handle)
++                                .entry(texture_slices.image)
+                                 .or_insert_with(|| {
+                                     render_device.create_bind_group(
+                                         "ui_texture_slice_image_layout",
+@@ -448,17 +448,17 @@ pub fn prepare_ui_slices(
+                             continue;
+                         }
+                     } else if let Some(ref mut existing_batch) = existing_batch
+-                        && batch_image_handle == AssetId::default()
++                        && batch_image_handle == Some(AssetId::default())
+                         && texture_slices.image != AssetId::default()
+                     {
+                         if let Some(gpu_image) = gpu_images.get(texture_slices.image) {
+-                            batch_image_handle = texture_slices.image;
++                            batch_image_handle = Some(texture_slices.image);
+                             batch_image_size = gpu_image.size_2d().as_vec2();
+                             existing_batch.1.image = texture_slices.image;
+ 
+                             image_bind_groups
+                                 .values
+-                                .entry(batch_image_handle)
++                                .entry(texture_slices.image)
+                                 .or_insert_with(|| {
+                                     render_device.create_bind_group(
+                                         "ui_texture_slice_image_layout",
+@@ -617,7 +617,7 @@ pub fn prepare_ui_slices(
+                     existing_batch.unwrap().1.range.end = vertices_index;
+                     ui_phase.items[batch_item_index].batch_range_mut().end += 1;
+                 } else {
+-                    batch_image_handle = AssetId::invalid();
++                    batch_image_handle = None;
+                 }
+             }
+         }
