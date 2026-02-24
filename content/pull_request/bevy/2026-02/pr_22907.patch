@@ -1,0 +1,151 @@
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index 8e143a130e2b6..f2539ba44d0af 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -164,7 +164,7 @@ pub use {assets::*, label::GltfAssetLabel, loader::*, material::GltfMaterial};
+ /// Re-exports for GLTF
+ pub mod gltf {
+     #[doc(hidden)]
+-    pub use gltf::{Animation, Gltf, Material, Mesh, Primitive, Scene, Texture};
++    pub use gltf::{Animation, Document, Gltf, Material, Mesh, Primitive, Scene, Texture};
+ }
+ 
+ // Has to store an Arc<Mutex<...>> as there is no other way to mutate fields of asset loaders.
+diff --git a/crates/bevy_gltf/src/loader/extensions/mod.rs b/crates/bevy_gltf/src/loader/extensions/mod.rs
+index bdbb67a7eb128..76487baad8134 100644
+--- a/crates/bevy_gltf/src/loader/extensions/mod.rs
++++ b/crates/bevy_gltf/src/loader/extensions/mod.rs
+@@ -119,6 +119,37 @@ pub trait GltfExtensionHandler: Send + Sync {
+     ) {
+     }
+ 
++    /// Called when an individual glTF primitive is processed
++    /// glTF primitives are what become a Bevy `Mesh`
++    ///
++    /// `buffer_data` is the raw buffer data from the glTF file, where each `Vec<u8>` represents
++    /// a buffer containing geometry data such as vertex attributes and indices. Extensions can
++    /// read this data to process compressed or encoded primitive data.
++    ///
++    /// `out_doc` allows extensions to provide a modified or
++    /// replacement glTF document. If set, the loader will use this modified document for subsequent
++    /// primitive processing. This is useful for extensions that need to decompress or transform
++    /// the glTF structure before it is processed.
++    ///
++    /// `out_data` allows extensions to provide modified or
++    /// replacement buffer data. If set, the loader will use this modified buffer data instead of
++    /// the original `buffer_data`. This is useful for extensions like `EXT_meshopt_compression`
++    /// that need to decompress buffer data before the primitive is processed.
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_gltf_primitive(
++        &mut self,
++        load_context: &mut LoadContext<'_>,
++        gltf_document: &gltf::Gltf,
++        gltf_primitive: &gltf::Primitive,
++        buffer_data: &[Vec<u8>],
++        out_doc: &mut Option<gltf::Document>,
++        out_data: &mut Option<Vec<Vec<u8>>>,
++    ) {
++    }
++
+     /// Called when an individual glTF Mesh is processed
+     #[expect(
+         unused,
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index 48395c746cba0..44939c20d8a22 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -207,6 +207,8 @@ pub struct GltfLoaderSettings {
+     pub default_sampler: Option<ImageSamplerDescriptor>,
+     /// If true, the loader will ignore sampler data from gltf and use the default sampler.
+     pub override_sampler: bool,
++    /// If false, the loader will load gltf json without validation, for unsupported extension it will ignore validation check.
++    pub validate: bool,
+     /// Overrides the default glTF coordinate conversion setting.
+     ///
+     /// If `None`, uses the global default set by [`GltfPlugin::convert_coordinates`](crate::GltfPlugin::convert_coordinates).
+@@ -226,6 +228,7 @@ impl Default for GltfLoaderSettings {
+             include_source: false,
+             default_sampler: None,
+             override_sampler: false,
++            validate: true,
+             convert_coordinates: None,
+             skinned_mesh_bounds_policy: None,
+         }
+@@ -240,7 +243,11 @@ impl GltfLoader {
+         load_context: &'b mut LoadContext<'c>,
+         settings: &'b GltfLoaderSettings,
+     ) -> Result<Gltf, GltfError> {
+-        let gltf = gltf::Gltf::from_slice(bytes)?;
++        let gltf = if settings.validate {
++            gltf::Gltf::from_slice(bytes)?
++        } else {
++            gltf::Gltf::from_slice_without_validation(bytes)?
++        };
+ 
+         // clone extensions to start with a fresh processing state
+         let mut extensions = loader.extensions.read().await.clone();
+@@ -719,6 +726,52 @@ impl GltfLoader {
+ 
+                 let mut mesh = Mesh::new(primitive_topology, settings.load_meshes);
+ 
++                let mut out_doc: Option<gltf::Document> = None;
++                let mut out_data: Option<Vec<Vec<u8>>> = None;
++                for extension in extensions.iter_mut() {
++                    extension.on_gltf_primitive(
++                        load_context,
++                        &gltf,
++                        &primitive,
++                        &buffer_data,
++                        &mut out_doc,
++                        &mut out_data,
++                    );
++                }
++
++                let primitive = if let Some(doc) = &out_doc {
++                    let meshes_len = doc.meshes().len();
++                    if meshes_len != 1 {
++                        warn!(
++                            "Extension returned {} meshes, expected exactly 1. Using original primitive.",
++                            meshes_len
++                        );
++                        primitive
++                    } else if let Some(mesh) = doc.meshes().next() {
++                        let primitives_len = mesh.primitives().len();
++                        if primitives_len != 1 {
++                            warn!(
++                                "Extension returned {} primitives, expected exactly 1. Using original primitive.",
++                                primitives_len
++                            );
++                            primitive
++                        } else if let Some(doc_primitive) = mesh.primitives().next() {
++                            doc_primitive
++                        } else {
++                            primitive
++                        }
++                    } else {
++                        primitive
++                    }
++                } else {
++                    primitive
++                };
++                let buffer_data = if let Some(data) = &out_data {
++                    data
++                } else {
++                    &buffer_data
++                };
++
+                 // Read vertex attributes
+                 for (semantic, accessor) in primitive.attributes() {
+                     if [Semantic::Joints(0), Semantic::Weights(0)].contains(&semantic) {
+@@ -736,7 +789,7 @@ impl GltfLoader {
+                     match convert_attribute(
+                         semantic,
+                         accessor,
+-                        &buffer_data,
++                        buffer_data,
+                         &loader.custom_vertex_attributes,
+                         convert_coordinates.rotate_meshes,
+                     ) {
