@@ -1,0 +1,4180 @@
+diff --git a/crates/bevy_core_pipeline/src/core_3d/mod.rs b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+index 42af8ed981880..3cc18c5bd6e03 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/mod.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+@@ -31,7 +31,7 @@ use bevy_diagnostic::FrameCount;
+ use bevy_render::{
+     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
+     camera::CameraRenderGraph,
+-    mesh::allocator::SlabId,
++    mesh::allocator::MeshSlabs,
+     occlusion_culling::OcclusionCulling,
+     render_phase::{PhaseItemBatchSetKey, ViewRangefinder3d},
+     texture::CachedTexture,
+@@ -195,16 +195,13 @@ pub struct Opaque3dBatchSetKey {
+     /// In the case of PBR, this is the `MaterialBindGroupIndex`.
+     pub material_bind_group_index: Option<u32>,
+ 
+-    /// The ID of the slab of GPU memory that contains vertex data.
++    /// The IDs of the slabs of GPU memory in the mesh allocator that contain
++    /// the mesh data.
+     ///
+-    /// For non-mesh items, you can fill this with 0 if your items can be
+-    /// multi-drawn, or with a unique value if they can't.
+-    pub vertex_slab: SlabId,
+-
+-    /// The ID of the slab of GPU memory that contains index data, if present.
+-    ///
+-    /// For non-mesh items, you can safely fill this with `None`.
+-    pub index_slab: Option<SlabId>,
++    /// For non-mesh items, you can fill the [`MeshSlabs::vertex_slab_id`] with
++    /// 0 if your items can be multi-drawn, or with a unique value if they
++    /// can't.
++    pub slabs: MeshSlabs,
+ 
+     /// Index of the slab that the lightmap resides in, if a lightmap is
+     /// present.
+@@ -213,7 +210,7 @@ pub struct Opaque3dBatchSetKey {
+ 
+ impl PhaseItemBatchSetKey for Opaque3dBatchSetKey {
+     fn indexed(&self) -> bool {
+-        self.index_slab.is_some()
++        self.slabs.index_slab_id.is_some()
+     }
+ }
+ 
+diff --git a/crates/bevy_core_pipeline/src/prepass/mod.rs b/crates/bevy_core_pipeline/src/prepass/mod.rs
+index c4ad850b348b7..4feb05f915520 100644
+--- a/crates/bevy_core_pipeline/src/prepass/mod.rs
++++ b/crates/bevy_core_pipeline/src/prepass/mod.rs
+@@ -34,7 +34,7 @@ use bevy_asset::UntypedAssetId;
+ use bevy_ecs::prelude::*;
+ use bevy_math::Mat4;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::mesh::allocator::SlabId;
++use bevy_render::mesh::allocator::MeshSlabs;
+ use bevy_render::render_phase::PhaseItemBatchSetKey;
+ use bevy_render::sync_world::MainEntity;
+ use bevy_render::{
+@@ -206,21 +206,18 @@ pub struct OpaqueNoLightmap3dBatchSetKey {
+     /// In the case of PBR, this is the `MaterialBindGroupIndex`.
+     pub material_bind_group_index: Option<u32>,
+ 
+-    /// The ID of the slab of GPU memory that contains vertex data.
++    /// The IDs of the slabs of GPU memory in the mesh allocator that contain
++    /// the mesh data.
+     ///
+-    /// For non-mesh items, you can fill this with 0 if your items can be
+-    /// multi-drawn, or with a unique value if they can't.
+-    pub vertex_slab: SlabId,
+-
+-    /// The ID of the slab of GPU memory that contains index data, if present.
+-    ///
+-    /// For non-mesh items, you can safely fill this with `None`.
+-    pub index_slab: Option<SlabId>,
++    /// For non-mesh items, you can fill the [`MeshSlabs::vertex_slab_id`] with
++    /// 0 if your items can be multi-drawn, or with a unique value if they
++    /// can't.
++    pub slabs: MeshSlabs,
+ }
+ 
+ impl PhaseItemBatchSetKey for OpaqueNoLightmap3dBatchSetKey {
+     fn indexed(&self) -> bool {
+-        self.index_slab.is_some()
++        self.slabs.index_slab_id.is_some()
+     }
+ }
+ 
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index a6930c32654f3..2ec20c74e1899 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -30,7 +30,7 @@ use bevy_math::{Mat4, Vec3};
+ #[cfg(feature = "pbr_transmission_textures")]
+ use bevy_mesh::UvChannel;
+ use bevy_mesh::{
+-    morph::{MeshMorphWeights, MorphAttributes, MorphTargetImage, MorphWeights},
++    morph::{MeshMorphWeights, MorphAttributes, MorphWeights},
+     skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+     Indices, Mesh, Mesh3d, MeshVertexAttribute, PrimitiveTopology,
+ };
+@@ -812,26 +812,17 @@ impl GltfLoader {
+                 {
+                     let morph_target_reader = reader.read_morph_targets();
+                     if morph_target_reader.len() != 0 {
+-                        let morph_targets_label = GltfAssetLabel::MorphTarget {
+-                            mesh: gltf_mesh.index(),
+-                            primitive: primitive.index(),
+-                        };
+-                        let morph_target_image = MorphTargetImage::new(
+-                            morph_target_reader.map(|i| PrimitiveMorphAttributesIter {
+-                                convert_coordinates: convert_coordinates.rotate_meshes,
+-                                positions: i.0,
+-                                normals: i.1,
+-                                tangents: i.2,
+-                            }),
+-                            mesh.count_vertices(),
+-                            RenderAssetUsages::default(),
+-                        )?;
+-                        let handle = load_context.add_labeled_asset(
+-                            morph_targets_label.to_string(),
+-                            morph_target_image.0,
++                        mesh.set_morph_targets(
++                            morph_target_reader
++                                .flat_map(|i| PrimitiveMorphAttributesIter {
++                                    convert_coordinates: convert_coordinates.rotate_meshes,
++                                    positions: i.0,
++                                    normals: i.1,
++                                    tangents: i.2,
++                                })
++                                .collect(),
+                         );
+ 
+-                        mesh.set_morph_targets(handle);
+                         let extras = gltf_mesh.extras().as_ref();
+                         if let Some(names) = extras.and_then(|extras| {
+                             serde_json::from_str::<MorphTargetNames>(extras.get()).ok()
+@@ -2076,6 +2067,9 @@ impl<'s> Iterator for PrimitiveMorphAttributesIter<'s> {
+             position: position.map(Into::into).unwrap_or(Vec3::ZERO),
+             normal: normal.map(Into::into).unwrap_or(Vec3::ZERO),
+             tangent: tangent.map(Into::into).unwrap_or(Vec3::ZERO),
++            pad_a: 0.0,
++            pad_b: 0.0,
++            pad_c: 0.0,
+         };
+ 
+         if self.convert_coordinates {
+@@ -2083,6 +2077,9 @@ impl<'s> Iterator for PrimitiveMorphAttributesIter<'s> {
+                 position: attributes.position.convert_coordinates(),
+                 normal: attributes.normal.convert_coordinates(),
+                 tangent: attributes.tangent.convert_coordinates(),
++                pad_a: 0.0,
++                pad_b: 0.0,
++                pad_c: 0.0,
+             }
+         }
+ 
+diff --git a/crates/bevy_mesh/Cargo.toml b/crates/bevy_mesh/Cargo.toml
+index 09dbc3241a213..23a2db39dbceb 100644
+--- a/crates/bevy_mesh/Cargo.toml
++++ b/crates/bevy_mesh/Cargo.toml
+@@ -12,6 +12,7 @@ keywords = ["bevy"]
+ # bevy
+ bevy_app = { path = "../bevy_app", version = "0.19.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.19.0-dev" }
++bevy_encase_derive = { path = "../bevy_encase_derive", version = "0.19.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.19.0-dev", optional = true }
+ bevy_math = { path = "../bevy_math", version = "0.19.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.19.0-dev" }
+@@ -35,6 +36,7 @@ hexasphere = "18.0"
+ thiserror = { version = "2", default-features = false }
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
+ derive_more = { version = "2", default-features = false, features = ["from"] }
++encase = "0.12"
+ 
+ [dev-dependencies]
+ approx = "0.5"
+diff --git a/crates/bevy_mesh/src/mesh.rs b/crates/bevy_mesh/src/mesh.rs
+index 77e1aa4344efc..e1288968dc9c6 100644
+--- a/crates/bevy_mesh/src/mesh.rs
++++ b/crates/bevy_mesh/src/mesh.rs
+@@ -8,14 +8,12 @@ use super::{
+     MeshVertexBufferLayoutRef, MeshVertexBufferLayouts, MeshWindingInvertError,
+     VertexAttributeValues, VertexBufferLayout,
+ };
++#[cfg(feature = "morph")]
++use crate::morph::MorphAttributes;
+ #[cfg(feature = "serialize")]
+ use crate::SerializedMeshAttributeData;
+ use alloc::collections::BTreeMap;
+-#[cfg(feature = "morph")]
+-use bevy_asset::Handle;
+ use bevy_asset::{Asset, RenderAssetUsages};
+-#[cfg(feature = "morph")]
+-use bevy_image::Image;
+ use bevy_math::{bounding::Aabb3d, primitives::Triangle3d, *};
+ use bevy_platform::collections::{hash_map, HashMap};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+@@ -237,7 +235,7 @@ pub struct Mesh {
+     attributes: MeshExtractableData<BTreeMap<MeshVertexAttributeId, MeshAttributeData>>,
+     indices: MeshExtractableData<Indices>,
+     #[cfg(feature = "morph")]
+-    morph_targets: MeshExtractableData<Handle<Image>>,
++    morph_targets: MeshExtractableData<Vec<MorphAttributes>>,
+     #[cfg(feature = "morph")]
+     morph_target_names: MeshExtractableData<Vec<String>>,
+     pub asset_usage: RenderAssetUsages,
+@@ -856,6 +854,20 @@ impl Mesh {
+         })
+     }
+ 
++    /// If any morph displacements are present, returns them as a
++    /// [`MorphAttributes`] array.
++    ///
++    /// # Panics
++    /// Panics when the mesh data has already been extracted to the render
++    /// world.
++    #[cfg(feature = "morph")]
++    pub fn get_morph_targets(&self) -> Option<&[MorphAttributes]> {
++        self.morph_targets
++            .as_ref_option()
++            .expect(MESH_EXTRACTED_ERROR)
++            .map(|morph_attributes| &morph_attributes[..])
++    }
++
+     /// Get this `Mesh`'s [`MeshVertexBufferLayout`], used in `SpecializedMeshPipeline`.
+     ///
+     /// # Panics
+@@ -2346,76 +2358,82 @@ impl Mesh {
+         Ok(self.morph_targets.as_ref_option()?.is_some())
+     }
+ 
+-    /// Set [morph targets] image for this mesh. This requires a "morph target image". See [`MorphTargetImage`](crate::morph::MorphTargetImage) for info.
++    /// Set the [morph target] displacements for this mesh.
+     ///
+-    /// [morph targets]: https://en.wikipedia.org/wiki/Morph_target_animation
++    /// [morph target]: https://en.wikipedia.org/wiki/Morph_target_animation
+     ///
+     /// # Panics
+     /// Panics when the mesh data has already been extracted to `RenderWorld`. To handle
+     /// this as an error use [`Mesh::try_set_morph_targets`]
+-    pub fn set_morph_targets(&mut self, morph_targets: Handle<Image>) {
++    #[cfg(feature = "morph")]
++    pub fn set_morph_targets(&mut self, morph_targets: Vec<MorphAttributes>) {
+         self.try_set_morph_targets(morph_targets)
+             .expect(MESH_EXTRACTED_ERROR);
+     }
+ 
+-    /// Set [morph targets] image for this mesh. This requires a "morph target image". See [`MorphTargetImage`](crate::morph::MorphTargetImage) for info.
++    /// Set the [morph target] displacements for this mesh.
+     ///
+     /// [morph targets]: https://en.wikipedia.org/wiki/Morph_target_animation
++    #[cfg(feature = "morph")]
+     pub fn try_set_morph_targets(
+         &mut self,
+-        morph_targets: Handle<Image>,
++        morph_targets: Vec<MorphAttributes>,
+     ) -> Result<(), MeshAccessError> {
+         self.morph_targets.replace(Some(morph_targets))?;
+         Ok(())
+     }
+ 
+-    /// Retrieve the morph targets for this mesh, or None if there are no morph targets.
++    /// Retrieve the morph target displacements for this mesh, or None if there
++    /// are no morph targets.
++    ///
+     /// # Panics
+     /// Panics when the mesh data has already been extracted to `RenderWorld`. To handle
+     /// this as an error use [`Mesh::try_morph_targets`]
+-    pub fn morph_targets(&self) -> Option<&Handle<Image>> {
++    #[cfg(feature = "morph")]
++    pub fn morph_targets(&self) -> Option<&Vec<MorphAttributes>> {
+         self.morph_targets
+             .as_ref_option()
+             .expect(MESH_EXTRACTED_ERROR)
+     }
+ 
+-    /// Retrieve the morph targets for this mesh, or None if there are no morph targets.
++    /// Retrieve the morph displacements for this mesh, or None if there are no
++    /// morph targets.
+     ///
+     /// Returns an error if the mesh data has been extracted to `RenderWorld`or
+     /// if the morph targets do not exist.
+-    pub fn try_morph_targets(&self) -> Result<&Handle<Image>, MeshAccessError> {
++    #[cfg(feature = "morph")]
++    pub fn try_morph_targets(&self) -> Result<&Vec<MorphAttributes>, MeshAccessError> {
+         self.morph_targets.as_ref()
+     }
+ 
+-    /// Consumes the mesh and returns a mesh with the given [morph targets].
+-    ///
+-    /// This requires a "morph target image". See [`MorphTargetImage`](crate::morph::MorphTargetImage) for info.
++    /// Consumes the mesh and returns a mesh with the given [morph target]
++    /// displacements.
+     ///
+     /// (Alternatively, you can use [`Mesh::set_morph_targets`] to mutate an existing mesh in-place)
+     ///
+-    /// [morph targets]: https://en.wikipedia.org/wiki/Morph_target_animation
++    /// [morph target]: https://en.wikipedia.org/wiki/Morph_target_animation
+     ///
+     /// # Panics
+     /// Panics when the mesh data has already been extracted to `RenderWorld`. To handle
+     /// this as an error use [`Mesh::try_with_morph_targets`]
+     #[must_use]
+-    pub fn with_morph_targets(mut self, morph_targets: Handle<Image>) -> Self {
++    #[cfg(feature = "morph")]
++    pub fn with_morph_targets(mut self, morph_targets: Vec<MorphAttributes>) -> Self {
+         self.set_morph_targets(morph_targets);
+         self
+     }
+ 
+     /// Consumes the mesh and returns a mesh with the given [morph targets].
+     ///
+-    /// This requires a "morph target image". See [`MorphTargetImage`](crate::morph::MorphTargetImage) for info.
+-    ///
+     /// (Alternatively, you can use [`Mesh::set_morph_targets`] to mutate an existing mesh in-place)
+     ///
+     /// [morph targets]: https://en.wikipedia.org/wiki/Morph_target_animation
+     ///
+     /// Returns an error if the mesh data has been extracted to `RenderWorld`.
++    #[cfg(feature = "morph")]
+     pub fn try_with_morph_targets(
+         mut self,
+-        morph_targets: Handle<Image>,
++        morph_targets: Vec<MorphAttributes>,
+     ) -> Result<Self, MeshAccessError> {
+         self.try_set_morph_targets(morph_targets)?;
+         Ok(self)
+diff --git a/crates/bevy_mesh/src/morph.rs b/crates/bevy_mesh/src/morph.rs
+index 37c6accff750c..ce5767b90f56d 100644
+--- a/crates/bevy_mesh/src/morph.rs
++++ b/crates/bevy_mesh/src/morph.rs
+@@ -1,25 +1,30 @@
+ use super::Mesh;
+-use bevy_asset::{Handle, RenderAssetUsages};
++use bevy_asset::Handle;
+ use bevy_ecs::prelude::*;
+-use bevy_image::Image;
+ use bevy_math::Vec3;
+ use bevy_reflect::prelude::*;
+ use bytemuck::{Pod, Zeroable};
++use encase::ShaderType;
+ use thiserror::Error;
+-use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
+ 
+-const MAX_TEXTURE_WIDTH: u32 = 2048;
+-// NOTE: "component" refers to the element count of math objects,
+-// Vec3 has 3 components, Mat2 has 4 components.
+-const MAX_COMPONENTS: u32 = MAX_TEXTURE_WIDTH * MAX_TEXTURE_WIDTH;
++/// The maximum size of the morph target texture, if morph target textures are
++/// in use on the current platform.
++pub const MAX_TEXTURE_WIDTH: u32 = 2048;
+ 
+ /// Max target count available for [morph targets](MorphWeights).
+ pub const MAX_MORPH_WEIGHTS: usize = 256;
+ 
++/// The maximum number of morph target components, if morph target textures are
++/// in use on the current platform.
++///
++/// NOTE: "component" refers to the element count of math objects,
++/// Vec3 has 3 components, Mat2 has 4 components.
++const MAX_COMPONENTS: u32 = MAX_TEXTURE_WIDTH * MAX_TEXTURE_WIDTH;
++
+ #[derive(Error, Clone, Debug)]
+ pub enum MorphBuildError {
+     #[error(
+-        "Too many vertex×components in morph target, max is {MAX_COMPONENTS}, \
++        "Too many vertex components in morph target, max is {MAX_COMPONENTS}, \
+         got {vertex_count}×{component_count} = {}",
+         *vertex_count * *component_count as usize
+     )]
+@@ -35,70 +40,12 @@ pub enum MorphBuildError {
+     TooManyTargets { target_count: usize },
+ }
+ 
+-/// An image formatted for use with [`MorphWeights`] for rendering the morph target.
+-#[derive(Debug)]
+-pub struct MorphTargetImage(pub Image);
+-
+-impl MorphTargetImage {
+-    /// Generate textures for each morph target.
+-    ///
+-    /// This accepts an "iterator of [`MorphAttributes`] iterators". Each item iterated in the top level
+-    /// iterator corresponds "the attributes of a specific morph target".
+-    ///
+-    /// Each pixel of the texture is a component of morph target animated
+-    /// attributes. So a set of 9 pixels is this morph's displacement for
+-    /// position, normal and tangents of a single vertex (each taking 3 pixels).
+-    pub fn new(
+-        targets: impl ExactSizeIterator<Item = impl Iterator<Item = MorphAttributes>>,
+-        vertex_count: usize,
+-        asset_usage: RenderAssetUsages,
+-    ) -> Result<Self, MorphBuildError> {
+-        let max = MAX_TEXTURE_WIDTH;
+-        let target_count = targets.len();
+-        if target_count > MAX_MORPH_WEIGHTS {
+-            return Err(MorphBuildError::TooManyTargets { target_count });
+-        }
+-        let component_count = (vertex_count * MorphAttributes::COMPONENT_COUNT) as u32;
+-        let Some((Rect(width, height), padding)) = lowest_2d(component_count, max) else {
+-            return Err(MorphBuildError::TooManyAttributes {
+-                vertex_count,
+-                component_count,
+-            });
+-        };
+-        let data = targets
+-            .flat_map(|mut attributes| {
+-                let layer_byte_count = (padding + component_count) as usize * size_of::<f32>();
+-                let mut buffer = Vec::with_capacity(layer_byte_count);
+-                for _ in 0..vertex_count {
+-                    let Some(to_add) = attributes.next() else {
+-                        break;
+-                    };
+-                    buffer.extend_from_slice(bytemuck::bytes_of(&to_add));
+-                }
+-                // Pad each layer so that they fit width * height
+-                buffer.extend(core::iter::repeat_n(0, padding as usize * size_of::<f32>()));
+-                debug_assert_eq!(buffer.len(), layer_byte_count);
+-                buffer
+-            })
+-            .collect();
+-        let extents = Extent3d {
+-            width,
+-            height,
+-            depth_or_array_layers: target_count as u32,
+-        };
+-        let image = Image::new(
+-            extents,
+-            TextureDimension::D3,
+-            data,
+-            TextureFormat::R32Float,
+-            asset_usage,
+-        );
+-        Ok(MorphTargetImage(image))
+-    }
+-}
+-
+-/// A component that controls the [morph targets] of one or more
+-/// [`Mesh3d`](crate::Mesh3d) components.
++/// Controls the [morph targets] for all child [`Mesh3d`](crate::Mesh3d)
++/// entities. In most cases, [`MorphWeights`] should be considered the "source
++/// of truth" when writing [morph targets] for meshes. However you can choose to
++/// write child [`MeshMorphWeights`] if your situation requires more
++/// granularity. Just note that if you set [`MorphWeights`], it will overwrite
++/// child [`MeshMorphWeights`] values.
+ ///
+ /// `MorphWeights` works together with the [`MeshMorphWeights`] component. When
+ /// a `MeshMorphWeights` is set to `MeshMorphWeights::Reference`, it references
+@@ -183,20 +130,25 @@ pub enum MeshMorphWeights {
+ }
+ 
+ /// Attributes **differences** used for morph targets.
+-///
+-/// See [`MorphTargetImage`] for more information.
+-#[derive(Copy, Clone, PartialEq, Pod, Zeroable, Default)]
++#[derive(Copy, Clone, PartialEq, Debug, Reflect, ShaderType, Pod, Zeroable, Default)]
++#[reflect(Clone, Default)]
+ #[repr(C)]
+ pub struct MorphAttributes {
+     /// The vertex position difference between base mesh and this target.
+     pub position: Vec3,
++    /// Padding to ensure that vectors start on 16-byte boundaries.
++    pub pad_a: f32,
+     /// The vertex normal difference between base mesh and this target.
+     pub normal: Vec3,
++    /// Padding to ensure that vectors start on 16-byte boundaries.
++    pub pad_b: f32,
+     /// The vertex tangent difference between base mesh and this target.
+     ///
+     /// Note that tangents are a `Vec4`, but only the `xyz` components are
+     /// animated, as the `w` component is the sign and cannot be animated.
+     pub tangent: Vec3,
++    /// Padding to ensure that vectors start on 16-byte boundaries.
++    pub pad_c: f32,
+ }
+ 
+ impl From<[Vec3; 3]> for MorphAttributes {
+@@ -205,6 +157,9 @@ impl From<[Vec3; 3]> for MorphAttributes {
+             position,
+             normal,
+             tangent,
++            pad_a: 0.0,
++            pad_b: 0.0,
++            pad_c: 0.0,
+         }
+     }
+ }
+@@ -220,36 +175,9 @@ impl MorphAttributes {
+             position,
+             normal,
+             tangent,
++            pad_a: 0.0,
++            pad_b: 0.0,
++            pad_c: 0.0,
+         }
+     }
+ }
+-
+-struct Rect(u32, u32);
+-
+-/// Find the smallest rectangle of maximum edge size `max_edge` that contains
+-/// at least `min_includes` cells. `u32` is how many extra cells the rectangle
+-/// has.
+-///
+-/// The following rectangle contains 27 cells, and its longest edge is 9:
+-/// ```text
+-/// ----------------------------
+-/// |1 |2 |3 |4 |5 |6 |7 |8 |9 |
+-/// ----------------------------
+-/// |2 |  |  |  |  |  |  |  |  |
+-/// ----------------------------
+-/// |3 |  |  |  |  |  |  |  |  |
+-/// ----------------------------
+-/// ```
+-///
+-/// Returns `None` if `max_edge` is too small to build a rectangle
+-/// containing `min_includes` cells.
+-fn lowest_2d(min_includes: u32, max_edge: u32) -> Option<(Rect, u32)> {
+-    (1..=max_edge)
+-        .filter_map(|a| {
+-            let b = min_includes.div_ceil(a);
+-            let diff = (a * b).checked_sub(min_includes)?;
+-            Some((Rect(a, b), diff))
+-        })
+-        .filter_map(|(rect, diff)| (rect.1 <= max_edge).then_some((rect, diff)))
+-        .min_by_key(|(_, diff)| *diff)
+-}
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index 974bd4f7f2417..dacf2af18e642 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -87,6 +87,7 @@ nonmax = "0.5"
+ static_assertions = "1"
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
+ offset-allocator = "0.2"
++arrayvec = { version = "0.7", default-features = false }
+ indexmap = { version = "2" }
+ 
+ [lints]
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 9a80d7e8be5c1..7c5f008f54541 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -1208,8 +1208,9 @@ pub fn queue_material_meshes(
+             };
+ 
+             // Fetch the slabs that this mesh resides in.
+-            let (vertex_slab, index_slab) =
+-                mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id());
++            let Some(mesh_slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
++                continue;
++            };
+ 
+             match material.properties.render_phase_type {
+                 RenderPhaseType::Transmissive => {
+@@ -1229,7 +1230,7 @@ pub fn queue_material_meshes(
+                         pipeline: pipeline_id,
+                         batch_range: 0..1,
+                         extra_index: PhaseItemExtraIndex::None,
+-                        indexed: index_slab.is_some(),
++                        indexed: mesh_slabs.index_slab_id.is_some(),
+                         // Filled in later.
+                         distance: 0.0,
+                     });
+@@ -1253,8 +1254,7 @@ pub fn queue_material_meshes(
+                         pipeline: pipeline_id,
+                         draw_function,
+                         material_bind_group_index: Some(material.binding.group.0),
+-                        vertex_slab: vertex_slab.unwrap_or_default(),
+-                        index_slab,
++                        slabs: mesh_slabs,
+                         lightmap_slab: mesh_instance
+                             .shared
+                             .lightmap_slab_index()
+@@ -1286,8 +1286,7 @@ pub fn queue_material_meshes(
+                         draw_function,
+                         pipeline: pipeline_id,
+                         material_bind_group_index: Some(material.binding.group.0),
+-                        vertex_slab: vertex_slab.unwrap_or_default(),
+-                        index_slab,
++                        slabs: mesh_slabs,
+                     };
+                     let bin_key = OpaqueNoLightmap3dBinKey {
+                         asset_id: mesh_instance.mesh_asset_id().into(),
+@@ -1320,7 +1319,7 @@ pub fn queue_material_meshes(
+                         pipeline: pipeline_id,
+                         batch_range: 0..1,
+                         extra_index: PhaseItemExtraIndex::None,
+-                        indexed: index_slab.is_some(),
++                        indexed: mesh_slabs.index_slab_id.is_some(),
+                         // Filled in later.
+                         distance: 0.0,
+                     });
+diff --git a/crates/bevy_pbr/src/meshlet/instance_manager.rs b/crates/bevy_pbr/src/meshlet/instance_manager.rs
+index 9f03c5243e2d3..a7f0e6c0c2820 100644
+--- a/crates/bevy_pbr/src/meshlet/instance_manager.rs
++++ b/crates/bevy_pbr/src/meshlet/instance_manager.rs
+@@ -133,6 +133,7 @@ impl InstanceManager {
+             None,
+             None,
+             None,
++            None,
+         );
+ 
+         // Append instance data
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index c83a660b53d52..0df4717eb3572 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -1292,8 +1292,9 @@ pub fn queue_prepass_material_meshes(
+                     .insert((*render_entity, *visible_entity));
+                 continue;
+             };
+-            let (vertex_slab, index_slab) =
+-                mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id());
++            let Some(mesh_slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
++                continue;
++            };
+ 
+             let deferred = match material.properties.render_method {
+                 OpaqueRendererMethod::Forward => false,
+@@ -1309,8 +1310,7 @@ pub fn queue_prepass_material_meshes(
+                                 draw_function,
+                                 pipeline: pipeline_id,
+                                 material_bind_group_index: Some(material.binding.group.0),
+-                                vertex_slab: vertex_slab.unwrap_or_default(),
+-                                index_slab,
++                                slabs: mesh_slabs,
+                             },
+                             OpaqueNoLightmap3dBinKey {
+                                 asset_id: mesh_instance.mesh_asset_id().into(),
+@@ -1337,8 +1337,7 @@ pub fn queue_prepass_material_meshes(
+                                 draw_function,
+                                 pipeline: pipeline_id,
+                                 material_bind_group_index,
+-                                vertex_slab: vertex_slab.unwrap_or_default(),
+-                                index_slab,
++                                slabs: mesh_slabs,
+                             },
+                             OpaqueNoLightmap3dBinKey {
+                                 asset_id: mesh_instance.mesh_asset_id().into(),
+@@ -1359,8 +1358,7 @@ pub fn queue_prepass_material_meshes(
+                                 draw_function,
+                                 pipeline: pipeline_id,
+                                 material_bind_group_index: Some(material.binding.group.0),
+-                                vertex_slab: vertex_slab.unwrap_or_default(),
+-                                index_slab,
++                                slabs: mesh_slabs,
+                             },
+                             OpaqueNoLightmap3dBinKey {
+                                 asset_id: mesh_instance.mesh_asset_id().into(),
+@@ -1378,8 +1376,7 @@ pub fn queue_prepass_material_meshes(
+                                 draw_function,
+                                 pipeline: pipeline_id,
+                                 material_bind_group_index: Some(material.binding.group.0),
+-                                vertex_slab: vertex_slab.unwrap_or_default(),
+-                                index_slab,
++                                slabs: mesh_slabs,
+                             },
+                             OpaqueNoLightmap3dBinKey {
+                                 asset_id: mesh_instance.mesh_asset_id().into(),
+diff --git a/crates/bevy_pbr/src/prepass/prepass.wgsl b/crates/bevy_pbr/src/prepass/prepass.wgsl
+index 52dd9bf201568..a5cd19d5ce24a 100644
+--- a/crates/bevy_pbr/src/prepass/prepass.wgsl
++++ b/crates/bevy_pbr/src/prepass/prepass.wgsl
+@@ -5,6 +5,7 @@
+     prepass_io::{Vertex, VertexOutput, FragmentOutput},
+     skinning,
+     morph,
++    morph::{morph_position, morph_normal, morph_tangent},
+     mesh_view_bindings::view,
+     view_transformations::position_world_to_clip,
+ }
+@@ -14,23 +15,25 @@
+ #endif
+ 
+ #ifdef MORPH_TARGETS
+-fn morph_vertex(vertex_in: Vertex) -> Vertex {
++// The instance_index parameter must match vertex_in.instance_index. This is a work around for a wgpu dx12 bug.
++// See https://github.com/gfx-rs/naga/issues/2416
++fn morph_vertex(vertex_in: Vertex, instance_index: u32) -> Vertex {
+     var vertex = vertex_in;
+-    let first_vertex = mesh[vertex.instance_index].first_vertex_index;
++    let first_vertex = mesh[instance_index].first_vertex_index;
+     let vertex_index = vertex.index - first_vertex;
+ 
+-    let weight_count = morph::layer_count();
++    let weight_count = morph::layer_count(instance_index);
+     for (var i: u32 = 0u; i < weight_count; i ++) {
+-        let weight = morph::weight_at(i);
++        let weight = morph::weight_at(i, instance_index);
+         if weight == 0.0 {
+             continue;
+         }
+-        vertex.position += weight * morph::morph(vertex_index, morph::position_offset, i);
++        vertex.position += weight * morph_position(vertex_index, i, instance_index);
+ #ifdef VERTEX_NORMALS
+-        vertex.normal += weight * morph::morph(vertex_index, morph::normal_offset, i);
++        vertex.normal += weight * morph_normal(vertex_index, i, instance_index);
+ #endif
+ #ifdef VERTEX_TANGENTS
+-        vertex.tangent += vec4(weight * morph::morph(vertex_index, morph::tangent_offset, i), 0.0);
++        vertex.tangent += vec4(weight * morph_tangent(vertex_index, i, instance_index), 0.0);
+ #endif
+     }
+     return vertex;
+@@ -40,15 +43,20 @@ fn morph_vertex(vertex_in: Vertex) -> Vertex {
+ //
+ // This function is used for motion vector calculation, and, as such, it doesn't
+ // bother morphing the normals and tangents.
+-fn morph_prev_vertex(vertex_in: Vertex) -> Vertex {
++//
++// The instance_index parameter must match vertex_in.instance_index. This is a work around for a wgpu dx12 bug.
++// See https://github.com/gfx-rs/naga/issues/2416
++fn morph_prev_vertex(vertex_in: Vertex, instance_index: u32) -> Vertex {
+     var vertex = vertex_in;
+-    let weight_count = morph::layer_count();
++    let first_vertex = mesh[instance_index].first_vertex_index;
++    let vertex_index = vertex.index - first_vertex;
++    let weight_count = morph::layer_count(instance_index);
+     for (var i: u32 = 0u; i < weight_count; i ++) {
+-        let weight = morph::prev_weight_at(i);
++        let weight = morph::prev_weight_at(i, instance_index);
+         if weight == 0.0 {
+             continue;
+         }
+-        vertex.position += weight * morph::morph(vertex.index, morph::position_offset, i);
++        vertex.position += weight * morph_position(vertex_index, i, instance_index);
+         // Don't bother morphing normals and tangents; we don't need them for
+         // motion vector calculation.
+     }
+@@ -61,7 +69,7 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
+     var out: VertexOutput;
+ 
+ #ifdef MORPH_TARGETS
+-    var vertex = morph_vertex(vertex_no_morph);
++    var vertex = morph_vertex(vertex_no_morph, vertex_no_morph.instance_index);
+ #else
+     var vertex = vertex_no_morph;
+ #endif
+@@ -69,14 +77,14 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
+     let mesh_world_from_local = mesh_functions::get_world_from_local(vertex_no_morph.instance_index);
+ 
+ #ifdef SKINNED
++    // Use vertex_no_morph.instance_index instead of vertex.instance_index to work around a wgpu dx12 bug.
++    // See https://github.com/gfx-rs/naga/issues/2416
+     var world_from_local = skinning::skin_model(
+         vertex.joint_indices,
+         vertex.joint_weights,
+         vertex_no_morph.instance_index
+     );
+ #else // SKINNED
+-    // Use vertex_no_morph.instance_index instead of vertex.instance_index to work around a wgpu dx12 bug.
+-    // See https://github.com/gfx-rs/naga/issues/2416
+     var world_from_local = mesh_world_from_local;
+ #endif // SKINNED
+ 
+@@ -151,11 +159,15 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
+         vertex_no_morph.instance_index
+     );
+ #else   // HAS_PREVIOUS_SKIN
+-    let prev_model = mesh_functions::get_previous_world_from_local(prev_vertex.instance_index);
++    // Use vertex_no_morph.instance_index instead of prev_vertex.instance_index to work around a wgpu dx12 bug.
++    // See https://github.com/gfx-rs/naga/issues/2416
++    let prev_model = mesh_functions::get_previous_world_from_local(vertex_no_morph.instance_index);
+ #endif  // HAS_PREVIOUS_SKIN
+ 
+ #else   // SKINNED
+-    let prev_model = mesh_functions::get_previous_world_from_local(prev_vertex.instance_index);
++    // Use vertex_no_morph.instance_index instead of prev_vertex.instance_index to work around a wgpu dx12 bug.
++    // See https://github.com/gfx-rs/naga/issues/2416
++    let prev_model = mesh_functions::get_previous_world_from_local(vertex_no_morph.instance_index);
+ #endif  // SKINNED
+ 
+     out.previous_world_position = mesh_functions::mesh_position_local_to_world(
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 8f26b266a15cb..f4157b4a12f05 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -39,9 +39,11 @@ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_platform::hash::FixedHasher;
+ use bevy_render::camera::{DirtySpecializations, PendingQueues};
+ use bevy_render::erased_render_asset::ErasedRenderAssets;
++use bevy_render::mesh::allocator::MeshSlabs;
+ use bevy_render::occlusion_culling::{
+     OcclusionCulling, OcclusionCullingSubview, OcclusionCullingSubviewEntities,
+ };
++use bevy_render::sync_world::{MainEntity, RenderEntity};
+ use bevy_render::sync_world::{MainEntityHashMap, MainEntityHashSet};
+ use bevy_render::view::RenderVisibleMeshEntities;
+ use bevy_render::{
+@@ -50,10 +52,6 @@ use bevy_render::{
+     mesh::allocator::MeshAllocator,
+     view::{NoIndirectDrawing, RetainedViewEntity},
+ };
+-use bevy_render::{
+-    mesh::allocator::SlabId,
+-    sync_world::{MainEntity, RenderEntity},
+-};
+ use bevy_render::{
+     mesh::RenderMesh,
+     render_asset::RenderAssets,
+@@ -2306,15 +2304,16 @@ pub fn queue_shadows(
+                     Some(material.binding.group.0)
+                 };
+ 
+-                let (vertex_slab, index_slab) =
+-                    mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id());
++                let Some(mesh_slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id())
++                else {
++                    continue;
++                };
+ 
+                 let batch_set_key = ShadowBatchSetKey {
+                     pipeline: pipeline_id,
+                     draw_function,
+                     material_bind_group_index,
+-                    vertex_slab: vertex_slab.unwrap_or_default(),
+-                    index_slab,
++                    slabs: mesh_slabs,
+                 };
+ 
+                 shadow_phase.add(
+@@ -2365,21 +2364,18 @@ pub struct ShadowBatchSetKey {
+     /// In the case of PBR, this is the `MaterialBindGroupIndex`.
+     pub material_bind_group_index: Option<u32>,
+ 
+-    /// The ID of the slab of GPU memory that contains vertex data.
+-    ///
+-    /// For non-mesh items, you can fill this with 0 if your items can be
+-    /// multi-drawn, or with a unique value if they can't.
+-    pub vertex_slab: SlabId,
+-
+-    /// The ID of the slab of GPU memory that contains index data, if present.
++    /// The IDs of the slabs of GPU memory in the mesh allocator that contain
++    /// the mesh data.
+     ///
+-    /// For non-mesh items, you can safely fill this with `None`.
+-    pub index_slab: Option<SlabId>,
++    /// For non-mesh items, you can fill the [`MeshSlabs::vertex_slab_id`] with
++    /// 0 if your items can be multi-drawn, or with a unique value if they
++    /// can't.
++    pub slabs: MeshSlabs,
+ }
+ 
+ impl PhaseItemBatchSetKey for ShadowBatchSetKey {
+     fn indexed(&self) -> bool {
+-        self.index_slab.is_some()
++        self.slabs.index_slab_id.is_some()
+     }
+ }
+ 
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 6dd5473952bee..902faff423015 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -39,6 +39,10 @@ use bevy_mesh::{
+ };
+ use bevy_platform::collections::{hash_map::Entry, HashMap};
+ use bevy_render::impl_atomic_pod;
++use bevy_render::mesh::allocator::SlabId;
++use bevy_render::mesh::morph::{
++    MorphTargetImage, MorphTargetsResource, RenderMorphTargetAllocator,
++};
+ use bevy_render::{
+     batching::{
+         gpu_preprocessing::{
+@@ -82,7 +86,7 @@ use self::irradiance_volume::IRRADIANCE_VOLUMES_ARE_USABLE;
+ use crate::{
+     render::{
+         morph::{
+-            extract_morphs, no_automatic_morph_batching, prepare_morphs, MorphIndices,
++            extract_morphs, no_automatic_morph_batching, write_morph_buffers, MorphIndices,
+             MorphUniforms,
+         },
+         skin::no_automatic_skin_batching,
+@@ -183,8 +187,6 @@ impl Plugin for MeshRenderPlugin {
+ 
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app
+-                .init_resource::<MorphUniforms>()
+-                .init_resource::<MorphIndices>()
+                 .init_resource::<MeshCullingDataBuffer>()
+                 .init_resource::<RenderMaterialInstances>()
+                 .configure_sets(
+@@ -207,7 +209,7 @@ impl Plugin for MeshRenderPlugin {
+                     (
+                         set_mesh_motion_vector_flags.in_set(RenderSystems::PrepareMeshes),
+                         prepare_skins.in_set(RenderSystems::PrepareResources),
+-                        prepare_morphs.in_set(RenderSystems::PrepareResources),
++                        write_morph_buffers.in_set(RenderSystems::PrepareResourcesFlush),
+                         prepare_mesh_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                         prepare_mesh_view_bind_groups
+                             .in_set(RenderSystems::PrepareBindGroups)
+@@ -216,6 +218,7 @@ impl Plugin for MeshRenderPlugin {
+                         no_gpu_preprocessing::clear_batched_cpu_instance_buffers::<MeshPipeline>
+                             .in_set(RenderSystems::Cleanup)
+                             .after(RenderSystems::Render),
++                        prepare_morph_descriptors.in_set(RenderSystems::PrepareMeshes),
+                     ),
+                 );
+         }
+@@ -226,6 +229,8 @@ impl Plugin for MeshRenderPlugin {
+ 
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app
++                .init_resource::<MorphIndices>()
++                .init_resource::<MorphUniforms>()
+                 .init_resource::<ViewKeyCache>()
+                 .init_resource::<GpuPreprocessingSupport>()
+                 .add_systems(RenderStartup, skin_uniforms_from_world)
+@@ -269,7 +274,12 @@ impl Plugin for MeshRenderPlugin {
+                                 // This must be before
+                                 // `set_mesh_motion_vector_flags` so it doesn't
+                                 // overwrite those flags.
+-                                .before(set_mesh_motion_vector_flags),
++                                .before(set_mesh_motion_vector_flags)
++                                // This must be after
++                                // `prepare_morph_descriptors` because it needs
++                                // the indices of the morph descriptors in the
++                                // buffer.
++                                .after(prepare_morph_descriptors),
+                         ),
+                     );
+             } else {
+@@ -510,8 +520,11 @@ pub struct MeshUniform {
+     pub material_and_lightmap_bind_group_slot: u32,
+     /// User supplied tag to identify this mesh instance.
+     pub tag: u32,
+-    /// Padding.
+-    pub pad: u32,
++    /// The index of the morph descriptor for this mesh instance in the
++    /// `morph_descriptors` table.
++    ///
++    /// If the mesh has no morph targets, this is `u32::MAX`.
++    pub morph_descriptor_index: u32,
+ }
+ 
+ /// Information that has to be transferred from CPU to GPU in order to produce
+@@ -576,8 +589,11 @@ pub struct MeshInputUniform {
+     pub timestamp: u32,
+     /// User supplied tag to identify this mesh instance.
+     pub tag: u32,
+-    /// Padding.
+-    pub pad: u32,
++    /// The index of the morph descriptor for this mesh instance in the
++    /// `morph_descriptors` table.
++    ///
++    /// If the mesh has no morph targets, this is `u32::MAX`.
++    pub morph_descriptor_index: u32,
+ }
+ 
+ impl_atomic_pod!(MeshInputUniform, MeshInputUniformBlob);
+@@ -614,6 +630,7 @@ impl MeshUniform {
+         material_bind_group_slot: MaterialBindGroupSlot,
+         maybe_lightmap: Option<(LightmapSlotIndex, Rect)>,
+         current_skin_index: Option<u32>,
++        morph_descriptor_index: Option<MorphDescriptorIndex>,
+         tag: Option<u32>,
+     ) -> Self {
+         let (local_from_world_transpose_a, local_from_world_transpose_b) =
+@@ -635,7 +652,10 @@ impl MeshUniform {
+             material_and_lightmap_bind_group_slot: u32::from(material_bind_group_slot)
+                 | ((lightmap_bind_group_slot as u32) << 16),
+             tag: tag.unwrap_or(0),
+-            pad: 0,
++            morph_descriptor_index: match morph_descriptor_index {
++                Some(morph_descriptor_index) => morph_descriptor_index.0,
++                None => u32::MAX,
++            },
+         }
+     }
+ }
+@@ -1318,6 +1338,7 @@ impl RenderMeshInstanceGpuBuilder {
+         render_material_bindings: &RenderMaterialBindings,
+         render_lightmaps: &RenderLightmaps,
+         skin_uniforms: &SkinUniforms,
++        morph_indices: &MorphIndices,
+         timestamp: FrameCount,
+     ) -> Option<RenderMeshInstanceGpuPrepared> {
+         // Look up the material index. If we couldn't fetch the material index,
+@@ -1366,6 +1387,11 @@ impl RenderMeshInstanceGpuBuilder {
+             .map(|lightmap| lightmap.slab_index);
+         self.shared.lightmap_slab_index = lightmap_slab_index.into();
+ 
++        let morph_descriptor_index = match morph_indices.morph_descriptor_index(entity) {
++            Some(morph_descriptor_index) => *morph_descriptor_index,
++            None => u32::MAX,
++        };
++
+         // Create the mesh input uniform.
+         let mesh_input_uniform = MeshInputUniform {
+             world_from_local: self.world_from_local.to_transpose(),
+@@ -1385,7 +1411,7 @@ impl RenderMeshInstanceGpuBuilder {
+                 self.shared.material_bindings_index.slot,
+             ) | ((lightmap_slot as u32) << 16),
+             tag: self.shared.tag,
+-            pad: 0,
++            morph_descriptor_index,
+         };
+ 
+         let world_from_local = &self.world_from_local;
+@@ -2025,13 +2051,37 @@ pub fn set_mesh_motion_vector_flags(
+     skin_uniforms: Res<SkinUniforms>,
+     morph_indices: Res<MorphIndices>,
+ ) {
++    // Set `HAS_PREVIOUS_SKIN` if the mesh has skin weights from the previous
++    // frame.
+     for &entity in skin_uniforms.all_skins() {
+         render_mesh_instances
+             .insert_mesh_instance_flags(entity, RenderMeshInstanceFlags::HAS_PREVIOUS_SKIN);
+     }
+-    for &entity in morph_indices.prev.keys() {
+-        render_mesh_instances
+-            .insert_mesh_instance_flags(entity, RenderMeshInstanceFlags::HAS_PREVIOUS_MORPH);
++
++    // Set `HAS_PREVIOUS_MORPH` if the mesh has morph targets from the previous
++    // frame.
++    match *morph_indices {
++        MorphIndices::Uniform { ref prev, .. } => {
++            for &entity in prev.keys() {
++                render_mesh_instances.insert_mesh_instance_flags(
++                    entity,
++                    RenderMeshInstanceFlags::HAS_PREVIOUS_MORPH,
++                );
++            }
++        }
++        MorphIndices::Storage {
++            morph_weights_info: ref morph_target_info,
++            ..
++        } => {
++            for (entity, morph_target_info) in morph_target_info {
++                if morph_target_info.prev_weight_offset.is_some() {
++                    render_mesh_instances.insert_mesh_instance_flags(
++                        *entity,
++                        RenderMeshInstanceFlags::HAS_PREVIOUS_MORPH,
++                    );
++                }
++            }
++        }
+     }
+ }
+ 
+@@ -2048,6 +2098,7 @@ pub fn collect_meshes_for_gpu_building(
+     render_material_bindings: Res<RenderMaterialBindings>,
+     render_lightmaps: Res<RenderLightmaps>,
+     skin_uniforms: Res<SkinUniforms>,
++    morph_indices: Res<MorphIndices>,
+     frame_count: Res<FrameCount>,
+     mut meshes_to_reextract_next_frame: ResMut<MeshesToReextractNextFrame>,
+ ) {
+@@ -2093,6 +2144,7 @@ pub fn collect_meshes_for_gpu_building(
+         let current_input_buffer = &*current_input_buffer;
+         let previous_input_buffer = &*previous_input_buffer;
+         let mesh_culling_data_buffer = &*mesh_culling_data_buffer;
++        let morph_indices = &*morph_indices;
+ 
+         // Spawn workers on the taskpool to prepare and update meshes in parallel.
+         ComputeTaskPool::get().scope(|scope| {
+@@ -2123,6 +2175,7 @@ pub fn collect_meshes_for_gpu_building(
+                                         render_material_bindings,
+                                         render_lightmaps,
+                                         skin_uniforms,
++                                        morph_indices,
+                                         frame_count,
+                                     ) {
+                                         Some(prepared) => {
+@@ -2158,6 +2211,7 @@ pub fn collect_meshes_for_gpu_building(
+                                         render_material_bindings,
+                                         render_lightmaps,
+                                         skin_uniforms,
++                                        morph_indices,
+                                         frame_count,
+                                     ) {
+                                         Some(mut prepared) => {
+@@ -2396,6 +2450,7 @@ impl GetBatchData for MeshPipeline {
+         SRes<RenderAssets<RenderMesh>>,
+         SRes<MeshAllocator>,
+         SRes<SkinUniforms>,
++        SRes<MorphIndices>,
+     );
+     // The material bind group ID, the mesh ID, and the lightmap ID,
+     // respectively.
+@@ -2408,7 +2463,7 @@ impl GetBatchData for MeshPipeline {
+     type BufferData = MeshUniform;
+ 
+     fn get_batch_data(
+-        (mesh_instances, lightmaps, _, mesh_allocator, skin_uniforms): &SystemParamItem<
++        (mesh_instances, lightmaps, _, mesh_allocator, skin_uniforms, morph_indices): &SystemParamItem<
+             Self::Param,
+         >,
+         (_entity, main_entity): (Entity, MainEntity),
+@@ -2429,6 +2484,7 @@ impl GetBatchData for MeshPipeline {
+         let maybe_lightmap = lightmaps.render_lightmaps.get(&main_entity);
+ 
+         let current_skin_index = skin_uniforms.skin_index(main_entity);
++        let morph_descriptor_index = morph_indices.morph_descriptor_index(main_entity);
+         let material_bind_group_index = mesh_instance.material_bindings_index();
+ 
+         Some((
+@@ -2438,6 +2494,7 @@ impl GetBatchData for MeshPipeline {
+                 material_bind_group_index.slot,
+                 maybe_lightmap.map(|lightmap| (lightmap.slot_index, lightmap.uv_rect)),
+                 current_skin_index,
++                morph_descriptor_index,
+                 Some(mesh_instance.tag()),
+             ),
+             mesh_instance.should_batch().then_some((
+@@ -2453,7 +2510,7 @@ impl GetFullBatchData for MeshPipeline {
+     type BufferInputData = MeshInputUniform;
+ 
+     fn get_index_and_compare_data(
+-        (mesh_instances, lightmaps, _, _, _): &SystemParamItem<Self::Param>,
++        (mesh_instances, lightmaps, _, _, _, _): &SystemParamItem<Self::Param>,
+         main_entity: MainEntity,
+     ) -> Option<(NonMaxU32, Option<Self::CompareData>)> {
+         // This should only be called during GPU building.
+@@ -2479,7 +2536,7 @@ impl GetFullBatchData for MeshPipeline {
+     }
+ 
+     fn get_binned_batch_data(
+-        (mesh_instances, lightmaps, _, mesh_allocator, skin_uniforms): &SystemParamItem<
++        (mesh_instances, lightmaps, _, mesh_allocator, skin_uniforms, morph_indices): &SystemParamItem<
+             Self::Param,
+         >,
+         main_entity: MainEntity,
+@@ -2499,6 +2556,7 @@ impl GetFullBatchData for MeshPipeline {
+         let maybe_lightmap = lightmaps.render_lightmaps.get(&main_entity);
+ 
+         let current_skin_index = skin_uniforms.skin_index(main_entity);
++        let morph_descriptor_index = morph_indices.morph_descriptor_index(main_entity);
+ 
+         Some(MeshUniform::new(
+             &mesh_instance.transforms,
+@@ -2506,12 +2564,13 @@ impl GetFullBatchData for MeshPipeline {
+             mesh_instance.material_bindings_index().slot,
+             maybe_lightmap.map(|lightmap| (lightmap.slot_index, lightmap.uv_rect)),
+             current_skin_index,
++            morph_descriptor_index,
+             Some(mesh_instance.tag()),
+         ))
+     }
+ 
+     fn get_binned_index(
+-        (mesh_instances, _, _, _, _): &SystemParamItem<Self::Param>,
++        (mesh_instances, _, _, _, _, _): &SystemParamItem<Self::Param>,
+         main_entity: MainEntity,
+     ) -> Option<NonMaxU32> {
+         // This should only be called during GPU building.
+@@ -3179,14 +3238,58 @@ impl SpecializedMeshPipeline for MeshPipeline {
+ ///
+ /// If GPU mesh preprocessing isn't in use, these are global to the scene. If
+ /// GPU mesh preprocessing is in use, these are specific to a single phase.
+-#[derive(Default)]
+ pub struct MeshPhaseBindGroups {
+     model_only: Option<BindGroup>,
+     skinned: Option<MeshBindGroupPair>,
+-    morph_targets: HashMap<AssetId<Mesh>, MeshBindGroupPair>,
++    /// Bind groups for meshes with morph targets.
++    morph_targets: MeshMorphTargetBindGroups,
+     lightmaps: HashMap<LightmapSlabIndex, BindGroup>,
+ }
+ 
++/// Stores bind groups for each mesh with morph targets.
++///
++/// If storage buffers aren't available on this platform, we use a single bind
++/// group per mesh. If they are available, however, we use a single bind group
++/// per morph target slab ID (managed by the mesh allocator).
++pub enum MeshMorphTargetBindGroups {
++    /// Maps a mesh asset ID to the bind group for that mesh.
++    ///
++    /// We use morph target images on platforms without storage buffers, and as
++    /// such platforms don't support bindless textures either, we must use a
++    /// single bind group per morphable mesh.
++    Uniform(HashMap<AssetId<Mesh>, MeshBindGroupPair>),
++
++    /// Maps a morph target slab ID that the mesh allocator manages to the bind
++    /// groups for morph displacements in that slab.
++    Storage(HashMap<SlabId, MeshMorphTargetStorageBindGroups>),
++}
++
++/// The bind groups associated with a single morph displacements slab.
++///
++/// Because a single morph displacement slab might contain morph displacements
++/// for both meshes with skins and meshes without skins, we need two separate
++/// bind groups here.
++pub struct MeshMorphTargetStorageBindGroups {
++    /// The bind group used for meshes with skins.
++    skinned: Option<MeshBindGroupPair>,
++    /// The bind group used for meshes without skins.
++    unskinned: Option<MeshBindGroupPair>,
++}
++
++impl MeshMorphTargetBindGroups {
++    /// Clears out all morph target bind groups.
++    fn clear(&mut self) {
++        match *self {
++            MeshMorphTargetBindGroups::Uniform(ref mut mesh_to_bind_group_pair) => {
++                mesh_to_bind_group_pair.clear();
++            }
++            MeshMorphTargetBindGroups::Storage(ref mut slab_id_to_bind_groups) => {
++                slab_id_to_bind_groups.clear();
++            }
++        }
++    }
++}
++
+ pub struct MeshBindGroupPair {
+     motion_vectors: BindGroup,
+     no_motion_vectors: BindGroup,
+@@ -3204,33 +3307,82 @@ pub enum MeshBindGroups {
+ }
+ 
+ impl MeshPhaseBindGroups {
++    /// Creates a new, blank, set of bind groups for this phase.
++    ///
++    /// Bind groups must be added to the resulting [`MeshPhaseBindGroups`]
++    /// explicitly.
++    pub fn new(render_device: &RenderDevice) -> MeshPhaseBindGroups {
++        MeshPhaseBindGroups {
++            model_only: None,
++            skinned: None,
++            morph_targets: if skins_use_uniform_buffers(&render_device.limits()) {
++                MeshMorphTargetBindGroups::Uniform(HashMap::default())
++            } else {
++                MeshMorphTargetBindGroups::Storage(HashMap::default())
++            },
++            lightmaps: HashMap::default(),
++        }
++    }
++
+     pub fn reset(&mut self) {
+         self.model_only = None;
+         self.skinned = None;
+         self.morph_targets.clear();
+         self.lightmaps.clear();
+     }
+-    /// Get the `BindGroup` for `RenderMesh` with given `handle_id` and lightmap
+-    /// key `lightmap`.
++
++    /// Get the appropriate `BindGroup` for `RenderMesh` with the given keys.
+     pub fn get(
+         &self,
+-        asset_id: AssetId<Mesh>,
+         lightmap: Option<LightmapSlabIndex>,
+         is_skinned: bool,
+-        morph: bool,
++        morph: MeshMorphBindGroupKey,
+         motion_vectors: bool,
+     ) -> Option<&BindGroup> {
+         match (is_skinned, morph, lightmap) {
+-            (_, true, _) => self
+-                .morph_targets
+-                .get(&asset_id)
+-                .map(|bind_group_pair| bind_group_pair.get(motion_vectors)),
+-            (true, false, _) => self
++            (_, MeshMorphBindGroupKey::Uniform(asset_id), _) => match self.morph_targets {
++                MeshMorphTargetBindGroups::Uniform(ref morph_targets) => morph_targets
++                    .get(&asset_id)
++                    .map(|bind_group_pair| bind_group_pair.get(motion_vectors)),
++                MeshMorphTargetBindGroups::Storage(..) => {
++                    error!(
++                        "Tried to look up a mesh morph target bind group using a mesh ID, but \
++                        we're using storage buffers. Look it up using the slab ID instead."
++                    );
++                    None
++                }
++            },
++            (_, MeshMorphBindGroupKey::Storage(slab_id), _) => match &self.morph_targets {
++                MeshMorphTargetBindGroups::Uniform(..) => {
++                    error!(
++                        "Tried to look up a mesh morph target bind group using a slab ID, but \
++                        we're using uniform buffers. Look it up using the mesh ID instead."
++                    );
++                    None
++                }
++                MeshMorphTargetBindGroups::Storage(slab_to_bind_group) => {
++                    let slab_bind_group = slab_to_bind_group.get(&slab_id)?;
++                    if is_skinned {
++                        slab_bind_group
++                            .skinned
++                            .as_ref()
++                            .map(|bind_group_pair| bind_group_pair.get(motion_vectors))
++                    } else {
++                        slab_bind_group
++                            .unskinned
++                            .as_ref()
++                            .map(|bind_group_pair| bind_group_pair.get(motion_vectors))
++                    }
++                }
++            },
++            (true, MeshMorphBindGroupKey::NoMorphTargets, _) => self
+                 .skinned
+                 .as_ref()
+                 .map(|bind_group_pair| bind_group_pair.get(motion_vectors)),
+-            (false, false, Some(lightmap_slab)) => self.lightmaps.get(&lightmap_slab),
+-            (false, false, None) => self.model_only.as_ref(),
++            (false, MeshMorphBindGroupKey::NoMorphTargets, Some(lightmap_slab)) => {
++                self.lightmaps.get(&lightmap_slab)
++            }
++            (false, MeshMorphBindGroupKey::NoMorphTargets, None) => self.model_only.as_ref(),
+         }
+     }
+ }
+@@ -3245,6 +3397,25 @@ impl MeshBindGroupPair {
+     }
+ }
+ 
++/// Data related to morph targets that we need in order to look up the bind
++/// group for a mesh.
++#[derive(Clone, Copy)]
++pub enum MeshMorphBindGroupKey {
++    /// The mesh has no morph targets.
++    NoMorphTargets,
++    /// The mesh has morph targets, and the current platform doesn't support
++    /// storage buffers.
++    ///
++    /// In this case, there's a single bind group per mesh.
++    Uniform(AssetId<Mesh>),
++    /// The mesh has morph targets, and the current platform does support
++    /// storage buffers.
++    ///
++    /// In this case, there's a bind group per morph displacement slab (managed
++    /// by the mesh allocator).
++    Storage(SlabId),
++}
++
+ /// Creates the per-mesh bind groups for each type of mesh and each phase.
+ pub fn prepare_mesh_bind_groups(
+     mut commands: Commands,
+@@ -3260,6 +3431,8 @@ pub fn prepare_mesh_bind_groups(
+     >,
+     skins_uniform: Res<SkinUniforms>,
+     weights_uniform: Res<MorphUniforms>,
++    mesh_allocator: Res<MeshAllocator>,
++    render_morph_target_allocator: Res<RenderMorphTargetAllocator>,
+     mut render_lightmaps: ResMut<RenderLightmaps>,
+ ) {
+     // CPU mesh preprocessing path.
+@@ -3277,6 +3450,8 @@ pub fn prepare_mesh_bind_groups(
+             &pipeline_cache,
+             &skins_uniform,
+             &weights_uniform,
++            &mesh_allocator,
++            &render_morph_target_allocator,
+             &mut render_lightmaps,
+         );
+ 
+@@ -3308,6 +3483,8 @@ pub fn prepare_mesh_bind_groups(
+                 &pipeline_cache,
+                 &skins_uniform,
+                 &weights_uniform,
++                &mesh_allocator,
++                &render_morph_target_allocator,
+                 &mut render_lightmaps,
+             );
+ 
+@@ -3329,6 +3506,8 @@ fn prepare_mesh_bind_groups_for_phase(
+     pipeline_cache: &PipelineCache,
+     skins_uniform: &SkinUniforms,
+     weights_uniform: &MorphUniforms,
++    mesh_allocator: &MeshAllocator,
++    render_morph_target_allocator: &RenderMorphTargetAllocator,
+     render_lightmaps: &mut RenderLightmaps,
+ ) -> MeshPhaseBindGroups {
+     let layouts = &mesh_pipeline.mesh_layouts;
+@@ -3336,7 +3515,7 @@ fn prepare_mesh_bind_groups_for_phase(
+     // TODO: Reuse allocations.
+     let mut groups = MeshPhaseBindGroups {
+         model_only: Some(layouts.model_only(render_device, pipeline_cache, &model)),
+-        ..default()
++        ..MeshPhaseBindGroups::new(render_device)
+     };
+ 
+     // Create the skinned mesh bind group with the current and previous buffers
+@@ -3355,52 +3534,45 @@ fn prepare_mesh_bind_groups_for_phase(
+ 
+     // Create the morphed bind groups just like we did for the skinned bind
+     // group.
+-    if let Some(weights) = weights_uniform.current_buffer.buffer() {
+-        let prev_weights = weights_uniform.prev_buffer.buffer().unwrap_or(weights);
+-        for (id, gpu_mesh) in meshes.iter() {
+-            if let Some(targets) = gpu_mesh.morph_targets.as_ref() {
+-                let bind_group_pair = if is_skinned(&gpu_mesh.layout) {
+-                    let prev_skin = &skins_uniform.prev_buffer;
+-                    MeshBindGroupPair {
+-                        motion_vectors: layouts.morphed_skinned_motion(
+-                            render_device,
+-                            pipeline_cache,
+-                            &model,
+-                            skin,
+-                            weights,
+-                            targets,
+-                            prev_skin,
+-                            prev_weights,
+-                        ),
+-                        no_motion_vectors: layouts.morphed_skinned(
+-                            render_device,
+-                            pipeline_cache,
+-                            &model,
+-                            skin,
+-                            weights,
+-                            targets,
+-                        ),
+-                    }
+-                } else {
+-                    MeshBindGroupPair {
+-                        motion_vectors: layouts.morphed_motion(
+-                            render_device,
+-                            pipeline_cache,
+-                            &model,
+-                            weights,
+-                            targets,
+-                            prev_weights,
+-                        ),
+-                        no_motion_vectors: layouts.morphed(
+-                            render_device,
+-                            pipeline_cache,
+-                            &model,
+-                            weights,
+-                            targets,
+-                        ),
+-                    }
+-                };
+-                groups.morph_targets.insert(id, bind_group_pair);
++    if weights_uniform.current_buffer.buffer().is_some() {
++        match (render_morph_target_allocator, &mut groups.morph_targets) {
++            (
++                RenderMorphTargetAllocator::Image { mesh_id_to_image },
++                &mut MeshMorphTargetBindGroups::Uniform(ref mut morph_targets),
++            ) => {
++                prepare_mesh_morph_target_bind_groups_for_phase_using_uniforms(
++                    &model,
++                    meshes,
++                    layouts,
++                    render_device,
++                    pipeline_cache,
++                    skins_uniform,
++                    weights_uniform,
++                    mesh_id_to_image,
++                    morph_targets,
++                );
++            }
++
++            (
++                &RenderMorphTargetAllocator::Storage,
++                &mut MeshMorphTargetBindGroups::Storage(ref mut morph_target_storage_bind_groups),
++            ) => {
++                prepare_mesh_morph_target_bind_groups_for_phase_using_storage(
++                    &model,
++                    layouts,
++                    render_device,
++                    pipeline_cache,
++                    skins_uniform,
++                    weights_uniform,
++                    mesh_allocator,
++                    morph_target_storage_bind_groups,
++                );
++            }
++
++            _ => {
++                error!(
++                    "Mismatched render morph target allocator and mesh morph target bind groups"
++                );
+             }
+         }
+     }
+@@ -3423,6 +3595,166 @@ fn prepare_mesh_bind_groups_for_phase(
+     groups
+ }
+ 
++/// Creates per-mesh morph target bind groups for a single phase.
++///
++/// This function is only used when the platform doesn't support storage
++/// buffers.
++fn prepare_mesh_morph_target_bind_groups_for_phase_using_uniforms(
++    model: &BindingResource,
++    meshes: &RenderAssets<RenderMesh>,
++    layouts: &MeshLayouts,
++    render_device: &RenderDevice,
++    pipeline_cache: &PipelineCache,
++    skins_uniform: &SkinUniforms,
++    weights_uniform: &MorphUniforms,
++    mesh_id_to_image: &HashMap<AssetId<Mesh>, MorphTargetImage>,
++    morph_targets: &mut HashMap<AssetId<Mesh>, MeshBindGroupPair>,
++) {
++    let (skin, prev_skin) = (&skins_uniform.current_buffer, &skins_uniform.prev_buffer);
++    let weights = weights_uniform
++        .current_buffer
++        .buffer()
++        .expect("Should have a weights buffer by now");
++    let prev_weights = weights_uniform.prev_buffer.buffer().unwrap_or(weights);
++    let maybe_morph_descriptors = weights_uniform
++        .descriptors_buffer
++        .as_ref()
++        .and_then(|descriptors_buffer| descriptors_buffer.buffer());
++
++    for (id, gpu_mesh) in meshes.iter() {
++        if !gpu_mesh.has_morph_targets() {
++            continue;
++        }
++        let Some(morph_targets_image) = mesh_id_to_image.get(&id) else {
++            continue;
++        };
++        let targets = MorphTargetsResource::Texture(&morph_targets_image.texture_view);
++        let bind_group_pair = if is_skinned(&gpu_mesh.layout) {
++            MeshBindGroupPair {
++                motion_vectors: layouts.morphed_skinned_motion(
++                    render_device,
++                    pipeline_cache,
++                    model,
++                    skin,
++                    weights,
++                    targets,
++                    prev_skin,
++                    prev_weights,
++                    maybe_morph_descriptors,
++                ),
++                no_motion_vectors: layouts.morphed_skinned(
++                    render_device,
++                    pipeline_cache,
++                    model,
++                    skin,
++                    weights,
++                    targets,
++                    maybe_morph_descriptors,
++                ),
++            }
++        } else {
++            MeshBindGroupPair {
++                motion_vectors: layouts.morphed_motion(
++                    render_device,
++                    pipeline_cache,
++                    model,
++                    weights,
++                    prev_weights,
++                    targets,
++                    maybe_morph_descriptors,
++                ),
++                no_motion_vectors: layouts.morphed(
++                    render_device,
++                    pipeline_cache,
++                    model,
++                    weights,
++                    targets,
++                    maybe_morph_descriptors,
++                ),
++            }
++        };
++        morph_targets.insert(id, bind_group_pair);
++    }
++}
++
++/// Creates per-slab morph target bind groups for a single phase.
++///
++/// This function is only used when the platform supports storage buffers.
++fn prepare_mesh_morph_target_bind_groups_for_phase_using_storage(
++    model: &BindingResource,
++    layouts: &MeshLayouts,
++    render_device: &RenderDevice,
++    pipeline_cache: &PipelineCache,
++    skins_uniform: &SkinUniforms,
++    weights_uniform: &MorphUniforms,
++    mesh_allocator: &MeshAllocator,
++    morph_target_storage_bind_groups: &mut HashMap<SlabId, MeshMorphTargetStorageBindGroups>,
++) {
++    let (skin, prev_skin) = (&skins_uniform.current_buffer, &skins_uniform.prev_buffer);
++    let weights = weights_uniform
++        .current_buffer
++        .buffer()
++        .expect("Should have a weights buffer by now");
++    let prev_weights = weights_uniform.prev_buffer.buffer().unwrap_or(weights);
++    let maybe_morph_descriptors = weights_uniform
++        .descriptors_buffer
++        .as_ref()
++        .and_then(|descriptors_buffer| descriptors_buffer.buffer());
++
++    for morph_target_slab_id in mesh_allocator.morph_target_slabs() {
++        let Some(buffer) = mesh_allocator.buffer_for_slab(morph_target_slab_id) else {
++            continue;
++        };
++        let targets = MorphTargetsResource::Storage(buffer);
++        morph_target_storage_bind_groups.insert(
++            morph_target_slab_id,
++            MeshMorphTargetStorageBindGroups {
++                skinned: Some(MeshBindGroupPair {
++                    motion_vectors: layouts.morphed_skinned_motion(
++                        render_device,
++                        pipeline_cache,
++                        model,
++                        skin,
++                        weights,
++                        targets,
++                        prev_skin,
++                        prev_weights,
++                        maybe_morph_descriptors,
++                    ),
++                    no_motion_vectors: layouts.morphed_skinned(
++                        render_device,
++                        pipeline_cache,
++                        model,
++                        skin,
++                        weights,
++                        targets,
++                        maybe_morph_descriptors,
++                    ),
++                }),
++                unskinned: Some(MeshBindGroupPair {
++                    motion_vectors: layouts.morphed_motion(
++                        render_device,
++                        pipeline_cache,
++                        model,
++                        weights,
++                        prev_weights,
++                        targets,
++                        maybe_morph_descriptors,
++                    ),
++                    no_motion_vectors: layouts.morphed(
++                        render_device,
++                        pipeline_cache,
++                        model,
++                        weights,
++                        targets,
++                        maybe_morph_descriptors,
++                    ),
++                }),
++            },
++        );
++    }
++}
++
+ pub struct SetMeshViewBindGroup<const I: usize>;
+ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshViewBindGroup<I> {
+     type Param = ();
+@@ -3523,6 +3855,7 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshBindGroup<I> {
+         SRes<RenderMeshInstances>,
+         SRes<SkinUniforms>,
+         SRes<MorphIndices>,
++        SRes<MeshAllocator>,
+         SRes<RenderLightmaps>,
+     );
+     type ViewQuery = Has<MotionVectorPrepass>;
+@@ -3539,6 +3872,7 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshBindGroup<I> {
+             mesh_instances,
+             skin_uniforms,
+             morph_indices,
++            mesh_allocator,
+             lightmaps,
+         ): SystemParamItem<'w, '_, Self::Param>,
+         pass: &mut TrackedRenderPass<'w>,
+@@ -3554,12 +3888,45 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshBindGroup<I> {
+             return RenderCommandResult::Success;
+         };
+ 
++        let skins_use_uniform_buffers = skins_use_uniform_buffers(&render_device.limits());
++
+         let current_skin_byte_offset = skin_uniforms.skin_byte_offset(*entity);
+-        let current_morph_index = morph_indices.current.get(entity);
+-        let prev_morph_index = morph_indices.prev.get(entity);
++
++        // Determine which morph bind group key we need, if any. If the platform
++        // doesn't support storage buffers, there's a separate bind group per
++        // mesh. Otherwise, if the platform does support storage buffers,
++        // there's one bind group per morph target displacement slab (managed by
++        // the mesh allocator).
++        let (current_morph_index, prev_morph_index, morph_bind_group_key);
++        match *morph_indices {
++            MorphIndices::Uniform {
++                ref current,
++                ref prev,
++            } => {
++                current_morph_index = current.get(entity);
++                prev_morph_index = prev.get(entity);
++                morph_bind_group_key = if current_morph_index.is_some() {
++                    MeshMorphBindGroupKey::Uniform(mesh_asset_id)
++                } else {
++                    MeshMorphBindGroupKey::NoMorphTargets
++                };
++            }
++            MorphIndices::Storage { .. } => {
++                current_morph_index = None;
++                prev_morph_index = None;
++                morph_bind_group_key = match mesh_allocator
++                    .mesh_slabs(&mesh_asset_id)
++                    .and_then(|mesh_slabs| mesh_slabs.morph_target_slab_id)
++                {
++                    Some(morph_target_slab_id) => {
++                        MeshMorphBindGroupKey::Storage(morph_target_slab_id)
++                    }
++                    None => MeshMorphBindGroupKey::NoMorphTargets,
++                };
++            }
++        };
+ 
+         let is_skinned = current_skin_byte_offset.is_some();
+-        let is_morphed = current_morph_index.is_some();
+ 
+         let lightmap_slab_index = lightmaps
+             .render_lightmaps
+@@ -3580,10 +3947,9 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshBindGroup<I> {
+         };
+ 
+         let Some(bind_group) = mesh_phase_bind_groups.get(
+-            mesh_asset_id,
+             lightmap_slab_index,
+             is_skinned,
+-            is_morphed,
++            morph_bind_group_key,
+             has_motion_vector_prepass,
+         ) else {
+             return RenderCommandResult::Failure(
+@@ -3599,23 +3965,21 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshBindGroup<I> {
+             dynamic_offsets[offset_count] = dynamic_offset;
+             offset_count += 1;
+         }
+-        if let Some(current_skin_index) = current_skin_byte_offset
+-            && skins_use_uniform_buffers(&render_device.limits())
+-        {
+-            dynamic_offsets[offset_count] = current_skin_index.byte_offset;
+-            offset_count += 1;
+-        }
+-        if let Some(current_morph_index) = current_morph_index {
+-            dynamic_offsets[offset_count] = current_morph_index.index;
+-            offset_count += 1;
++        if skins_use_uniform_buffers {
++            if let Some(current_skin_index) = current_skin_byte_offset {
++                dynamic_offsets[offset_count] = current_skin_index.byte_offset;
++                offset_count += 1;
++            }
++            if let Some(current_morph_index) = current_morph_index {
++                dynamic_offsets[offset_count] = current_morph_index.index;
++                offset_count += 1;
++            }
+         }
+ 
+         // Attach motion vectors if needed.
+-        if has_motion_vector_prepass {
++        if skins_use_uniform_buffers && has_motion_vector_prepass {
+             // Attach the previous skin index for motion vector computation.
+-            if skins_use_uniform_buffers(&render_device.limits())
+-                && let Some(current_skin_byte_offset) = current_skin_byte_offset
+-            {
++            if let Some(current_skin_byte_offset) = current_skin_byte_offset {
+                 dynamic_offsets[offset_count] = current_skin_byte_offset.byte_offset;
+                 offset_count += 1;
+             }
+diff --git a/crates/bevy_pbr/src/render/mesh.wgsl b/crates/bevy_pbr/src/render/mesh.wgsl
+index 95684684f5140..dd82736d96dea 100644
+--- a/crates/bevy_pbr/src/render/mesh.wgsl
++++ b/crates/bevy_pbr/src/render/mesh.wgsl
+@@ -2,29 +2,31 @@
+     mesh_bindings::mesh,
+     mesh_functions,
+     skinning,
+-    morph::morph,
++    morph::{morph_position, morph_normal, morph_tangent},
+     forward_io::{Vertex, VertexOutput},
+     view_transformations::position_world_to_clip,
+ }
+ 
+ #ifdef MORPH_TARGETS
+-fn morph_vertex(vertex_in: Vertex) -> Vertex {
++// The instance_index parameter must match vertex_in.instance_index. This is a work around for a wgpu dx12 bug.
++// See https://github.com/gfx-rs/naga/issues/2416
++fn morph_vertex(vertex_in: Vertex, instance_index: u32) -> Vertex {
+     var vertex = vertex_in;
+-    let first_vertex = mesh[vertex.instance_index].first_vertex_index;
++    let first_vertex = mesh[instance_index].first_vertex_index;
+     let vertex_index = vertex.index - first_vertex;
+ 
+-    let weight_count = bevy_pbr::morph::layer_count();
++    let weight_count = bevy_pbr::morph::layer_count(instance_index);
+     for (var i: u32 = 0u; i < weight_count; i ++) {
+-        let weight = bevy_pbr::morph::weight_at(i);
++        let weight = bevy_pbr::morph::weight_at(i, instance_index);
+         if weight == 0.0 {
+             continue;
+         }
+-        vertex.position += weight * morph(vertex_index, bevy_pbr::morph::position_offset, i);
++        vertex.position += weight * morph_position(vertex_index, i, instance_index);
+ #ifdef VERTEX_NORMALS
+-        vertex.normal += weight * morph(vertex_index, bevy_pbr::morph::normal_offset, i);
++        vertex.normal += weight * morph_normal(vertex_index, i, instance_index);
+ #endif
+ #ifdef VERTEX_TANGENTS
+-        vertex.tangent += vec4(weight * morph(vertex_index, bevy_pbr::morph::tangent_offset, i), 0.0);
++        vertex.tangent += vec4(weight * morph_tangent(vertex_index, i, instance_index), 0.0);
+ #endif
+     }
+     return vertex;
+@@ -36,7 +38,7 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
+     var out: VertexOutput;
+ 
+ #ifdef MORPH_TARGETS
+-    var vertex = morph_vertex(vertex_no_morph);
++    var vertex = morph_vertex(vertex_no_morph, vertex_no_morph.instance_index);
+ #else
+     var vertex = vertex_no_morph;
+ #endif
+@@ -44,14 +46,14 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
+     let mesh_world_from_local = mesh_functions::get_world_from_local(vertex_no_morph.instance_index);
+ 
+ #ifdef SKINNED
++    // Use vertex_no_morph.instance_index instead of vertex.instance_index to work around a wgpu dx12 bug.
++    // See https://github.com/gfx-rs/naga/issues/2416 .
+     var world_from_local = skinning::skin_model(
+         vertex.joint_indices,
+         vertex.joint_weights,
+         vertex_no_morph.instance_index
+     );
+ #else
+-    // Use vertex_no_morph.instance_index instead of vertex.instance_index to work around a wgpu dx12 bug.
+-    // See https://github.com/gfx-rs/naga/issues/2416 .
+     var world_from_local = mesh_world_from_local;
+ #endif
+ 
+diff --git a/crates/bevy_pbr/src/render/mesh_bindings.rs b/crates/bevy_pbr/src/render/mesh_bindings.rs
+index 0708bc08daa04..0e72ad666b885 100644
+--- a/crates/bevy_pbr/src/render/mesh_bindings.rs
++++ b/crates/bevy_pbr/src/render/mesh_bindings.rs
+@@ -1,13 +1,15 @@
+ //! Bind group layout related definitions for the mesh pipeline.
+ 
++use arrayvec::ArrayVec;
+ use bevy_math::Mat4;
+ use bevy_mesh::morph::MAX_MORPH_WEIGHTS;
+ use bevy_render::{
++    mesh::morph::MorphTargetsResource,
+     render_resource::*,
+     renderer::{RenderAdapter, RenderDevice},
+ };
+ 
+-use crate::{binding_arrays_are_usable, render::skin::MAX_JOINTS, LightmapSlab};
++use crate::{binding_arrays_are_usable, render::skin::MAX_JOINTS, skin, LightmapSlab};
+ 
+ const MORPH_WEIGHT_SIZE: usize = size_of::<f32>();
+ 
+@@ -26,12 +28,13 @@ mod layout_entry {
+     use core::num::NonZeroU32;
+ 
+     use super::{JOINT_BUFFER_SIZE, MORPH_BUFFER_SIZE};
+-    use crate::{render::skin, MeshUniform, LIGHTMAPS_PER_SLAB};
++    use crate::{render::skin, GpuMorphDescriptor, MeshUniform, LIGHTMAPS_PER_SLAB};
++    use bevy_mesh::morph::MorphAttributes;
+     use bevy_render::{
+         render_resource::{
+             binding_types::{
+-                sampler, storage_buffer_read_only_sized, texture_2d, texture_3d,
+-                uniform_buffer_sized,
++                sampler, storage_buffer_read_only, storage_buffer_read_only_sized, texture_2d,
++                texture_3d, uniform_buffer_sized,
+             },
+             BindGroupLayoutEntryBuilder, BufferSize, GpuArrayBuffer, SamplerBindingType,
+             ShaderStages, TextureSampleType,
+@@ -53,11 +56,22 @@ mod layout_entry {
+             storage_buffer_read_only_sized(false, size)
+         }
+     }
+-    pub(super) fn weights() -> BindGroupLayoutEntryBuilder {
+-        uniform_buffer_sized(true, BufferSize::new(MORPH_BUFFER_SIZE as u64))
++    pub(super) fn weights(limits: &WgpuLimits) -> BindGroupLayoutEntryBuilder {
++        if skin::skins_use_uniform_buffers(limits) {
++            uniform_buffer_sized(true, BufferSize::new(MORPH_BUFFER_SIZE as u64))
++        } else {
++            storage_buffer_read_only::<f32>(false)
++        }
++    }
++    pub(super) fn targets(limits: &WgpuLimits) -> BindGroupLayoutEntryBuilder {
++        if skin::skins_use_uniform_buffers(limits) {
++            texture_3d(TextureSampleType::Float { filterable: false })
++        } else {
++            storage_buffer_read_only::<MorphAttributes>(false)
++        }
+     }
+-    pub(super) fn targets() -> BindGroupLayoutEntryBuilder {
+-        texture_3d(TextureSampleType::Float { filterable: false })
++    pub(super) fn morph_descriptors() -> BindGroupLayoutEntryBuilder {
++        storage_buffer_read_only::<GpuMorphDescriptor>(false)
+     }
+     pub(super) fn lightmaps_texture_view() -> BindGroupLayoutEntryBuilder {
+         texture_2d(TextureSampleType::Float { filterable: true }).visibility(ShaderStages::FRAGMENT)
+@@ -81,6 +95,7 @@ mod layout_entry {
+ /// for bind groups.
+ mod entry {
+     use crate::render::skin;
++    use bevy_render::mesh::morph::MorphTargetsResource;
+ 
+     use super::{JOINT_BUFFER_SIZE, MORPH_BUFFER_SIZE};
+     use bevy_render::{
+@@ -116,15 +131,31 @@ mod entry {
+         };
+         entry(binding, size, buffer)
+     }
+-    pub(super) fn weights(binding: u32, buffer: &Buffer) -> BindGroupEntry<'_> {
+-        entry(binding, Some(MORPH_BUFFER_SIZE as u64), buffer)
++    pub(super) fn weights<'a>(
++        render_device: &'_ RenderDevice,
++        binding: u32,
++        buffer: &'a Buffer,
++    ) -> BindGroupEntry<'a> {
++        if skin::skins_use_uniform_buffers(&render_device.limits()) {
++            entry(binding, Some(MORPH_BUFFER_SIZE as u64), buffer)
++        } else {
++            entry(binding, None, buffer)
++        }
+     }
+-    pub(super) fn targets(binding: u32, texture: &TextureView) -> BindGroupEntry<'_> {
++    pub(super) fn targets(binding: u32, targets: MorphTargetsResource<'_>) -> BindGroupEntry<'_> {
+         BindGroupEntry {
+             binding,
+-            resource: BindingResource::TextureView(texture),
++            resource: match targets {
++                MorphTargetsResource::Texture(texture_view) => {
++                    BindingResource::TextureView(texture_view)
++                }
++                MorphTargetsResource::Storage(buffer) => buffer.as_entire_binding(),
++            },
+         }
+     }
++    pub(super) fn morph_descriptors(binding: u32, buffer: &Buffer) -> BindGroupEntry<'_> {
++        entry(binding, None, buffer)
++    }
+     pub(super) fn lightmaps_texture_view(
+         binding: u32,
+         texture: &TextureView,
+@@ -261,79 +292,111 @@ impl MeshLayouts {
+ 
+     /// Creates the layout for meshes with morph targets.
+     fn morphed_layout(render_device: &RenderDevice) -> BindGroupLayoutDescriptor {
+-        BindGroupLayoutDescriptor::new(
+-            "morphed_mesh_layout",
+-            &BindGroupLayoutEntries::with_indices(
+-                ShaderStages::VERTEX,
+-                (
+-                    (0, layout_entry::model(&render_device.limits())),
+-                    // The current frame's morph weight buffer.
+-                    (2, layout_entry::weights()),
+-                    (3, layout_entry::targets()),
+-                ),
+-            ),
+-        )
++        let limits = render_device.limits();
++
++        let mut entries: ArrayVec<BindGroupLayoutEntry, 4> = ArrayVec::new();
++
++        entries.extend(
++            [
++                (0, layout_entry::model(&limits)),
++                // The current frame's morph weight buffer.
++                (2, layout_entry::weights(&limits)),
++                (3, layout_entry::targets(&limits)),
++            ]
++            .iter()
++            .map(|(binding, entry)| entry.build(*binding, ShaderStages::VERTEX)),
++        );
++
++        if !skin::skins_use_uniform_buffers(&render_device.limits()) {
++            entries.push(layout_entry::morph_descriptors().build(8, ShaderStages::VERTEX));
++        }
++
++        BindGroupLayoutDescriptor::new("morphed_mesh_layout", &entries)
+     }
+ 
+     /// Creates the layout for meshes with morph targets and the infrastructure
+     /// to compute motion vectors.
+     fn morphed_motion_layout(render_device: &RenderDevice) -> BindGroupLayoutDescriptor {
+-        BindGroupLayoutDescriptor::new(
+-            "morphed_mesh_layout",
+-            &BindGroupLayoutEntries::with_indices(
+-                ShaderStages::VERTEX,
+-                (
+-                    (0, layout_entry::model(&render_device.limits())),
+-                    // The current frame's morph weight buffer.
+-                    (2, layout_entry::weights()),
+-                    (3, layout_entry::targets()),
+-                    // The previous frame's morph weight buffer.
+-                    (7, layout_entry::weights()),
+-                ),
+-            ),
+-        )
++        let limits = render_device.limits();
++
++        let mut entries: ArrayVec<BindGroupLayoutEntry, 5> = ArrayVec::new();
++
++        entries.extend(
++            [
++                (0, layout_entry::model(&limits)),
++                // The current frame's morph weight buffer.
++                (2, layout_entry::weights(&limits)),
++                (3, layout_entry::targets(&limits)),
++                // The previous frame's morph weight buffer.
++                (7, layout_entry::weights(&limits)),
++            ]
++            .iter()
++            .map(|(binding, entry)| entry.build(*binding, ShaderStages::VERTEX)),
++        );
++
++        if !skin::skins_use_uniform_buffers(&render_device.limits()) {
++            entries.push(layout_entry::morph_descriptors().build(8, ShaderStages::VERTEX));
++        }
++
++        BindGroupLayoutDescriptor::new("morphed_motion_layout", &entries)
+     }
+ 
+     /// Creates the bind group layout for meshes with both skins and morph
+     /// targets.
+     fn morphed_skinned_layout(render_device: &RenderDevice) -> BindGroupLayoutDescriptor {
+-        BindGroupLayoutDescriptor::new(
+-            "morphed_skinned_mesh_layout",
+-            &BindGroupLayoutEntries::with_indices(
+-                ShaderStages::VERTEX,
+-                (
+-                    (0, layout_entry::model(&render_device.limits())),
+-                    // The current frame's joint matrix buffer.
+-                    (1, layout_entry::skinning(&render_device.limits())),
+-                    // The current frame's morph weight buffer.
+-                    (2, layout_entry::weights()),
+-                    (3, layout_entry::targets()),
+-                ),
+-            ),
+-        )
++        let limits = render_device.limits();
++
++        let mut entries: ArrayVec<BindGroupLayoutEntry, 5> = ArrayVec::new();
++
++        entries.extend(
++            [
++                (0, layout_entry::model(&limits)),
++                // The current frame's joint matrix buffer.
++                (1, layout_entry::skinning(&limits)),
++                // The current frame's morph weight buffer.
++                (2, layout_entry::weights(&limits)),
++                (3, layout_entry::targets(&limits)),
++            ]
++            .iter()
++            .map(|(binding, entry)| entry.build(*binding, ShaderStages::VERTEX)),
++        );
++
++        if !skin::skins_use_uniform_buffers(&render_device.limits()) {
++            entries.push(layout_entry::morph_descriptors().build(8, ShaderStages::VERTEX));
++        }
++
++        BindGroupLayoutDescriptor::new("morphed_skinned_mesh_layout", &entries)
+     }
+ 
+     /// Creates the bind group layout for meshes with both skins and morph
+     /// targets, in addition to the infrastructure to compute motion vectors.
+     fn morphed_skinned_motion_layout(render_device: &RenderDevice) -> BindGroupLayoutDescriptor {
+-        BindGroupLayoutDescriptor::new(
+-            "morphed_skinned_motion_mesh_layout",
+-            &BindGroupLayoutEntries::with_indices(
+-                ShaderStages::VERTEX,
+-                (
+-                    (0, layout_entry::model(&render_device.limits())),
+-                    // The current frame's joint matrix buffer.
+-                    (1, layout_entry::skinning(&render_device.limits())),
+-                    // The current frame's morph weight buffer.
+-                    (2, layout_entry::weights()),
+-                    (3, layout_entry::targets()),
+-                    // The previous frame's joint matrix buffer.
+-                    (6, layout_entry::skinning(&render_device.limits())),
+-                    // The previous frame's morph weight buffer.
+-                    (7, layout_entry::weights()),
+-                ),
+-            ),
+-        )
++        let limits = render_device.limits();
++
++        let mut entries: ArrayVec<BindGroupLayoutEntry, 7> = ArrayVec::new();
++
++        entries.extend(
++            [
++                (0, layout_entry::model(&limits)),
++                // The current frame's joint matrix buffer.
++                (1, layout_entry::skinning(&limits)),
++                // The current frame's morph weight buffer.
++                (2, layout_entry::weights(&limits)),
++                (3, layout_entry::targets(&limits)),
++                // The previous frame's joint matrix buffer.
++                (6, layout_entry::skinning(&limits)),
++                // The previous frame's morph weight buffer.
++                (7, layout_entry::weights(&limits)),
++            ]
++            .iter()
++            .map(|(binding, entry)| entry.build(*binding, ShaderStages::VERTEX)),
++        );
++
++        if !skin::skins_use_uniform_buffers(&render_device.limits()) {
++            entries.push(layout_entry::morph_descriptors().build(8, ShaderStages::VERTEX));
++        }
++
++        BindGroupLayoutDescriptor::new("morphed_skinned_motion_mesh_layout", &entries)
+     }
+ 
+     fn lightmapped_layout(
+@@ -466,16 +529,25 @@ impl MeshLayouts {
+         pipeline_cache: &PipelineCache,
+         model: &BindingResource,
+         current_weights: &Buffer,
+-        targets: &TextureView,
++        targets: MorphTargetsResource,
++        maybe_morph_descriptors: Option<&Buffer>,
+     ) -> BindGroup {
++        let mut entries: ArrayVec<BindGroupEntry, 4> = ArrayVec::new();
++
++        entries.extend([
++            entry::model(0, model.clone()),
++            entry::weights(render_device, 2, current_weights),
++            entry::targets(3, targets),
++        ]);
++
++        if let Some(morph_descriptors) = maybe_morph_descriptors {
++            entries.push(entry::morph_descriptors(8, morph_descriptors));
++        }
++
+         render_device.create_bind_group(
+             "morphed_mesh_bind_group",
+             &pipeline_cache.get_bind_group_layout(&self.morphed),
+-            &[
+-                entry::model(0, model.clone()),
+-                entry::weights(2, current_weights),
+-                entry::targets(3, targets),
+-            ],
++            &entries,
+         )
+     }
+ 
+@@ -492,18 +564,27 @@ impl MeshLayouts {
+         pipeline_cache: &PipelineCache,
+         model: &BindingResource,
+         current_weights: &Buffer,
+-        targets: &TextureView,
+         prev_weights: &Buffer,
++        targets: MorphTargetsResource,
++        maybe_morph_descriptors: Option<&Buffer>,
+     ) -> BindGroup {
++        let mut entries: ArrayVec<BindGroupEntry, 5> = ArrayVec::new();
++
++        entries.extend([
++            entry::model(0, model.clone()),
++            entry::weights(render_device, 2, current_weights),
++            entry::targets(3, targets),
++            entry::weights(render_device, 7, prev_weights),
++        ]);
++
++        if let Some(morph_descriptors) = maybe_morph_descriptors {
++            entries.push(entry::morph_descriptors(8, morph_descriptors));
++        }
++
+         render_device.create_bind_group(
+             "morphed_motion_mesh_bind_group",
+             &pipeline_cache.get_bind_group_layout(&self.morphed_motion),
+-            &[
+-                entry::model(0, model.clone()),
+-                entry::weights(2, current_weights),
+-                entry::targets(3, targets),
+-                entry::weights(7, prev_weights),
+-            ],
++            &entries,
+         )
+     }
+ 
+@@ -515,17 +596,26 @@ impl MeshLayouts {
+         model: &BindingResource,
+         current_skin: &Buffer,
+         current_weights: &Buffer,
+-        targets: &TextureView,
++        targets: MorphTargetsResource,
++        maybe_morph_descriptors: Option<&Buffer>,
+     ) -> BindGroup {
++        let mut entries: ArrayVec<BindGroupEntry, 5> = ArrayVec::new();
++
++        entries.extend([
++            entry::model(0, model.clone()),
++            entry::skinning(render_device, 1, current_skin),
++            entry::weights(render_device, 2, current_weights),
++            entry::targets(3, targets),
++        ]);
++
++        if let Some(morph_descriptors) = maybe_morph_descriptors {
++            entries.push(entry::morph_descriptors(8, morph_descriptors));
++        }
++
+         render_device.create_bind_group(
+             "morphed_skinned_mesh_bind_group",
+             &pipeline_cache.get_bind_group_layout(&self.morphed_skinned),
+-            &[
+-                entry::model(0, model.clone()),
+-                entry::skinning(render_device, 1, current_skin),
+-                entry::weights(2, current_weights),
+-                entry::targets(3, targets),
+-            ],
++            &entries,
+         )
+     }
+ 
+@@ -543,21 +633,30 @@ impl MeshLayouts {
+         model: &BindingResource,
+         current_skin: &Buffer,
+         current_weights: &Buffer,
+-        targets: &TextureView,
++        targets: MorphTargetsResource,
+         prev_skin: &Buffer,
+         prev_weights: &Buffer,
++        morph_descriptors: Option<&Buffer>,
+     ) -> BindGroup {
++        let mut entries: ArrayVec<BindGroupEntry, 7> = ArrayVec::new();
++
++        entries.extend([
++            entry::model(0, model.clone()),
++            entry::skinning(render_device, 1, current_skin),
++            entry::weights(render_device, 2, current_weights),
++            entry::targets(3, targets),
++            entry::skinning(render_device, 6, prev_skin),
++            entry::weights(render_device, 7, prev_weights),
++        ]);
++
++        if let Some(morph_descriptors) = morph_descriptors {
++            entries.push(entry::morph_descriptors(8, morph_descriptors));
++        }
++
+         render_device.create_bind_group(
+             "morphed_skinned_motion_mesh_bind_group",
+             &pipeline_cache.get_bind_group_layout(&self.morphed_skinned_motion),
+-            &[
+-                entry::model(0, model.clone()),
+-                entry::skinning(render_device, 1, current_skin),
+-                entry::weights(2, current_weights),
+-                entry::targets(3, targets),
+-                entry::skinning(render_device, 6, prev_skin),
+-                entry::weights(7, prev_weights),
+-            ],
++            &entries,
+         )
+     }
+ }
+diff --git a/crates/bevy_pbr/src/render/mesh_preprocess.wgsl b/crates/bevy_pbr/src/render/mesh_preprocess.wgsl
+index 4145e1af0eea8..ace75cd53c65e 100644
+--- a/crates/bevy_pbr/src/render/mesh_preprocess.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_preprocess.wgsl
+@@ -375,4 +375,5 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+     output[mesh_output_index].material_and_lightmap_bind_group_slot =
+         current_input[input_index].material_and_lightmap_bind_group_slot;
+     output[mesh_output_index].tag = current_input[input_index].tag;
++    output[mesh_output_index].morph_descriptor_index = current_input[input_index].morph_descriptor_index;
+ }
+diff --git a/crates/bevy_pbr/src/render/mesh_types.wgsl b/crates/bevy_pbr/src/render/mesh_types.wgsl
+index 476391d6f8415..993185d5b35f9 100644
+--- a/crates/bevy_pbr/src/render/mesh_types.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_types.wgsl
+@@ -23,7 +23,7 @@ struct Mesh {
+     material_and_lightmap_bind_group_slot: u32,
+     // User supplied index to identify the mesh instance
+     tag: u32,
+-    pad: u32,
++    morph_descriptor_index: u32,
+ };
+ 
+ #ifdef SKINNED
+@@ -33,10 +33,44 @@ struct SkinnedMesh {
+ #endif
+ 
+ #ifdef MORPH_TARGETS
++
+ struct MorphWeights {
+     weights: array<vec4<f32>, 64u>, // 64 = 256 / 4 (256 = MAX_MORPH_WEIGHTS)
+ };
+-#endif
++
++// Describes a single mesh instance that uses morph targets.
++struct MorphDescriptor {
++    // The index of the first morph target weight in the `morph_weights` array.
++    current_weights_offset: u32,
++    // The index of the first morph target weight in the `prev_morph_weights`
++    // array.
++    prev_weights_offset: u32,
++    // The index of the first morph target for this mesh in the
++    // `MorphAttributes` array.
++    targets_offset: u32,
++    // The number of vertices in the mesh.
++    vertex_count: u32,
++    // The number of morph targets this mesh has.
++    weight_count: u32,
++};
++
++// Morph displacement for a single vertex.
++struct MorphAttributes {
++    // The position delta.
++    position: vec3<f32>,
++    // Padding, to ensure that each `vec3<f32>` is aligned to 16 bytes.
++    pad_a: f32,
++    // The normal delta.
++    normal: vec3<f32>,
++    // Padding, to ensure that each `vec3<f32>` is aligned to 16 bytes.
++    pad_b: f32,
++    // The tangent delta.
++    tangent: vec3<f32>,
++    // Padding, to ensure that each `vec3<f32>` is aligned to 16 bytes.
++    pad_c: f32,
++};
++
++#endif  // MORPH_TARGETS
+ 
+ // [2^0, 2^16)
+ const MESH_FLAGS_VISIBILITY_RANGE_INDEX_BITS: u32     = (1u << 16u) - 1u;
+diff --git a/crates/bevy_pbr/src/render/morph.rs b/crates/bevy_pbr/src/render/morph.rs
+index c04d06dabd2b0..d9d1dbf2c85d8 100644
+--- a/crates/bevy_pbr/src/render/morph.rs
++++ b/crates/bevy_pbr/src/render/morph.rs
+@@ -1,36 +1,97 @@
+ use core::{iter, mem};
+ 
+ use bevy_camera::visibility::ViewVisibility;
++use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::prelude::*;
+ use bevy_mesh::morph::{MeshMorphWeights, MorphWeights, MAX_MORPH_WEIGHTS};
+-use bevy_render::sync_world::MainEntityHashMap;
++use bevy_platform::collections::hash_map::Entry;
++use bevy_render::mesh::allocator::MeshAllocator;
++use bevy_render::mesh::RenderMesh;
++use bevy_render::render_asset::RenderAssets;
++use bevy_render::render_resource::ShaderType;
++use bevy_render::sync_world::{MainEntity, MainEntityHashMap};
+ use bevy_render::{
+     batching::NoAutomaticBatching,
+     render_resource::{BufferUsages, RawBufferVec},
+     renderer::{RenderDevice, RenderQueue},
+     Extract,
+ };
+-use bytemuck::NoUninit;
++use bytemuck::{NoUninit, Pod, Zeroable};
++
++use crate::{skin, RenderMeshInstances};
+ 
+ #[derive(Component)]
+ pub struct MorphIndex {
+     pub index: u32,
+ }
+ 
++/// The index of the [`GpuMorphDescriptor`] in the `morph_descriptors` buffer.
++#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Deref, DerefMut)]
++pub struct MorphDescriptorIndex(pub u32);
++
+ /// Maps each mesh affected by morph targets to the applicable offset within the
+ /// [`MorphUniforms`] buffer.
+ ///
+ /// We store both the current frame's mapping and the previous frame's mapping
+ /// for the purposes of motion vector calculation.
+-#[derive(Default, Resource)]
+-pub struct MorphIndices {
+-    /// Maps each entity with a morphed mesh to the appropriate offset within
+-    /// [`MorphUniforms::current_buffer`].
+-    pub current: MainEntityHashMap<MorphIndex>,
+-
+-    /// Maps each entity with a morphed mesh to the appropriate offset within
+-    /// [`MorphUniforms::prev_buffer`].
+-    pub prev: MainEntityHashMap<MorphIndex>,
++#[derive(Resource)]
++pub enum MorphIndices {
++    /// The variant used when storage buffers aren't supported on the current
++    /// platform.
++    Uniform {
++        /// Maps each entity with a morphed mesh to the appropriate offset within
++        /// [`MorphUniforms::current_buffer`].
++        current: MainEntityHashMap<MorphIndex>,
++
++        /// Maps each entity with a morphed mesh to the appropriate offset within
++        /// [`MorphUniforms::prev_buffer`].
++        prev: MainEntityHashMap<MorphIndex>,
++    },
++
++    /// The variant used when storage buffers are supported on the current
++    /// platform.
++    Storage {
++        /// Maps each entity with a morphed mesh to the [`MorphWeightsInfo`].
++        morph_weights_info: MainEntityHashMap<MorphWeightsInfo>,
++        /// Maps each entity with a morphed mesh to the [`GpuMorphDescriptor`]
++        /// in the `morph_descriptors` buffer.
++        gpu_descriptor_indices: MainEntityHashMap<MorphDescriptorIndex>,
++        /// Indices in the `morph_descriptors` buffer available for use.
++        gpu_descriptor_free_list: Vec<MorphDescriptorIndex>,
++    },
++}
++
++/// Information that the CPU needs about each morh target for the purposes of
++/// weight calculation.
++#[derive(Clone, Copy)]
++pub struct MorphWeightsInfo {
++    /// The offset to the first weight for this mesh instance in the
++    /// `morph_weights` buffer.
++    current_weight_offset: u32,
++    /// The offset to the first weight for this mesh instance in the
++    /// `prev_morph_weights` buffer, if applicable
++    pub(crate) prev_weight_offset: Option<u32>,
++    /// The total number of morph targets that this mesh instance has.
++    weight_count: u32,
++}
++
++impl FromWorld for MorphIndices {
++    fn from_world(world: &mut World) -> MorphIndices {
++        let render_device = world.resource::<RenderDevice>();
++
++        if skin::skins_use_uniform_buffers(&render_device.limits()) {
++            MorphIndices::Uniform {
++                current: MainEntityHashMap::default(),
++                prev: MainEntityHashMap::default(),
++            }
++        } else {
++            MorphIndices::Storage {
++                morph_weights_info: MainEntityHashMap::default(),
++                gpu_descriptor_indices: MainEntityHashMap::default(),
++                gpu_descriptor_free_list: vec![],
++            }
++        }
++    }
+ }
+ 
+ /// The GPU buffers containing morph weights for all meshes with morph targets.
+@@ -45,18 +106,93 @@ pub struct MorphUniforms {
+     pub current_buffer: RawBufferVec<f32>,
+     /// The morph weights for the previous frame.
+     pub prev_buffer: RawBufferVec<f32>,
++    /// Information that the GPU needs about each morph target.
++    ///
++    /// This is only present if morph targets use storage buffers. If the
++    /// platform doesn't support storage buffers, we're using morph target
++    /// images instead, and the shader can determine the relevant info from the
++    /// texture dimensions.
++    pub descriptors_buffer: Option<RawBufferVec<GpuMorphDescriptor>>,
+ }
+ 
+-impl Default for MorphUniforms {
+-    fn default() -> Self {
+-        Self {
+-            current_buffer: RawBufferVec::new(BufferUsages::UNIFORM),
+-            prev_buffer: RawBufferVec::new(BufferUsages::UNIFORM),
++impl FromWorld for MorphUniforms {
++    fn from_world(world: &mut World) -> MorphUniforms {
++        let render_device = world.resource::<RenderDevice>();
++
++        let skins_use_uniform_buffers = skin::skins_use_uniform_buffers(&render_device.limits());
++
++        let buffer_usages = BufferUsages::COPY_DST
++            | (if skins_use_uniform_buffers {
++                BufferUsages::UNIFORM
++            } else {
++                BufferUsages::STORAGE
++            });
++
++        MorphUniforms {
++            current_buffer: RawBufferVec::new(buffer_usages),
++            prev_buffer: RawBufferVec::new(buffer_usages),
++            descriptors_buffer: if skins_use_uniform_buffers {
++                None
++            } else {
++                Some(RawBufferVec::new(
++                    BufferUsages::COPY_DST | BufferUsages::STORAGE,
++                ))
++            },
+         }
+     }
+ }
+ 
+-pub fn prepare_morphs(
++impl MorphUniforms {
++    /// Swaps the current buffer and previous buffer, and clears out the new
++    /// current buffer in preparation for a new frame.
++    fn prepare_for_new_frame(&mut self) {
++        mem::swap(&mut self.current_buffer, &mut self.prev_buffer);
++        self.current_buffer.clear();
++    }
++}
++
++impl MorphIndices {
++    /// Returns the index of the morph descriptor in the morph descriptor table
++    /// for the given entity.
++    ///
++    /// As morph descriptors are only present if the platform supports storage
++    /// buffers, this method returns `None` if the platform doesn't support
++    /// them.
++    pub(crate) fn morph_descriptor_index(
++        &self,
++        main_entity: MainEntity,
++    ) -> Option<MorphDescriptorIndex> {
++        match *self {
++            MorphIndices::Uniform { .. } => None,
++            MorphIndices::Storage {
++                ref gpu_descriptor_indices,
++                ..
++            } => gpu_descriptor_indices.get(&main_entity).copied(),
++        }
++    }
++}
++
++/// Information that the GPU needs about a single mesh instance that uses morph
++/// targets.
++#[derive(Clone, Copy, Default, ShaderType, Pod, Zeroable)]
++#[repr(C)]
++pub struct GpuMorphDescriptor {
++    /// The index of the first morph target weight in the `morph_weights` array.
++    pub current_weights_offset: u32,
++    /// The index of the first morph target weight in the `prev_morph_weights`
++    /// array.
++    pub prev_weights_offset: u32,
++    /// The index of the first morph target for this mesh in the
++    /// `MorphAttributes` array.
++    pub targets_offset: u32,
++    /// The number of vertices in the mesh.
++    pub vertex_count: u32,
++    /// The number of morph targets this mesh has.
++    pub weight_count: u32,
++}
++
++/// A system that writes the buffers inside [`MorphUniforms`] to the GPU.
++pub fn write_morph_buffers(
+     render_device: Res<RenderDevice>,
+     render_queue: Res<RenderQueue>,
+     mut uniform: ResMut<MorphUniforms>,
+@@ -72,6 +208,13 @@ pub fn prepare_morphs(
+ 
+     // We don't need to write `uniform.prev_buffer` because we already wrote it
+     // last frame, and the data should still be on the GPU.
++
++    if let Some(ref mut descriptors_buffer) = uniform.descriptors_buffer {
++        if descriptors_buffer.is_empty() {
++            descriptors_buffer.push(GpuMorphDescriptor::default());
++        }
++        descriptors_buffer.write_buffer(&render_device, &render_queue);
++    }
+ }
+ 
+ const fn can_align(step: usize, target: usize) -> bool {
+@@ -111,17 +254,33 @@ pub fn extract_morphs(
+     uniform: ResMut<MorphUniforms>,
+     query: Extract<Query<(Entity, &ViewVisibility, &MeshMorphWeights)>>,
+     weights_query: Extract<Query<&MorphWeights>>,
++    render_device: Res<RenderDevice>,
+ ) {
+     // Borrow check workaround.
+     let (morph_indices, uniform) = (morph_indices.into_inner(), uniform.into_inner());
+ 
++    let morphs_use_uniform_buffers = skin::skins_use_uniform_buffers(&render_device.limits());
++
+     // Swap buffers. We need to keep the previous frame's buffer around for the
+     // purposes of motion vector computation.
+-    mem::swap(&mut morph_indices.current, &mut morph_indices.prev);
+-    mem::swap(&mut uniform.current_buffer, &mut uniform.prev_buffer);
+-    morph_indices.current.clear();
+-    uniform.current_buffer.clear();
++    let maybe_old_morph_target_info = match *morph_indices {
++        MorphIndices::Uniform {
++            ref mut current,
++            ref mut prev,
++        } => {
++            mem::swap(current, prev);
++            current.clear();
++            None
++        }
++        MorphIndices::Storage {
++            morph_weights_info: ref mut morph_target_info,
++            ..
++        } => Some(mem::take(morph_target_info)),
++    };
++
++    uniform.prepare_for_new_frame();
+ 
++    // Loop over each entity with morph targets.
+     for (entity, view_visibility, mesh_weights) in &query {
+         if !view_visibility.get() {
+             continue;
+@@ -134,28 +293,157 @@ pub fn extract_morphs(
+         }) else {
+             continue;
+         };
++
++        // Write the weights to the buffer. If we're using uniform buffers, then
++        // we have to pad out the buffer to its fixed length.
+         let start = uniform.current_buffer.len();
+-        let legal_weights = weights
+-            .iter()
+-            .chain(iter::repeat(&0.0))
+-            .take(MAX_MORPH_WEIGHTS)
+-            .copied();
+-        uniform.current_buffer.extend(legal_weights);
+-        add_to_alignment::<f32>(&mut uniform.current_buffer);
+-
+-        let index = (start * size_of::<f32>()) as u32;
+-        morph_indices
+-            .current
+-            .insert(entity.into(), MorphIndex { index });
++        if morphs_use_uniform_buffers {
++            let legal_weights = weights
++                .iter()
++                .chain(iter::repeat(&0.0))
++                .take(MAX_MORPH_WEIGHTS)
++                .copied();
++            uniform.current_buffer.extend(legal_weights);
++            add_to_alignment::<f32>(&mut uniform.current_buffer);
++        } else {
++            uniform.current_buffer.extend(weights.iter().copied());
++        }
++
++        // Find the index of the weights for the previous frame in the buffer.
++        let maybe_prev_weights_offset =
++            maybe_old_morph_target_info
++                .as_ref()
++                .and_then(|old_morph_target_info| {
++                    old_morph_target_info
++                        .get(&MainEntity::from(entity))
++                        .map(|morph_target_info| morph_target_info.current_weight_offset)
++                });
++
++        // Store the location of the weights for future use.
++        match *morph_indices {
++            MorphIndices::Uniform {
++                ref mut current, ..
++            } => {
++                let index = (start * size_of::<f32>()) as u32;
++                current.insert(entity.into(), MorphIndex { index });
++            }
++            MorphIndices::Storage {
++                morph_weights_info: ref mut morph_target_info,
++                ..
++            } => {
++                morph_target_info.insert(
++                    entity.into(),
++                    MorphWeightsInfo {
++                        current_weight_offset: start as u32,
++                        prev_weight_offset: maybe_prev_weights_offset,
++                        weight_count: weights.len() as u32,
++                    },
++                );
++            }
++        }
+     }
+ }
+ 
++/// A system that writes [`GpuMorphDescriptor`] values to the [`MorphUniforms`]
++/// for each mesh instance with morph targets.
++///
++/// As morph descriptors are only used when the platform supports storage
++/// buffers, if the platform doesn't support storage buffers, this system does
++/// nothing.
++pub fn prepare_morph_descriptors(
++    mut morph_indices: ResMut<MorphIndices>,
++    mut morph_uniforms: ResMut<MorphUniforms>,
++    render_mesh_instances: Res<RenderMeshInstances>,
++    meshes: Res<RenderAssets<RenderMesh>>,
++    mesh_allocator: Res<MeshAllocator>,
++) {
++    // Don't do anything unless the platform supports storage buffers.
++    let (
++        &mut MorphIndices::Storage {
++            morph_weights_info: ref morph_target_info,
++            ref mut gpu_descriptor_indices,
++            ref mut gpu_descriptor_free_list,
++        },
++        &mut Some(ref mut descriptors_buffer),
++    ) = (&mut *morph_indices, &mut morph_uniforms.descriptors_buffer)
++    else {
++        return;
++    };
++
++    for (&morph_target_main_entity, morph_target_info) in morph_target_info {
++        let Some(mesh_id) = render_mesh_instances.mesh_asset_id(morph_target_main_entity) else {
++            continue;
++        };
++        let Some(mesh) = meshes.get(mesh_id) else {
++            continue;
++        };
++        let Some(morph_targets_slice) = mesh_allocator.mesh_morph_target_slice(&mesh_id) else {
++            continue;
++        };
++
++        // Create our morph descriptor.
++        let morph_descriptor = GpuMorphDescriptor {
++            current_weights_offset: morph_target_info.current_weight_offset,
++            prev_weights_offset: morph_target_info.prev_weight_offset.unwrap_or(!0),
++            targets_offset: morph_targets_slice.range.start,
++            vertex_count: mesh.vertex_count,
++            weight_count: morph_target_info.weight_count,
++        };
++
++        // Place it in the descriptors buffer. Note that if the morph target
++        // descriptor for an entity was in the buffer last frame, then it must
++        // be at the same index this frame. That's because the
++        // `MeshInputUniform` stores the index of the morph target descriptor,
++        // and `MeshInputUniform`s aren't updated unless the mesh instance
++        // changes.
++        let descriptor_index;
++        match gpu_descriptor_indices.entry(morph_target_main_entity) {
++            Entry::Occupied(occupied_entry) => {
++                descriptor_index = *occupied_entry.get();
++                descriptors_buffer.set(descriptor_index.0, morph_descriptor);
++            }
++            Entry::Vacant(vacant_entry) => {
++                match gpu_descriptor_free_list.pop() {
++                    Some(free_descriptor_index) => {
++                        descriptor_index = free_descriptor_index;
++                        descriptors_buffer.set(descriptor_index.0, morph_descriptor);
++                    }
++                    None => {
++                        descriptor_index =
++                            MorphDescriptorIndex(descriptors_buffer.push(morph_descriptor) as u32);
++                    }
++                }
++                vacant_entry.insert(descriptor_index);
++            }
++        };
++
++        // Note where we wrote it.
++        gpu_descriptor_indices.insert(morph_target_main_entity, descriptor_index);
++    }
++
++    // Expire descriptor indices corresponding to entities no longer present.
++    gpu_descriptor_indices.retain(|morph_target_main_entity, descriptor_index| {
++        let live = morph_target_info.contains_key(morph_target_main_entity);
++        if !live {
++            gpu_descriptor_free_list.push(*descriptor_index);
++        }
++        live
++    });
++}
++
+ // NOTE: Because morph targets require per-morph target texture bindings, they cannot
+-// currently be batched.
++// currently be batched on platforms without storage buffers.
+ pub fn no_automatic_morph_batching(
+     mut commands: Commands,
+     query: Query<Entity, (With<MeshMorphWeights>, Without<NoAutomaticBatching>)>,
++    render_device: Res<RenderDevice>,
+ ) {
++    // We *can* batch mesh instances with morph targets if the platform supports
++    // storage buffers.
++    if !skin::skins_use_uniform_buffers(&render_device.limits()) {
++        return;
++    }
++
+     for entity in &query {
+         commands.entity(entity).try_insert(NoAutomaticBatching);
+     }
+diff --git a/crates/bevy_pbr/src/render/morph.wgsl b/crates/bevy_pbr/src/render/morph.wgsl
+index 6689d68cc6415..1b9e7d9505623 100644
+--- a/crates/bevy_pbr/src/render/morph.wgsl
++++ b/crates/bevy_pbr/src/render/morph.wgsl
+@@ -2,12 +2,24 @@
+ 
+ #ifdef MORPH_TARGETS
+ 
+-#import bevy_pbr::mesh_types::MorphWeights;
++#import bevy_pbr::mesh_types::{MorphAttributes, MorphDescriptor, MorphWeights}
++#import bevy_pbr::mesh_bindings::mesh
++
++#ifdef SKINS_USE_UNIFORM_BUFFERS
+ 
+ @group(2) @binding(2) var<uniform> morph_weights: MorphWeights;
+ @group(2) @binding(3) var morph_targets: texture_3d<f32>;
+ @group(2) @binding(7) var<uniform> prev_morph_weights: MorphWeights;
+ 
++#else   // SKINS_USE_UNIFORM_BUFFERS
++
++@group(2) @binding(2) var<storage> morph_weights: array<f32>;
++@group(2) @binding(3) var<storage> morph_targets: array<MorphAttributes>;
++@group(2) @binding(7) var<storage> prev_morph_weights: array<f32>;
++@group(2) @binding(8) var<storage> morph_descriptors: array<MorphDescriptor>;
++
++#endif  // SKINS_USE_UNIFORM_BUFFERS
++
+ // NOTE: Those are the "hardcoded" values found in `MorphAttributes` struct
+ // in crates/bevy_render/src/mesh/morph/visitors.rs
+ // In an ideal world, the offsets are established dynamically and passed as #defines
+@@ -17,23 +29,48 @@ const normal_offset: u32 = 3u;
+ const tangent_offset: u32 = 6u;
+ const total_component_count: u32 = 9u;
+ 
+-fn layer_count() -> u32 {
++fn layer_count(instance_index: u32) -> u32 {
++#ifdef SKINS_USE_UNIFORM_BUFFERS
+     let dimensions = textureDimensions(morph_targets);
+     return u32(dimensions.z);
++#else   // SKINS_USE_UNIFORM_BUFFERS
++    let morph_descriptor_index = mesh[instance_index].morph_descriptor_index;
++    return morph_descriptors[morph_descriptor_index].weight_count;
++#endif  // SKINS_USE_UNIFORM_BUFFERS
+ }
++
++#ifdef SKINS_USE_UNIFORM_BUFFERS
+ fn component_texture_coord(vertex_index: u32, component_offset: u32) -> vec2<u32> {
+     let width = u32(textureDimensions(morph_targets).x);
+     let component_index = total_component_count * vertex_index + component_offset;
+     return vec2<u32>(component_index % width, component_index / width);
+ }
+-fn weight_at(weight_index: u32) -> f32 {
++#endif  // SKINS_USE_UNIFORM_BUFFERS
++
++fn weight_at(weight_index: u32, instance_index: u32) -> f32 {
++#ifdef SKINS_USE_UNIFORM_BUFFERS
+     let i = weight_index;
+     return morph_weights.weights[i / 4u][i % 4u];
++#else   // SKINS_USE_UNIFORM_BUFFERS
++    let morph_descriptor_index = mesh[instance_index].morph_descriptor_index;
++    let weights_offset = morph_descriptors[morph_descriptor_index].current_weights_offset;
++    return morph_weights[weights_offset + weight_index];
++#endif  // SKINS_USE_UNIFORM_BUFFERS
+ }
+-fn prev_weight_at(weight_index: u32) -> f32 {
++
++fn prev_weight_at(weight_index: u32, instance_index: u32) -> f32 {
++#ifdef SKINS_USE_UNIFORM_BUFFERS
+     let i = weight_index;
+     return prev_morph_weights.weights[i / 4u][i % 4u];
++#else   // SKINS_USE_UNIFORM_BUFFERS
++    let morph_descriptor_index = mesh[instance_index].morph_descriptor_index;
++    let weights_offset = morph_descriptors[morph_descriptor_index].prev_weights_offset;
++    return prev_morph_weights[weights_offset + weight_index];
++#endif  // SKINS_USE_UNIFORM_BUFFERS
+ }
++
++#ifdef SKINS_USE_UNIFORM_BUFFERS
++
+ fn morph_pixel(vertex: u32, component: u32, weight: u32) -> f32 {
+     let coord = component_texture_coord(vertex, component);
+     // Due to https://gpuweb.github.io/gpuweb/wgsl/#texel-formats
+@@ -41,6 +78,7 @@ fn morph_pixel(vertex: u32, component: u32, weight: u32) -> f32 {
+     // only the first component is set.
+     return textureLoad(morph_targets, vec3(coord, weight), 0).r;
+ }
++
+ fn morph(vertex_index: u32, component_offset: u32, weight_index: u32) -> vec3<f32> {
+     return vec3<f32>(
+         morph_pixel(vertex_index, component_offset, weight_index),
+@@ -49,4 +87,39 @@ fn morph(vertex_index: u32, component_offset: u32, weight_index: u32) -> vec3<f3
+     );
+ }
+ 
++fn morph_position(vertex_index: u32, weight_index: u32, instance_index: u32) -> vec3<f32> {
++    return morph(vertex_index, position_offset, weight_index);
++}
++
++fn morph_normal(vertex_index: u32, weight_index: u32, instance_index: u32) -> vec3<f32> {
++    return morph(vertex_index, normal_offset, weight_index);
++}
++
++fn morph_tangent(vertex_index: u32, weight_index: u32, instance_index: u32) -> vec3<f32> {
++    return morph(vertex_index, tangent_offset, weight_index);
++}
++
++#else   // SKINS_USE_UNIFORM_BUFFERS
++
++fn get_morph_target(vertex_index: u32, weight_index: u32, instance_index: u32) -> MorphAttributes {
++    let morph_descriptor_index = mesh[instance_index].morph_descriptor_index;
++    let targets_offset = morph_descriptors[morph_descriptor_index].targets_offset;
++    let vertex_count = morph_descriptors[morph_descriptor_index].vertex_count;
++    return morph_targets[targets_offset + weight_index * vertex_count + vertex_index];
++}
++
++fn morph_position(vertex_index: u32, weight_index: u32, instance_index: u32) -> vec3<f32> {
++    return get_morph_target(vertex_index, weight_index, instance_index).position;
++}
++
++fn morph_normal(vertex_index: u32, weight_index: u32, instance_index: u32) -> vec3<f32> {
++    return get_morph_target(vertex_index, weight_index, instance_index).normal;
++}
++
++fn morph_tangent(vertex_index: u32, weight_index: u32, instance_index: u32) -> vec3<f32> {
++    return get_morph_target(vertex_index, weight_index, instance_index).tangent;
++}
++
++#endif  // SKINS_USE_UNIFORM_BUFFERS
++
+ #endif // MORPH_TARGETS
+diff --git a/crates/bevy_pbr/src/render/skin.rs b/crates/bevy_pbr/src/render/skin.rs
+index 48576b5081bb8..71c1fbb38e433 100644
+--- a/crates/bevy_pbr/src/render/skin.rs
++++ b/crates/bevy_pbr/src/render/skin.rs
+@@ -1,5 +1,4 @@
+ use core::mem::{self, size_of};
+-use std::sync::OnceLock;
+ 
+ use bevy_asset::{prelude::AssetChanged, Assets};
+ use bevy_camera::visibility::ViewVisibility;
+@@ -191,8 +190,7 @@ impl SkinUniformInfo {
+ /// Returns true if skinning must use uniforms (and dynamic offsets) because
+ /// storage buffers aren't supported on the current platform.
+ pub fn skins_use_uniform_buffers(limits: &WgpuLimits) -> bool {
+-    static SKINS_USE_UNIFORM_BUFFERS: OnceLock<bool> = OnceLock::new();
+-    *SKINS_USE_UNIFORM_BUFFERS.get_or_init(|| limits.max_storage_buffers_per_shader_stage == 0)
++    bevy_render::storage_buffers_are_unsupported(limits)
+ }
+ 
+ /// Uploads the buffers containing the joints to the GPU.
+diff --git a/crates/bevy_pbr/src/wireframe.rs b/crates/bevy_pbr/src/wireframe.rs
+index 7b40874bbfd4c..235a5f64f2a50 100644
+--- a/crates/bevy_pbr/src/wireframe.rs
++++ b/crates/bevy_pbr/src/wireframe.rs
+@@ -34,7 +34,7 @@ use bevy_render::{
+     },
+     extract_resource::ExtractResource,
+     mesh::{
+-        allocator::{MeshAllocator, SlabId},
++        allocator::{MeshAllocator, MeshSlabs},
+         RenderMesh, RenderMeshBufferInfo,
+     },
+     prelude::*,
+@@ -282,16 +282,14 @@ pub struct Wireframe3dBatchSetKey {
+ 
+     /// The function used to draw.
+     pub draw_function: DrawFunctionId,
+-    /// The ID of the slab of GPU memory that contains vertex data.
+-    ///
+-    /// For non-mesh items, you can fill this with 0 if your items can be
+-    /// multi-drawn, or with a unique value if they can't.
+-    pub vertex_slab: SlabId,
+ 
+-    /// The ID of the slab of GPU memory that contains index data, if present.
++    /// The IDs of the slabs of GPU memory in the mesh allocator that contain
++    /// the mesh data.
+     ///
+-    /// For non-mesh items, you can safely fill this with `None`.
+-    pub index_slab: Option<SlabId>,
++    /// For non-mesh items, you can fill the [`MeshSlabs::vertex_slab_id`] with
++    /// 0 if your items can be multi-drawn, or with a unique value if they
++    /// can't.
++    pub slabs: MeshSlabs,
+ 
+     /// For the wide wireframe path, the mesh asset ID ensures all draws in one
+     /// batch set share the same vertex-pull params uniform. `None` for the thin
+@@ -301,7 +299,7 @@ pub struct Wireframe3dBatchSetKey {
+ 
+ impl PhaseItemBatchSetKey for Wireframe3dBatchSetKey {
+     fn indexed(&self) -> bool {
+-        self.index_slab.is_some()
++        self.slabs.index_slab_id.is_some()
+     }
+ }
+ 
+@@ -1597,8 +1595,14 @@ fn queue_wireframes(
+                 .unwrap_or(false);
+             let draw_function = if is_wide { draw_wide } else { draw_thin };
+ 
+-            let (vertex_slab, index_slab) =
+-                mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id());
++            let Some(MeshSlabs {
++                vertex_slab_id: vertex_slab,
++                index_slab_id: index_slab,
++                morph_target_slab_id: morph_target_slab,
++            }) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id())
++            else {
++                continue;
++            };
+             let bin_key = Wireframe3dBinKey {
+                 asset_id: mesh_instance.mesh_asset_id().untyped(),
+             };
+@@ -1606,11 +1610,15 @@ fn queue_wireframes(
+                 pipeline: pipeline_id,
+                 asset_id: wireframe_instance.untyped(),
+                 draw_function,
+-                vertex_slab: vertex_slab.unwrap_or_default(),
+-                // wide wireframes use non-indexed draws (vertex pulling from storage),
+-                // so set index_slab to None to make the preprocessor emit
+-                // IndirectParametersNonIndexed instead of IndirectParametersIndexed.
+-                index_slab: if is_wide { None } else { index_slab },
++                slabs: MeshSlabs {
++                    vertex_slab_id: vertex_slab,
++                    morph_target_slab_id: morph_target_slab,
++                    // wide wireframes use non-indexed draws (vertex pulling
++                    // from storage), so set index_slab to None to make the
++                    // preprocessor emit IndirectParametersNonIndexed instead of
++                    // IndirectParametersIndexed.
++                    index_slab_id: if is_wide { None } else { index_slab },
++                },
+                 mesh_asset_id: if is_wide {
+                     Some(mesh_instance.mesh_asset_id().untyped())
+                 } else {
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index cb5f717ed63f8..f1dd48b088497 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -86,7 +86,7 @@ use crate::{
+     render_asset::prepare_assets,
+     render_resource::PipelineCache,
+     renderer::{render_system, RenderAdapterInfo, RenderGraph},
+-    settings::RenderCreation,
++    settings::{RenderCreation, WgpuLimits},
+     storage::StoragePlugin,
+     texture::TexturePlugin,
+     view::{ViewPlugin, WindowRenderPlugin},
+@@ -109,7 +109,7 @@ use render_asset::{
+     RenderAssetBytesPerFrame, RenderAssetBytesPerFrameLimiter,
+ };
+ use settings::RenderResources;
+-use std::sync::Mutex;
++use std::sync::{Mutex, OnceLock};
+ 
+ /// Contains the default Bevy rendering backend based on wgpu.
+ ///
+@@ -472,3 +472,10 @@ pub fn get_mali_driver_version(adapter_info: &RenderAdapterInfo) -> Option<u32>
+ 
+     None
+ }
++
++/// Returns true if storage buffers are unsupported on this platform or false
++/// if they are supported.
++pub fn storage_buffers_are_unsupported(limits: &WgpuLimits) -> bool {
++    static STORAGE_BUFFERS_UNSUPPORTED: OnceLock<bool> = OnceLock::new();
++    *STORAGE_BUFFERS_UNSUPPORTED.get_or_init(|| limits.max_storage_buffers_per_shader_stage == 0)
++}
+diff --git a/crates/bevy_render/src/mesh/allocator.rs b/crates/bevy_render/src/mesh/allocator.rs
+index 88a882e0368a6..262fdf8bc536d 100644
+--- a/crates/bevy_render/src/mesh/allocator.rs
++++ b/crates/bevy_render/src/mesh/allocator.rs
+@@ -26,6 +26,9 @@ use wgpu::{
+     COPY_BUFFER_ALIGNMENT,
+ };
+ 
++#[cfg(feature = "morph")]
++use bevy_mesh::morph::MorphAttributes;
++
+ use crate::{
+     mesh::{Mesh, MeshVertexBufferLayouts, RenderMesh},
+     render_asset::{prepare_assets, ExtractedAssets},
+@@ -69,6 +72,10 @@ pub struct MeshAllocator {
+     /// Maps mesh asset IDs to the ID of the slabs that hold their index data.
+     mesh_id_to_index_slab: HashMap<AssetId<Mesh>, SlabId>,
+ 
++    /// Maps mesh asset IDs to the ID of the slabs that hold their morph target
++    /// data.
++    mesh_id_to_morph_target_slab: HashMap<AssetId<Mesh>, SlabId>,
++
+     /// The next slab ID to assign.
+     next_slab_id: SlabId,
+ 
+@@ -138,6 +145,17 @@ impl Default for MeshAllocatorSettings {
+     }
+ }
+ 
++/// The [`ElementLayout`] for morph displacements.
++///
++/// All morph displacements currently have the same element layout, so we only
++/// need one of these.
++#[cfg(feature = "morph")]
++static MORPH_ATTRIBUTE_ELEMENT_LAYOUT: ElementLayout = ElementLayout {
++    class: ElementClass::MorphTarget,
++    size: size_of::<MorphAttributes>() as u64,
++    elements_per_slot: 1,
++};
++
+ /// The hardware buffer that mesh data lives in, as well as the range within
+ /// that buffer.
+ pub struct MeshBufferSlice<'a> {
+@@ -173,11 +191,41 @@ enum Slab {
+     LargeObject(LargeObjectSlab),
+ }
+ 
++/// IDs of the slabs associated with a single mesh.
++#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
++pub struct MeshSlabs {
++    /// The slab storing the mesh's vertex data.
++    pub vertex_slab_id: SlabId,
++    /// The slab storing the mesh's index data, if the mesh is indexed.
++    pub index_slab_id: Option<SlabId>,
++    /// The slab storing the mesh's morph target displacements, if the mesh has
++    /// morph targets.
++    pub morph_target_slab_id: Option<SlabId>,
++}
++
+ impl Slab {
++    /// Returns the GPU buffer corresponding to this slab, if it's been
++    /// uploaded.
++    pub fn buffer(&self) -> Option<&Buffer> {
++        match self {
++            Slab::General(general_slab) => general_slab.buffer.as_ref(),
++            Slab::LargeObject(large_object_slab) => large_object_slab.buffer.as_ref(),
++        }
++    }
++
+     pub fn buffer_size(&self) -> u64 {
++        match self.buffer() {
++            Some(buffer) => buffer.size(),
++            None => 0,
++        }
++    }
++
++    /// Returns the type of buffer that this is: vertex, index, or morph target.
++    #[cfg(feature = "morph")]
++    pub fn element_class(&self) -> ElementClass {
+         match self {
+-            Self::General(gs) => gs.buffer.as_ref().map(|buffer| buffer.size()).unwrap_or(0),
+-            Self::LargeObject(lo) => lo.buffer.as_ref().map(|buffer| buffer.size()).unwrap_or(0),
++            Slab::General(general_slab) => general_slab.element_layout.class,
++            Slab::LargeObject(large_object_slab) => large_object_slab.element_layout.class,
+         }
+     }
+ }
+@@ -239,6 +287,9 @@ enum ElementClass {
+     Vertex,
+     /// A vertex index.
+     Index,
++    #[cfg(feature = "morph")]
++    /// Displacement data for a morph target.
++    MorphTarget,
+ }
+ 
+ /// The results of [`GeneralSlab::grow_if_necessary`].
+@@ -359,6 +410,7 @@ impl FromWorld for MeshAllocator {
+             slab_layouts: HashMap::default(),
+             mesh_id_to_vertex_slab: HashMap::default(),
+             mesh_id_to_index_slab: HashMap::default(),
++            mesh_id_to_morph_target_slab: HashMap::default(),
+             next_slab_id: default(),
+             general_vertex_slabs_supported,
+             extra_buffer_usages: BufferUsages::empty(),
+@@ -406,17 +458,26 @@ impl MeshAllocator {
+         self.mesh_slice_in_slab(mesh_id, *self.mesh_id_to_index_slab.get(mesh_id)?)
+     }
+ 
++    /// Returns the buffer and range within that buffer of the morph target data
++    /// for the mesh with the given ID.
++    ///
++    /// If the mesh has no morph target data or wasn't allocated, returns None.
++    pub fn mesh_morph_target_slice(&self, mesh_id: &AssetId<Mesh>) -> Option<MeshBufferSlice<'_>> {
++        self.mesh_slice_in_slab(mesh_id, *self.mesh_id_to_morph_target_slab.get(mesh_id)?)
++    }
++
+     /// Returns the IDs of the vertex buffer and index buffer respectively for
+     /// the mesh with the given ID.
+     ///
+     /// If the mesh wasn't allocated, or has no index data in the case of the
+     /// index buffer, the corresponding element in the returned tuple will be
+     /// None.
+-    pub fn mesh_slabs(&self, mesh_id: &AssetId<Mesh>) -> (Option<SlabId>, Option<SlabId>) {
+-        (
+-            self.mesh_id_to_vertex_slab.get(mesh_id).cloned(),
+-            self.mesh_id_to_index_slab.get(mesh_id).cloned(),
+-        )
++    pub fn mesh_slabs(&self, mesh_id: &AssetId<Mesh>) -> Option<MeshSlabs> {
++        Some(MeshSlabs {
++            vertex_slab_id: self.mesh_id_to_vertex_slab.get(mesh_id).cloned()?,
++            index_slab_id: self.mesh_id_to_index_slab.get(mesh_id).cloned(),
++            morph_target_slab_id: self.mesh_id_to_morph_target_slab.get(mesh_id).cloned(),
++        })
+     }
+ 
+     /// Get the number of allocated slabs
+@@ -433,6 +494,24 @@ impl MeshAllocator {
+         self.mesh_id_to_index_slab.len()
+     }
+ 
++    /// Returns an iterator over all slabs that contain morph targets.
++    #[cfg(feature = "morph")]
++    pub fn morph_target_slabs(&self) -> impl Iterator<Item = SlabId> {
++        self.slabs.iter().filter_map(|(slab_id, slab)| {
++            if matches!(slab.element_class(), ElementClass::MorphTarget) {
++                Some(*slab_id)
++            } else {
++                None
++            }
++        })
++    }
++
++    /// Returns the GPU buffer corresponding to the slab with the given ID if
++    /// that slab has been uploaded to the GPU.
++    pub fn buffer_for_slab(&self, slab_id: SlabId) -> Option<&Buffer> {
++        self.slabs.get(&slab_id).and_then(|slab| slab.buffer())
++    }
++
+     /// Given a slab and a mesh with data located with it, returns the buffer
+     /// and range of that mesh data within the slab.
+     fn mesh_slice_in_slab(
+@@ -507,6 +586,18 @@ impl MeshAllocator {
+                     mesh_allocator_settings,
+                 );
+             }
++
++            // Allocate morph target data.
++            #[cfg(feature = "morph")]
++            if let Some(morph_targets) = mesh.get_morph_targets() {
++                self.allocate(
++                    mesh_id,
++                    morph_targets.len() as u64 * size_of::<MorphAttributes>() as u64,
++                    MORPH_ATTRIBUTE_ELEMENT_LAYOUT,
++                    &mut slabs_to_grow,
++                    mesh_allocator_settings,
++                );
++            }
+         }
+ 
+         // Perform growth.
+@@ -518,6 +609,8 @@ impl MeshAllocator {
+         for (mesh_id, mesh) in &extracted_meshes.extracted {
+             self.copy_mesh_vertex_data(mesh_id, mesh, render_device, render_queue);
+             self.copy_mesh_index_data(mesh_id, mesh, render_device, render_queue);
++            #[cfg(feature = "morph")]
++            self.copy_mesh_morph_target_data(mesh_id, mesh, render_device, render_queue);
+         }
+     }
+ 
+@@ -539,7 +632,6 @@ impl MeshAllocator {
+             mesh_id,
+             mesh.get_vertex_buffer_size(),
+             |slice| mesh.write_packed_vertex_buffer_data(slice),
+-            BufferUsages::VERTEX,
+             slab_id,
+             render_device,
+             render_queue,
+@@ -567,7 +659,34 @@ impl MeshAllocator {
+             mesh_id,
+             index_data.len(),
+             |slice| slice.copy_from_slice(index_data),
+-            BufferUsages::INDEX,
++            slab_id,
++            render_device,
++            render_queue,
++        );
++    }
++
++    /// Copies morph target array data from a mesh into the appropriate spot in
++    /// the slab.
++    #[cfg(feature = "morph")]
++    fn copy_mesh_morph_target_data(
++        &mut self,
++        mesh_id: &AssetId<Mesh>,
++        mesh: &Mesh,
++        render_device: &RenderDevice,
++        render_queue: &RenderQueue,
++    ) {
++        let Some(&slab_id) = self.mesh_id_to_morph_target_slab.get(mesh_id) else {
++            return;
++        };
++        let Some(morph_targets) = mesh.get_morph_targets() else {
++            return;
++        };
++
++        // Call the generic function.
++        self.copy_element_data(
++            mesh_id,
++            size_of_val(morph_targets),
++            |slice| slice.copy_from_slice(bytemuck::cast_slice(morph_targets)),
+             slab_id,
+             render_device,
+             render_queue,
+@@ -580,7 +699,6 @@ impl MeshAllocator {
+         mesh_id: &AssetId<Mesh>,
+         len: usize,
+         fill_data: impl Fn(&mut [u8]),
+-        buffer_usages: BufferUsages,
+         slab_id: SlabId,
+         render_device: &RenderDevice,
+         render_queue: &RenderQueue,
+@@ -623,6 +741,7 @@ impl MeshAllocator {
+                 debug_assert!(large_object_slab.buffer.is_none());
+ 
+                 // Create the buffer and its data in one go.
++                let buffer_usages = large_object_slab.element_layout.class.buffer_usages();
+                 let buffer = render_device.create_buffer(&BufferDescriptor {
+                     label: Some(&format!(
+                         "large mesh slab {} ({}buffer)",
+@@ -853,11 +972,9 @@ impl MeshAllocator {
+ 
+         let old_buffer = slab.buffer.take();
+ 
+-        let mut buffer_usages = BufferUsages::COPY_SRC | BufferUsages::COPY_DST;
+-        match slab.element_layout.class {
+-            ElementClass::Vertex => buffer_usages |= BufferUsages::VERTEX,
+-            ElementClass::Index => buffer_usages |= BufferUsages::INDEX,
+-        };
++        let buffer_usages = BufferUsages::COPY_SRC
++            | BufferUsages::COPY_DST
++            | slab.element_layout.class.buffer_usages();
+ 
+         // Create the buffer.
+         let new_buffer = render_device.create_buffer(&BufferDescriptor {
+@@ -909,6 +1026,10 @@ impl MeshAllocator {
+             ElementClass::Index => {
+                 self.mesh_id_to_index_slab.insert(*mesh_id, slab_id);
+             }
++            #[cfg(feature = "morph")]
++            ElementClass::MorphTarget => {
++                self.mesh_id_to_morph_target_slab.insert(*mesh_id, slab_id);
++            }
+         }
+     }
+ }
+@@ -1037,6 +1158,19 @@ impl ElementLayout {
+     }
+ }
+ 
++impl ElementClass {
++    /// Returns the `wgpu` [`BufferUsages`] appropriate for a buffer of this
++    /// class.
++    fn buffer_usages(&self) -> BufferUsages {
++        match *self {
++            ElementClass::Vertex => BufferUsages::VERTEX,
++            ElementClass::Index => BufferUsages::INDEX,
++            #[cfg(feature = "morph")]
++            ElementClass::MorphTarget => BufferUsages::STORAGE,
++        }
++    }
++}
++
+ impl GeneralSlab {
+     /// Returns true if this slab is empty.
+     fn is_empty(&self) -> bool {
+@@ -1050,6 +1184,8 @@ fn buffer_usages_to_str(buffer_usages: BufferUsages) -> &'static str {
+         "vertex "
+     } else if buffer_usages.contains(BufferUsages::INDEX) {
+         "index "
++    } else if buffer_usages.contains(BufferUsages::STORAGE) {
++        "storage "
+     } else {
+         ""
+     }
+diff --git a/crates/bevy_render/src/mesh/mod.rs b/crates/bevy_render/src/mesh/mod.rs
+index a00381642a798..d6a6c1c46d415 100644
+--- a/crates/bevy_render/src/mesh/mod.rs
++++ b/crates/bevy_render/src/mesh/mod.rs
+@@ -1,8 +1,10 @@
+ pub mod allocator;
++#[cfg(feature = "morph")]
++pub mod morph;
++
+ use crate::{
+-    render_asset::{
+-        AssetExtractionError, PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets,
+-    },
++    render_asset::{AssetExtractionError, PrepareAssetError, RenderAsset, RenderAssetPlugin},
++    renderer::{RenderDevice, RenderQueue},
+     texture::GpuImage,
+     RenderApp,
+ };
+@@ -19,6 +21,9 @@ use bevy_ecs::{
+ pub use bevy_mesh::*;
+ use wgpu::IndexFormat;
+ 
++#[cfg(feature = "morph")]
++use crate::mesh::morph::RenderMorphTargetAllocator;
++
+ /// Makes sure that [`Mesh`]es are extracted and prepared for the GPU.
+ /// Does *not* add the [`Mesh`] as an asset. Use [`MeshPlugin`] for that.
+ pub struct MeshRenderAssetPlugin;
+@@ -36,6 +41,15 @@ impl Plugin for MeshRenderAssetPlugin {
+ 
+         render_app.init_resource::<MeshVertexBufferLayouts>();
+     }
++
++    fn finish(&self, app: &mut App) {
++        let Some(_render_app) = app.get_sub_app_mut(RenderApp) else {
++            return;
++        };
++
++        #[cfg(feature = "morph")]
++        _render_app.init_resource::<RenderMorphTargetAllocator>();
++    }
+ }
+ 
+ /// The render world representation of a [`Mesh`].
+@@ -44,10 +58,6 @@ pub struct RenderMesh {
+     /// The number of vertices in the mesh.
+     pub vertex_count: u32,
+ 
+-    /// Morph targets for the mesh, if present.
+-    #[cfg(feature = "morph")]
+-    pub morph_targets: Option<crate::render_resource::TextureView>,
+-
+     /// Information about the mesh data buffers, including whether the mesh uses
+     /// indices or not.
+     pub buffer_info: RenderMeshBufferInfo,
+@@ -75,6 +85,11 @@ impl RenderMesh {
+     pub fn indexed(&self) -> bool {
+         matches!(self.buffer_info, RenderMeshBufferInfo::Indexed { .. })
+     }
++
++    #[inline]
++    pub fn has_morph_targets(&self) -> bool {
++        self.key_bits.contains(BaseMeshPipelineKey::MORPH_TARGETS)
++    }
+ }
+ 
+ /// The index/vertex buffer info of a [`RenderMesh`].
+@@ -89,9 +104,20 @@ pub enum RenderMeshBufferInfo {
+ 
+ impl RenderAsset for RenderMesh {
+     type SourceAsset = Mesh;
++
++    #[cfg(not(feature = "morph"))]
+     type Param = (
+-        SRes<RenderAssets<GpuImage>>,
++        SRes<RenderDevice>,
++        SRes<RenderQueue>,
+         SResMut<MeshVertexBufferLayouts>,
++        (),
++    );
++    #[cfg(feature = "morph")]
++    type Param = (
++        SRes<RenderDevice>,
++        SRes<RenderQueue>,
++        SResMut<MeshVertexBufferLayouts>,
++        SResMut<RenderMorphTargetAllocator>,
+     );
+ 
+     #[inline]
+@@ -123,21 +149,15 @@ impl RenderAsset for RenderMesh {
+     /// Converts the extracted mesh into a [`RenderMesh`].
+     fn prepare_asset(
+         mesh: Self::SourceAsset,
+-        _: AssetId<Self::SourceAsset>,
+-        (_images, mesh_vertex_buffer_layouts): &mut SystemParamItem<Self::Param>,
++        _mesh_id: AssetId<Self::SourceAsset>,
++        (
++            _render_device,
++            _render_queue,
++            mesh_vertex_buffer_layouts,
++            _render_morph_targets_allocator,
++        ): &mut SystemParamItem<Self::Param>,
+         _: Option<&Self>,
+     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+-        #[cfg(feature = "morph")]
+-        let morph_targets = match mesh.morph_targets() {
+-            Some(mt) => {
+-                let Some(target_image) = _images.get(mt) else {
+-                    return Err(PrepareAssetError::RetryNextUpdate(mesh));
+-                };
+-                Some(target_image.texture_view.clone())
+-            }
+-            None => None,
+-        };
+-
+         let buffer_info = match mesh.indices() {
+             Some(indices) => RenderMeshBufferInfo::Indexed {
+                 count: indices.len() as u32,
+@@ -157,13 +177,32 @@ impl RenderAsset for RenderMesh {
+             key_bits
+         };
+ 
++        // Place the morph displacements in an image if necessary.
++        #[cfg(feature = "morph")]
++        if let Some(morph_targets) = mesh.morph_targets() {
++            _render_morph_targets_allocator.allocate(
++                _render_device,
++                _render_queue,
++                _mesh_id,
++                morph_targets,
++                mesh.count_vertices(),
++            );
++        }
++
+         Ok(RenderMesh {
+             vertex_count: mesh.count_vertices() as u32,
+             buffer_info,
+             key_bits,
+             layout: mesh_vertex_buffer_layout,
+-            #[cfg(feature = "morph")]
+-            morph_targets,
+         })
+     }
++
++    fn unload_asset(
++        _mesh_id: AssetId<Self::SourceAsset>,
++        (_, _, _, _render_morph_targets_allocator): &mut SystemParamItem<Self::Param>,
++    ) {
++        // Free the morph target images if necessary.
++        #[cfg(feature = "morph")]
++        _render_morph_targets_allocator.free(_mesh_id);
++    }
+ }
+diff --git a/crates/bevy_render/src/mesh/morph.rs b/crates/bevy_render/src/mesh/morph.rs
+new file mode 100644
+index 0000000000000..d3b05c07dac1f
+--- /dev/null
++++ b/crates/bevy_render/src/mesh/morph.rs
+@@ -0,0 +1,274 @@
++use bevy_asset::AssetId;
++use bevy_ecs::{
++    resource::Resource,
++    world::{FromWorld, World},
++};
++use bevy_log::error;
++use bevy_mesh::{
++    morph::{MorphAttributes, MorphBuildError, MAX_MORPH_WEIGHTS, MAX_TEXTURE_WIDTH},
++    Mesh,
++};
++use bevy_platform::collections::HashMap;
++use wgpu::{
++    Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
++    TextureViewDescriptor,
++};
++use wgpu_types::TextureDataOrder;
++
++use crate::{
++    render_resource::{Buffer, Texture, TextureView},
++    renderer::{RenderDevice, RenderQueue},
++};
++
++/// An image formatted for use with [`bevy_mesh::morph::MorphWeights`] for
++/// rendering the morph target, containing the vertex displacements.
++///
++/// We only use these if storage buffers aren't supported on the current
++/// platform. Otherwise, we store the mesh displacements in a storage buffer,
++/// managed by the mesh allocator.
++#[derive(Clone, Debug)]
++pub struct MorphTargetImage {
++    /// The texture containing the vertex displacements.
++    pub texture: Texture,
++    /// A view into the texture, suitable for attaching to the vertex shader.
++    pub texture_view: TextureView,
++}
++
++impl MorphTargetImage {
++    /// Generate textures for each morph target.
++    ///
++    /// This accepts an "iterator of [`MorphAttributes`] iterators". Each item
++    /// iterated in the top level iterator corresponds "the attributes of a
++    /// specific morph target".
++    ///
++    /// Each pixel of the texture is a component of morph target animated
++    /// attributes. So a set of 9 pixels is this morph's displacement for
++    /// position, normal and tangents of a single vertex (each taking 3 pixels).
++    pub fn new(
++        render_device: &RenderDevice,
++        render_queue: &RenderQueue,
++        targets: &[MorphAttributes],
++        vertex_count: usize,
++    ) -> Result<Self, MorphBuildError> {
++        let max = MAX_TEXTURE_WIDTH;
++        let target_count = targets.len() / vertex_count;
++        if target_count > MAX_MORPH_WEIGHTS {
++            return Err(MorphBuildError::TooManyTargets { target_count });
++        }
++        let component_count = (vertex_count * MorphAttributes::COMPONENT_COUNT) as u32;
++        let Some((Rect(width, height), padding)) = lowest_2d(component_count, max) else {
++            return Err(MorphBuildError::TooManyAttributes {
++                vertex_count,
++                component_count,
++            });
++        };
++        let data: Vec<u8> = targets
++            .chunks(vertex_count)
++            .flat_map(|attributes| {
++                let layer_byte_count = (padding + component_count) as usize * size_of::<f32>();
++                let mut buffer = Vec::with_capacity(layer_byte_count);
++                for to_add in attributes {
++                    buffer.extend_from_slice(bytemuck::bytes_of(&[
++                        to_add.position,
++                        to_add.normal,
++                        to_add.tangent,
++                    ]));
++                }
++                // Pad each layer so that they fit width * height
++                buffer.extend(core::iter::repeat_n(0, padding as usize * size_of::<f32>()));
++                debug_assert_eq!(buffer.len(), layer_byte_count);
++                buffer
++            })
++            .collect();
++        let extents = Extent3d {
++            width,
++            height,
++            depth_or_array_layers: target_count as u32,
++        };
++        let texture = render_device.create_texture_with_data(
++            render_queue,
++            &TextureDescriptor {
++                label: Some("morph target image"),
++                size: extents,
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: TextureDimension::D3,
++                format: TextureFormat::R32Float,
++                usage: TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING,
++                view_formats: &[],
++            },
++            TextureDataOrder::LayerMajor,
++            &data,
++        );
++        let texture_view = texture.create_view(&TextureViewDescriptor {
++            label: Some("morph target texture view"),
++            ..TextureViewDescriptor::default()
++        });
++        Ok(MorphTargetImage {
++            texture,
++            texture_view,
++        })
++    }
++}
++
++/// Stores the images for all morph target displacement data, if the current
++/// platform doesn't support storage buffers.
++///
++/// If the current platform does support storage buffers, the mesh allocator
++/// stores displacement data instead.
++#[derive(Resource)]
++pub enum RenderMorphTargetAllocator {
++    /// The variant used when the current platform doesn't support storage
++    /// buffers.
++    Image {
++        /// Maps the ID of each mesh to the image containing its morph target
++        /// displacements.
++        mesh_id_to_image: HashMap<AssetId<Mesh>, MorphTargetImage>,
++    },
++    /// The variant used when the current platform does support storage buffers.
++    ///
++    /// In this case, this resource is empty, because the mesh allocator stores
++    /// displacements instead.
++    Storage,
++}
++
++impl FromWorld for RenderMorphTargetAllocator {
++    fn from_world(world: &mut World) -> RenderMorphTargetAllocator {
++        let render_device = world.resource::<RenderDevice>();
++        if bevy_render::storage_buffers_are_unsupported(&render_device.limits()) {
++            RenderMorphTargetAllocator::Image {
++                mesh_id_to_image: HashMap::default(),
++            }
++        } else {
++            RenderMorphTargetAllocator::Storage
++        }
++    }
++}
++
++/// A reference to the resource in which morph displacements for a mesh are
++/// stored.
++#[derive(Clone, Copy)]
++pub enum MorphTargetsResource<'a> {
++    /// The [`MorphTargetImage`].
++    ///
++    /// This variant is used when storage buffers aren't supported on the
++    /// current platform.
++    Texture(&'a TextureView),
++
++    /// The slab containing the morph target displacements.
++    ///
++    /// This variant is used when storage buffers are supported on the current
++    /// platform.
++    Storage(&'a Buffer),
++}
++
++impl RenderMorphTargetAllocator {
++    /// Allocates morph target displacements for the given mesh.
++    ///
++    /// If storage buffers aren't supported on the current platform, this method
++    /// creates a new [`MorphTargetImage`] and stores it inside the allocator.
++    ///
++    /// If storage buffers are supported on the current platform, this method
++    /// does nothing, as morph target displacements are instead managed by the
++    /// mesh allocator.
++    pub fn allocate(
++        &mut self,
++        render_device: &RenderDevice,
++        render_queue: &RenderQueue,
++        mesh_id: AssetId<Mesh>,
++        targets: &[MorphAttributes],
++        vertex_count: usize,
++    ) {
++        match *self {
++            RenderMorphTargetAllocator::Image {
++                ref mut mesh_id_to_image,
++            } => {
++                if let Ok(morph_target_image) =
++                    MorphTargetImage::new(render_device, render_queue, targets, vertex_count)
++                {
++                    mesh_id_to_image.insert(mesh_id, morph_target_image);
++                }
++            }
++
++            RenderMorphTargetAllocator::Storage => {
++                // Do nothing. Morph target displacements are managed by the
++                // mesh allocator in this case.
++            }
++        }
++    }
++
++    /// Frees the storage associated with morph target displacements for the
++    /// mesh with the given ID.
++    ///
++    /// If the current platform doesn't support storage buffers, this drops the
++    /// reference to the [`MorphTargetImage`] that stores the data for the
++    /// mesh's morph target displacements. If the current platform does support
++    /// storage buffers, this method does nothing, as morph target displacements
++    /// are managed by the mesh allocator in this case.
++    ///
++    /// If passed a mesh without morph targets, this method does nothing.
++    pub fn free(&mut self, mesh_id: AssetId<Mesh>) {
++        match *self {
++            RenderMorphTargetAllocator::Image {
++                ref mut mesh_id_to_image,
++            } => {
++                if mesh_id_to_image.remove(&mesh_id).is_none() {
++                    error!(
++                        "Attempted to free a morph target allocation that wasn't allocated: {:?}",
++                        mesh_id
++                    );
++                }
++            }
++            RenderMorphTargetAllocator::Storage => {
++                // Do nothing. Morph target displacements are managed by the
++                // mesh allocator in this case.
++            }
++        }
++    }
++
++    /// Returns the [`MorphTargetImage`] containing the packed morph target
++    /// displacements for the mesh with the given ID, if that image is present.
++    ///
++    /// A [`MorphTargetImage`] is only available if storage buffers aren't
++    /// supported on the given platform. If storage buffers are supported, this
++    /// method returns `None`, as the mesh allocator stores the morph target
++    /// displacements in that case.
++    pub fn get_image(&self, mesh_id: AssetId<Mesh>) -> Option<MorphTargetImage> {
++        match *self {
++            RenderMorphTargetAllocator::Image {
++                ref mesh_id_to_image,
++            } => mesh_id_to_image.get(&mesh_id).cloned(),
++            RenderMorphTargetAllocator::Storage => None,
++        }
++    }
++}
++
++struct Rect(u32, u32);
++
++/// Find the smallest rectangle of maximum edge size `max_edge` that contains
++/// at least `min_includes` cells. `u32` is how many extra cells the rectangle
++/// has.
++///
++/// The following rectangle contains 27 cells, and its longest edge is 9:
++/// ```text
++/// ----------------------------
++/// |1 |2 |3 |4 |5 |6 |7 |8 |9 |
++/// ----------------------------
++/// |2 |  |  |  |  |  |  |  |  |
++/// ----------------------------
++/// |3 |  |  |  |  |  |  |  |  |
++/// ----------------------------
++/// ```
++///
++/// Returns `None` if `max_edge` is too small to build a rectangle
++/// containing `min_includes` cells.
++fn lowest_2d(min_includes: u32, max_edge: u32) -> Option<(Rect, u32)> {
++    (1..=max_edge)
++        .filter_map(|a| {
++            let b = min_includes.div_ceil(a);
++            let diff = (a * b).checked_sub(min_includes)?;
++            Some((Rect(a, b), diff))
++        })
++        .filter_map(|(rect, diff)| (rect.1 <= max_edge).then_some((rect, diff)))
++        .min_by_key(|(_, diff)| *diff)
++}
+diff --git a/crates/bevy_render/src/occlusion_culling/mesh_preprocess_types.wgsl b/crates/bevy_render/src/occlusion_culling/mesh_preprocess_types.wgsl
+index a597fb0537228..b8b6349500824 100644
+--- a/crates/bevy_render/src/occlusion_culling/mesh_preprocess_types.wgsl
++++ b/crates/bevy_render/src/occlusion_culling/mesh_preprocess_types.wgsl
+@@ -21,7 +21,11 @@ struct MeshInput {
+     timestamp: u32,
+     // User supplied index to identify the mesh instance
+     tag: u32,
+-    pad: u32,
++    // The index of the morph descriptor for this mesh instance in the
++    // `morph_descriptors` table.
++    //
++    // If the mesh has no morph targets, this is `u32::MAX`.
++    morph_descriptor_index: u32,
+ }
+ 
+ // The `wgpu` indirect parameters structure. This is a union of two structures.
+diff --git a/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs b/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs
+index 6878ff8a47c71..28dc491711133 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/wireframe2d.rs
+@@ -30,7 +30,7 @@ use bevy_render::{
+     },
+     extract_resource::ExtractResource,
+     mesh::{
+-        allocator::{MeshAllocator, SlabId},
++        allocator::{MeshAllocator, MeshSlabs, SlabId},
+         RenderMesh,
+     },
+     prelude::*,
+@@ -249,6 +249,7 @@ pub struct Wireframe2dBatchSetKey {
+ 
+     /// The function used to draw.
+     pub draw_function: DrawFunctionId,
++
+     /// The ID of the slab of GPU memory that contains vertex data.
+     ///
+     /// For non-mesh items, you can fill this with 0 if your items can be
+@@ -897,7 +898,14 @@ fn queue_wireframes(
+             let Some(mesh_instance) = render_mesh_instances.get(visible_entity) else {
+                 continue;
+             };
+-            let (vertex_slab, index_slab) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
++            let Some(MeshSlabs {
++                vertex_slab_id: vertex_slab,
++                index_slab_id: index_slab,
++                ..
++            }) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id)
++            else {
++                continue;
++            };
+             let bin_key = Wireframe2dBinKey {
+                 asset_id: mesh_instance.mesh_asset_id.untyped(),
+             };
+@@ -905,7 +913,7 @@ fn queue_wireframes(
+                 pipeline: pipeline_id,
+                 asset_id: wireframe_instance.untyped(),
+                 draw_function: draw_wireframe,
+-                vertex_slab: vertex_slab.unwrap_or_default(),
++                vertex_slab,
+                 index_slab,
+             };
+             wireframe_phase.add(
+diff --git a/examples/shader_advanced/custom_phase_item.rs b/examples/shader_advanced/custom_phase_item.rs
+index 01cba00e1e000..4996f9dfb9ce0 100644
+--- a/examples/shader_advanced/custom_phase_item.rs
++++ b/examples/shader_advanced/custom_phase_item.rs
+@@ -22,6 +22,7 @@ use bevy::{
+     render::{
+         camera::{DirtySpecializations, PendingQueues},
+         extract_component::{ExtractComponent, ExtractComponentPlugin},
++        mesh::allocator::MeshSlabs,
+         render_phase::{
+             AddRenderCommand, BinnedRenderPhaseType, DrawFunctions, InputUniformIndex, PhaseItem,
+             RenderCommand, RenderCommandResult, SetItemPipeline, TrackedRenderPass,
+@@ -296,8 +297,7 @@ fn queue_custom_phase_item(
+                     pipeline: pipeline_id,
+                     material_bind_group_index: None,
+                     lightmap_slab: None,
+-                    vertex_slab: default(),
+-                    index_slab: None,
++                    slabs: MeshSlabs::default(),
+                 },
+                 Opaque3dBinKey {
+                     asset_id: AssetId::<Mesh>::invalid().untyped(),
+diff --git a/examples/shader_advanced/custom_render_phase.rs b/examples/shader_advanced/custom_render_phase.rs
+index e65701c0b57b6..70adfa05aff82 100644
+--- a/examples/shader_advanced/custom_render_phase.rs
++++ b/examples/shader_advanced/custom_render_phase.rs
+@@ -384,7 +384,7 @@ impl GetBatchData for StencilPipeline {
+                 current_skin_index: u32::MAX,
+                 material_and_lightmap_bind_group_slot: 0,
+                 tag: 0,
+-                pad: 0,
++                morph_descriptor_index: u32::MAX,
+             }
+         };
+         Some((mesh_uniform, None))
+@@ -439,6 +439,7 @@ impl GetFullBatchData for StencilPipeline {
+             None,
+             None,
+             None,
++            None,
+         ))
+     }
+ 
+diff --git a/examples/shader_advanced/specialized_mesh_pipeline.rs b/examples/shader_advanced/specialized_mesh_pipeline.rs
+index b13a69dd99545..00ff905701f85 100644
+--- a/examples/shader_advanced/specialized_mesh_pipeline.rs
++++ b/examples/shader_advanced/specialized_mesh_pipeline.rs
+@@ -355,8 +355,9 @@ fn queue_custom_mesh_pipeline(
+                 continue;
+             };
+ 
+-            let (vertex_slab, index_slab) =
+-                mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id());
++            let Some(mesh_slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
++                continue;
++            };
+ 
+             // Specialize the key for the current mesh entity
+             // For this example we only specialize based on the mesh topology
+@@ -386,8 +387,7 @@ fn queue_custom_mesh_pipeline(
+                     draw_function,
+                     pipeline: pipeline_id,
+                     material_bind_group_index: None,
+-                    vertex_slab: vertex_slab.unwrap_or_default(),
+-                    index_slab,
++                    slabs: mesh_slabs,
+                     lightmap_slab: None,
+                 },
+                 // For this example we can use the mesh asset id as the bin key,
+diff --git a/examples/stress_tests/many_morph_targets.rs b/examples/stress_tests/many_morph_targets.rs
+index 49a55897a18bd..5168ce4ac37ca 100644
+--- a/examples/stress_tests/many_morph_targets.rs
++++ b/examples/stress_tests/many_morph_targets.rs
+@@ -67,6 +67,46 @@ impl FromStr for ArgCamera {
+     }
+ }
+ 
++/// Controls how the meshes spawn.
++#[derive(PartialEq)]
++enum ArgSpawning {
++    /// All meshes will spawn in one frame.
++    Instant,
++
++    /// One mesh will spawn per frame.
++    Gradual,
++
++    /// Spawn one mesh per frame in a consistent order until all are spawned,
++    /// then despawn one mesh per frame in the same order, and repeat.
++    RegularCycle,
++
++    /// Spawn one mesh per frame in a random order until all are spawned, then
++    /// despawn one mesh per frame in a random order, and repeat.
++    RandomCycle,
++
++    /// All meshes will spawn in one frame, and after that one mesh will spawn
++    /// and one mesh will despawn per frame.
++    RandomSteady,
++}
++
++impl FromStr for ArgSpawning {
++    type Err = String;
++
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        match s {
++            "instant" => Ok(Self::Instant),
++            "gradual" => Ok(Self::Gradual),
++            "regular-cycle" => Ok(Self::RegularCycle),
++            "random-cycle" => Ok(Self::RandomCycle),
++            "random-steady" => Ok(Self::RandomSteady),
++            _ => Err(
++                "must be 'instant', 'gradual', 'regular-cycle', 'random-cycle', or 'random-steady'"
++                    .into(),
++            ),
++        }
++    }
++}
++
+ /// `many_morph_targets` stress test
+ #[derive(FromArgs, Resource)]
+ struct Args {
+@@ -82,6 +122,10 @@ struct Args {
+     #[argh(option, default = "ArgCamera::Near")]
+     camera: ArgCamera,
+ 
++    /// options: 'instant', 'gradual', 'regular-cycle', 'random-cycle', 'random-steady' - default = 'instant'
++    #[argh(option, default = "ArgSpawning::Instant")]
++    spawning: ArgSpawning,
++
+     /// enable motion blur
+     #[argh(switch)]
+     motion_blur: bool,
+@@ -113,11 +157,21 @@ fn main() {
+             brightness: 1000.0,
+             ..Default::default()
+         })
++        .insert_resource(MorphAssets::default())
++        .insert_resource(Rng(ChaCha8Rng::seed_from_u64(856673)))
++        .insert_resource(State::new(&args))
+         .insert_resource(args)
+         .add_systems(Startup, setup)
++        .add_systems(Update, update)
+         .run();
+ }
+ 
++#[derive(Resource, Default)]
++struct MorphAssets {
++    scene: Handle<Scene>,
++    animations: Vec<(Handle<AnimationGraph>, AnimationNodeIndex)>,
++}
++
+ #[derive(Component, Clone)]
+ struct AnimationToPlay {
+     graph_handle: Handle<AnimationGraph>,
+@@ -125,66 +179,22 @@ struct AnimationToPlay {
+     speed: f32,
+ }
+ 
+-impl AnimationToPlay {
+-    fn with_speed(&self, speed: f32) -> Self {
+-        AnimationToPlay {
+-            speed,
+-            ..self.clone()
+-        }
+-    }
++fn dims(count: usize) -> (usize, usize) {
++    let x_dim = ((count as f32).sqrt().ceil() as usize).max(1);
++    let y_dim = count.div_ceil(x_dim);
++
++    (x_dim, y_dim)
+ }
+ 
+ fn setup(
+     args: Res<Args>,
++    mut commands: Commands,
++    mut assets: ResMut<MorphAssets>,
+     asset_server: Res<AssetServer>,
+     mut graphs: ResMut<Assets<AnimationGraph>>,
+-    mut commands: Commands,
++    state: Res<State>,
+ ) {
+-    const ASSET_PATH: &str = "models/animated/MorphStressTest.gltf";
+-
+-    let scene = SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(ASSET_PATH)));
+-
+-    let mut rng = ChaCha8Rng::seed_from_u64(856673);
+-
+-    let animations = (0..3)
+-        .map(|gltf_index| {
+-            let (graph, index) = AnimationGraph::from_clip(
+-                asset_server.load(GltfAssetLabel::Animation(gltf_index).from_asset(ASSET_PATH)),
+-            );
+-            AnimationToPlay {
+-                graph_handle: graphs.add(graph),
+-                index,
+-                speed: 1.0,
+-            }
+-        })
+-        .collect::<Vec<_>>();
+-
+-    // Arrange the meshes in a grid.
+-
+-    let count = args.count;
+-    let x_dim = ((count as f32).sqrt().ceil() as usize).max(1);
+-    let y_dim = count.div_ceil(x_dim);
+-
+-    for mesh_index in 0..count {
+-        let animation = animations[mesh_index.rem_euclid(animations.len())].clone();
+-
+-        let x = 2.5 + (5.0 * ((mesh_index.rem_euclid(x_dim) as f32) - ((x_dim as f32) * 0.5)));
+-        let y = -2.2 - (3.0 * ((mesh_index.div_euclid(x_dim) as f32) - ((y_dim as f32) * 0.5)));
+-
+-        // Randomly vary the animation speed so that the number of morph targets
+-        // active on each frame is more likely to be stable.
+-
+-        let animation_speed = rng.random_range(0.5..=1.5);
+-
+-        commands
+-            .spawn((
+-                animation.with_speed(animation_speed),
+-                scene.clone(),
+-                Transform::from_xyz(x, y, 0.0),
+-            ))
+-            .observe(play_animation)
+-            .observe(set_weights);
+-    }
++    let (x_dim, _) = dims(state.slot_count);
+ 
+     commands.spawn((
+         DirectionalLight::default(),
+@@ -214,6 +224,143 @@ fn setup(
+             Msaa::Off,
+         ));
+     }
++
++    const ASSET_PATH: &str = "models/animated/MorphStressTest.gltf";
++
++    *assets = MorphAssets {
++        scene: asset_server.load(GltfAssetLabel::Scene(0).from_asset(ASSET_PATH)),
++        animations: (0..3)
++            .map(|gltf_index| {
++                let (graph, index) = AnimationGraph::from_clip(
++                    asset_server.load(GltfAssetLabel::Animation(gltf_index).from_asset(ASSET_PATH)),
++                );
++                (graphs.add(graph), index)
++            })
++            .collect::<Vec<_>>(),
++    }
++}
++
++enum CycleState {
++    Spawn,
++    Despawn,
++}
++
++#[derive(Resource)]
++struct State {
++    ticks: usize,
++    slot_count: usize,
++    spawned: Vec<(usize, Entity)>,
++    despawned: Vec<usize>,
++    cycle: CycleState,
++}
++
++impl State {
++    fn new(args: &Args) -> State {
++        // The `RandomSteady` case allocates double the number of slots but only
++        // keeps half occupied.
++        let slot_count = match args.spawning {
++            ArgSpawning::RandomSteady => args.count * 2,
++            _ => args.count,
++        };
++
++        State {
++            ticks: 0,
++            slot_count,
++            spawned: Default::default(),
++            despawned: (0..slot_count).collect::<Vec<_>>(),
++            cycle: CycleState::Spawn,
++        }
++    }
++}
++
++#[derive(Resource)]
++struct Rng(ChaCha8Rng);
++
++// Randomly take `count` entries from the given `Vec` and return them.
++fn take_random<T>(rng: &mut ChaCha8Rng, from: &mut Vec<T>, count: usize) -> Vec<T> {
++    (0..count)
++        .map(|_| from.swap_remove(rng.random_range(..from.len())))
++        .collect()
++}
++
++fn update(
++    args: Res<Args>,
++    mut commands: Commands,
++    mut state: ResMut<State>,
++    mut rng: ResMut<Rng>,
++    assets: Res<MorphAssets>,
++) {
++    state.ticks += 1;
++
++    if state.spawned.is_empty() {
++        state.cycle = CycleState::Spawn;
++    } else if state.despawned.is_empty() {
++        state.cycle = CycleState::Despawn;
++    }
++
++    let mut to_spawn = Vec::<usize>::default();
++    let mut to_despawn = Vec::<(usize, Entity)>::default();
++
++    match args.spawning {
++        ArgSpawning::Instant => to_spawn = std::mem::take(&mut state.despawned),
++        ArgSpawning::Gradual => to_spawn = state.despawned.pop().into_iter().collect(),
++        ArgSpawning::RegularCycle => match state.cycle {
++            CycleState::Spawn => to_spawn.push(state.despawned.pop().unwrap()),
++            CycleState::Despawn => to_despawn.push(state.spawned.pop().unwrap()),
++        },
++        ArgSpawning::RandomCycle => match state.cycle {
++            CycleState::Spawn => to_spawn = take_random(&mut rng.0, &mut state.despawned, 1),
++            CycleState::Despawn => to_despawn = take_random(&mut rng.0, &mut state.spawned, 1),
++        },
++        ArgSpawning::RandomSteady => {
++            if state.spawned.is_empty() {
++                let spawn_count = state.slot_count / 2;
++                to_spawn = take_random(&mut rng.0, &mut state.despawned, spawn_count);
++            } else {
++                to_spawn = take_random(&mut rng.0, &mut state.despawned, 1);
++                to_despawn = take_random(&mut rng.0, &mut state.spawned, 1);
++            }
++        }
++    }
++
++    for (mesh_index, entity) in to_despawn {
++        commands.entity(entity).despawn();
++        state.despawned.push(mesh_index);
++    }
++
++    for mesh_index in to_spawn {
++        // Arrange the meshes in a grid.
++
++        let (x_dim, y_dim) = dims(state.slot_count);
++
++        let x = 2.5 + (5.0 * ((mesh_index.rem_euclid(x_dim) as f32) - ((x_dim as f32) * 0.5)));
++        let y = -2.2 - (3.0 * ((mesh_index.div_euclid(x_dim) as f32) - ((y_dim as f32) * 0.5)));
++
++        // Vary the animation speed so that the number of morph targets
++        // active on each frame is more likely to be stable.
++
++        let speed = ((mesh_index as f32) * 0.1).rem_euclid(1.0) + 0.5;
++
++        let animation_asset =
++            assets.animations[mesh_index.rem_euclid(assets.animations.len())].clone();
++        let animation = AnimationToPlay {
++            graph_handle: animation_asset.0.clone(),
++            index: animation_asset.1,
++            speed,
++        };
++
++        let entity = commands
++            .spawn((
++                animation,
++                Transform::from_xyz(x, y, 0.0),
++                SceneRoot(assets.scene.clone()),
++            ))
++            .observe(play_animation)
++            .observe(set_weights)
++            .id();
++
++        state.spawned.push((mesh_index, entity));
++    }
+ }
+ 
+ fn play_animation(
