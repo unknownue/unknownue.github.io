@@ -1,0 +1,723 @@
+diff --git a/crates/bevy_ecs/src/bundle/impls.rs b/crates/bevy_ecs/src/bundle/impls.rs
+index c8d9160dc2135..4083ae916b7d2 100644
+--- a/crates/bevy_ecs/src/bundle/impls.rs
++++ b/crates/bevy_ecs/src/bundle/impls.rs
+@@ -138,8 +138,14 @@ macro_rules! tuple_impl {
+                 bevy_ptr::deconstruct_moving_ptr!({
+                     let tuple { $($index: $alias,)* } = ptr;
+                 });
++                #[allow(
++                    unused_unsafe,
++                    reason = "Zero-length tuples will generate a function body equivalatent to (); however, this macro is meant for all applicable tuples, and as such it makes no sense to rewrite it just for that case."
++                )]
+                 // SAFETY: Caller ensures requirements for calling `get_components` are met.
+-                $( $name::get_components($alias, func); )*
++                unsafe {
++                    $( $name::get_components($alias, func); )*
++                }
+             }
+ 
+             #[allow(
+@@ -151,8 +157,14 @@ macro_rules! tuple_impl {
+                 bevy_ptr::deconstruct_moving_ptr!({
+                     let MaybeUninit::<tuple> { $($index: $alias,)* } = ptr;
+                 });
++                #[allow(
++                    unused_unsafe,
++                    reason = "Zero-length tuples will generate a function body equivalent to `()`; however, this macro is meant for all applicable tuples, and as such it makes no sense to rewrite it just for that case."
++                )]
+                 // SAFETY: Caller ensures requirements for calling `apply_effect` are met.
+-                $( $name::apply_effect($alias, entity); )*
++                unsafe {
++                    $( $name::apply_effect($alias, entity); )*
++                }
+             }
+         }
+ 
+diff --git a/crates/bevy_ecs/src/bundle/insert.rs b/crates/bevy_ecs/src/bundle/insert.rs
+index cefdde59172fa..cc6d852d0f705 100644
+--- a/crates/bevy_ecs/src/bundle/insert.rs
++++ b/crates/bevy_ecs/src/bundle/insert.rs
+@@ -535,13 +535,15 @@ impl BundleInfo {
+                 };
+             };
+             // SAFETY: ids in self must be valid
+-            let (new_archetype_id, is_new_created) = archetypes.get_id_or_insert(
+-                components,
+-                observers,
+-                table_id,
+-                table_components,
+-                sparse_set_components,
+-            );
++            let (new_archetype_id, is_new_created) = unsafe {
++                archetypes.get_id_or_insert(
++                    components,
++                    observers,
++                    table_id,
++                    table_components,
++                    sparse_set_components,
++                )
++            };
+ 
+             // Add an edge from the old archetype to the new archetype.
+             archetypes[archetype_id]
+diff --git a/crates/bevy_ecs/src/component/required.rs b/crates/bevy_ecs/src/component/required.rs
+index 9974763623a2e..04abda66a9de6 100644
+--- a/crates/bevy_ecs/src/component/required.rs
++++ b/crates/bevy_ecs/src/component/required.rs
+@@ -390,11 +390,12 @@ impl Components {
+         let old_required_count = required_components.all.len();
+ 
+         // SAFETY: the caller guarantees that `requiree` is valid in `self`.
+-        self.required_components_scope(requiree, |this, required_components| {
+-            // SAFETY: the caller guarantees that `required` is valid for type `R` in `self`
+-            unsafe { required_components.register_by_id(required, this, constructor) };
+-        });
+-
++        unsafe {
++            self.required_components_scope(requiree, |this, required_components| {
++                // SAFETY: the caller guarantees that `required` is valid for type `R` in `self`
++                required_components.register_by_id(required, this, constructor);
++            });
++        }
+         // Third step: update the required components and required_by of all the indirect requirements/requirees.
+ 
+         // Borrow again otherwise it conflicts with the `self.required_components_scope` call.
+@@ -435,11 +436,13 @@ impl Components {
+         // Skip the first one (requiree) because we already updates it.
+         for &indirect_requiree in &new_requiree_components[1..] {
+             // SAFETY: `indirect_requiree` comes from `self` so it must be valid.
+-            self.required_components_scope(indirect_requiree, |this, required_components| {
+-                // Rebuild the inherited required components.
+-                // SAFETY: `required_components` comes from `self`, so all its components must have be valid in `self`.
+-                unsafe { required_components.rebuild_inherited_required_components(this) };
+-            });
++            unsafe {
++                self.required_components_scope(indirect_requiree, |this, required_components| {
++                    // Rebuild the inherited required components.
++                    // SAFETY: `required_components` comes from `self`, so all its components must have be valid in `self`.
++                    required_components.rebuild_inherited_required_components(this);
++                });
++            }
+         }
+ 
+         // Update the `required_by` of all the components that were newly required (directly or indirectly).
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index 62c1c3de94eb7..db8425c260448 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -993,7 +993,7 @@ impl Entities {
+     ) -> Option<EntityLocation> {
+         self.ensure_index_index_is_valid(index);
+         // SAFETY: We just did `ensure_index`
+-        self.update_existing_location(index, location)
++        unsafe { self.update_existing_location(index, location) }
+     }
+ 
+     /// Ensures the index is within the bounds of [`Self::meta`], expanding it if necessary.
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index 79ecf09b20176..448335db8ed0f 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -1099,7 +1099,8 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         world: UnsafeWorldCell<'w>,
+         entity: Entity,
+     ) -> Result<D::Item<'w, '_>, QueryEntityError> {
+-        self.query_unchecked(world).get_inner(entity)
++        // SAFETY: Upheld by caller
++        unsafe { self.query_unchecked(world) }.get_inner(entity)
+     }
+ 
+     /// Returns an [`Iterator`] over the query results for the given [`World`].
+@@ -1314,7 +1315,8 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         &'s mut self,
+         world: UnsafeWorldCell<'w>,
+     ) -> QueryIter<'w, 's, D, F> {
+-        self.query_unchecked(world).into_iter()
++        // SAFETY: Upheld by caller
++        unsafe { self.query_unchecked(world) }.into_iter()
+     }
+ 
+     /// Returns an [`Iterator`] over all possible combinations of `K` query results for the
+@@ -1333,7 +1335,8 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         &'s mut self,
+         world: UnsafeWorldCell<'w>,
+     ) -> QueryCombinationIter<'w, 's, D, F, K> {
+-        self.query_unchecked(world).iter_combinations_inner()
++        // SAFETY: Upheld by caller
++        unsafe { self.query_unchecked(world) }.iter_combinations_inner()
+     }
+ 
+     /// Returns a parallel iterator over the query results for the given [`World`].
+@@ -1755,7 +1758,8 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         &mut self,
+         world: UnsafeWorldCell<'w>,
+     ) -> Result<D::Item<'w, '_>, QuerySingleError> {
+-        self.query_unchecked(world).single_inner()
++        // SAFETY: Upheld by caller
++        unsafe { self.query_unchecked(world) }.single_inner()
+     }
+ 
+     /// Returns a query result when there is exactly one entity matching the query,
+@@ -1780,8 +1784,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+         // SAFETY:
+         // - The caller ensured we have the correct access to the world.
+         // - The caller ensured that the world matches.
+-        self.query_unchecked_manual_with_ticks(world, last_run, this_run)
+-            .single_inner()
++        unsafe { self.query_unchecked_manual_with_ticks(world, last_run, this_run) }.single_inner()
+     }
+ }
+ 
+diff --git a/crates/bevy_ecs/src/schedule/executor/mod.rs b/crates/bevy_ecs/src/schedule/executor/mod.rs
+index 197ba52be51c5..df297637a6037 100644
+--- a/crates/bevy_ecs/src/schedule/executor/mod.rs
++++ b/crates/bevy_ecs/src/schedule/executor/mod.rs
+@@ -260,7 +260,8 @@ mod __rust_begin_short_backtrace {
+         system: &mut ScheduleSystem,
+         world: UnsafeWorldCell,
+     ) -> Result<(), RunSystemError> {
+-        let result = system.run_unsafe((), world);
++        // SAFETY: Upheld by caller
++        let result = unsafe { system.run_unsafe((), world) };
+         // Call `black_box` to prevent this frame from being tail-call optimized away
+         black_box(());
+         result
+@@ -276,7 +277,8 @@ mod __rust_begin_short_backtrace {
+         world: UnsafeWorldCell,
+     ) -> Result<O, RunSystemError> {
+         // Call `black_box` to prevent this frame from being tail-call optimized away
+-        black_box(system.run_unsafe((), world))
++        // SAFETY: Upheld by caller
++        black_box(unsafe { system.run_unsafe((), world) })
+     }
+ 
+     #[cfg(feature = "std")]
+diff --git a/crates/bevy_ecs/src/spawn.rs b/crates/bevy_ecs/src/spawn.rs
+index c01897870f953..c4224b99efc87 100644
+--- a/crates/bevy_ecs/src/spawn.rs
++++ b/crates/bevy_ecs/src/spawn.rs
+@@ -327,7 +327,7 @@ impl<R: Relationship, L: SpawnableList<R>> DynamicBundle for SpawnRelatedBundle<
+         //   called exactly once for each component being fetched with the correct `StorageType`
+         // - `Effect: !NoBundleEffect`, which means the caller is responsible for calling this type's `apply_effect`
+         //   at least once before returning to safe code.
+-        <R::RelationshipTarget as DynamicBundle>::get_components(target, func);
++        unsafe { <R::RelationshipTarget as DynamicBundle>::get_components(target, func) };
+         // Forget the pointer so that the value is available in `apply_effect`.
+         mem::forget(ptr);
+     }
+@@ -372,7 +372,7 @@ impl<R: Relationship, B: Bundle> DynamicBundle for SpawnOneRelated<R, B> {
+         //   called exactly once for each component being fetched with the correct `StorageType`
+         // - `Effect: !NoBundleEffect`, which means the caller is responsible for calling this type's `apply_effect`
+         //   at least once before returning to safe code.
+-        <R::RelationshipTarget as DynamicBundle>::get_components(target, func);
++        unsafe { <R::RelationshipTarget as DynamicBundle>::get_components(target, func) };
+         // Forget the pointer so that the value is available in `apply_effect`.
+         mem::forget(ptr);
+     }
+diff --git a/crates/bevy_ecs/src/storage/blob_array.rs b/crates/bevy_ecs/src/storage/blob_array.rs
+index 3ef2e5a90d007..01280228bcd7c 100644
+--- a/crates/bevy_ecs/src/storage/blob_array.rs
++++ b/crates/bevy_ecs/src/storage/blob_array.rs
+@@ -51,7 +51,8 @@ impl BlobArray {
+                 capacity,
+             }
+         } else {
+-            let mut arr = Self::with_capacity(item_layout, drop_fn, 0);
++            // SAFETY: Upheld by caller
++            let mut arr = unsafe { Self::with_capacity(item_layout, drop_fn, 0) };
+             // SAFETY: `capacity` > 0
+             unsafe { arr.alloc(NonZeroUsize::new_unchecked(capacity)) }
+             arr
+diff --git a/crates/bevy_ecs/src/storage/mod.rs b/crates/bevy_ecs/src/storage/mod.rs
+index 0b163b1b4feca..0584ae15c6738 100644
+--- a/crates/bevy_ecs/src/storage/mod.rs
++++ b/crates/bevy_ecs/src/storage/mod.rs
+@@ -102,7 +102,8 @@ impl<T> VecExtensions<T> for Vec<T> {
+         // SAFETY: We replace self[index] with the last element. The caller must ensure that
+         // both the last element and `index` must be valid and cannot point to the same place.
+         unsafe { core::ptr::copy_nonoverlapping(base_ptr.add(len - 1), base_ptr.add(index), 1) };
+-        self.set_len(len - 1);
++        // SAFETY: Upheld by caller
++        unsafe { self.set_len(len - 1) };
+         value
+     }
+ }
+diff --git a/crates/bevy_ecs/src/storage/table/column.rs b/crates/bevy_ecs/src/storage/table/column.rs
+index 239a7bfeb7244..903147449c849 100644
+--- a/crates/bevy_ecs/src/storage/table/column.rs
++++ b/crates/bevy_ecs/src/storage/table/column.rs
+@@ -336,7 +336,8 @@ impl Column {
+     /// - `T` must match the type of data that's stored in this [`Column`]
+     /// - `len` must match the actual length of this column (number of elements stored)
+     pub unsafe fn get_data_slice<T>(&self, len: usize) -> &[UnsafeCell<T>] {
+-        self.data.get_sub_slice(len)
++        // SAFETY: Upheld by caller
++        unsafe { self.data.get_sub_slice(len) }
+     }
+ 
+     /// Get a slice to the added [`ticks`](Tick) in this [`Column`].
+@@ -344,7 +345,8 @@ impl Column {
+     /// # Safety
+     /// - `len` must match the actual length of this column (number of elements stored)
+     pub unsafe fn get_added_ticks_slice(&self, len: usize) -> &[UnsafeCell<Tick>] {
+-        self.added_ticks.as_slice(len)
++        // SAFETY: Upheld by caller
++        unsafe { self.added_ticks.as_slice(len) }
+     }
+ 
+     /// Get a slice to the changed [`ticks`](Tick) in this [`Column`].
+@@ -352,7 +354,8 @@ impl Column {
+     /// # Safety
+     /// - `len` must match the actual length of this column (number of elements stored)
+     pub unsafe fn get_changed_ticks_slice(&self, len: usize) -> &[UnsafeCell<Tick>] {
+-        self.changed_ticks.as_slice(len)
++        // SAFETY: Upheld by caller
++        unsafe { self.changed_ticks.as_slice(len) }
+     }
+ 
+     /// Get a slice to the calling locations that last changed each value in this [`Column`]
+@@ -402,7 +405,8 @@ impl Column {
+     /// `row` must be within the range `[0, self.len())`.
+     #[inline]
+     pub unsafe fn get_added_tick_unchecked(&self, row: TableRow) -> &UnsafeCell<Tick> {
+-        self.added_ticks.get_unchecked(row.index())
++        // SAFETY: Upheld by caller
++        unsafe { self.added_ticks.get_unchecked(row.index()) }
+     }
+ 
+     /// Fetches the "changed" change detection tick for the value at `row`
+@@ -412,7 +416,8 @@ impl Column {
+     /// `row` must be within the range `[0, self.len())`.
+     #[inline]
+     pub unsafe fn get_changed_tick_unchecked(&self, row: TableRow) -> &UnsafeCell<Tick> {
+-        self.changed_ticks.get_unchecked(row.index())
++        // SAFETY: Upheld by caller
++        unsafe { self.changed_ticks.get_unchecked(row.index()) }
+     }
+ 
+     /// Fetches the change detection ticks for the value at `row`.
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index a12b3469a4651..3dfb6758f2d51 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -373,11 +373,14 @@ where
+         input: SystemIn<'_, Self>,
+         world: UnsafeWorldCell,
+     ) -> Result<Self::Out, RunSystemError> {
+-        let value = self.a.run_unsafe(input, world)?;
+-        // `Self::validate_param_unsafe` already validated the first system,
+-        // but we still need to validate the second system once the first one runs.
+-        self.b.validate_param_unsafe(world)?;
+-        self.b.run_unsafe(value, world)
++        // SAFETY: Upheld by caller
++        unsafe {
++            let value = self.a.run_unsafe(input, world)?;
++            // `Self::validate_param_unsafe` already validated the first system,
++            // but we still need to validate the second system once the first one runs.
++            self.b.validate_param_unsafe(world)?;
++            self.b.run_unsafe(value, world)
++        }
+     }
+ 
+     #[cfg(feature = "hotpatching")]
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index 8422ceacaa643..6df15e84c7492 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -182,11 +182,14 @@ const _: () = {
+             system_meta: &bevy_ecs::system::SystemMeta,
+             world: UnsafeWorldCell,
+         ) -> Result<(), SystemParamValidationError> {
+-            <__StructFieldsAlias as bevy_ecs::system::SystemParam>::validate_param(
+-                &mut state.state,
+-                system_meta,
+-                world,
+-            )
++            // SAFETY: Upheld by caller
++            unsafe {
++                <__StructFieldsAlias as bevy_ecs::system::SystemParam>::validate_param(
++                    &mut state.state,
++                    system_meta,
++                    world,
++                )
++            }
+         }
+ 
+         #[inline]
+@@ -196,12 +199,15 @@ const _: () = {
+             world: UnsafeWorldCell<'w>,
+             change_tick: bevy_ecs::change_detection::Tick,
+         ) -> Self::Item<'w, 's> {
+-            let params = <__StructFieldsAlias as bevy_ecs::system::SystemParam>::get_param(
+-                &mut state.state,
+-                system_meta,
+-                world,
+-                change_tick,
+-            );
++            // SAFETY: Upheld by caller
++            let params = unsafe {
++                <__StructFieldsAlias as bevy_ecs::system::SystemParam>::get_param(
++                    &mut state.state,
++                    system_meta,
++                    world,
++                    change_tick,
++                )
++            };
+             Commands {
+                 queue: InternalQueue::CommandQueue(params.0),
+                 allocator: params.1,
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index 2481bb5f25f4f..8116f6c06b400 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -66,7 +66,8 @@ where
+         _input: SystemIn<'_, Self>,
+         world: UnsafeWorldCell,
+     ) -> Result<Self::Out, RunSystemError> {
+-        self.system.run_unsafe(&mut self.value, world)
++        // SAFETY: Upheld by caller
++        unsafe { self.system.run_unsafe(&mut self.value, world) }
+     }
+ 
+     #[cfg(feature = "hotpatching")]
+@@ -87,7 +88,8 @@ where
+         &mut self,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        self.system.validate_param_unsafe(world)
++        // SAFETY: Upheld by caller
++        unsafe { self.system.validate_param_unsafe(world) }
+     }
+ 
+     fn initialize(&mut self, world: &mut World) -> FilteredAccessSet {
+@@ -163,7 +165,8 @@ where
+             .value
+             .as_mut()
+             .expect("System input value was not found. Did you forget to initialize the system before running it?");
+-        self.system.run_unsafe(value, world)
++        // SAFETY: Upheld by caller
++        unsafe { self.system.run_unsafe(value, world) }
+     }
+ 
+     #[cfg(feature = "hotpatching")]
+@@ -184,7 +187,8 @@ where
+         &mut self,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        self.system.validate_param_unsafe(world)
++        // SAFETY: Upheld by caller
++        unsafe { self.system.validate_param_unsafe(world) }
+     }
+ 
+     fn initialize(&mut self, world: &mut World) -> FilteredAccessSet {
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index 80d449017d2eb..0ee28bd444273 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -703,7 +703,10 @@ macro_rules! impl_param_set {
+                 system_meta: &SystemMeta,
+                 world: UnsafeWorldCell<'w>,
+             ) -> Result<(), SystemParamValidationError> {
+-                <($($param,)*) as SystemParam>::validate_param(state, system_meta, world)
++                // SAFETY: Upheld by caller
++                unsafe {
++                    <($($param,)*) as SystemParam>::validate_param(state, system_meta, world)
++                }
+             }
+ 
+             #[inline]
+@@ -968,7 +971,8 @@ unsafe impl<'w> SystemParam for DeferredWorld<'w> {
+         world: UnsafeWorldCell<'world>,
+         _change_tick: Tick,
+     ) -> Self::Item<'world, 'state> {
+-        world.into_deferred()
++        // SAFETY: Upheld by caller
++        unsafe { world.into_deferred() }
+     }
+ }
+ 
+@@ -1773,9 +1777,12 @@ unsafe impl<T: SystemParam> SystemParam for Option<T> {
+         world: UnsafeWorldCell<'world>,
+         change_tick: Tick,
+     ) -> Self::Item<'world, 'state> {
+-        T::validate_param(state, system_meta, world)
+-            .ok()
+-            .map(|()| T::get_param(state, system_meta, world, change_tick))
++        // SAFETY: Upheld by caller
++        unsafe {
++            T::validate_param(state, system_meta, world)
++                .ok()
++                .map(|()| T::get_param(state, system_meta, world, change_tick))
++        }
+     }
+ 
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+@@ -1816,8 +1823,11 @@ unsafe impl<T: SystemParam> SystemParam for Result<T, SystemParamValidationError
+         world: UnsafeWorldCell<'world>,
+         change_tick: Tick,
+     ) -> Self::Item<'world, 'state> {
+-        T::validate_param(state, system_meta, world)
+-            .map(|()| T::get_param(state, system_meta, world, change_tick))
++        // SAFETY: Upheld by caller
++        unsafe {
++            T::validate_param(state, system_meta, world)
++                .map(|()| T::get_param(state, system_meta, world, change_tick))
++        }
+     }
+ 
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+@@ -1910,7 +1920,8 @@ unsafe impl<T: SystemParam> SystemParam for If<T> {
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        T::validate_param(state, system_meta, world).map_err(|mut e| {
++        // SAFETY: Upheld by caller
++        unsafe { T::validate_param(state, system_meta, world) }.map_err(|mut e| {
+             e.skipped = true;
+             e
+         })
+@@ -1923,7 +1934,8 @@ unsafe impl<T: SystemParam> SystemParam for If<T> {
+         world: UnsafeWorldCell<'world>,
+         change_tick: Tick,
+     ) -> Self::Item<'world, 'state> {
+-        If(T::get_param(state, system_meta, world, change_tick))
++        // SAFETY: Upheld by caller.
++        If(unsafe { T::get_param(state, system_meta, world, change_tick) })
+     }
+ 
+     fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
+@@ -1967,7 +1979,8 @@ unsafe impl<T: SystemParam> SystemParam for Vec<T> {
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+         for state in state {
+-            T::validate_param(state, system_meta, world)?;
++            // SAFETY: Upheld by caller
++            unsafe { T::validate_param(state, system_meta, world)? };
+         }
+         Ok(())
+     }
+@@ -2148,9 +2161,17 @@ macro_rules! impl_system_param_tuple {
+                 world: UnsafeWorldCell,
+             ) -> Result<(), SystemParamValidationError> {
+                 let ($($param,)*) = state;
+-                $(
+-                    $param::validate_param($param, system_meta, world)?;
+-                )*
++
++                #[allow(
++                    unused_unsafe,
++                    reason = "Zero-length tuples won't have any params to validate."
++                )]
++                // SAFETY: Upheld by caller
++                unsafe {
++                    $(
++                        $param::validate_param($param, system_meta, world)?;
++                    )*
++                }
+                 Ok(())
+             }
+ 
+@@ -2162,11 +2183,19 @@ macro_rules! impl_system_param_tuple {
+                 change_tick: Tick,
+             ) -> Self::Item<'w, 's> {
+                 let ($($param,)*) = state;
++
+                 #[allow(
+-                    clippy::unused_unit,
+-                    reason = "Zero-length tuples won't have any params to get."
++                    unused_unsafe,
++                    reason = "Zero-length tuples won't have any params to validate."
+                 )]
+-                ($($param::get_param($param, system_meta, world, change_tick),)*)
++                // SAFETY: Upheld by caller
++                unsafe {
++                    #[allow(
++                        clippy::unused_unit,
++                        reason = "Zero-length tuples won't have any params to get."
++                    )]
++                    ($($param::get_param($param, system_meta, world, change_tick),)*)
++                }
+             }
+         }
+     };
+@@ -2319,7 +2348,8 @@ unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        P::validate_param(state, system_meta, world)
++        // SAFETY: Upheld by caller
++        unsafe { P::validate_param(state, system_meta, world) }
+     }
+ 
+     #[inline]
+@@ -2604,7 +2634,8 @@ impl<T: SystemParam + 'static> DynParamState for ParamState<T> {
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        T::validate_param(&mut self.0, system_meta, world)
++        // SAFETY: Upheld by caller
++        unsafe { T::validate_param(&mut self.0, system_meta, world) }
+     }
+ }
+ 
+@@ -2635,7 +2666,8 @@ unsafe impl SystemParam for DynSystemParam<'_, '_> {
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        state.0.validate_param(system_meta, world)
++        // SAFETY: Upheld by caller.
++        unsafe { state.0.validate_param(system_meta, world) }
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/world/entity_access/component_fetch.rs b/crates/bevy_ecs/src/world/entity_access/component_fetch.rs
+index ee074bcf20f78..18dce1d725708 100644
+--- a/crates/bevy_ecs/src/world/entity_access/component_fetch.rs
++++ b/crates/bevy_ecs/src/world/entity_access/component_fetch.rs
+@@ -140,21 +140,24 @@ unsafe impl<const N: usize> DynamicComponentFetch for [ComponentId; N] {
+         self,
+         cell: UnsafeEntityCell<'_>,
+     ) -> Result<Self::Ref<'_>, EntityComponentError> {
+-        <&Self>::fetch_ref(&self, cell)
++        // SAFETY: Uphelp by caller.
++        unsafe { <&Self>::fetch_ref(&self, cell) }
+     }
+ 
+     unsafe fn fetch_mut(
+         self,
+         cell: UnsafeEntityCell<'_>,
+     ) -> Result<Self::Mut<'_>, EntityComponentError> {
+-        <&Self>::fetch_mut(&self, cell)
++        // SAFETY: Uphelp by caller.
++        unsafe { <&Self>::fetch_mut(&self, cell) }
+     }
+ 
+     unsafe fn fetch_mut_assume_mutable(
+         self,
+         cell: UnsafeEntityCell<'_>,
+     ) -> Result<Self::Mut<'_>, EntityComponentError> {
+-        <&Self>::fetch_mut_assume_mutable(&self, cell)
++        // SAFETY: Uphelp by caller.
++        unsafe { <&Self>::fetch_mut_assume_mutable(&self, cell) }
+     }
+ }
+ 
+diff --git a/crates/bevy_ecs/src/world/entity_access/filtered.rs b/crates/bevy_ecs/src/world/entity_access/filtered.rs
+index 4459fc262e517..b72540e452b8a 100644
+--- a/crates/bevy_ecs/src/world/entity_access/filtered.rs
++++ b/crates/bevy_ecs/src/world/entity_access/filtered.rs
+@@ -325,7 +325,8 @@ impl<'w, 's> UnsafeFilteredEntityMut<'w, 's> {
+     /// - The user must ensure that no aliasing violations occur when using the returned `FilteredEntityMut`.
+     #[inline]
+     pub unsafe fn into_mut(self) -> FilteredEntityMut<'w, 's> {
+-        FilteredEntityMut::new(self.entity, self.access)
++        // SAFETY: Upheld by caller.
++        unsafe { FilteredEntityMut::new(self.entity, self.access) }
+     }
+ }
+ 
+diff --git a/crates/bevy_ecs/src/world/entity_access/world_mut.rs b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+index 1ca4e24c75f5b..609fc4d195a3f 100644
+--- a/crates/bevy_ecs/src/world/entity_access/world_mut.rs
++++ b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+@@ -770,8 +770,11 @@ impl<'w> EntityWorldMut<'w> {
+         &mut self,
+         component_ids: F,
+     ) -> Result<F::Mut<'_>, EntityComponentError> {
+-        self.as_mutable()
+-            .into_mut_assume_mutable_by_id(component_ids)
++        // SAFETY: Upheld by caller
++        unsafe {
++            self.as_mutable()
++                .into_mut_assume_mutable_by_id(component_ids)
++        }
+     }
+ 
+     /// Consumes `self` and returns [untyped mutable reference(s)](MutUntyped)
+@@ -840,8 +843,11 @@ impl<'w> EntityWorldMut<'w> {
+         self,
+         component_ids: F,
+     ) -> Result<F::Mut<'w>, EntityComponentError> {
+-        self.into_mutable()
+-            .into_mut_assume_mutable_by_id(component_ids)
++        // SAFETY: Upheld by caller
++        unsafe {
++            self.into_mutable()
++                .into_mut_assume_mutable_by_id(component_ids)
++        }
+     }
+ 
+     /// Adds a [`Bundle`] of components to the entity.
+@@ -971,13 +977,16 @@ impl<'w> EntityWorldMut<'w> {
+         component_id: ComponentId,
+         component: OwningPtr<'_>,
+     ) -> &mut Self {
+-        self.insert_by_id_with_caller(
+-            component_id,
+-            component,
+-            InsertMode::Replace,
+-            MaybeLocation::caller(),
+-            RelationshipHookMode::Run,
+-        )
++        // SAFETY: Upheld by caller
++        unsafe {
++            self.insert_by_id_with_caller(
++                component_id,
++                component,
++                InsertMode::Replace,
++                MaybeLocation::caller(),
++                RelationshipHookMode::Run,
++            )
++        }
+     }
+ 
+     /// # Safety
+diff --git a/crates/bevy_ecs/src/world/entity_fetch.rs b/crates/bevy_ecs/src/world/entity_fetch.rs
+index 1c2e2d2fcf705..457f176d0457d 100644
+--- a/crates/bevy_ecs/src/world/entity_fetch.rs
++++ b/crates/bevy_ecs/src/world/entity_fetch.rs
+@@ -247,7 +247,8 @@ unsafe impl<const N: usize> WorldEntityFetch for [Entity; N] {
+         self,
+         cell: UnsafeWorldCell<'_>,
+     ) -> Result<Self::Ref<'_>, EntityNotSpawnedError> {
+-        <&Self>::fetch_ref(&self, cell)
++        // SAFETY: Upheld by caller
++        unsafe { <&Self>::fetch_ref(&self, cell) }
+     }
+ 
+     #[inline]
+@@ -255,7 +256,8 @@ unsafe impl<const N: usize> WorldEntityFetch for [Entity; N] {
+         self,
+         cell: UnsafeWorldCell<'_>,
+     ) -> Result<Self::Mut<'_>, EntityMutableFetchError> {
+-        <&Self>::fetch_mut(&self, cell)
++        // SAFETY: Upheld by caller
++        unsafe { <&Self>::fetch_mut(&self, cell) }
+     }
+ 
+     #[inline]
+@@ -263,7 +265,8 @@ unsafe impl<const N: usize> WorldEntityFetch for [Entity; N] {
+         self,
+         cell: UnsafeWorldCell<'_>,
+     ) -> Result<Self::DeferredMut<'_>, EntityMutableFetchError> {
+-        <&Self>::fetch_deferred_mut(&self, cell)
++        // SAFETY: Upheld by caller
++        unsafe { <&Self>::fetch_deferred_mut(&self, cell) }
+     }
+ }
+ 
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index 3b450e066e241..5a98c81b2c0c3 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -697,7 +697,8 @@ impl<'w> UnsafeWorldCell<'w> {
+     /// Must have read access to [`DefaultErrorHandler`].
+     #[inline]
+     pub unsafe fn default_error_handler(&self) -> ErrorHandler {
+-        self.get_resource::<DefaultErrorHandler>()
++        // SAFETY: Upheld by caller
++        unsafe { self.get_resource::<DefaultErrorHandler>() }
+             .copied()
+             .unwrap_or_default()
+             .0

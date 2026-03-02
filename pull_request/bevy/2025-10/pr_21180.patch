@@ -1,0 +1,716 @@
+diff --git a/crates/bevy_sprite/src/text2d.rs b/crates/bevy_sprite/src/text2d.rs
+index c33dfe8fd6c40..bfdf64ecae5a7 100644
+--- a/crates/bevy_sprite/src/text2d.rs
++++ b/crates/bevy_sprite/src/text2d.rs
+@@ -20,9 +20,9 @@ use bevy_image::prelude::*;
+ use bevy_math::{FloatOrd, Vec2, Vec3};
+ use bevy_reflect::{prelude::ReflectDefault, Reflect};
+ use bevy_text::{
+-    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, LineBreak, SwashCache, TextBounds,
+-    TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextPipeline, TextReader, TextRoot,
+-    TextSpanAccess, TextWriter,
++    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, LineBreak, LineHeight, SwashCache,
++    TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextPipeline,
++    TextReader, TextRoot, TextSpanAccess, TextWriter,
+ };
+ use bevy_transform::components::Transform;
+ use core::any::TypeId;
+@@ -83,6 +83,7 @@ use core::any::TypeId;
+     TextLayout,
+     TextFont,
+     TextColor,
++    LineHeight,
+     TextBounds,
+     Anchor,
+     Visibility,
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index 7f267e52020c6..21b63149468a1 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -17,8 +17,8 @@ use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Wrap};
+ 
+ use crate::{
+     add_glyph_to_atlas, error::TextError, get_glyph_atlas_info, ComputedTextBlock, Font,
+-    FontAtlasKey, FontAtlasSet, FontSmoothing, Justify, LineBreak, PositionedGlyph, TextBounds,
+-    TextEntity, TextFont, TextLayout,
++    FontAtlasKey, FontAtlasSet, FontSmoothing, Justify, LineBreak, LineHeight, PositionedGlyph,
++    TextBounds, TextEntity, TextFont, TextLayout,
+ };
+ 
+ /// A wrapper resource around a [`cosmic_text::FontSystem`]
+@@ -75,7 +75,13 @@ pub struct TextPipeline {
+     /// Buffered vec for collecting spans.
+     ///
+     /// See [this dark magic](https://users.rust-lang.org/t/how-to-cache-a-vectors-capacity/94478/10).
+-    spans_buffer: Vec<(usize, &'static str, &'static TextFont, FontFaceInfo)>,
++    spans_buffer: Vec<(
++        usize,
++        &'static str,
++        &'static TextFont,
++        FontFaceInfo,
++        LineHeight,
++    )>,
+     /// Buffered vec for collecting info for glyph assembly.
+     glyph_info: Vec<(AssetId<Font>, FontSmoothing, f32, f32, f32, f32)>,
+ }
+@@ -87,7 +93,7 @@ impl TextPipeline {
+     pub fn update_buffer<'a>(
+         &mut self,
+         fonts: &Assets<Font>,
+-        text_spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color)>,
++        text_spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color, LineHeight)>,
+         linebreak: LineBreak,
+         justify: Justify,
+         bounds: TextBounds,
+@@ -101,15 +107,21 @@ impl TextPipeline {
+         // to FontSystem, which the cosmic-text Buffer also needs.
+         let mut max_font_size: f32 = 0.;
+         let mut max_line_height: f32 = 0.0;
+-        let mut spans: Vec<(usize, &str, &TextFont, FontFaceInfo, Color)> =
++        let mut spans: Vec<(usize, &str, &TextFont, FontFaceInfo, Color, LineHeight)> =
+             core::mem::take(&mut self.spans_buffer)
+                 .into_iter()
+-                .map(|_| -> (usize, &str, &TextFont, FontFaceInfo, Color) { unreachable!() })
++                .map(
++                    |_| -> (usize, &str, &TextFont, FontFaceInfo, Color, LineHeight) {
++                        unreachable!()
++                    },
++                )
+                 .collect();
+ 
+         computed.entities.clear();
+ 
+-        for (span_index, (entity, depth, span, text_font, color)) in text_spans.enumerate() {
++        for (span_index, (entity, depth, span, text_font, color, line_height)) in
++            text_spans.enumerate()
++        {
+             // Save this span entity in the computed text block.
+             computed.entities.push(TextEntity { entity, depth });
+ 
+@@ -122,9 +134,13 @@ impl TextPipeline {
+                 self.spans_buffer = spans
+                     .into_iter()
+                     .map(
+-                        |_| -> (usize, &'static str, &'static TextFont, FontFaceInfo) {
+-                            unreachable!()
+-                        },
++                        |_| -> (
++                            usize,
++                            &'static str,
++                            &'static TextFont,
++                            FontFaceInfo,
++                            LineHeight,
++                        ) { unreachable!() },
+                     )
+                     .collect();
+ 
+@@ -133,7 +149,7 @@ impl TextPipeline {
+ 
+             // Get max font size for use in cosmic Metrics.
+             max_font_size = max_font_size.max(text_font.font_size);
+-            max_line_height = max_line_height.max(text_font.line_height.eval(text_font.font_size));
++            max_line_height = max_line_height.max(line_height.eval(text_font.font_size));
+ 
+             // Load Bevy fonts into cosmic-text's font system.
+             let face_info = load_font_to_fontdb(
+@@ -151,7 +167,7 @@ impl TextPipeline {
+ 
+                 continue;
+             }
+-            spans.push((span_index, span, text_font, face_info, color));
++            spans.push((span_index, span, text_font, face_info, color, line_height));
+         }
+ 
+         let mut metrics = Metrics::new(max_font_size, max_line_height).scale(scale_factor as f32);
+@@ -167,14 +183,21 @@ impl TextPipeline {
+         // The section index is stored in the metadata of the spans, and could be used
+         // to look up the section the span came from and is not used internally
+         // in cosmic-text.
+-        let spans_iter = spans
+-            .iter()
+-            .map(|(span_index, span, text_font, font_info, color)| {
++        let spans_iter = spans.iter().map(
++            |(span_index, span, text_font, font_info, color, line_height)| {
+                 (
+                     *span,
+-                    get_attrs(*span_index, text_font, *color, font_info, scale_factor),
++                    get_attrs(
++                        *span_index,
++                        text_font,
++                        *line_height,
++                        *color,
++                        font_info,
++                        scale_factor,
++                    ),
+                 )
+-            });
++            },
++        );
+ 
+         // Update the buffer.
+         let buffer = &mut computed.buffer;
+@@ -212,7 +235,15 @@ impl TextPipeline {
+         spans.clear();
+         self.spans_buffer = spans
+             .into_iter()
+-            .map(|_| -> (usize, &'static str, &'static TextFont, FontFaceInfo) { unreachable!() })
++            .map(
++                |_| -> (
++                    usize,
++                    &'static str,
++                    &'static TextFont,
++                    FontFaceInfo,
++                    LineHeight,
++                ) { unreachable!() },
++            )
+             .collect();
+ 
+         Ok(())
+@@ -226,7 +257,7 @@ impl TextPipeline {
+         &mut self,
+         layout_info: &mut TextLayoutInfo,
+         fonts: &Assets<Font>,
+-        text_spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color)>,
++        text_spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color, LineHeight)>,
+         scale_factor: f64,
+         layout: &TextLayout,
+         bounds: TextBounds,
+@@ -247,7 +278,7 @@ impl TextPipeline {
+         // Extract font ids from the iterator while traversing it.
+         let mut glyph_info = core::mem::take(&mut self.glyph_info);
+         glyph_info.clear();
+-        let text_spans = text_spans.inspect(|(_, _, _, text_font, _)| {
++        let text_spans = text_spans.inspect(|(_, _, _, text_font, _, _)| {
+             glyph_info.push((
+                 text_font.font.id(),
+                 text_font.font_smoothing,
+@@ -428,7 +459,7 @@ impl TextPipeline {
+         &mut self,
+         entity: Entity,
+         fonts: &Assets<Font>,
+-        text_spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color)>,
++        text_spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color, LineHeight)>,
+         scale_factor: f64,
+         layout: &TextLayout,
+         computed: &mut ComputedTextBlock,
+@@ -565,6 +596,7 @@ pub fn load_font_to_fontdb(
+ fn get_attrs<'a>(
+     span_index: usize,
+     text_font: &TextFont,
++    line_height: LineHeight,
+     color: Color,
+     face_info: &'a FontFaceInfo,
+     scale_factor: f64,
+@@ -578,7 +610,7 @@ fn get_attrs<'a>(
+         .metrics(
+             Metrics {
+                 font_size: text_font.font_size,
+-                line_height: text_font.line_height.eval(text_font.font_size),
++                line_height: line_height.eval(text_font.font_size),
+             }
+             .scale(scale_factor as f32),
+         )
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index b9b98b1277bdb..74e2e29c4fcc1 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -172,7 +172,7 @@ impl TextLayout {
+ /// but each node has its own [`TextFont`] and [`TextColor`].
+ #[derive(Component, Debug, Default, Clone, Deref, DerefMut, Reflect)]
+ #[reflect(Component, Default, Debug, Clone)]
+-#[require(TextFont, TextColor)]
++#[require(TextFont, TextColor, LineHeight)]
+ pub struct TextSpan(pub String);
+ 
+ impl TextSpan {
+@@ -264,11 +264,6 @@ pub struct TextFont {
+     /// A new font atlas is generated for every combination of font handle and scaled font size
+     /// which can have a strong performance impact.
+     pub font_size: f32,
+-    /// The vertical height of a line of text, from the top of one line to the top of the
+-    /// next.
+-    ///
+-    /// Defaults to `LineHeight::RelativeToFont(1.2)`
+-    pub line_height: LineHeight,
+     /// The antialiasing method to use when rendering text.
+     pub font_smoothing: FontSmoothing,
+ }
+@@ -296,12 +291,6 @@ impl TextFont {
+         self.font_smoothing = font_smoothing;
+         self
+     }
+-
+-    /// Returns this [`TextFont`] with the specified [`LineHeight`].
+-    pub const fn with_line_height(mut self, line_height: LineHeight) -> Self {
+-        self.line_height = line_height;
+-        self
+-    }
+ }
+ 
+ impl From<Handle<Font>> for TextFont {
+@@ -310,21 +299,11 @@ impl From<Handle<Font>> for TextFont {
+     }
+ }
+ 
+-impl From<LineHeight> for TextFont {
+-    fn from(line_height: LineHeight) -> Self {
+-        Self {
+-            line_height,
+-            ..default()
+-        }
+-    }
+-}
+-
+ impl Default for TextFont {
+     fn default() -> Self {
+         Self {
+             font: Default::default(),
+             font_size: 20.0,
+-            line_height: LineHeight::default(),
+             font_smoothing: Default::default(),
+         }
+     }
+@@ -333,8 +312,8 @@ impl Default for TextFont {
+ /// Specifies the height of each line of text for `Text` and `Text2d`
+ ///
+ /// Default is 1.2x the font size
+-#[derive(Debug, Clone, Copy, PartialEq, Reflect)]
+-#[reflect(Debug, Clone, PartialEq)]
++#[derive(Component, Debug, Clone, Copy, PartialEq, Reflect)]
++#[reflect(Component, Debug, Clone, PartialEq)]
+ pub enum LineHeight {
+     /// Set line height to a specific number of pixels
+     Px(f32),
+diff --git a/crates/bevy_text/src/text_access.rs b/crates/bevy_text/src/text_access.rs
+index 7de9e8e323b36..9d04c1dbb5da8 100644
+--- a/crates/bevy_text/src/text_access.rs
++++ b/crates/bevy_text/src/text_access.rs
+@@ -5,7 +5,7 @@ use bevy_ecs::{
+     system::{Query, SystemParam},
+ };
+ 
+-use crate::{TextColor, TextFont, TextSpan};
++use crate::{LineHeight, TextColor, TextFont, TextSpan};
+ 
+ /// Helper trait for using the [`TextReader`] and [`TextWriter`] system params.
+ pub trait TextSpanAccess: Component<Mutability = Mutable> {
+@@ -58,6 +58,7 @@ pub struct TextReader<'w, 's, R: TextRoot> {
+             &'static R,
+             &'static TextFont,
+             &'static TextColor,
++            &'static LineHeight,
+             Option<&'static Children>,
+         ),
+     >,
+@@ -68,6 +69,7 @@ pub struct TextReader<'w, 's, R: TextRoot> {
+             &'static TextSpan,
+             &'static TextFont,
+             &'static TextColor,
++            &'static LineHeight,
+             Option<&'static Children>,
+         ),
+     >,
+@@ -92,24 +94,32 @@ impl<'w, 's, R: TextRoot> TextReader<'w, 's, R> {
+         &mut self,
+         root_entity: Entity,
+         index: usize,
+-    ) -> Option<(Entity, usize, &str, &TextFont, Color)> {
++    ) -> Option<(Entity, usize, &str, &TextFont, Color, LineHeight)> {
+         self.iter(root_entity).nth(index)
+     }
+ 
+     /// Gets the text value of a text span within a text block at a specific index in the flattened span list.
+     pub fn get_text(&mut self, root_entity: Entity, index: usize) -> Option<&str> {
+-        self.get(root_entity, index).map(|(_, _, text, _, _)| text)
++        self.get(root_entity, index)
++            .map(|(_, _, text, _, _, _)| text)
+     }
+ 
+     /// Gets the [`TextFont`] of a text span within a text block at a specific index in the flattened span list.
+     pub fn get_font(&mut self, root_entity: Entity, index: usize) -> Option<&TextFont> {
+-        self.get(root_entity, index).map(|(_, _, _, font, _)| font)
++        self.get(root_entity, index)
++            .map(|(_, _, _, font, _, _)| font)
+     }
+ 
+     /// Gets the [`TextColor`] of a text span within a text block at a specific index in the flattened span list.
+     pub fn get_color(&mut self, root_entity: Entity, index: usize) -> Option<Color> {
+         self.get(root_entity, index)
+-            .map(|(_, _, _, _, color)| color)
++            .map(|(_, _, _, _, color, _)| color)
++    }
++
++    /// Gets the [`LineHeight`] of a text span within a text block at a specific index in the flattened span list.
++    pub fn get_line_height(&mut self, root_entity: Entity, index: usize) -> Option<LineHeight> {
++        self.get(root_entity, index)
++            .map(|(_, _, _, _, _, line_height)| line_height)
+     }
+ 
+     /// Gets the text value of a text span within a text block at a specific index in the flattened span list.
+@@ -132,6 +142,11 @@ impl<'w, 's, R: TextRoot> TextReader<'w, 's, R> {
+     pub fn color(&mut self, root_entity: Entity, index: usize) -> Color {
+         self.get_color(root_entity, index).unwrap()
+     }
++
++    /// Gets the [`LineHeight`] of a text span within a text block at a specific index in the flattened span list.
++    pub fn line_height(&mut self, root_entity: Entity, index: usize) -> LineHeight {
++        self.get_line_height(root_entity, index).unwrap()
++    }
+ }
+ 
+ /// Iterator returned by [`TextReader::iter`].
+@@ -151,6 +166,7 @@ pub struct TextSpanIter<'a, R: TextRoot> {
+             &'static R,
+             &'static TextFont,
+             &'static TextColor,
++            &'static LineHeight,
+             Option<&'static Children>,
+         ),
+     >,
+@@ -161,6 +177,7 @@ pub struct TextSpanIter<'a, R: TextRoot> {
+             &'static TextSpan,
+             &'static TextFont,
+             &'static TextColor,
++            &'static LineHeight,
+             Option<&'static Children>,
+         ),
+     >,
+@@ -168,15 +185,24 @@ pub struct TextSpanIter<'a, R: TextRoot> {
+ 
+ impl<'a, R: TextRoot> Iterator for TextSpanIter<'a, R> {
+     /// Item = (entity in text block, hierarchy depth in the block, span text, span style).
+-    type Item = (Entity, usize, &'a str, &'a TextFont, Color);
++    type Item = (Entity, usize, &'a str, &'a TextFont, Color, LineHeight);
+     fn next(&mut self) -> Option<Self::Item> {
+         // Root
+         if let Some(root_entity) = self.root_entity.take() {
+-            if let Ok((text, text_font, color, maybe_children)) = self.roots.get(root_entity) {
++            if let Ok((text, text_font, color, line_height, maybe_children)) =
++                self.roots.get(root_entity)
++            {
+                 if let Some(children) = maybe_children {
+                     self.stack.push((children, 0));
+                 }
+-                return Some((root_entity, 0, text.read_span(), text_font, color.0));
++                return Some((
++                    root_entity,
++                    0,
++                    text.read_span(),
++                    text_font,
++                    color.0,
++                    *line_height,
++                ));
+             }
+             return None;
+         }
+@@ -194,7 +220,9 @@ impl<'a, R: TextRoot> Iterator for TextSpanIter<'a, R> {
+                 *idx += 1;
+ 
+                 let entity = *child;
+-                let Ok((span, text_font, color, maybe_children)) = self.spans.get(entity) else {
++                let Ok((span, text_font, color, line_height, maybe_children)) =
++                    self.spans.get(entity)
++                else {
+                     continue;
+                 };
+ 
+@@ -202,7 +230,14 @@ impl<'a, R: TextRoot> Iterator for TextSpanIter<'a, R> {
+                 if let Some(children) = maybe_children {
+                     self.stack.push((children, 0));
+                 }
+-                return Some((entity, depth, span.read_span(), text_font, color.0));
++                return Some((
++                    entity,
++                    depth,
++                    span.read_span(),
++                    text_font,
++                    color.0,
++                    *line_height,
++                ));
+             }
+ 
+             // All children at this stack entry have been iterated.
+@@ -233,6 +268,7 @@ pub struct TextWriter<'w, 's, R: TextRoot> {
+             &'static mut R,
+             &'static mut TextFont,
+             &'static mut TextColor,
++            &'static mut LineHeight,
+         ),
+         Without<TextSpan>,
+     >,
+@@ -243,6 +279,7 @@ pub struct TextWriter<'w, 's, R: TextRoot> {
+             &'static mut TextSpan,
+             &'static mut TextFont,
+             &'static mut TextColor,
++            &'static mut LineHeight,
+         ),
+         Without<R>,
+     >,
+@@ -261,16 +298,18 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+         Mut<'_, String>,
+         Mut<'_, TextFont>,
+         Mut<'_, TextColor>,
++        Mut<'_, LineHeight>,
+     )> {
+         // Root
+         if index == 0 {
+-            let (text, font, color) = self.roots.get_mut(root_entity).ok()?;
++            let (text, font, color, line_height) = self.roots.get_mut(root_entity).ok()?;
+             return Some((
+                 root_entity,
+                 0,
+                 text.map_unchanged(|t| t.write_span()),
+                 font,
+                 color,
++                line_height,
+             ));
+         }
+ 
+@@ -317,13 +356,14 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+         };
+ 
+         // Note: We do this outside the loop due to borrow checker limitations.
+-        let (text, font, color) = self.spans.get_mut(entity).unwrap();
++        let (text, font, color, line_height) = self.spans.get_mut(entity).unwrap();
+         Some((
+             entity,
+             depth,
+             text.map_unchanged(|t| t.write_span()),
+             font,
+             color,
++            line_height,
+         ))
+     }
+ 
+@@ -334,13 +374,23 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+ 
+     /// Gets the [`TextFont`] of a text span within a text block at a specific index in the flattened span list.
+     pub fn get_font(&mut self, root_entity: Entity, index: usize) -> Option<Mut<'_, TextFont>> {
+-        self.get(root_entity, index).map(|(_, _, _, font, _)| font)
++        self.get(root_entity, index).map(|(_, _, _, font, ..)| font)
+     }
+ 
+     /// Gets the [`TextColor`] of a text span within a text block at a specific index in the flattened span list.
+     pub fn get_color(&mut self, root_entity: Entity, index: usize) -> Option<Mut<'_, TextColor>> {
+         self.get(root_entity, index)
+-            .map(|(_, _, _, _, color)| color)
++            .map(|(_, _, _, _, color, ..)| color)
++    }
++
++    /// Gets the [`LineHeight`] of a text span within a text block at a specific index in the flattened span list.
++    pub fn get_line_height(
++        &mut self,
++        root_entity: Entity,
++        index: usize,
++    ) -> Option<Mut<'_, LineHeight>> {
++        self.get(root_entity, index)
++            .map(|(_, _, _, _, _, line_height)| line_height)
+     }
+ 
+     /// Gets the text value of a text span within a text block at a specific index in the flattened span list.
+@@ -364,28 +414,42 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+         self.get_color(root_entity, index).unwrap()
+     }
+ 
++    /// Gets the [`LineHeight`] of a text span within a text block at a specific index in the flattened span list.
++    ///
++    /// Panics if there is no span at the requested index.
++    pub fn line_height(&mut self, root_entity: Entity, index: usize) -> Mut<'_, LineHeight> {
++        self.get_line_height(root_entity, index).unwrap()
++    }
++
+     /// Invokes a callback on each span in a text block, starting with the root entity.
+     pub fn for_each(
+         &mut self,
+         root_entity: Entity,
+-        mut callback: impl FnMut(Entity, usize, Mut<String>, Mut<TextFont>, Mut<TextColor>),
++        mut callback: impl FnMut(
++            Entity,
++            usize,
++            Mut<String>,
++            Mut<TextFont>,
++            Mut<TextColor>,
++            Mut<LineHeight>,
++        ),
+     ) {
+-        self.for_each_until(root_entity, |a, b, c, d, e| {
+-            (callback)(a, b, c, d, e);
++        self.for_each_until(root_entity, |a, b, c, d, e, f| {
++            (callback)(a, b, c, d, e, f);
+             true
+         });
+     }
+ 
+     /// Invokes a callback on each span's string value in a text block, starting with the root entity.
+     pub fn for_each_text(&mut self, root_entity: Entity, mut callback: impl FnMut(Mut<String>)) {
+-        self.for_each(root_entity, |_, _, text, _, _| {
++        self.for_each(root_entity, |_, _, text, _, _, _| {
+             (callback)(text);
+         });
+     }
+ 
+     /// Invokes a callback on each span's [`TextFont`] in a text block, starting with the root entity.
+     pub fn for_each_font(&mut self, root_entity: Entity, mut callback: impl FnMut(Mut<TextFont>)) {
+-        self.for_each(root_entity, |_, _, _, font, _| {
++        self.for_each(root_entity, |_, _, _, font, _, _| {
+             (callback)(font);
+         });
+     }
+@@ -396,11 +460,22 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+         root_entity: Entity,
+         mut callback: impl FnMut(Mut<TextColor>),
+     ) {
+-        self.for_each(root_entity, |_, _, _, _, color| {
++        self.for_each(root_entity, |_, _, _, _, color, _| {
+             (callback)(color);
+         });
+     }
+ 
++    /// Invokes a callback on each span's [`LineHeight`] in a text block, starting with the root entity.
++    pub fn for_each_line_height(
++        &mut self,
++        root_entity: Entity,
++        mut callback: impl FnMut(Mut<LineHeight>),
++    ) {
++        self.for_each(root_entity, |_, _, _, _, _, line_height| {
++            (callback)(line_height);
++        });
++    }
++
+     /// Invokes a callback on each span in a text block, starting with the root entity.
+     ///
+     /// Traversal will stop when the callback returns `false`.
+@@ -408,10 +483,17 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+     pub fn for_each_until(
+         &mut self,
+         root_entity: Entity,
+-        mut callback: impl FnMut(Entity, usize, Mut<String>, Mut<TextFont>, Mut<TextColor>) -> bool,
++        mut callback: impl FnMut(
++            Entity,
++            usize,
++            Mut<String>,
++            Mut<TextFont>,
++            Mut<TextColor>,
++            Mut<LineHeight>,
++        ) -> bool,
+     ) {
+         // Root
+-        let Ok((text, font, color)) = self.roots.get_mut(root_entity) else {
++        let Ok((text, font, color, line_height)) = self.roots.get_mut(root_entity) else {
+             return;
+         };
+         if !(callback)(
+@@ -420,6 +502,7 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+             text.map_unchanged(|t| t.write_span()),
+             font,
+             color,
++            line_height,
+         ) {
+             return;
+         }
+@@ -449,7 +532,7 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+                 *idx += 1;
+ 
+                 let entity = *child;
+-                let Ok((text, font, color)) = self.spans.get_mut(entity) else {
++                let Ok((text, font, color, line_height)) = self.spans.get_mut(entity) else {
+                     continue;
+                 };
+ 
+@@ -459,6 +542,7 @@ impl<'w, 's, R: TextRoot> TextWriter<'w, 's, R> {
+                     text.map_unchanged(|t| t.write_span()),
+                     font,
+                     color,
++                    line_height,
+                 ) {
+                     self.scratch.recover(stack);
+                     return;
+diff --git a/crates/bevy_ui/src/accessibility.rs b/crates/bevy_ui/src/accessibility.rs
+index 81c78a50a2da8..9e8559d218ec9 100644
+--- a/crates/bevy_ui/src/accessibility.rs
++++ b/crates/bevy_ui/src/accessibility.rs
+@@ -26,7 +26,7 @@ fn calc_label(
+     for child in children {
+         let values = text_reader
+             .iter(child)
+-            .map(|(_, _, text, _, _)| text.into())
++            .map(|(_, _, text, _, _, _)| text.into())
+             .collect::<Vec<String>>();
+         if !values.is_empty() {
+             name = Some(values.join(" "));
+@@ -119,7 +119,7 @@ fn label_changed(
+     for (entity, accessible) in &mut query {
+         let values = text_reader
+             .iter(entity)
+-            .map(|(_, _, text, _, _)| text.into())
++            .map(|(_, _, text, _, _, _)| text.into())
+             .collect::<Vec<String>>();
+         let label = Some(values.join(" ").into_boxed_str());
+         if let Some(mut accessible) = accessible {
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index a84a6689f1f47..6f45d78c56388 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -18,9 +18,9 @@ use bevy_image::prelude::*;
+ use bevy_math::Vec2;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_text::{
+-    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, LineBreak, SwashCache, TextBounds,
+-    TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextMeasureInfo, TextPipeline,
+-    TextReader, TextRoot, TextSpanAccess, TextWriter,
++    ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSet, LineBreak, LineHeight, SwashCache,
++    TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextMeasureInfo,
++    TextPipeline, TextReader, TextRoot, TextSpanAccess, TextWriter,
+ };
+ use taffy::style::AvailableSpace;
+ use tracing::error;
+@@ -95,7 +95,15 @@ impl Default for TextNodeFlags {
+ /// ```
+ #[derive(Component, Debug, Default, Clone, Deref, DerefMut, Reflect, PartialEq)]
+ #[reflect(Component, Default, Debug, PartialEq, Clone)]
+-#[require(Node, TextLayout, TextFont, TextColor, TextNodeFlags, ContentSize)]
++#[require(
++    Node,
++    TextLayout,
++    TextFont,
++    TextColor,
++    LineHeight,
++    TextNodeFlags,
++    ContentSize
++)]
+ pub struct Text(pub String);
+ 
+ impl Text {
+@@ -220,7 +228,7 @@ fn create_text_measure<'a>(
+     entity: Entity,
+     fonts: &Assets<Font>,
+     scale_factor: f64,
+-    spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color)>,
++    spans: impl Iterator<Item = (Entity, usize, &'a str, &'a TextFont, Color, LineHeight)>,
+     block: Ref<TextLayout>,
+     text_pipeline: &mut TextPipeline,
+     mut content_size: Mut<ContentSize>,
+diff --git a/examples/dev_tools/fps_overlay.rs b/examples/dev_tools/fps_overlay.rs
+index 5637706c756ed..6e758013ff187 100644
+--- a/examples/dev_tools/fps_overlay.rs
++++ b/examples/dev_tools/fps_overlay.rs
+@@ -26,7 +26,6 @@ fn main() {
+                         font: default(),
+                         // We could also disable font smoothing,
+                         font_smoothing: FontSmoothing::default(),
+-                        ..default()
+                     },
+                     // We can also change color of the overlay
+                     text_color: OverlayColor::GREEN,
+diff --git a/release-content/migration-guides/lineheight_is_now_a_separate_component.md b/release-content/migration-guides/lineheight_is_now_a_separate_component.md
+new file mode 100644
+index 0000000000000..8a8ed6d5f2fa8
+--- /dev/null
++++ b/release-content/migration-guides/lineheight_is_now_a_separate_component.md
+@@ -0,0 +1,6 @@
++---
++title: "`LineHeight` is now a separate component"
++pull_requests: []
++---
++
++The `line_height` field has been removed from `TextFont`. `LineHeight` is now a component required by `Text`, `Text2d`, and `TextSpan`.

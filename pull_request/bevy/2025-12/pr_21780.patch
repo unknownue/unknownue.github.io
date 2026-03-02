@@ -1,0 +1,1398 @@
+diff --git a/benches/Cargo.toml b/benches/Cargo.toml
+index 8940f1eed7105..a8bb418259a46 100644
+--- a/benches/Cargo.toml
++++ b/benches/Cargo.toml
+@@ -11,6 +11,7 @@ autobenches = false
+ # The primary crate that runs and analyzes our benchmarks. This is a regular dependency because the
+ # `bench!` macro refers to it in its documentation.
+ criterion = { version = "0.8.0", features = ["html_reports"] }
++seq-macro = "0.3.6"
+ 
+ [dev-dependencies]
+ # Bevy crates
+diff --git a/benches/benches/bevy_ecs/world/mod.rs b/benches/benches/bevy_ecs/world/mod.rs
+index 7158f2f033498..b71b59bc69160 100644
+--- a/benches/benches/bevy_ecs/world/mod.rs
++++ b/benches/benches/bevy_ecs/world/mod.rs
+@@ -35,5 +35,8 @@ criterion_group!(
+     query_get_many::<2>,
+     query_get_many::<5>,
+     query_get_many::<10>,
++    query_get_components_mut_2,
++    query_get_components_mut_5,
++    query_get_components_mut_10,
+     entity_set_build_and_lookup,
+ );
+diff --git a/benches/benches/bevy_ecs/world/world_get.rs b/benches/benches/bevy_ecs/world/world_get.rs
+index dc5c2c5caf420..080990f85d30b 100644
+--- a/benches/benches/bevy_ecs/world/world_get.rs
++++ b/benches/benches/bevy_ecs/world/world_get.rs
+@@ -1,3 +1,4 @@
++use benches::bench;
+ use core::hint::black_box;
+ 
+ use bevy_ecs::{
+@@ -5,11 +6,12 @@ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+     system::{Query, SystemState},
+-    world::World,
++    world::{EntityMut, World},
+ };
+ use criterion::Criterion;
+ use rand::{prelude::SliceRandom, SeedableRng};
+ use rand_chacha::ChaCha8Rng;
++use seq_macro::seq;
+ 
+ #[derive(Component, Default)]
+ #[component(storage = "Table")]
+@@ -357,3 +359,64 @@ pub fn query_get_many<const N: usize>(criterion: &mut Criterion) {
+         });
+     }
+ }
++
++macro_rules! query_get_components_mut {
++    ($function_name:ident, $val:literal) => {
++        pub fn $function_name(criterion: &mut Criterion) {
++            let mut group = criterion.benchmark_group(bench!("world_query_get_components_mut"));
++            group.warm_up_time(core::time::Duration::from_millis(500));
++            group.measurement_time(core::time::Duration::from_secs(4));
++
++            for entity_count in RANGE.map(|i| i * 10_000) {
++                seq!(N in 0..$val {
++                    let (mut world, entities) = setup_wide::<(
++                        #(WideTable<N>,)*
++                    )>(entity_count);
++                });
++                let mut query = world.query::<EntityMut>();
++                group.bench_function(format!("{}_components_{entity_count}_entities", $val), |bencher| {
++                    bencher.iter(|| {
++                        for entity in &entities {
++                            seq!(N in 0..$val {
++                                assert!(query
++                                    .get_mut(&mut world, *entity)
++                                    .unwrap()
++                                    .get_components_mut::<(
++                                            #(&mut WideTable<N>,)*
++                                        )>()
++                                        .is_ok());
++                            });
++                        }
++                    });
++                });
++                group.bench_function(
++                    format!("unchecked_{}_components_{entity_count}_entities", $val),
++                    |bencher| {
++                        bencher.iter(|| {
++                            for entity in &entities {
++                                // SAFETY: no duplicate components are listed
++                                unsafe {
++                                    seq!(N in 0..$val {
++                                        assert!(query
++                                            .get_mut(&mut world, *entity)
++                                            .unwrap()
++                                            .get_components_mut_unchecked::<(
++                                                    #(&mut WideTable<N>,)*
++                                                )>()
++                                                .is_ok());
++                                    });
++                                }
++                            }
++                        });
++                    },
++                );
++            }
++
++            group.finish();
++        }
++    };
++}
++
++query_get_components_mut!(query_get_components_mut_2, 2);
++query_get_components_mut!(query_get_components_mut_5, 5);
++query_get_components_mut!(query_get_components_mut_10, 10);
+diff --git a/crates/bevy_ecs/macros/src/query_data.rs b/crates/bevy_ecs/macros/src/query_data.rs
+index 1e9dea94bbca3..a91dd193e51c1 100644
+--- a/crates/bevy_ecs/macros/src/query_data.rs
++++ b/crates/bevy_ecs/macros/src/query_data.rs
+@@ -267,6 +267,12 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                             #(#field_members: <#read_only_field_types>::fetch(&_state.#field_aliases, &mut _fetch.#field_aliases, _entity, _table_row)?,)*
+                         })
+                     }
++
++                    fn iter_access(
++                        _state: &Self::State,
++                    ) -> impl core::iter::Iterator<Item = #path::query::EcsAccessType<'_>> {
++                        core::iter::empty() #(.chain(<#field_types>::iter_access(&_state.#field_aliases)))*
++                    }
+                 }
+ 
+                 impl #user_impl_generics #path::query::ReleaseStateQueryData
+@@ -332,6 +338,12 @@ pub fn derive_query_data_impl(input: TokenStream) -> TokenStream {
+                         #(#field_members: <#field_types>::fetch(&_state.#field_aliases, &mut _fetch.#field_aliases, _entity, _table_row)?,)*
+                     })
+                 }
++
++                fn iter_access(
++                    _state: &Self::State,
++                ) -> impl core::iter::Iterator<Item = #path::query::EcsAccessType<'_>> {
++                    core::iter::empty() #(.chain(<#field_types>::iter_access(&_state.#field_aliases)))*
++                }
+             }
+ 
+             impl #user_impl_generics #path::query::ReleaseStateQueryData
+diff --git a/crates/bevy_ecs/src/event/trigger.rs b/crates/bevy_ecs/src/event/trigger.rs
+index 9492380b63159..ba8a06bc2918d 100644
+--- a/crates/bevy_ecs/src/event/trigger.rs
++++ b/crates/bevy_ecs/src/event/trigger.rs
+@@ -301,7 +301,7 @@ unsafe impl<
+                 return;
+             }
+             if let Ok(entity) = world.get_entity(current_entity)
+-                && let Some(item) = entity.get_components::<T>()
++                && let Ok(item) = entity.get_components::<T>()
+                 && let Some(traverse_to) = T::traverse(item, event)
+             {
+                 current_entity = traverse_to;
+diff --git a/crates/bevy_ecs/src/query/access_iter.rs b/crates/bevy_ecs/src/query/access_iter.rs
+new file mode 100644
+index 0000000000000..9b79b8156edef
+--- /dev/null
++++ b/crates/bevy_ecs/src/query/access_iter.rs
+@@ -0,0 +1,467 @@
++use core::fmt::Display;
++
++use crate::{
++    component::{ComponentId, Components},
++    query::{Access, QueryData},
++};
++
++/// Check if `Q` has any internal conflicts.
++#[inline(never)]
++pub fn has_conflicts<Q: QueryData>(components: &Components) -> Result<(), QueryAccessError> {
++    // increasing this too much may slow down smaller queries
++    const MAX_SIZE: usize = 16;
++    let Some(state) = Q::get_state(components) else {
++        return Err(QueryAccessError::ComponentNotRegistered);
++    };
++    let iter = Q::iter_access(&state).enumerate();
++    let size = iter.size_hint().1.unwrap_or(MAX_SIZE);
++
++    if size > MAX_SIZE {
++        for (i, access) in iter {
++            for access_other in Q::iter_access(&state).take(i) {
++                if let Err(err) = access.is_compatible(access_other) {
++                    panic!("{}", err);
++                }
++            }
++        }
++    } else {
++        // we can optimize small sizes by caching the iteration result in an array on the stack
++        let mut inner_access = [EcsAccessType::Empty; MAX_SIZE];
++        for (i, access) in iter {
++            for access_other in inner_access.iter().take(i) {
++                if let Err(err) = access.is_compatible(*access_other) {
++                    panic!("{}", err);
++                }
++            }
++            inner_access[i] = access;
++        }
++    }
++
++    Ok(())
++}
++
++/// The data storage type that is being accessed.
++#[derive(Copy, Clone, Debug, PartialEq)]
++pub enum EcsAccessType<'a> {
++    /// Accesses [`Component`](crate::prelude::Component) data
++    Component(EcsAccessLevel),
++    /// Accesses [`Resource`](crate::prelude::Resource) data
++    Resource(ResourceAccessLevel),
++    /// borrowed access from [`WorldQuery::State`](crate::query::WorldQuery)
++    Access(&'a Access),
++    /// Does not access any data that can conflict.
++    Empty,
++}
++
++impl<'a> EcsAccessType<'a> {
++    /// Returns `Ok(())` if `self` and `other` are compatible. Returns a [`AccessConflictError`] otherwise.
++    #[inline(never)]
++    pub fn is_compatible(&self, other: Self) -> Result<(), AccessConflictError<'_>> {
++        use EcsAccessLevel::*;
++        use EcsAccessType::*;
++
++        match (*self, other) {
++            (Component(ReadAll), Component(Write(_)))
++            | (Component(Write(_)), Component(ReadAll))
++            | (Component(_), Component(WriteAll))
++            | (Component(WriteAll), Component(_)) => Err(AccessConflictError(*self, other)),
++
++            (Empty, _)
++            | (_, Empty)
++            | (Component(_), Resource(_))
++            | (Resource(_), Component(_))
++            // read only access doesn't conflict
++            | (Component(Read(_)), Component(Read(_)))
++            | (Component(ReadAll), Component(Read(_)))
++            | (Component(Read(_)), Component(ReadAll))
++            | (Component(ReadAll), Component(ReadAll))
++            | (Resource(ResourceAccessLevel::Read(_)), Resource(ResourceAccessLevel::Read(_))) => {
++                Ok(())
++            }
++
++            (Component(Read(id)), Component(Write(id_other)))
++            | (Component(Write(id)), Component(Read(id_other)))
++            | (Component(Write(id)), Component(Write(id_other)))
++            | (
++                Resource(ResourceAccessLevel::Read(id)),
++                Resource(ResourceAccessLevel::Write(id_other)),
++            )
++            | (
++                Resource(ResourceAccessLevel::Write(id)),
++                Resource(ResourceAccessLevel::Read(id_other)),
++            )
++            | (
++                Resource(ResourceAccessLevel::Write(id)),
++                Resource(ResourceAccessLevel::Write(id_other)),
++            ) => if id == id_other {
++                Err(AccessConflictError(*self, other))
++            } else {
++                Ok(())
++            },
++
++            // Borrowed Access
++            (Component(Read(component_id)), Access(access))
++            | (Access(access), Component(Read(component_id))) => if access.has_component_write(component_id) {
++                Err(AccessConflictError(*self, other))
++            } else {
++                Ok(())
++            },
++
++            (Component(Write(component_id)), Access(access))
++            | (Access(access), Component(Write(component_id))) => if access.has_component_read(component_id) {
++                Err(AccessConflictError(*self, other))
++            } else {
++                Ok(())
++            },
++
++            (Component(ReadAll), Access(access))
++            | (Access(access), Component(ReadAll)) => if access.has_any_component_write() {
++                Err(AccessConflictError(*self, other))
++            } else {
++                Ok(())
++            },
++
++            (Component(WriteAll), Access(access))
++            | (Access(access), Component(WriteAll))=> if access.has_any_component_read() {
++                Err(AccessConflictError(*self, other))
++            } else {
++                Ok(())
++            },
++
++            (Resource(ResourceAccessLevel::Read(component_id)), Access(access))
++            | (Access(access), Resource(ResourceAccessLevel::Read(component_id))) => if access.has_resource_write(component_id) {
++                Err(AccessConflictError(*self, other))
++            } else {
++                Ok(())
++            },
++            (Resource(ResourceAccessLevel::Write(component_id)), Access(access))
++            | (Access(access), Resource(ResourceAccessLevel::Write(component_id))) => if access.has_resource_read(component_id) {
++                Err(AccessConflictError(*self, other))
++            } else {
++                Ok(())
++            },
++
++            (Access(access), Access(other_access)) => if access.is_compatible(other_access) {
++                Ok(())
++            } else {
++                Err(AccessConflictError(*self, other))
++            },
++        }
++    }
++}
++
++/// The way the data will be accessed and whether we take access on all the components on
++/// an entity or just one component.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum EcsAccessLevel {
++    /// Reads [`Component`](crate::prelude::Component) with [`ComponentId`]
++    Read(ComponentId),
++    /// Writes [`Component`](crate::prelude::Component) with [`ComponentId`]
++    Write(ComponentId),
++    /// Potentially reads all [`Component`](crate::prelude::Component)'s in the [`World`](crate::prelude::World)
++    ReadAll,
++    /// Potentially writes all [`Component`](crate::prelude::Component)'s in the [`World`](crate::prelude::World)
++    WriteAll,
++}
++
++/// Access level needed by [`QueryData`] fetch to the resource.
++#[derive(Copy, Clone, Debug, PartialEq)]
++pub enum ResourceAccessLevel {
++    /// Reads the resource with [`ComponentId`]
++    Read(ComponentId),
++    /// Writes the resource with [`ComponentId`]
++    Write(ComponentId),
++}
++
++/// Error returned from [`EcsAccessType::is_compatible`]
++pub struct AccessConflictError<'a>(EcsAccessType<'a>, EcsAccessType<'a>);
++
++impl Display for AccessConflictError<'_> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        use EcsAccessLevel::*;
++        use EcsAccessType::*;
++
++        let AccessConflictError(a, b) = self;
++        match (a, b) {
++            // ReadAll/WriteAll + Component conflicts
++            (Component(ReadAll), Component(Write(id)))
++            | (Component(Write(id)), Component(ReadAll)) => {
++                write!(
++                    f,
++                    "Component read all access conflicts with component {id:?} write."
++                )
++            }
++            (Component(WriteAll), Component(Write(id)))
++            | (Component(Write(id)), Component(WriteAll)) => {
++                write!(
++                    f,
++                    "Component write all access conflicts with component {id:?} write."
++                )
++            }
++            (Component(WriteAll), Component(Read(id)))
++            | (Component(Read(id)), Component(WriteAll)) => {
++                write!(
++                    f,
++                    "Component write all access conflicts with component {id:?} read."
++                )
++            }
++            (Component(WriteAll), Component(ReadAll))
++            | (Component(ReadAll), Component(WriteAll)) => {
++                write!(f, "Component write all conflicts with component read all.")
++            }
++            (Component(WriteAll), Component(WriteAll)) => {
++                write!(f, "Component write all conflicts with component write all.")
++            }
++
++            // Component + Component conflicts
++            (Component(Read(id)), Component(Write(id_other)))
++            | (Component(Write(id_other)), Component(Read(id))) => write!(
++                f,
++                "Component {id:?} read conflicts with component {id_other:?} write."
++            ),
++            (Component(Write(id)), Component(Write(id_other))) => write!(
++                f,
++                "Component {id:?} write conflicts with component {id_other:?} write."
++            ),
++
++            // Borrowed Access conflicts
++            (Access(_), Component(Read(id))) | (Component(Read(id)), Access(_)) => write!(
++                f,
++                "Access has a write that conflicts with component {id:?} read."
++            ),
++            (Access(_), Component(Write(id))) | (Component(Write(id)), Access(_)) => write!(
++                f,
++                "Access has a read that conflicts with component {id:?} write."
++            ),
++            (Access(_), Component(ReadAll)) | (Component(ReadAll), Access(_)) => write!(
++                f,
++                "Access has a write that conflicts with component read all"
++            ),
++            (Access(_), Component(WriteAll)) | (Component(WriteAll), Access(_)) => write!(
++                f,
++                "Access has a read that conflicts with component write all"
++            ),
++            (Access(_), Resource(ResourceAccessLevel::Read(id)))
++            | (Resource(ResourceAccessLevel::Read(id)), Access(_)) => write!(
++                f,
++                "Access has a write that conflicts with resource {id:?} read."
++            ),
++            (Access(_), Resource(ResourceAccessLevel::Write(id)))
++            | (Resource(ResourceAccessLevel::Write(id)), Access(_)) => write!(
++                f,
++                "Access has a read that conflicts with resource {id:?} write."
++            ),
++            (Access(_), Access(_)) => write!(f, "Access conflicts with other Access"),
++
++            _ => {
++                unreachable!("Other accesses should be compatible");
++            }
++        }
++    }
++}
++
++/// Error returned from [`has_conflicts`].
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum QueryAccessError {
++    /// Component was not registered on world
++    ComponentNotRegistered,
++    /// Entity did not have the requested components
++    EntityDoesNotMatch,
++}
++
++impl core::error::Error for QueryAccessError {}
++
++impl Display for QueryAccessError {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match *self {
++            QueryAccessError::ComponentNotRegistered => {
++                write!(
++                    f,
++                    "At least one component in Q was not registered in world. 
++                    Consider calling `World::register_component`"
++                )
++            }
++            QueryAccessError::EntityDoesNotMatch => {
++                write!(f, "Entity does not match Q")
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{
++        prelude::Component,
++        world::{EntityMut, EntityMutExcept, EntityRef, EntityRefExcept, World},
++    };
++
++    #[derive(Component)]
++    struct C1;
++
++    #[derive(Component)]
++    struct C2;
++
++    fn setup_world() -> World {
++        let world = World::new();
++        let mut world = world;
++        world.register_component::<C1>();
++        world.register_component::<C2>();
++        world
++    }
++
++    #[test]
++    fn simple_compatible() {
++        let world = setup_world();
++        let c = world.components();
++
++        // Compatible
++        assert!(has_conflicts::<&mut C1>(c).is_ok());
++        assert!(has_conflicts::<&C1>(c).is_ok());
++        assert!(has_conflicts::<(&C1, &C1)>(c).is_ok());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn conflict_component_read_conflicts_write() {
++        let _ = has_conflicts::<(&C1, &mut C1)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn conflict_component_write_conflicts_read() {
++        let _ = has_conflicts::<(&mut C1, &C1)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn conflict_component_write_conflicts_write() {
++        let _ = has_conflicts::<(&mut C1, &mut C1)>(setup_world().components());
++    }
++
++    #[test]
++    fn entity_ref_compatible() {
++        let world = setup_world();
++        let c = world.components();
++
++        // Compatible
++        assert!(has_conflicts::<(EntityRef, &C1)>(c).is_ok());
++        assert!(has_conflicts::<(&C1, EntityRef)>(c).is_ok());
++        assert!(has_conflicts::<(EntityRef, EntityRef)>(c).is_ok());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_ref_conflicts_component_write() {
++        let _ = has_conflicts::<(EntityRef, &mut C1)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn component_write_conflicts_entity_ref() {
++        let _ = has_conflicts::<(&mut C1, EntityRef)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_mut_conflicts_component_read() {
++        let _ = has_conflicts::<(EntityMut, &C1)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn component_read_conflicts_entity_mut() {
++        let _ = has_conflicts::<(&C1, EntityMut)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_mut_conflicts_component_write() {
++        let _ = has_conflicts::<(EntityMut, &mut C1)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn component_write_conflicts_entity_mut() {
++        let _ = has_conflicts::<(&mut C1, EntityMut)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_mut_conflicts_entity_ref() {
++        let _ = has_conflicts::<(EntityMut, EntityRef)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_ref_conflicts_entity_mut() {
++        let _ = has_conflicts::<(EntityRef, EntityMut)>(setup_world().components());
++    }
++
++    #[test]
++    fn entity_ref_except_compatible() {
++        let world = setup_world();
++        let c = world.components();
++
++        // Compatible
++        assert!(has_conflicts::<(EntityRefExcept<C1>, &mut C1)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, EntityRefExcept<C1>)>(c).is_ok());
++        assert!(has_conflicts::<(&C2, EntityRefExcept<C1>)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, EntityRefExcept<(C1, C2)>,)>(c).is_ok());
++        assert!(has_conflicts::<(EntityRefExcept<(C1, C2)>, &mut C1,)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, &mut C2, EntityRefExcept<(C1, C2)>,)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, EntityRefExcept<(C1, C2)>, &mut C2,)>(c).is_ok());
++        assert!(has_conflicts::<(EntityRefExcept<(C1, C2)>, &mut C1, &mut C2,)>(c).is_ok());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_ref_except_conflicts_component_write() {
++        let _ = has_conflicts::<(EntityRefExcept<C1>, &mut C2)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn component_write_conflicts_entity_ref_except() {
++        let _ = has_conflicts::<(&mut C2, EntityRefExcept<C1>)>(setup_world().components());
++    }
++
++    #[test]
++    fn entity_mut_except_compatible() {
++        let world = setup_world();
++        let c = world.components();
++
++        // Compatible
++        assert!(has_conflicts::<(EntityMutExcept<C1>, &mut C1)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, EntityMutExcept<C1>)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, EntityMutExcept<(C1, C2)>,)>(c).is_ok());
++        assert!(has_conflicts::<(EntityMutExcept<(C1, C2)>, &mut C1,)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, &mut C2, EntityMutExcept<(C1, C2)>,)>(c).is_ok());
++        assert!(has_conflicts::<(&mut C1, EntityMutExcept<(C1, C2)>, &mut C2,)>(c).is_ok());
++        assert!(has_conflicts::<(EntityMutExcept<(C1, C2)>, &mut C1, &mut C2,)>(c).is_ok());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_mut_except_conflicts_component_read() {
++        let _ = has_conflicts::<(EntityMutExcept<C1>, &C2)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn component_read_conflicts_entity_mut_except() {
++        let _ = has_conflicts::<(&C2, EntityMutExcept<C1>)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn entity_mut_except_conflicts_component_write() {
++        let _ = has_conflicts::<(EntityMutExcept<C1>, &mut C2)>(setup_world().components());
++    }
++
++    #[test]
++    #[should_panic(expected = "conflicts")]
++    fn component_write_conflicts_entity_mut_except() {
++        let _ = has_conflicts::<(&mut C2, EntityMutExcept<C1>)>(setup_world().components());
++    }
++}
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index d672b6ae4d0b7..c90de055fffa5 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -4,7 +4,10 @@ use crate::{
+     change_detection::{ComponentTicksMut, ComponentTicksRef, MaybeLocation, Tick},
+     component::{Component, ComponentId, Components, Mutable, StorageType},
+     entity::{Entities, Entity, EntityLocation},
+-    query::{Access, DebugCheckedUnwrap, FilteredAccess, WorldQuery},
++    query::{
++        access_iter::{EcsAccessLevel, EcsAccessType},
++        Access, DebugCheckedUnwrap, FilteredAccess, WorldQuery,
++    },
+     storage::{ComponentSparseSet, Table, TableRow},
+     world::{
+         unsafe_world_cell::UnsafeWorldCell, EntityMut, EntityMutExcept, EntityRef, EntityRefExcept,
+@@ -13,7 +16,7 @@ use crate::{
+ };
+ use bevy_ptr::{ThinSlicePtr, UnsafeCellDeref};
+ use bevy_utils::prelude::DebugName;
+-use core::{cell::UnsafeCell, marker::PhantomData, panic::Location};
++use core::{cell::UnsafeCell, iter, marker::PhantomData, panic::Location};
+ use variadics_please::all_tuples;
+ 
+ /// Types that can be fetched from a [`World`] using a [`Query`].
+@@ -342,6 +345,11 @@ pub unsafe trait QueryData: WorldQuery {
+         entity: Entity,
+         table_row: TableRow,
+     ) -> Option<Self::Item<'w, 's>>;
++
++    /// Returns an iterator over the access needed by [`QueryData::fetch`]. Access conflicts are usually
++    /// checked in [`WorldQuery::update_component_access`], but in certain cases this method can be useful to implement
++    /// a way of checking for access conflicts in a non-allocating way.
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>>;
+ }
+ 
+ /// A [`QueryData`] that is read only.
+@@ -450,6 +458,10 @@ unsafe impl QueryData for Entity {
+     ) -> Option<Self::Item<'w, 's>> {
+         Some(entity)
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::empty()
++    }
+ }
+ 
+ /// SAFETY: access is read only
+@@ -543,6 +555,10 @@ unsafe impl QueryData for EntityLocation {
+         // SAFETY: `fetch` must be called with an entity that exists in the world
+         Some(unsafe { fetch.get_spawned(entity).debug_checked_unwrap() })
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::empty()
++    }
+ }
+ 
+ /// SAFETY: access is read only
+@@ -719,6 +735,10 @@ unsafe impl QueryData for SpawnDetails {
+             this_run: fetch.this_run,
+         })
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::empty()
++    }
+ }
+ 
+ /// SAFETY: access is read only
+@@ -838,6 +858,10 @@ unsafe impl<'a> QueryData for EntityRef<'a> {
+         // SAFETY: Read-only access to every component has been registered.
+         Some(unsafe { EntityRef::new(cell) })
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Component(EcsAccessLevel::ReadAll))
++    }
+ }
+ 
+ /// SAFETY: access is read only
+@@ -944,6 +968,10 @@ unsafe impl<'a> QueryData for EntityMut<'a> {
+         // SAFETY: mutable access to every component has been registered.
+         Some(unsafe { EntityMut::new(cell) })
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Component(EcsAccessLevel::WriteAll))
++    }
+ }
+ 
+ impl ReleaseStateQueryData for EntityMut<'_> {
+@@ -1020,7 +1048,7 @@ unsafe impl WorldQuery for FilteredEntityRef<'_, '_> {
+ }
+ 
+ /// SAFETY: `Self` is the same as `Self::ReadOnly`
+-unsafe impl QueryData for FilteredEntityRef<'_, '_> {
++unsafe impl<'a, 'b> QueryData for FilteredEntityRef<'a, 'b> {
+     const IS_READ_ONLY: bool = true;
+     const IS_ARCHETYPAL: bool = true;
+     type ReadOnly = Self;
+@@ -1068,6 +1096,10 @@ unsafe impl QueryData for FilteredEntityRef<'_, '_> {
+         // SAFETY: mutable access to every component has been registered.
+         Some(unsafe { FilteredEntityRef::new(cell, access) })
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Access(state))
++    }
+ }
+ 
+ /// SAFETY: Access is read-only.
+@@ -1187,6 +1219,10 @@ unsafe impl<'a, 'b> QueryData for FilteredEntityMut<'a, 'b> {
+         // SAFETY: mutable access to every component has been registered.
+         Some(unsafe { FilteredEntityMut::new(cell, access) })
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Access(state))
++    }
+ }
+ 
+ impl ArchetypeQueryData for FilteredEntityMut<'_, '_> {}
+@@ -1297,6 +1333,10 @@ where
+             .unwrap();
+         Some(EntityRefExcept::new(cell, access))
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Access(state))
++    }
+ }
+ 
+ /// SAFETY: `EntityRefExcept` enforces read-only access to its contained
+@@ -1412,6 +1452,10 @@ where
+             .unwrap();
+         Some(EntityMutExcept::new(cell, access))
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Access(state))
++    }
+ }
+ 
+ impl<B: Bundle> ArchetypeQueryData for EntityMutExcept<'_, '_, B> {}
+@@ -1499,6 +1543,10 @@ unsafe impl QueryData for &Archetype {
+         // SAFETY: The assigned archetype for a living entity must always be valid.
+         Some(unsafe { archetypes.get(location.archetype_id).debug_checked_unwrap() })
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::empty()
++    }
+ }
+ 
+ /// SAFETY: access is read only
+@@ -1668,6 +1716,10 @@ unsafe impl<T: Component> QueryData for &T {
+             },
+         ))
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Component(EcsAccessLevel::Read(*state)))
++    }
+ }
+ 
+ /// SAFETY: access is read only
+@@ -1881,6 +1933,10 @@ unsafe impl<'__w, T: Component> QueryData for Ref<'__w, T> {
+             },
+         ))
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Component(EcsAccessLevel::Read(*state)))
++    }
+ }
+ 
+ /// SAFETY: access is read only
+@@ -2094,6 +2150,10 @@ unsafe impl<'__w, T: Component<Mutability = Mutable>> QueryData for &'__w mut T
+             },
+         ))
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Component(EcsAccessLevel::Write(*state)))
++    }
+ }
+ 
+ impl<T: Component<Mutability = Mutable>> ReleaseStateQueryData for &mut T {
+@@ -2209,6 +2269,10 @@ unsafe impl<'__w, T: Component<Mutability = Mutable>> QueryData for Mut<'__w, T>
+     ) -> Option<Self::Item<'w, 's>> {
+         <&mut T as QueryData>::fetch(state, fetch, entity, table_row)
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::once(EcsAccessType::Component(EcsAccessLevel::Write(*state)))
++    }
+ }
+ 
+ impl<T: Component<Mutability = Mutable>> ReleaseStateQueryData for Mut<'_, T> {
+@@ -2357,6 +2421,10 @@ unsafe impl<T: QueryData> QueryData for Option<T> {
+                 .flatten(),
+         )
+     }
++
++    fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        T::iter_access(state)
++    }
+ }
+ 
+ /// SAFETY: [`OptionFetch`] is read only because `T` is read only
+@@ -2533,6 +2601,10 @@ unsafe impl<T: Component> QueryData for Has<T> {
+     ) -> Option<Self::Item<'w, 's>> {
+         Some(*fetch)
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::empty()
++    }
+ }
+ 
+ /// SAFETY: [`Has`] is read only
+@@ -2608,6 +2680,11 @@ macro_rules! impl_tuple_query_data {
+                 // SAFETY: The invariants are upheld by the caller.
+                 Some(($(unsafe { $name::fetch($state, $name, entity, table_row) }?,)*))
+             }
++
++            fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++                let ($($name,)*) = state;
++                iter::empty()$(.chain($name::iter_access($name)))*
++            }
+         }
+ 
+         $(#[$meta])*
+@@ -2805,6 +2882,11 @@ macro_rules! impl_anytuple_fetch {
+                     || !(false $(|| $name.1)*))
+                 .then_some(result)
+             }
++
++            fn iter_access(state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++                let ($($name,)*) = state;
++                iter::empty()$(.chain($name::iter_access($name)))*
++            }
+         }
+ 
+         $(#[$meta])*
+@@ -2926,6 +3008,10 @@ unsafe impl<D: QueryData> QueryData for NopWorldQuery<D> {
+     ) -> Option<Self::Item<'w, 's>> {
+         Some(())
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::empty()
++    }
+ }
+ 
+ /// SAFETY: `NopFetch` never accesses any data
+@@ -3011,6 +3097,10 @@ unsafe impl<T: ?Sized> QueryData for PhantomData<T> {
+     ) -> Option<Self::Item<'w, 's>> {
+         Some(())
+     }
++
++    fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++        iter::empty()
++    }
+ }
+ 
+ /// SAFETY: `PhantomData` never accesses any world data.
+@@ -3219,6 +3309,10 @@ mod tests {
+             ) -> Option<Self::Item<'w, 's>> {
+                 Some(())
+             }
++
++            fn iter_access(_state: &Self::State) -> impl Iterator<Item = EcsAccessType<'_>> {
++                iter::empty()
++            }
+         }
+ 
+         /// SAFETY: access is read only
+diff --git a/crates/bevy_ecs/src/query/mod.rs b/crates/bevy_ecs/src/query/mod.rs
+index eb3dad12bd367..b5c1b3d7d18a5 100644
+--- a/crates/bevy_ecs/src/query/mod.rs
++++ b/crates/bevy_ecs/src/query/mod.rs
+@@ -1,6 +1,7 @@
+ //! Contains APIs for retrieving component data from the world.
+ 
+ mod access;
++mod access_iter;
+ mod builder;
+ mod error;
+ mod fetch;
+@@ -11,6 +12,7 @@ mod state;
+ mod world_query;
+ 
+ pub use access::*;
++pub use access_iter::*;
+ pub use bevy_ecs_macros::{QueryData, QueryFilter};
+ pub use builder::*;
+ pub use error::*;
+@@ -897,6 +899,14 @@ mod tests {
+         ) -> Option<Self::Item<'w, 's>> {
+             Some(())
+         }
++
++        fn iter_access(
++            state: &Self::State,
++        ) -> impl Iterator<Item = super::access_iter::EcsAccessType<'_>> {
++            core::iter::once(super::access_iter::EcsAccessType::Resource(
++                super::access_iter::ResourceAccessLevel::Read(*state),
++            ))
++        }
+     }
+ 
+     /// SAFETY: access is read only
+diff --git a/crates/bevy_ecs/src/world/entity_access/entity_mut.rs b/crates/bevy_ecs/src/world/entity_access/entity_mut.rs
+index c7ecdb4adb62f..ed6ffbe1c9109 100644
+--- a/crates/bevy_ecs/src/world/entity_access/entity_mut.rs
++++ b/crates/bevy_ecs/src/world/entity_access/entity_mut.rs
+@@ -3,7 +3,7 @@ use crate::{
+     change_detection::{ComponentTicks, MaybeLocation, Tick},
+     component::{Component, ComponentId, Mutable},
+     entity::{ContainsEntity, Entity, EntityEquivalent, EntityLocation},
+-    query::{Access, ReadOnlyQueryData, ReleaseStateQueryData},
++    query::{has_conflicts, Access, QueryAccessError, ReadOnlyQueryData, ReleaseStateQueryData},
+     world::{
+         error::EntityComponentError, unsafe_world_cell::UnsafeEntityCell, DynamicComponentFetch,
+         EntityRef, FilteredEntityMut, FilteredEntityRef, Mut, Ref,
+@@ -152,7 +152,7 @@ impl<'w> EntityMut<'w> {
+     /// or `None` if the entity does not have the components required by the query `Q`.
+     pub fn get_components<Q: ReadOnlyQueryData + ReleaseStateQueryData>(
+         &self,
+-    ) -> Option<Q::Item<'_, 'static>> {
++    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
+         self.as_readonly().get_components::<Q>()
+     }
+ 
+@@ -184,13 +184,46 @@ impl<'w> EntityMut<'w> {
+     /// # Safety
+     /// It is the caller's responsibility to ensure that
+     /// the `QueryData` does not provide aliasing mutable references to the same component.
++    ///
++    /// # See also
++    ///
++    /// - [`Self::get_components_mut`] for the safe version that performs aliasing checks
+     pub unsafe fn get_components_mut_unchecked<Q: ReleaseStateQueryData>(
+         &mut self,
+-    ) -> Option<Q::Item<'_, 'static>> {
+-        // SAFETY: Caller the `QueryData` does not provide aliasing mutable references to the same component
++    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
++        // SAFETY: Caller ensures the `QueryData` does not provide aliasing mutable references to the same component
+         unsafe { self.reborrow().into_components_mut_unchecked::<Q>() }
+     }
+ 
++    /// Returns components for the current entity that match the query `Q`.
++    /// In the case of conflicting [`QueryData`](crate::query::QueryData), unregistered components, or missing components,
++    /// this will return a [`QueryAccessError`]
++    ///
++    /// # Example
++    ///
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// #[derive(Component)]
++    /// struct X(usize);
++    /// #[derive(Component)]
++    /// struct Y(usize);
++    ///
++    /// # let mut world = World::default();
++    /// let mut entity = world.spawn((X(0), Y(0))).into_mutable();
++    /// // Get mutable access to two components at once
++    /// // SAFETY: X and Y are different components
++    /// let (mut x, mut y) = entity.get_components_mut::<(&mut X, &mut Y)>().unwrap();
++    /// ```
++    ///
++    /// Note that this does a O(n^2) check that the [`QueryData`](crate::query::QueryData) does not conflict. If performance is a
++    /// consideration you should use [`Self::get_components_mut_unchecked`] instead.
++    pub fn get_components_mut<Q: ReleaseStateQueryData>(
++        &mut self,
++    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
++        self.reborrow().into_components_mut::<Q>()
++    }
++
+     /// Consumes self and returns components for the current entity that match the query `Q` for the world lifetime `'w`,
+     /// or `None` if the entity does not have the components required by the query `Q`.
+     ///
+@@ -219,15 +252,68 @@ impl<'w> EntityMut<'w> {
+     /// # Safety
+     /// It is the caller's responsibility to ensure that
+     /// the `QueryData` does not provide aliasing mutable references to the same component.
++    ///
++    /// # See also
++    ///
++    /// - [`Self::into_components_mut`] for the safe version that performs aliasing checks
+     pub unsafe fn into_components_mut_unchecked<Q: ReleaseStateQueryData>(
+         self,
+-    ) -> Option<Q::Item<'w, 'static>> {
++    ) -> Result<Q::Item<'w, 'static>, QueryAccessError> {
+         // SAFETY:
+         // - We have mutable access to all components of this entity.
+         // - Caller asserts the `QueryData` does not provide aliasing mutable references to the same component
+         unsafe { self.cell.get_components::<Q>() }
+     }
+ 
++    /// Consumes self and returns components for the current entity that match the query `Q` for the world lifetime `'w`,
++    /// or `None` if the entity does not have the components required by the query `Q`.
++    ///
++    /// The checks for aliasing mutable references may be expensive.
++    /// If performance is a concern, consider making multiple calls to [`Self::get_mut`].
++    /// If that is not possible, consider using [`Self::into_components_mut_unchecked`] to skip the checks.
++    ///
++    /// # Panics
++    ///
++    /// If the `QueryData` provides aliasing mutable references to the same component.
++    ///
++    /// # Example
++    ///
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// #[derive(Component)]
++    /// struct X(usize);
++    /// #[derive(Component)]
++    /// struct Y(usize);
++    ///
++    /// # let mut world = World::default();
++    /// let mut entity = world.spawn((X(0), Y(0))).into_mutable();
++    /// // Get mutable access to two components at once
++    /// let (mut x, mut y) = entity.into_components_mut::<(&mut X, &mut Y)>().unwrap();
++    /// *x = X(1);
++    /// *y = Y(1);
++    /// ```
++    ///
++    /// ```should_panic
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct X(usize);
++    /// #
++    /// # let mut world = World::default();
++    /// let mut entity = world.spawn((X(0))).into_mutable();
++    /// // This panics, as the `&mut X`s would alias:
++    /// entity.into_components_mut::<(&mut X, &mut X)>();
++    /// ```
++    pub fn into_components_mut<Q: ReleaseStateQueryData>(
++        self,
++    ) -> Result<Q::Item<'w, 'static>, QueryAccessError> {
++        has_conflicts::<Q>(self.cell.world().components())?;
++
++        // SAFETY: we checked that there were not conflicting components above
++        unsafe { self.into_components_mut_unchecked::<Q>() }
++    }
++
+     /// Consumes `self` and gets access to the component of type `T` with the
+     /// world `'w` lifetime for the current entity.
+     ///
+diff --git a/crates/bevy_ecs/src/world/entity_access/entity_ref.rs b/crates/bevy_ecs/src/world/entity_access/entity_ref.rs
+index 9978c775bc4b7..abe884a1ccf0e 100644
+--- a/crates/bevy_ecs/src/world/entity_access/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_access/entity_ref.rs
+@@ -3,7 +3,7 @@ use crate::{
+     change_detection::{ComponentTicks, MaybeLocation, Tick},
+     component::{Component, ComponentId},
+     entity::{ContainsEntity, Entity, EntityEquivalent, EntityLocation},
+-    query::{Access, ReadOnlyQueryData, ReleaseStateQueryData},
++    query::{Access, QueryAccessError, ReadOnlyQueryData, ReleaseStateQueryData},
+     world::{
+         error::EntityComponentError, unsafe_world_cell::UnsafeEntityCell, DynamicComponentFetch,
+         FilteredEntityRef, Ref,
+@@ -270,7 +270,7 @@ impl<'w> EntityRef<'w> {
+     /// or `None` if the entity does not have the components required by the query `Q`.
+     pub fn get_components<Q: ReadOnlyQueryData + ReleaseStateQueryData>(
+         &self,
+-    ) -> Option<Q::Item<'w, 'static>> {
++    ) -> Result<Q::Item<'w, 'static>, QueryAccessError> {
+         // SAFETY:
+         // - We have read-only access to all components of this entity.
+         // - The query is read-only, and read-only references cannot have conflicts.
+diff --git a/crates/bevy_ecs/src/world/entity_access/mod.rs b/crates/bevy_ecs/src/world/entity_access/mod.rs
+index 187540f868995..cc1bd85449761 100644
+--- a/crates/bevy_ecs/src/world/entity_access/mod.rs
++++ b/crates/bevy_ecs/src/world/entity_access/mod.rs
+@@ -23,6 +23,7 @@ mod tests {
+ 
+     use crate::change_detection::Tick;
+     use crate::lifecycle::HookContext;
++    use crate::query::QueryAccessError;
+     use crate::{
+         change_detection::{MaybeLocation, MutUntyped},
+         component::ComponentId,
+@@ -815,11 +816,35 @@ mod tests {
+         let e3 = world.spawn_empty().id();
+ 
+         assert_eq!(
+-            Some((&X(7), &Y(10))),
++            Ok((&X(7), &Y(10))),
++            world.entity(e1).get_components::<(&X, &Y)>()
++        );
++        assert_eq!(
++            Err(QueryAccessError::EntityDoesNotMatch),
++            world.entity(e2).get_components::<(&X, &Y)>()
++        );
++        assert_eq!(
++            Err(QueryAccessError::EntityDoesNotMatch),
++            world.entity(e3).get_components::<(&X, &Y)>()
++        );
++    }
++
++    #[test]
++    fn get_components_mut() {
++        let mut world = World::default();
++        let e1 = world.spawn((X(7), Y(10))).id();
++
++        let mut entity_mut_1 = world.entity_mut(e1);
++        let Ok((mut x, mut y)) = entity_mut_1.get_components_mut::<(&mut X, &mut Y)>() else {
++            panic!("could not get components");
++        };
++        x.0 += 1;
++        y.0 += 1;
++
++        assert_eq!(
++            Ok((&X(8), &Y(11))),
+             world.entity(e1).get_components::<(&X, &Y)>()
+         );
+-        assert_eq!(None, world.entity(e2).get_components::<(&X, &Y)>());
+-        assert_eq!(None, world.entity(e3).get_components::<(&X, &Y)>());
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_ecs/src/world/entity_access/world_mut.rs b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+index 1ca4e24c75f5b..97cb0e4007584 100644
+--- a/crates/bevy_ecs/src/world/entity_access/world_mut.rs
++++ b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+@@ -9,7 +9,10 @@ use crate::{
+     event::{EntityComponentsTrigger, EntityEvent},
+     lifecycle::{Despawn, Remove, Replace, DESPAWN, REMOVE, REPLACE},
+     observer::Observer,
+-    query::{Access, DebugCheckedUnwrap, ReadOnlyQueryData, ReleaseStateQueryData},
++    query::{
++        has_conflicts, Access, DebugCheckedUnwrap, QueryAccessError, ReadOnlyQueryData,
++        ReleaseStateQueryData,
++    },
+     relationship::RelationshipHookMode,
+     resource::Resource,
+     storage::{SparseSets, Table},
+@@ -284,7 +287,7 @@ impl<'w> EntityWorldMut<'w> {
+     #[inline]
+     pub fn get_components<Q: ReadOnlyQueryData + ReleaseStateQueryData>(
+         &self,
+-    ) -> Option<Q::Item<'_, 'static>> {
++    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
+         self.as_readonly().get_components::<Q>()
+     }
+ 
+@@ -316,13 +319,46 @@ impl<'w> EntityWorldMut<'w> {
+     /// # Safety
+     /// It is the caller's responsibility to ensure that
+     /// the `QueryData` does not provide aliasing mutable references to the same component.
++    ///
++    /// /// # See also
++    ///
++    /// - [`Self::get_components_mut`] for the safe version that performs aliasing checks
+     pub unsafe fn get_components_mut_unchecked<Q: ReleaseStateQueryData>(
+         &mut self,
+-    ) -> Option<Q::Item<'_, 'static>> {
++    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
+         // SAFETY: Caller the `QueryData` does not provide aliasing mutable references to the same component
+         unsafe { self.as_mutable().into_components_mut_unchecked::<Q>() }
+     }
+ 
++    /// Returns components for the current entity that match the query `Q`.
++    /// In the case of conflicting [`QueryData`](crate::query::QueryData), unregistered components, or missing components,
++    /// this will return a [`QueryAccessError`]
++    ///
++    /// # Example
++    ///
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// #[derive(Component)]
++    /// struct X(usize);
++    /// #[derive(Component)]
++    /// struct Y(usize);
++    ///
++    /// # let mut world = World::default();
++    /// let mut entity = world.spawn((X(0), Y(0))).into_mutable();
++    /// // Get mutable access to two components at once
++    /// // SAFETY: X and Y are different components
++    /// let (mut x, mut y) = entity.get_components_mut::<(&mut X, &mut Y)>().unwrap();
++    /// ```
++    ///
++    /// Note that this does a O(n^2) check that the [`QueryData`](crate::query::QueryData) does not conflict. If performance is a
++    /// consideration you should use [`Self::get_components_mut_unchecked`] instead.
++    pub fn get_components_mut<Q: ReleaseStateQueryData>(
++        &mut self,
++    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
++        self.as_mutable().into_components_mut::<Q>()
++    }
++
+     /// Consumes self and returns components for the current entity that match the query `Q` for the world lifetime `'w`,
+     /// or `None` if the entity does not have the components required by the query `Q`.
+     ///
+@@ -351,13 +387,66 @@ impl<'w> EntityWorldMut<'w> {
+     /// # Safety
+     /// It is the caller's responsibility to ensure that
+     /// the `QueryData` does not provide aliasing mutable references to the same component.
++    ///
++    /// # See also
++    ///
++    /// - [`Self::into_components_mut`] for the safe version that performs aliasing checks
+     pub unsafe fn into_components_mut_unchecked<Q: ReleaseStateQueryData>(
+         self,
+-    ) -> Option<Q::Item<'w, 'static>> {
++    ) -> Result<Q::Item<'w, 'static>, QueryAccessError> {
+         // SAFETY: Caller the `QueryData` does not provide aliasing mutable references to the same component
+         unsafe { self.into_mutable().into_components_mut_unchecked::<Q>() }
+     }
+ 
++    /// Consumes self and returns components for the current entity that match the query `Q` for the world lifetime `'w`,
++    /// or `None` if the entity does not have the components required by the query `Q`.
++    ///
++    /// The checks for aliasing mutable references may be expensive.
++    /// If performance is a concern, consider making multiple calls to [`Self::get_mut`].
++    /// If that is not possible, consider using [`Self::into_components_mut_unchecked`] to skip the checks.
++    ///
++    /// # Panics
++    ///
++    /// - If the `QueryData` provides aliasing mutable references to the same component.
++    /// - If the entity has been despawned while this `EntityWorldMut` is still alive.
++    ///
++    /// # Example
++    ///
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// #[derive(Component)]
++    /// struct X(usize);
++    /// #[derive(Component)]
++    /// struct Y(usize);
++    ///
++    /// # let mut world = World::default();
++    /// let mut entity = world.spawn((X(0), Y(0)));
++    /// // Get mutable access to two components at once
++    /// let (mut x, mut y) = entity.into_components_mut::<(&mut X, &mut Y)>().unwrap();
++    /// *x = X(1);
++    /// *y = Y(1);
++    /// ```
++    ///
++    /// ```should_panic
++    /// # use bevy_ecs::prelude::*;
++    /// #
++    /// # #[derive(Component)]
++    /// # struct X(usize);
++    /// #
++    /// # let mut world = World::default();
++    /// let mut entity = world.spawn((X(0)));
++    /// // This panics, as the `&mut X`s would alias:
++    /// entity.into_components_mut::<(&mut X, &mut X)>();
++    /// ```
++    pub fn into_components_mut<Q: ReleaseStateQueryData>(
++        self,
++    ) -> Result<Q::Item<'w, 'static>, QueryAccessError> {
++        has_conflicts::<Q>(self.world.components())?;
++        // SAFETY: we checked that there were not conflicting components above
++        unsafe { self.into_mutable().into_components_mut_unchecked::<Q>() }
++    }
++
+     /// Consumes `self` and gets access to the component of type `T` with
+     /// the world `'w` lifetime for the current entity.
+     /// Returns `None` if the entity does not have a component of type `T`.
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index 3b450e066e241..54a835e2863ab 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -16,7 +16,7 @@ use crate::{
+     lifecycle::RemovedComponentMessages,
+     observer::Observers,
+     prelude::Component,
+-    query::{DebugCheckedUnwrap, ReleaseStateQueryData},
++    query::{DebugCheckedUnwrap, QueryAccessError, ReleaseStateQueryData},
+     resource::Resource,
+     storage::{ComponentSparseSet, Storages, Table},
+     world::RawCommandQueue,
+@@ -983,11 +983,11 @@ impl<'w> UnsafeEntityCell<'w> {
+     /// - The `QueryData` does not provide aliasing mutable references to the same component.
+     pub(crate) unsafe fn get_components<Q: ReleaseStateQueryData>(
+         &self,
+-    ) -> Option<Q::Item<'w, 'static>> {
++    ) -> Result<Q::Item<'w, 'static>, QueryAccessError> {
+         // SAFETY: World is only used to access query data and initialize query state
+         let state = unsafe {
+             let world = self.world().world();
+-            Q::get_state(world.components())?
++            Q::get_state(world.components()).ok_or(QueryAccessError::ComponentNotRegistered)?
+         };
+         let location = self.location();
+         // SAFETY: Location is guaranteed to exist
+@@ -1015,8 +1015,9 @@ impl<'w> UnsafeEntityCell<'w> {
+             // SAFETY: Called after set_archetype above. Entity and location are guaranteed to exist.
+             let item = unsafe { Q::fetch(&state, &mut fetch, self.id(), location.table_row) };
+             item.map(Q::release_state)
++                .ok_or(QueryAccessError::EntityDoesNotMatch)
+         } else {
+-            None
++            Err(QueryAccessError::EntityDoesNotMatch)
+         }
+     }
+ 
+diff --git a/crates/bevy_render/src/sync_world.rs b/crates/bevy_render/src/sync_world.rs
+index bac8c4a3c6202..6a1a1fa813a21 100644
+--- a/crates/bevy_render/src/sync_world.rs
++++ b/crates/bevy_render/src/sync_world.rs
+@@ -385,6 +385,12 @@ mod render_entities_world_query_impls {
+                 unsafe { <&RenderEntity as QueryData>::fetch(state, fetch, entity, table_row) };
+             component.map(RenderEntity::id)
+         }
++
++        fn iter_access(
++            state: &Self::State,
++        ) -> impl Iterator<Item = bevy_ecs::query::EcsAccessType<'_>> {
++            <&RenderEntity as QueryData>::iter_access(state)
++        }
+     }
+ 
+     // SAFETY: the underlying `Entity` is copied, and no mutable access is provided.
+@@ -494,6 +500,12 @@ mod render_entities_world_query_impls {
+                 unsafe { <&MainEntity as QueryData>::fetch(state, fetch, entity, table_row) };
+             component.map(MainEntity::id)
+         }
++
++        fn iter_access(
++            state: &Self::State,
++        ) -> impl Iterator<Item = bevy_ecs::query::EcsAccessType<'_>> {
++            <&MainEntity as QueryData>::iter_access(state)
++        }
+     }
+ 
+     // SAFETY: the underlying `Entity` is copied, and no mutable access is provided.
+diff --git a/release-content/migration-guides/get_components.md b/release-content/migration-guides/get_components.md
+new file mode 100644
+index 0000000000000..f91a5e44300d6
+--- /dev/null
++++ b/release-content/migration-guides/get_components.md
+@@ -0,0 +1,7 @@
++---
++title: get_components, get_components_mut_unchecked now return a Result
++pull_requests: [21780]
++---
++
++`get_components`, `get_components_mut_unchecked`, and `into_components_mut_unchecked`
++now return a `Result<_, QueryAccessError>` instead of an `Option`.
+diff --git a/release-content/release-notes/get_components_mut.md b/release-content/release-notes/get_components_mut.md
+new file mode 100644
+index 0000000000000..85a300e9f1496
+--- /dev/null
++++ b/release-content/release-notes/get_components_mut.md
+@@ -0,0 +1,13 @@
++---
++title: get_components_mut
++authors: ["@hymm"]
++pull_requests: [21780]
++---
++
++A safe version of `EntityMut::get_components_mut` and `EntityWorldMut::get_components_mut`
++was added. Previously a unsafe version was added `get_components_mut_unchecked`. It needed
++to be unsafe because specifying (&mut T, &mut T) is possible which would return multiple
++mutable references to the same component. This was done by adding a O(n^2) check for
++conflicts which returns a `QueryAccessError::Conflict`. Because of the cost of the checks
++if your code is performance sensitive it may make sense to keep using
++`get_components_mut_unchecked`.

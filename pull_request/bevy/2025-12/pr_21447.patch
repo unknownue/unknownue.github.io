@@ -1,0 +1,328 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 10ae2847938bc..59313d406e6fb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -691,6 +691,21 @@ libm = ["bevy_internal/libm"]
+ # Enables use of browser APIs. Note this is currently only applicable on `wasm32` architectures.
+ web = ["bevy_internal/web"]
+ 
++# Mouse support. Automatically enabled by `bevy_window`.
++mouse = ["bevy_internal/mouse"]
++
++# Keyboard support. Automatically enabled by `bevy_window`.
++keyboard = ["bevy_internal/keyboard"]
++
++# Gamepad support. Automatically enabled by `bevy_gilrs`.
++gamepad = ["bevy_internal/gamepad"]
++
++# Touch support. Automatically enabled by `bevy_window`.
++touch = ["bevy_internal/touch"]
++
++# Gestures support. Automatically enabled by `bevy_window`.
++gestures = ["bevy_internal/gestures"]
++
+ # Enable hotpatching of Bevy systems
+ hotpatching = ["bevy_internal/hotpatching"]
+ 
+diff --git a/crates/bevy_gilrs/Cargo.toml b/crates/bevy_gilrs/Cargo.toml
+index 2646436bc209c..965be89ca1386 100644
+--- a/crates/bevy_gilrs/Cargo.toml
++++ b/crates/bevy_gilrs/Cargo.toml
+@@ -12,7 +12,9 @@ keywords = ["bevy"]
+ # bevy
+ bevy_app = { path = "../bevy_app", version = "0.18.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.18.0-dev" }
+-bevy_input = { path = "../bevy_input", version = "0.18.0-dev" }
++bevy_input = { path = "../bevy_input", version = "0.18.0-dev", features = [
++  "gamepad",
++] }
+ bevy_time = { path = "../bevy_time", version = "0.18.0-dev" }
+ bevy_platform = { path = "../bevy_platform", version = "0.18.0-dev", default-features = false, features = [
+   "std",
+diff --git a/crates/bevy_input/Cargo.toml b/crates/bevy_input/Cargo.toml
+index cf6d1a3dd9add..6cda733b56257 100644
+--- a/crates/bevy_input/Cargo.toml
++++ b/crates/bevy_input/Cargo.toml
+@@ -13,6 +13,13 @@ default = ["std", "bevy_reflect", "bevy_ecs/async_executor", "smol_str"]
+ 
+ # Functionality
+ 
++## Input sources
++mouse = []
++keyboard = []
++gamepad = []
++touch = []
++gestures = []
++
+ ## Adds runtime reflection support using `bevy_reflect`.
+ bevy_reflect = [
+   "dep:bevy_reflect",
+diff --git a/crates/bevy_input/src/lib.rs b/crates/bevy_input/src/lib.rs
+index 27d4fea818668..2fa5b328553fe 100644
+--- a/crates/bevy_input/src/lib.rs
++++ b/crates/bevy_input/src/lib.rs
+@@ -21,10 +21,20 @@ mod axis;
+ mod button_input;
+ /// Common run conditions
+ pub mod common_conditions;
++
++#[cfg(feature = "gamepad")]
+ pub mod gamepad;
++
++#[cfg(feature = "gestures")]
+ pub mod gestures;
++
++#[cfg(feature = "keyboard")]
+ pub mod keyboard;
++
++#[cfg(feature = "mouse")]
+ pub mod mouse;
++
++#[cfg(feature = "touch")]
+ pub mod touch;
+ 
+ pub use axis::*;
+@@ -35,28 +45,47 @@ pub use button_input::*;
+ /// This includes the most common types in this crate, re-exported for your convenience.
+ pub mod prelude {
+     #[doc(hidden)]
+-    pub use crate::{
+-        gamepad::{Gamepad, GamepadAxis, GamepadButton, GamepadSettings},
+-        keyboard::KeyCode,
+-        mouse::MouseButton,
+-        touch::{TouchInput, Touches},
+-        Axis, ButtonInput,
+-    };
++    pub use crate::{Axis, ButtonInput};
++
++    #[doc(hidden)]
++    #[cfg(feature = "gamepad")]
++    pub use crate::gamepad::{Gamepad, GamepadAxis, GamepadButton, GamepadSettings};
++
++    #[doc(hidden)]
++    #[cfg(feature = "keyboard")]
++    pub use crate::keyboard::KeyCode;
++
++    #[doc(hidden)]
++    #[cfg(feature = "mouse")]
++    pub use crate::mouse::MouseButton;
++
++    #[doc(hidden)]
++    #[cfg(feature = "touch")]
++    pub use crate::touch::{TouchInput, Touches};
+ }
+ 
+ use bevy_app::prelude::*;
+ use bevy_ecs::prelude::*;
+ #[cfg(feature = "bevy_reflect")]
+ use bevy_reflect::Reflect;
++
++#[cfg(feature = "gestures")]
+ use gestures::*;
++
++#[cfg(feature = "keyboard")]
+ use keyboard::{keyboard_input_system, Key, KeyCode, KeyboardFocusLost, KeyboardInput};
++
++#[cfg(feature = "mouse")]
+ use mouse::{
+     accumulate_mouse_motion_system, accumulate_mouse_scroll_system, mouse_button_input_system,
+     AccumulatedMouseMotion, AccumulatedMouseScroll, MouseButton, MouseButtonInput, MouseMotion,
+     MouseWheel,
+ };
++
++#[cfg(feature = "touch")]
+ use touch::{touch_screen_input_system, TouchInput, Touches};
+ 
++#[cfg(feature = "gamepad")]
+ use gamepad::{
+     gamepad_connection_system, gamepad_event_processing_system, GamepadAxisChangedEvent,
+     GamepadButtonChangedEvent, GamepadButtonStateChangedEvent, GamepadConnectionEvent,
+@@ -67,7 +96,7 @@ use gamepad::{
+ #[cfg(all(feature = "serialize", feature = "bevy_reflect"))]
+ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
+ 
+-/// Adds keyboard and mouse input to an App
++/// Adds input from various sources to an App
+ #[derive(Default)]
+ pub struct InputPlugin;
+ 
+@@ -76,18 +105,22 @@ pub struct InputPlugin;
+ pub struct InputSystems;
+ 
+ impl Plugin for InputPlugin {
++    #[expect(clippy::allow_attributes, reason = "this is only sometimes unused")]
++    #[allow(unused, reason = "all features could be disabled")]
+     fn build(&self, app: &mut App) {
+-        app
+-            // keyboard
+-            .add_message::<KeyboardInput>()
++        #[cfg(feature = "keyboard")]
++        app.add_message::<KeyboardInput>()
+             .add_message::<KeyboardFocusLost>()
+             .init_resource::<ButtonInput<KeyCode>>()
+             .init_resource::<ButtonInput<Key>>()
+-            .add_systems(PreUpdate, keyboard_input_system.in_set(InputSystems))
+-            // mouse
+-            .add_message::<MouseButtonInput>()
++            .add_systems(PreUpdate, keyboard_input_system.in_set(InputSystems));
++
++        #[cfg(feature = "mouse")]
++        app.add_message::<MouseButtonInput>()
+             .add_message::<MouseMotion>()
+             .add_message::<MouseWheel>()
++            .init_resource::<AccumulatedMouseMotion>()
++            .init_resource::<AccumulatedMouseScroll>()
+             .init_resource::<ButtonInput<MouseButton>>()
+             .add_systems(
+                 PreUpdate,
+@@ -97,13 +130,16 @@ impl Plugin for InputPlugin {
+                     accumulate_mouse_scroll_system,
+                 )
+                     .in_set(InputSystems),
+-            )
+-            .add_message::<PinchGesture>()
++            );
++
++        #[cfg(feature = "gestures")]
++        app.add_message::<PinchGesture>()
+             .add_message::<RotationGesture>()
+             .add_message::<DoubleTapGesture>()
+-            .add_message::<PanGesture>()
+-            // gamepad
+-            .add_message::<GamepadEvent>()
++            .add_message::<PanGesture>();
++
++        #[cfg(feature = "gamepad")]
++        app.add_message::<GamepadEvent>()
+             .add_message::<GamepadConnectionEvent>()
+             .add_message::<GamepadButtonChangedEvent>()
+             .add_message::<GamepadButtonStateChangedEvent>()
+@@ -112,8 +148,6 @@ impl Plugin for InputPlugin {
+             .add_message::<RawGamepadAxisChangedEvent>()
+             .add_message::<RawGamepadButtonChangedEvent>()
+             .add_message::<GamepadRumbleRequest>()
+-            .init_resource::<AccumulatedMouseMotion>()
+-            .init_resource::<AccumulatedMouseScroll>()
+             .add_systems(
+                 PreUpdate,
+                 (
+@@ -121,9 +155,10 @@ impl Plugin for InputPlugin {
+                     gamepad_event_processing_system.after(gamepad_connection_system),
+                 )
+                     .in_set(InputSystems),
+-            )
+-            // touch
+-            .add_message::<TouchInput>()
++            );
++
++        #[cfg(feature = "touch")]
++        app.add_message::<TouchInput>()
+             .init_resource::<Touches>()
+             .add_systems(PreUpdate, touch_screen_input_system.in_set(InputSystems));
+     }
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 7aac25bb4b432..40993d65c9e7a 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -426,6 +426,13 @@ async_executor = [
+ # Note this is currently only applicable on `wasm32` architectures.
+ web = ["bevy_app/web", "bevy_platform/web", "bevy_reflect/web"]
+ 
++# Input sources.
++mouse = ["bevy_input/mouse"]
++keyboard = ["bevy_input/keyboard"]
++gamepad = ["bevy_input/gamepad"]
++touch = ["bevy_input/touch"]
++gestures = ["bevy_input/gestures"]
++
+ hotpatching = ["bevy_app/hotpatching", "bevy_ecs/hotpatching"]
+ 
+ debug = ["bevy_utils/debug", "bevy_ecs/debug"]
+diff --git a/crates/bevy_window/Cargo.toml b/crates/bevy_window/Cargo.toml
+index 601803b6825bf..0bada9d2b4648 100644
+--- a/crates/bevy_window/Cargo.toml
++++ b/crates/bevy_window/Cargo.toml
+@@ -50,7 +50,12 @@ libm = ["bevy_math/libm"]
+ # bevy
+ bevy_app = { path = "../bevy_app", version = "0.18.0-dev", default-features = false }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.18.0-dev", default-features = false }
+-bevy_input = { path = "../bevy_input", version = "0.18.0-dev", default-features = false }
++bevy_input = { path = "../bevy_input", version = "0.18.0-dev", default-features = false, features = [
++  "gestures",
++  "keyboard",
++  "mouse",
++  "touch",
++] }
+ bevy_math = { path = "../bevy_math", version = "0.18.0-dev", default-features = false }
+ bevy_platform = { path = "../bevy_platform", version = "0.18.0-dev", default-features = false }
+ 
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 5f7e33960539d..231038b9e1f31 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -125,6 +125,8 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
+ |flac|FLAC audio format support|
+ |force_disable_dlss|Forcibly disable DLSS so that cargo build --all-features works without the DLSS SDK being installed. Not meant for users.|
+ |free_camera|Enables the free cam from bevy_camera_controller|
++|gamepad|Gamepad support. Automatically enabled by `bevy_gilrs`.|
++|gestures|Gestures support. Automatically enabled by `bevy_window`.|
+ |ghost_nodes|Experimental support for nodes that are ignored for UI layouting|
+ |gif|GIF image format support|
+ |glam_assert|Enable assertions to check the validity of parameters passed to glam|
+@@ -135,6 +137,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
+ |https|Enables downloading assets from HTTPS sources. Warning: there are security implications. Read the docs on WebAssetPlugin.|
+ |ico|ICO image format support|
+ |jpeg|JPEG image format support|
++|keyboard|Keyboard support. Automatically enabled by `bevy_window`.|
+ |ktx2|KTX2 compressed texture support|
+ |libm|Uses the `libm` maths library instead of the one provided in `std` and `core`.|
+ |mesh_picking|Provides an implementation for picking meshes|
+@@ -142,6 +145,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
+ |meshlet_processor|Enables processing meshes into meshlet meshes for bevy_pbr|
+ |morph|Enables support for morph target weights in bevy_mesh|
+ |morph_animation|Enables bevy_mesh and bevy_animation morph weight support|
++|mouse|Mouse support. Automatically enabled by `bevy_window`.|
+ |mp3|MP3 audio format support|
+ |multi_threaded|Enables multithreaded parallelism in the engine. Disabling it forces all engine tasks to run on a single thread.|
+ |pan_camera|Enables the pan camera from bevy_camera_controller|
+@@ -178,6 +182,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
+ |tga|TGA image format support|
+ |tiff|TIFF image format support|
+ |tonemapping_luts|Include tonemapping Look Up Tables KTX2 files. If everything is pink, you need to enable this feature or change the `Tonemapping` method for your `Camera2d` or `Camera3d`.|
++|touch|Touch support. Automatically enabled by `bevy_window`.|
+ |trace|Tracing support|
+ |trace_chrome|Tracing support, saving a file in Chrome Tracing format|
+ |trace_tracy|Tracing support, exposing a port for Tracy|
+diff --git a/release-content/migration-guides/bevy_input_features.md b/release-content/migration-guides/bevy_input_features.md
+new file mode 100644
+index 0000000000000..dbab8f69455e9
+--- /dev/null
++++ b/release-content/migration-guides/bevy_input_features.md
+@@ -0,0 +1,27 @@
++---
++title: Put input sources for `bevy_input` under features
++pull_requests: [21447]
++---
++
++`bevy_input` provides primitives for all kinds of input. But on
++consoles you usually don't have things like touch. On more obscure
++platforms, like GBA, only gamepad input is needed.
++
++If you use `bevy_window` or `bevy_gilrs`, they will automatically
++enable the necessary features on `bevy_input`. If you don't depend
++on them (for example, if you are developing for a platform that
++isn't supported by these crates), you need to enable the required
++input sources on `bevy_input` manually:
++
++```toml
++# Before:
++bevy = { version = "0.17", default-features = false }
++# After (enable sources that you actually use):
++bevy = { version = "0.18", default-features = false, features = [
++  "mouse",
++  "keyboard",
++  "gamepad",
++  "touch",
++  "gestures",
++] }
++```

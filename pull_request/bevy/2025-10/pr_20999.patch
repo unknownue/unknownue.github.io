@@ -1,0 +1,277 @@
+diff --git a/crates/bevy_pbr/src/decal/forward.rs b/crates/bevy_pbr/src/decal/forward.rs
+index 65ef0a44663ac..fa38e084dd7c7 100644
+--- a/crates/bevy_pbr/src/decal/forward.rs
++++ b/crates/bevy_pbr/src/decal/forward.rs
+@@ -41,8 +41,6 @@ impl Plugin for ForwardDecalPlugin {
+         app.insert_resource(ForwardDecalMesh(mesh));
+ 
+         app.add_plugins(MaterialPlugin::<ForwardDecalMaterial<StandardMaterial>> {
+-            prepass_enabled: false,
+-            shadows_enabled: false,
+             debug_flags: RenderDebugFlags::default(),
+             ..Default::default()
+         });
+diff --git a/crates/bevy_pbr/src/extended_material.rs b/crates/bevy_pbr/src/extended_material.rs
+index 585039263100b..4e310a2d388bd 100644
+--- a/crates/bevy_pbr/src/extended_material.rs
++++ b/crates/bevy_pbr/src/extended_material.rs
+@@ -48,6 +48,19 @@ pub trait MaterialExtension: Asset + AsBindGroup + Clone + Sized {
+         None
+     }
+ 
++    /// Controls if the prepass is enabled for the Material.
++    /// For more information about what a prepass is, see the [`bevy_core_pipeline::prepass`] docs.
++    #[inline]
++    fn enable_prepass() -> bool {
++        true
++    }
++
++    /// Controls if shadows are enabled for the Material.
++    #[inline]
++    fn enable_shadows() -> bool {
++        true
++    }
++
+     /// Returns this material's prepass vertex shader. If [`ShaderRef::Default`] is returned, the base material prepass vertex shader
+     /// will be used.
+     fn prepass_vertex_shader() -> ShaderRef {
+@@ -325,6 +338,14 @@ impl<B: Material, E: MaterialExtension> Material for ExtendedMaterial<B, E> {
+         B::reads_view_transmission_texture(&self.base)
+     }
+ 
++    fn enable_prepass() -> bool {
++        E::enable_prepass()
++    }
++
++    fn enable_shadows() -> bool {
++        E::enable_prepass()
++    }
++
+     fn prepass_vertex_shader() -> ShaderRef {
+         match E::prepass_vertex_shader() {
+             ShaderRef::Default => B::prepass_vertex_shader(),
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index 47dc7556a2779..460b4c6687a55 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -223,7 +223,6 @@ impl Plugin for PbrPlugin {
+                     debug_flags: self.debug_flags,
+                 },
+                 MaterialPlugin::<StandardMaterial> {
+-                    prepass_enabled: self.prepass_enabled,
+                     debug_flags: self.debug_flags,
+                     ..Default::default()
+                 },
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index c6e7ac597c7a6..af4067e08bd93 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -179,6 +179,19 @@ pub trait Material: Asset + AsBindGroup + Clone + Sized {
+         false
+     }
+ 
++    /// Controls if the prepass is enabled for the Material.
++    /// For more information about what a prepass is, see the [`bevy_core_pipeline::prepass`] docs.
++    #[inline]
++    fn enable_prepass() -> bool {
++        true
++    }
++
++    /// Controls if shadows are enabled for the Material.
++    #[inline]
++    fn enable_shadows() -> bool {
++        true
++    }
++
+     /// Returns this material's prepass vertex shader. If [`ShaderRef::Default`] is returned, the default prepass vertex shader
+     /// will be used.
+     ///
+@@ -324,14 +337,6 @@ impl Plugin for MaterialsPlugin {
+ /// Adds the necessary ECS resources and render logic to enable rendering entities using the given [`Material`]
+ /// asset type.
+ pub struct MaterialPlugin<M: Material> {
+-    /// Controls if the prepass is enabled for the Material.
+-    /// For more information about what a prepass is, see the [`bevy_core_pipeline::prepass`] docs.
+-    ///
+-    /// When it is enabled, it will automatically add the [`PrepassPlugin`]
+-    /// required to make the prepass work on this Material.
+-    pub prepass_enabled: bool,
+-    /// Controls if shadows are enabled for the Material.
+-    pub shadows_enabled: bool,
+     /// Debugging flags that can optionally be set when constructing the renderer.
+     pub debug_flags: RenderDebugFlags,
+     pub _marker: PhantomData<M>,
+@@ -340,8 +345,6 @@ pub struct MaterialPlugin<M: Material> {
+ impl<M: Material> Default for MaterialPlugin<M> {
+     fn default() -> Self {
+         Self {
+-            prepass_enabled: true,
+-            shadows_enabled: true,
+             debug_flags: RenderDebugFlags::default(),
+             _marker: Default::default(),
+         }
+@@ -366,7 +369,7 @@ where
+                     .after(mark_3d_meshes_as_changed_if_their_assets_changed),
+             );
+ 
+-        if self.shadows_enabled {
++        if M::enable_shadows() {
+             app.add_systems(
+                 PostUpdate,
+                 check_light_entities_needing_specialization::<M>
+@@ -375,13 +378,6 @@ where
+         }
+ 
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            if self.prepass_enabled {
+-                render_app.init_resource::<PrepassEnabled<M>>();
+-            }
+-            if self.shadows_enabled {
+-                render_app.init_resource::<ShadowsEnabled<M>>();
+-            }
+-
+             render_app
+                 .add_systems(RenderStartup, add_material_bind_group_allocator::<M>)
+                 .add_systems(
+@@ -1511,11 +1507,7 @@ where
+         SRes<DrawFunctions<AlphaMask3dDeferred>>,
+         SRes<DrawFunctions<Shadow>>,
+         SRes<AssetServer>,
+-        (
+-            Option<SRes<ShadowsEnabled<M>>>,
+-            Option<SRes<PrepassEnabled<M>>>,
+-            M::Param,
+-        ),
++        M::Param,
+     );
+ 
+     fn prepare_asset(
+@@ -1536,13 +1528,13 @@ where
+             alpha_mask_deferred_draw_functions,
+             shadow_draw_functions,
+             asset_server,
+-            (shadows_enabled, prepass_enabled, material_param),
++            material_param,
+         ): &mut SystemParamItem<Self::Param>,
+     ) -> Result<Self::ErasedAsset, PrepareAssetError<Self::SourceAsset>> {
+         let material_layout = M::bind_group_layout(render_device);
+ 
+-        let shadows_enabled = shadows_enabled.is_some();
+-        let prepass_enabled = prepass_enabled.is_some();
++        let shadows_enabled = M::enable_shadows();
++        let prepass_enabled = M::enable_prepass();
+ 
+         let draw_opaque_pbr = opaque_draw_functions.read().id::<DrawMaterial>();
+         let draw_alpha_mask_pbr = alpha_mask_draw_functions.read().id::<DrawMaterial>();
+@@ -1811,13 +1803,3 @@ pub fn write_material_bind_group_buffers(
+         allocator.write_buffers(&render_device, &render_queue);
+     }
+ }
+-
+-/// Marker resource for whether shadows are enabled for this material type
+-#[derive(Resource, Debug)]
+-pub struct ShadowsEnabled<M: Material>(PhantomData<M>);
+-
+-impl<M: Material> Default for ShadowsEnabled<M> {
+-    fn default() -> Self {
+-        Self(PhantomData)
+-    }
+-}
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 69113359f5808..581b8af288660 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -4,7 +4,7 @@ use crate::{
+     alpha_mode_pipeline_key, binding_arrays_are_usable, buffer_layout,
+     collect_meshes_for_gpu_building, init_material_pipeline, set_mesh_motion_vector_flags,
+     setup_morph_and_skinning_defs, skin, DeferredDrawFunction, DeferredFragmentShader,
+-    DeferredVertexShader, DrawMesh, EntitySpecializationTicks, ErasedMaterialPipelineKey, Material,
++    DeferredVertexShader, DrawMesh, EntitySpecializationTicks, ErasedMaterialPipelineKey,
+     MaterialPipeline, MaterialProperties, MeshLayouts, MeshPipeline, MeshPipelineKey,
+     OpaqueRendererMethod, PreparedMaterial, PrepassDrawFunction, PrepassFragmentShader,
+     PrepassVertexShader, RenderLightmaps, RenderMaterialInstances, RenderMeshInstanceFlags,
+@@ -61,7 +61,6 @@ use bevy_render::{
+     RenderSystems::{PrepareAssets, PrepareResources},
+ };
+ use bevy_utils::default;
+-use core::marker::PhantomData;
+ 
+ /// Sets up everything required to use the prepass pipeline.
+ ///
+@@ -183,16 +182,6 @@ impl Plugin for PrepassPlugin {
+     }
+ }
+ 
+-/// Marker resource for whether prepass is enabled globally for this material type
+-#[derive(Resource, Debug)]
+-pub struct PrepassEnabled<M: Material>(PhantomData<M>);
+-
+-impl<M: Material> Default for PrepassEnabled<M> {
+-    fn default() -> Self {
+-        PrepassEnabled(PhantomData)
+-    }
+-}
+-
+ #[derive(Resource)]
+ struct AnyPrepassPluginLoaded;
+ 
+diff --git a/examples/shader/shader_prepass.rs b/examples/shader/shader_prepass.rs
+index 5ab120aa7fec9..58b6bf7ed7360 100644
+--- a/examples/shader/shader_prepass.rs
++++ b/examples/shader/shader_prepass.rs
+@@ -27,12 +27,7 @@ fn main() {
+                 ..default()
+             }),
+             MaterialPlugin::<CustomMaterial>::default(),
+-            MaterialPlugin::<PrepassOutputMaterial> {
+-                // This material only needs to read the prepass textures,
+-                // but the meshes using it should not contribute to the prepass render, so we can disable it.
+-                prepass_enabled: false,
+-                ..default()
+-            },
++            MaterialPlugin::<PrepassOutputMaterial>::default(),
+         ))
+         .add_systems(Startup, setup)
+         .add_systems(Update, (rotate, toggle_prepass_view))
+@@ -207,6 +202,10 @@ impl Material for PrepassOutputMaterial {
+     fn alpha_mode(&self) -> AlphaMode {
+         AlphaMode::Blend
+     }
++
++    fn enable_prepass() -> bool {
++        false
++    }
+ }
+ 
+ /// Every time you press space, it will cycle between transparent, depth and normals view
+diff --git a/release-content/migration-guides/enable_prepass.md b/release-content/migration-guides/enable_prepass.md
+new file mode 100644
+index 0000000000000..32ea69d646bed
+--- /dev/null
++++ b/release-content/migration-guides/enable_prepass.md
+@@ -0,0 +1,25 @@
++---
++title: "`enable_prepass` and `enable_shadows` are now Material methods"
++pull_requests: [20999]
++---
++
++The `MaterialPlugin` fields `prepass_enabled` and `shadows_enabled` have
++been replaced by the `Material` methods `enable_prepass` and `enable_shadows`.
++
++Analogous methods have also been added to `MaterialExtension`
++
++```rust
++/// before
++MaterialPlugin::<MyMaterial> {
++    prepass_enabled: false,
++    shadows_enabled: false,
++}
++
++/// after
++impl Material for MyMaterial {
++    /// ...
++
++    fn enable_prepass() { false }
++    fn enable_shadows() { false }
++}
++```

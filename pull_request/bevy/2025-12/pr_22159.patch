@@ -1,0 +1,333 @@
+diff --git a/crates/bevy_asset/src/asset_changed.rs b/crates/bevy_asset/src/asset_changed.rs
+index fdf8b53f8d622..555861dd9809f 100644
+--- a/crates/bevy_asset/src/asset_changed.rs
++++ b/crates/bevy_asset/src/asset_changed.rs
+@@ -288,13 +288,14 @@ unsafe impl<A: AsAssetId> QueryFilter for AssetChanged<A> {
+ #[cfg(test)]
+ #[expect(clippy::print_stdout, reason = "Allowed in tests.")]
+ mod tests {
+-    use crate::{AssetEventSystems, AssetPlugin, Handle};
++    use crate::tests::create_app;
++    use crate::{AssetEventSystems, Handle};
+     use alloc::{vec, vec::Vec};
+     use core::num::NonZero;
+     use std::println;
+ 
+     use crate::{AssetApp, Assets};
+-    use bevy_app::{App, AppExit, PostUpdate, Startup, TaskPoolPlugin, Update};
++    use bevy_app::{App, AppExit, PostUpdate, Startup, Update};
+     use bevy_ecs::schedule::IntoScheduleConfigs;
+     use bevy_ecs::{
+         component::Component,
+@@ -321,10 +322,8 @@ mod tests {
+     }
+ 
+     fn run_app<Marker>(system: impl IntoSystem<(), (), Marker>) {
+-        let mut app = App::new();
+-        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
+-            .init_asset::<MyAsset>()
+-            .add_systems(Update, system);
++        let mut app = create_app().0;
++        app.init_asset::<MyAsset>().add_systems(Update, system);
+         app.update();
+     }
+ 
+@@ -405,10 +404,9 @@ mod tests {
+ 
+     #[test]
+     fn added() {
+-        let mut app = App::new();
++        let mut app = create_app().0;
+ 
+-        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
+-            .init_asset::<MyAsset>()
++        app.init_asset::<MyAsset>()
+             .insert_resource(Counter(vec![0, 0, 0, 0]))
+             .add_systems(Update, add_some)
+             .add_systems(PostUpdate, count_update.after(AssetEventSystems));
+@@ -428,10 +426,9 @@ mod tests {
+ 
+     #[test]
+     fn changed() {
+-        let mut app = App::new();
++        let mut app = create_app().0;
+ 
+-        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
+-            .init_asset::<MyAsset>()
++        app.init_asset::<MyAsset>()
+             .insert_resource(Counter(vec![0, 0]))
+             .add_systems(
+                 Startup,
+diff --git a/crates/bevy_asset/src/handle.rs b/crates/bevy_asset/src/handle.rs
+index 1e03767c658dd..234f664db10f9 100644
+--- a/crates/bevy_asset/src/handle.rs
++++ b/crates/bevy_asset/src/handle.rs
+@@ -542,6 +542,8 @@ mod tests {
+     use core::hash::BuildHasher;
+     use uuid::Uuid;
+ 
++    use crate::tests::create_app;
++
+     use super::*;
+ 
+     type TestAsset = ();
+@@ -646,8 +648,7 @@ mod tests {
+     /// `PartialReflect::reflect_clone`/`PartialReflect::to_dynamic` should increase the strong count of a strong handle
+     #[test]
+     fn strong_handle_reflect_clone() {
+-        use crate::{AssetApp, AssetPlugin, Assets, VisitAssetDependencies};
+-        use bevy_app::App;
++        use crate::{AssetApp, Assets, VisitAssetDependencies};
+         use bevy_reflect::FromReflect;
+ 
+         #[derive(Reflect)]
+@@ -659,9 +660,8 @@ mod tests {
+             fn visit_dependencies(&self, _visit: &mut impl FnMut(UntypedAssetId)) {}
+         }
+ 
+-        let mut app = App::new();
+-        app.add_plugins(AssetPlugin::default())
+-            .init_asset::<MyAsset>();
++        let mut app = create_app().0;
++        app.init_asset::<MyAsset>();
+         let mut assets = app.world_mut().resource_mut::<Assets<MyAsset>>();
+ 
+         let handle: Handle<MyAsset> = assets.add(MyAsset { value: 1 });
+diff --git a/crates/bevy_asset/src/lib.rs b/crates/bevy_asset/src/lib.rs
+index 37f7513e4ebaa..8ae1bba29b4ee 100644
+--- a/crates/bevy_asset/src/lib.rs
++++ b/crates/bevy_asset/src/lib.rs
+@@ -905,7 +905,7 @@ mod tests {
+     }
+ 
+     /// Creates a basic asset app and an in-memory file system.
+-    fn create_app() -> (App, Dir) {
++    pub(crate) fn create_app() -> (App, Dir) {
+         let mut app = App::new();
+         let dir = Dir::default();
+         let dir_clone = dir.clone();
+@@ -919,7 +919,11 @@ mod tests {
+         )
+         .add_plugins((
+             TaskPoolPlugin::default(),
+-            AssetPlugin::default(),
++            AssetPlugin {
++                watch_for_changes_override: Some(false),
++                use_asset_processor_override: Some(false),
++                ..Default::default()
++            },
+             DiagnosticsPlugin,
+         ));
+         (app, dir)
+@@ -934,7 +938,11 @@ mod tests {
+         )
+         .add_plugins((
+             TaskPoolPlugin::default(),
+-            AssetPlugin::default(),
++            AssetPlugin {
++                watch_for_changes_override: Some(false),
++                use_asset_processor_override: Some(false),
++                ..Default::default()
++            },
+             DiagnosticsPlugin,
+         ));
+         (app, gate_opener)
+@@ -1868,10 +1876,27 @@ mod tests {
+ 
+         let mut app = App::new();
+         app.register_asset_source(
++            AssetSourceId::Default,
++            AssetSourceBuilder::new(move || {
++                // This reader is unused, but we set it here so we don't accidentally use the
++                // filesystem.
++                Box::new(MemoryAssetReader {
++                    root: Dir::default(),
++                })
++            }),
++        )
++        .register_asset_source(
+             "unstable",
+             AssetSourceBuilder::new(move || Box::new(unstable_reader.clone())),
+         )
+-        .add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
++        .add_plugins((
++            TaskPoolPlugin::default(),
++            AssetPlugin {
++                watch_for_changes_override: Some(false),
++                use_asset_processor_override: Some(false),
++                ..Default::default()
++            },
++        ))
+         .init_asset::<CoolText>()
+         .register_asset_loader(CoolTextLoader)
+         .init_resource::<ErrorTracker>()
+@@ -2060,6 +2085,8 @@ mod tests {
+             TaskPoolPlugin::default(),
+             AssetPlugin {
+                 unapproved_path_mode: mode,
++                watch_for_changes_override: Some(false),
++                use_asset_processor_override: Some(false),
+                 ..Default::default()
+             },
+         ));
+@@ -2311,6 +2338,7 @@ mod tests {
+             TaskPoolPlugin::default(),
+             AssetPlugin {
+                 watch_for_changes_override: Some(true),
++                use_asset_processor_override: Some(false),
+                 ..Default::default()
+             },
+         ));
+diff --git a/crates/bevy_asset/src/processor/tests.rs b/crates/bevy_asset/src/processor/tests.rs
+index b639623959bdd..3bf573613fc96 100644
+--- a/crates/bevy_asset/src/processor/tests.rs
++++ b/crates/bevy_asset/src/processor/tests.rs
+@@ -237,6 +237,55 @@ fn serialize_as_cool_text(text: &str) -> String {
+     ron::ser::to_string_pretty(&cool_text_ron, PrettyConfig::new().new_line("\n")).unwrap()
+ }
+ 
++/// Sets the transaction log for the app to a fake one to prevent touching the filesystem.
++fn set_fake_transaction_log(app: &mut App) {
++    /// A dummy transaction log factory that just creates [`FakeTransactionLog`].
++    struct FakeTransactionLogFactory;
++
++    impl ProcessorTransactionLogFactory for FakeTransactionLogFactory {
++        fn read(&self) -> BoxedFuture<'_, Result<Vec<LogEntry>, BevyError>> {
++            Box::pin(async move { Ok(vec![]) })
++        }
++
++        fn create_new_log(
++            &self,
++        ) -> BoxedFuture<'_, Result<Box<dyn ProcessorTransactionLog>, BevyError>> {
++            Box::pin(async move { Ok(Box::new(FakeTransactionLog) as _) })
++        }
++    }
++
++    /// A dummy transaction log that just drops every log.
++    // TODO: In the future it's possible for us to have a test of the transaction log, so making
++    // this more complex may be necessary.
++    struct FakeTransactionLog;
++
++    impl ProcessorTransactionLog for FakeTransactionLog {
++        fn begin_processing<'a>(
++            &'a mut self,
++            _asset: &'a AssetPath<'_>,
++        ) -> BoxedFuture<'a, Result<(), BevyError>> {
++            Box::pin(async move { Ok(()) })
++        }
++
++        fn end_processing<'a>(
++            &'a mut self,
++            _asset: &'a AssetPath<'_>,
++        ) -> BoxedFuture<'a, Result<(), BevyError>> {
++            Box::pin(async move { Ok(()) })
++        }
++
++        fn unrecoverable(&mut self) -> BoxedFuture<'_, Result<(), BevyError>> {
++            Box::pin(async move { Ok(()) })
++        }
++    }
++
++    app.world()
++        .resource::<AssetProcessor>()
++        .data()
++        .set_log_factory(Box::new(FakeTransactionLogFactory))
++        .unwrap();
++}
++
+ fn create_app_with_asset_processor(extra_sources: &[String]) -> AppWithProcessor {
+     let mut app = App::new();
+     let source_gate = Arc::new(RwLock::new(()));
+@@ -332,51 +381,7 @@ fn create_app_with_asset_processor(extra_sources: &[String]) -> AppWithProcessor
+         },
+     ));
+ 
+-    /// A dummy transaction log factory that just creates [`FakeTransactionLog`].
+-    struct FakeTransactionLogFactory;
+-
+-    impl ProcessorTransactionLogFactory for FakeTransactionLogFactory {
+-        fn read(&self) -> BoxedFuture<'_, Result<Vec<LogEntry>, BevyError>> {
+-            Box::pin(async move { Ok(vec![]) })
+-        }
+-
+-        fn create_new_log(
+-            &self,
+-        ) -> BoxedFuture<'_, Result<Box<dyn ProcessorTransactionLog>, BevyError>> {
+-            Box::pin(async move { Ok(Box::new(FakeTransactionLog) as _) })
+-        }
+-    }
+-
+-    /// A dummy transaction log that just drops every log.
+-    // TODO: In the future it's possible for us to have a test of the transaction log, so making
+-    // this more complex may be necessary.
+-    struct FakeTransactionLog;
+-
+-    impl ProcessorTransactionLog for FakeTransactionLog {
+-        fn begin_processing<'a>(
+-            &'a mut self,
+-            _asset: &'a AssetPath<'_>,
+-        ) -> BoxedFuture<'a, Result<(), BevyError>> {
+-            Box::pin(async move { Ok(()) })
+-        }
+-
+-        fn end_processing<'a>(
+-            &'a mut self,
+-            _asset: &'a AssetPath<'_>,
+-        ) -> BoxedFuture<'a, Result<(), BevyError>> {
+-            Box::pin(async move { Ok(()) })
+-        }
+-
+-        fn unrecoverable(&mut self) -> BoxedFuture<'_, Result<(), BevyError>> {
+-            Box::pin(async move { Ok(()) })
+-        }
+-    }
+-
+-    app.world()
+-        .resource::<AssetProcessor>()
+-        .data()
+-        .set_log_factory(Box::new(FakeTransactionLogFactory))
+-        .unwrap();
++    set_fake_transaction_log(&mut app);
+ 
+     // Now that we've built the app, finish all the processing dirs.
+ 
+@@ -1675,10 +1680,13 @@ fn only_reprocesses_wrong_hash_on_startup() {
+         AssetPlugin {
+             mode: AssetMode::Processed,
+             use_asset_processor_override: Some(true),
++            watch_for_changes_override: Some(true),
+             ..Default::default()
+         },
+     ));
+ 
++    set_fake_transaction_log(&mut app);
++
+     app.init_asset::<CoolText>()
+         .init_asset::<SubText>()
+         .register_asset_loader(CoolTextLoader)
+diff --git a/crates/bevy_asset/src/reflect.rs b/crates/bevy_asset/src/reflect.rs
+index 08ceea28c486f..2fc18d69bdfa1 100644
+--- a/crates/bevy_asset/src/reflect.rs
++++ b/crates/bevy_asset/src/reflect.rs
+@@ -264,8 +264,7 @@ mod tests {
+     use alloc::{string::String, vec::Vec};
+     use core::any::TypeId;
+ 
+-    use crate::{Asset, AssetApp, AssetPlugin, ReflectAsset};
+-    use bevy_app::App;
++    use crate::{tests::create_app, Asset, AssetApp, ReflectAsset};
+     use bevy_ecs::reflect::AppTypeRegistry;
+     use bevy_reflect::Reflect;
+ 
+@@ -276,9 +275,8 @@ mod tests {
+ 
+     #[test]
+     fn test_reflect_asset_operations() {
+-        let mut app = App::new();
+-        app.add_plugins(AssetPlugin::default())
+-            .init_asset::<AssetType>()
++        let mut app = create_app().0;
++        app.init_asset::<AssetType>()
+             .register_asset_reflect::<AssetType>();
+ 
+         let reflect_asset = {

@@ -1,0 +1,320 @@
+diff --git a/benches/Cargo.toml b/benches/Cargo.toml
+index a8bb418259a46..fb77af9e39246 100644
+--- a/benches/Cargo.toml
++++ b/benches/Cargo.toml
+@@ -30,7 +30,7 @@ bevy_platform = { path = "../crates/bevy_platform", default-features = false, fe
+ ] }
+ 
+ # Other crates
+-glam = { version = "0.30.7", default-features = false, features = [
++glam = { version = "0.31.0", default-features = false, features = [
+   "std",
+   "rand",
+ ] }
+diff --git a/crates/bevy_gizmos_render/src/lib.rs b/crates/bevy_gizmos_render/src/lib.rs
+index 4557d38a651a5..d7a735e83c674 100755
+--- a/crates/bevy_gizmos_render/src/lib.rs
++++ b/crates/bevy_gizmos_render/src/lib.rs
+@@ -30,6 +30,7 @@ use bevy_ecs::{
+     schedule::{IntoScheduleConfigs, SystemSet},
+     system::Res,
+ };
++use bevy_math::Affine3Ext;
+ 
+ use {bevy_gizmos::config::GizmoMeshConfig, bevy_mesh::VertexBufferLayout};
+ 
+@@ -183,7 +184,7 @@ fn extract_gizmo_data(
+ 
+         commands.spawn((
+             LineGizmoUniform {
+-                world_from_local: Affine3::from(&Affine3A::IDENTITY).to_transpose(),
++                world_from_local: Affine3::from(Affine3A::IDENTITY).to_transpose(),
+                 line_width: config.line.width,
+                 depth_bias: config.depth_bias,
+                 joints_resolution,
+diff --git a/crates/bevy_gizmos_render/src/retained.rs b/crates/bevy_gizmos_render/src/retained.rs
+index 25780096c0e21..5d3b837982b90 100644
+--- a/crates/bevy_gizmos_render/src/retained.rs
++++ b/crates/bevy_gizmos_render/src/retained.rs
+@@ -3,7 +3,7 @@
+ use crate::LineGizmoUniform;
+ use bevy_camera::visibility::RenderLayers;
+ use bevy_gizmos::retained::Gizmo;
+-use bevy_math::Affine3;
++use bevy_math::{Affine3, Affine3Ext};
+ use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
+ use bevy_utils::once;
+ use tracing::warn;
+@@ -57,7 +57,7 @@ pub(crate) fn extract_linegizmos(
+ 
+         values.push((
+             LineGizmoUniform {
+-                world_from_local: Affine3::from(&transform.affine()).to_transpose(),
++                world_from_local: Affine3::from(transform.affine()).to_transpose(),
+                 line_width: gizmo.line_config.width,
+                 depth_bias: gizmo.depth_bias,
+                 joints_resolution,
+diff --git a/crates/bevy_math/Cargo.toml b/crates/bevy_math/Cargo.toml
+index 84b206ad17530..1973b1d60c47b 100644
+--- a/crates/bevy_math/Cargo.toml
++++ b/crates/bevy_math/Cargo.toml
+@@ -10,7 +10,7 @@ keywords = ["bevy"]
+ rust-version = "1.85.0"
+ 
+ [dependencies]
+-glam = { version = "0.30.7", default-features = false, features = ["bytemuck"] }
++glam = { version = "0.31.0", default-features = false, features = ["bytemuck"] }
+ thiserror = { version = "2", default-features = false }
+ derive_more = { version = "2", default-features = false, features = [
+   "from",
+@@ -37,7 +37,7 @@ rand = "0.9"
+ rand_chacha = "0.9"
+ # Enable the approx feature when testing.
+ bevy_math = { path = ".", default-features = false, features = ["approx"] }
+-glam = { version = "0.30.7", default-features = false, features = ["approx"] }
++glam = { version = "0.31.0", default-features = false, features = ["approx"] }
+ 
+ [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+ getrandom = { version = "0.3", default-features = false, features = [
+diff --git a/crates/bevy_math/src/affine3.rs b/crates/bevy_math/src/affine3.rs
+index 654721bdfe8a4..1abf6615ee20e 100644
+--- a/crates/bevy_math/src/affine3.rs
++++ b/crates/bevy_math/src/affine3.rs
+@@ -1,23 +1,16 @@
+-use glam::{Affine3A, Mat3, Vec3, Vec3Swizzles, Vec4};
++use glam::{Affine3, Affine3A, Vec3Swizzles, Vec4};
+ 
+-#[cfg(feature = "bevy_reflect")]
+-use bevy_reflect::Reflect;
+-
+-/// Reduced-size version of `glam::Affine3A` for use when storage has
+-/// significant performance impact. Convert to `glam::Affine3A` to do
+-/// non-trivial calculations.
+-#[cfg_attr(feature = "bevy_reflect", derive(Reflect))]
+-pub struct Affine3 {
+-    /// Scaling, rotation, shears, and other non-translation affine transforms
+-    pub matrix3: Mat3,
+-    /// Translation
+-    pub translation: Vec3,
++/// Extension trait for [`Affine3`]
++pub trait Affine3Ext {
++    /// Calculates the transpose of the affine 4x3 matrix to a 3x4 and formats it for packing into GPU buffers
++    fn to_transpose(self) -> [Vec4; 3];
++    /// Calculates the inverse transpose of the 3x3 matrix and formats it for packing into GPU buffers
++    fn inverse_transpose_3x3(self) -> ([Vec4; 2], f32);
+ }
+ 
+-impl Affine3 {
+-    /// Calculates the transpose of the affine 4x3 matrix to a 3x4 and formats it for packing into GPU buffers
++impl Affine3Ext for Affine3 {
+     #[inline]
+-    pub fn to_transpose(&self) -> [Vec4; 3] {
++    fn to_transpose(self) -> [Vec4; 3] {
+         let transpose_3x3 = self.matrix3.transpose();
+         [
+             transpose_3x3.x_axis.extend(self.translation.x),
+@@ -26,9 +19,8 @@ impl Affine3 {
+         ]
+     }
+ 
+-    /// Calculates the inverse transpose of the 3x3 matrix and formats it for packing into GPU buffers
+     #[inline]
+-    pub fn inverse_transpose_3x3(&self) -> ([Vec4; 2], f32) {
++    fn inverse_transpose_3x3(self) -> ([Vec4; 2], f32) {
+         let inverse_transpose_3x3 = Affine3A::from(self).inverse().matrix3.transpose();
+         (
+             [
+@@ -43,21 +35,3 @@ impl Affine3 {
+         )
+     }
+ }
+-
+-impl From<&Affine3A> for Affine3 {
+-    fn from(affine: &Affine3A) -> Self {
+-        Self {
+-            matrix3: affine.matrix3.into(),
+-            translation: affine.translation.into(),
+-        }
+-    }
+-}
+-
+-impl From<&Affine3> for Affine3A {
+-    fn from(affine3: &Affine3) -> Self {
+-        Self {
+-            matrix3: affine3.matrix3.into(),
+-            translation: affine3.translation.into(),
+-        }
+-    }
+-}
+diff --git a/crates/bevy_mesh/Cargo.toml b/crates/bevy_mesh/Cargo.toml
+index 9a59efb650746..7269759a7f2f3 100644
+--- a/crates/bevy_mesh/Cargo.toml
++++ b/crates/bevy_mesh/Cargo.toml
+@@ -31,7 +31,7 @@ wgpu-types = { version = "28", default-features = false }
+ serde = { version = "1", default-features = false, features = [
+   "derive",
+ ], optional = true }
+-hexasphere = "16.0"
++hexasphere = "17.0"
+ thiserror = { version = "2", default-features = false }
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
+ derive_more = { version = "2", default-features = false, features = ["from"] }
+diff --git a/crates/bevy_pbr/src/meshlet/instance_manager.rs b/crates/bevy_pbr/src/meshlet/instance_manager.rs
+index 6747732f26c1d..9f03c5243e2d3 100644
+--- a/crates/bevy_pbr/src/meshlet/instance_manager.rs
++++ b/crates/bevy_pbr/src/meshlet/instance_manager.rs
+@@ -110,8 +110,8 @@ impl InstanceManager {
+             flags |= MeshFlags::SIGN_DETERMINANT_MODEL_3X3;
+         }
+         let transforms = MeshTransforms {
+-            world_from_local: (&transform).into(),
+-            previous_world_from_local: (&previous_transform).into(),
++            world_from_local: transform.into(),
++            previous_world_from_local: previous_transform.into(),
+             flags: flags.bits(),
+         };
+ 
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 4a79e1373984b..e320def183063 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -30,7 +30,7 @@ use bevy_light::{
+     EnvironmentMapLight, IrradianceVolume, NotShadowCaster, NotShadowReceiver,
+     ShadowFilteringMethod, TransmittedShadowReceiver,
+ };
+-use bevy_math::{Affine3, Rect, UVec2, Vec3, Vec4};
++use bevy_math::{Affine3, Affine3Ext, Rect, UVec2, Vec3, Vec4};
+ use bevy_mesh::{
+     skinning::SkinnedMesh, BaseMeshPipelineKey, Mesh, Mesh3d, MeshTag, MeshVertexBufferLayoutRef,
+     VertexAttributeDescriptor,
+@@ -1455,11 +1455,11 @@ pub fn extract_meshes_for_cpu_building(
+                 entity,
+                 RenderMeshInstanceCpu {
+                     transforms: MeshTransforms {
+-                        world_from_local: (&world_from_local).into(),
+-                        previous_world_from_local: (&previous_transform
++                        world_from_local: world_from_local.into(),
++                        previous_world_from_local: (previous_transform
+                             .map(|t| t.0)
+                             .unwrap_or(world_from_local))
+-                            .into(),
++                        .into(),
+                         flags: mesh_flags.bits(),
+                     },
+                     shared,
+@@ -1719,7 +1719,7 @@ fn extract_mesh_for_gpu_building(
+ 
+     let gpu_mesh_instance_builder = RenderMeshInstanceGpuBuilder {
+         shared,
+-        world_from_local: (&transform.affine()).into(),
++        world_from_local: (transform.affine()).into(),
+         lightmap_uv_rect,
+         mesh_flags,
+         previous_input_index,
+diff --git a/crates/bevy_reflect/Cargo.toml b/crates/bevy_reflect/Cargo.toml
+index f357bfc539592..35af5314a6c52 100644
+--- a/crates/bevy_reflect/Cargo.toml
++++ b/crates/bevy_reflect/Cargo.toml
+@@ -116,7 +116,7 @@ derive_more = { version = "2", default-features = false, features = ["from"] }
+ serde = { version = "1", default-features = false, features = ["alloc"] }
+ assert_type_match = "0.1.1"
+ smallvec = { version = "1", default-features = false, optional = true }
+-glam = { version = "0.30.7", default-features = false, features = [
++glam = { version = "0.31.0", default-features = false, features = [
+   "serde",
+ ], optional = true }
+ indexmap = { version = "2.5.0", default-features = false, optional = true }
+diff --git a/crates/bevy_reflect/src/impls/glam.rs b/crates/bevy_reflect/src/impls/glam.rs
+index 84aabb694c3df..95f908472d251 100644
+--- a/crates/bevy_reflect/src/impls/glam.rs
++++ b/crates/bevy_reflect/src/impls/glam.rs
+@@ -413,6 +413,14 @@ impl_reflect!(
+         translation: Vec2,
+     }
+ );
++impl_reflect!(
++    #[reflect(Clone, Debug, PartialEq, Default, Deserialize, Serialize)]
++    #[type_path = "glam"]
++    struct Affine3 {
++        matrix3: Mat3,
++        translation: Vec3,
++    }
++);
+ impl_reflect!(
+     #[reflect(Clone, Debug, PartialEq, Default, Deserialize, Serialize)]
+     #[type_path = "glam"]
+diff --git a/crates/bevy_render/Cargo.toml b/crates/bevy_render/Cargo.toml
+index 1578e72c28089..88185df8a29e7 100644
+--- a/crates/bevy_render/Cargo.toml
++++ b/crates/bevy_render/Cargo.toml
+@@ -103,7 +103,7 @@ downcast-rs = { version = "2", default-features = false, features = ["std"] }
+ thiserror = { version = "2", default-features = false }
+ derive_more = { version = "2", default-features = false, features = ["from"] }
+ encase = "0.12"
+-glam = { version = "0.30.7", default-features = false, features = [
++glam = { version = "0.31.0", default-features = false, features = [
+   "std",
+   "encase",
+ ] }
+diff --git a/crates/bevy_sprite_render/src/mesh2d/mesh.rs b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+index a1f03b85acfa1..7df8be5a46702 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+@@ -21,7 +21,7 @@ use bevy_ecs::{
+     system::{lifetimeless::*, SystemParamItem},
+ };
+ use bevy_image::BevyDefault;
+-use bevy_math::{Affine3, Vec4};
++use bevy_math::{Affine3, Affine3Ext, Vec4};
+ use bevy_mesh::{Mesh, Mesh2d, MeshTag, MeshVertexBufferLayoutRef};
+ use bevy_render::prelude::Msaa;
+ use bevy_render::RenderSystems::PrepareAssets;
+@@ -269,7 +269,7 @@ pub fn extract_mesh2d(
+             entity.into(),
+             RenderMesh2dInstance {
+                 transforms: Mesh2dTransforms {
+-                    world_from_local: (&transform.affine()).into(),
++                    world_from_local: transform.affine().into(),
+                     flags: MeshFlags::empty().bits(),
+                 },
+                 mesh_asset_id: handle.0.id(),
+diff --git a/examples/2d/mesh2d_manual.rs b/examples/2d/mesh2d_manual.rs
+index 8eb5c051c3deb..c080d77c7deac 100644
+--- a/examples/2d/mesh2d_manual.rs
++++ b/examples/2d/mesh2d_manual.rs
+@@ -353,7 +353,7 @@ pub fn extract_colored_mesh2d(
+         }
+ 
+         let transforms = Mesh2dTransforms {
+-            world_from_local: (&transform.affine()).into(),
++            world_from_local: transform.affine().into(),
+             flags: MeshFlags::empty().bits(),
+         };
+ 
+diff --git a/examples/shader_advanced/custom_render_phase.rs b/examples/shader_advanced/custom_render_phase.rs
+index 7f0d11cec7466..b8927dae103a7 100644
+--- a/examples/shader_advanced/custom_render_phase.rs
++++ b/examples/shader_advanced/custom_render_phase.rs
+@@ -13,6 +13,7 @@
+ use std::ops::Range;
+ 
+ use bevy::camera::Viewport;
++use bevy::math::Affine3Ext;
+ use bevy::pbr::SetMeshViewEmptyBindGroup;
+ use bevy::{
+     camera::MainPassResolutionOverride,
+diff --git a/release-content/migration-guides/affine3_extension_trait.md b/release-content/migration-guides/affine3_extension_trait.md
+new file mode 100644
+index 0000000000000..31b5dc3a5f26e
+--- /dev/null
++++ b/release-content/migration-guides/affine3_extension_trait.md
+@@ -0,0 +1,9 @@
++---
++title: Methods of `Affine3` `to_transpose` and `inverse_transpose_3x3` are now part of an extension trait
++pull_requests: [22681]
++---
++
++With the addition of `Affine3` on glam, Bevy's version was removed, to keep the functionalities that
++the Bevy version provided the extension trait `Affine3Ext` was created. Locations that used to
++access `Affine3::to_transpose` or `Affine3::inverse_transpose_3x3` will now require that the
++extension be in scope.

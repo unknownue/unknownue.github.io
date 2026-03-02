@@ -1,0 +1,166 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 87904d32fd284..688147ff9ba3e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -165,6 +165,7 @@ default = [
+   "webgl2",
+   "x11",
+   "debug",
++  "zstd_rust",
+ ]
+ 
+ # Recommended defaults for no_std applications
+@@ -381,8 +382,11 @@ webp = ["bevy_internal/webp"]
+ # For KTX2 supercompression
+ zlib = ["bevy_internal/zlib"]
+ 
+-# For KTX2 supercompression
+-zstd = ["bevy_internal/zstd"]
++# For KTX2 Zstandard decompression using pure rust [ruzstd](https://crates.io/crates/ruzstd). This is the safe default. For maximum performance, use "zstd_c".
++zstd_rust = ["bevy_internal/zstd_rust"]
++
++# For KTX2 Zstandard decompression using [zstd](https://crates.io/crates/zstd). This is a faster backend, but uses unsafe C bindings. For the safe option, stick to the default backend with "zstd_rust".
++zstd_c = ["bevy_internal/zstd_c"]
+ 
+ # FLAC audio format support
+ flac = ["bevy_internal/flac"]
+@@ -451,7 +455,7 @@ android_shared_stdcxx = ["bevy_internal/android_shared_stdcxx"]
+ detailed_trace = ["bevy_internal/detailed_trace"]
+ 
+ # Include tonemapping Look Up Tables KTX2 files. If everything is pink, you need to enable this feature or change the `Tonemapping` method for your `Camera2d` or `Camera3d`.
+-tonemapping_luts = ["bevy_internal/tonemapping_luts", "ktx2", "zstd"]
++tonemapping_luts = ["bevy_internal/tonemapping_luts", "ktx2", "bevy_image/zstd"]
+ 
+ # Include SMAA Look Up Tables KTX2 Files
+ smaa_luts = ["bevy_internal/smaa_luts"]
+diff --git a/crates/bevy_image/Cargo.toml b/crates/bevy_image/Cargo.toml
+index 1ed4f29ca624b..7b49b5210a2ae 100644
+--- a/crates/bevy_image/Cargo.toml
++++ b/crates/bevy_image/Cargo.toml
+@@ -36,7 +36,14 @@ serialize = ["bevy_reflect", "bevy_platform/serialize"]
+ 
+ # For ktx2 supercompression
+ zlib = ["flate2"]
+-zstd = ["ruzstd"]
++
++# A marker feature indicating zstd support is required for a particular feature.
++# A backend must be chosen by enabling either the "zstd_rust" or the "zstd_c" feature.
++zstd = []
++# Pure-rust zstd implementation (safer)
++zstd_rust = ["zstd", "dep:ruzstd"]
++# Binding to zstd C implementation (faster)
++zstd_c = ["zstd", "dep:zstd"]
+ 
+ # Enables compressed KTX2 UASTC texture output on the asset processor
+ compressed_image_saver = ["basis-universal"]
+@@ -73,6 +80,7 @@ ddsfile = { version = "0.5.2", optional = true }
+ ktx2 = { version = "0.4.0", optional = true }
+ # For ktx2 supercompression
+ flate2 = { version = "1.0.22", optional = true }
++zstd = { version = "0.13.3", optional = true }
+ ruzstd = { version = "0.8.0", optional = true }
+ # For transcoding of UASTC/ETC1S universal formats, and for .basis file support
+ basis-universal = { version = "0.3.0", optional = true }
+diff --git a/crates/bevy_image/src/ktx2.rs b/crates/bevy_image/src/ktx2.rs
+index c86e32ef525e1..c8245f3893546 100644
+--- a/crates/bevy_image/src/ktx2.rs
++++ b/crates/bevy_image/src/ktx2.rs
+@@ -1,4 +1,4 @@
+-#[cfg(any(feature = "flate2", feature = "ruzstd"))]
++#[cfg(any(feature = "flate2", feature = "zstd_rust"))]
+ use std::io::Read;
+ 
+ #[cfg(feature = "basis-universal")]
+@@ -7,7 +7,7 @@ use basis_universal::{
+ };
+ use bevy_color::Srgba;
+ use bevy_utils::default;
+-#[cfg(any(feature = "flate2", feature = "ruzstd"))]
++#[cfg(any(feature = "flate2", feature = "zstd_rust", feature = "zstd_c"))]
+ use ktx2::SupercompressionScheme;
+ use ktx2::{
+     ChannelTypeQualifiers, ColorModel, DfdBlockBasic, DfdBlockHeaderBasic, DfdHeader, Header,
+@@ -58,7 +58,7 @@ pub fn ktx2_buffer_to_image(
+                     })?;
+                     levels.push(decompressed);
+                 }
+-                #[cfg(feature = "ruzstd")]
++                #[cfg(feature = "zstd_rust")]
+                 SupercompressionScheme::Zstandard => {
+                     let mut cursor = std::io::Cursor::new(level.data);
+                     let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut cursor)
+@@ -71,6 +71,14 @@ pub fn ktx2_buffer_to_image(
+                     })?;
+                     levels.push(decompressed);
+                 }
++                #[cfg(all(feature = "zstd_c", not(feature = "zstd_rust")))]
++                SupercompressionScheme::Zstandard => {
++                    levels.push(zstd::decode_all(level.data).map_err(|err| {
++                        TextureError::SuperDecompressionError(format!(
++                            "Failed to decompress {supercompression_scheme:?} for mip {level_index}: {err:?}",
++                        ))
++                    })?);
++                }
+                 _ => {
+                     return Err(TextureError::SuperDecompressionError(format!(
+                         "Unsupported supercompression scheme: {supercompression_scheme:?}",
+diff --git a/crates/bevy_image/src/lib.rs b/crates/bevy_image/src/lib.rs
+index 02c3785ceda98..385afc49333d8 100644
+--- a/crates/bevy_image/src/lib.rs
++++ b/crates/bevy_image/src/lib.rs
+@@ -10,6 +10,11 @@ pub mod prelude {
+     };
+ }
+ 
++#[cfg(all(feature = "zstd", not(feature = "zstd_rust"), not(feature = "zstd_c")))]
++compile_error!(
++    "Choosing a zstd backend is required for zstd support. Please enable either the \"zstd_rust\" or the \"zstd_c\" feature."
++);
++
+ mod image;
+ pub use self::image::*;
+ #[cfg(feature = "basis-universal")]
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 1edc0e317e9af..5e5c95f3ec16b 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -43,6 +43,8 @@ ktx2 = ["bevy_image/ktx2", "bevy_render/ktx2"]
+ # For ktx2 supercompression
+ zlib = ["bevy_image/zlib"]
+ zstd = ["bevy_image/zstd"]
++zstd_rust = ["bevy_image/zstd_rust"]
++zstd_c = ["bevy_image/zstd_c"]
+ 
+ # Image format support (PNG enabled by default)
+ bmp = ["bevy_image/bmp"]
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index 20e6e5369804e..0f9bdc507a75e 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -54,7 +54,7 @@ The default feature set enables most of the expected features of a game engine,
+ |vorbis|OGG/VORBIS audio format support|
+ |webgl2|Enable some limitations to be able to use WebGL2. Please refer to the [WebGL2 and WebGPU](https://github.com/bevyengine/bevy/tree/latest/examples#webgl2-and-webgpu) section of the examples README for more information on how to run Wasm builds with WebGPU.|
+ |x11|X11 display server support|
+-|zstd|For KTX2 supercompression|
++|zstd_rust|For KTX2 Zstandard decompression using pure rust [ruzstd](https://crates.io/crates/ruzstd). This is the safe default. For maximum performance, use "zstd_c".|
+ 
+ ### Optional Features
+ 
+@@ -130,3 +130,4 @@ The default feature set enables most of the expected features of a game engine,
+ |webgpu|Enable support for WebGPU in Wasm. When enabled, this feature will override the `webgl2` feature and you won't be able to run Wasm builds with WebGL2, only with WebGPU.|
+ |webp|WebP image format support|
+ |zlib|For KTX2 supercompression|
++|zstd_c|For KTX2 Zstandard decompression using [zstd](https://crates.io/crates/zstd). This is a faster backend, but uses unsafe C bindings. For the safe option, stick to the default backend with "zstd_rust".|
+diff --git a/release-content/migration-guides/zstd.md b/release-content/migration-guides/zstd.md
+new file mode 100644
+index 0000000000000..013aa7ef54081
+--- /dev/null
++++ b/release-content/migration-guides/zstd.md
+@@ -0,0 +1,7 @@
++---
++title: New zstd backend
++pull_requests: [19793]
++---
++
++A more performant zstd backend has been added for texture decompression. To enable it, disable default-features and enable feature "zstd_c".
++If you have default-features disabled and use functionality that requires zstd decompression ("tonemapping_luts" or "ktx2"), you must choose a zstd implementation with one of the following feature flags: "zstd_c" (faster) or "zstd_rust" (safer)

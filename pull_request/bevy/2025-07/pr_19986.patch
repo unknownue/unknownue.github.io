@@ -1,0 +1,177 @@
+diff --git a/crates/bevy_pbr/src/cluster/extract_and_prepare.rs b/crates/bevy_pbr/src/cluster/extract_and_prepare.rs
+index 9fa6a5996c642..56267f46b2efb 100644
+--- a/crates/bevy_pbr/src/cluster/extract_and_prepare.rs
++++ b/crates/bevy_pbr/src/cluster/extract_and_prepare.rs
+@@ -13,7 +13,8 @@ use bevy_render::{
+ };
+ use tracing::warn;
+ 
+-use crate::{cluster::ClusterableObjectCounts, Clusters, GlobalClusterSettings, MeshPipeline};
++use super::{ClusterableObjectCounts, Clusters, GlobalClusterSettings};
++use crate::MeshPipeline;
+ 
+ // NOTE: this must be kept in sync with the same constants in
+ // `mesh_view_types.wgsl`.
+diff --git a/crates/bevy_pbr/src/cluster/mod.rs b/crates/bevy_pbr/src/cluster/mod.rs
+index 9cddc0a1b6a51..90af295cf6a20 100644
+--- a/crates/bevy_pbr/src/cluster/mod.rs
++++ b/crates/bevy_pbr/src/cluster/mod.rs
+@@ -22,7 +22,6 @@ use bevy_transform::components::Transform;
+ use tracing::warn;
+ 
+ pub(crate) use crate::cluster::assign::assign_objects_to_clusters;
+-use crate::LightVisibilityClass;
+ 
+ pub(crate) mod assign;
+ mod extract_and_prepare;
+@@ -115,6 +114,11 @@ pub struct Clusters {
+     pub(crate) clusterable_objects: Vec<VisibleClusterableObjects>,
+ }
+ 
++/// The [`VisibilityClass`] used for clusterables (decals, point lights, directional lights, and spot lights).
++///
++/// [`VisibilityClass`]: bevy_camera::visibility::VisibilityClass
++pub struct ClusterVisibilityClass;
++
+ #[derive(Clone, Component, Debug, Default)]
+ pub struct VisibleClusterableObjects {
+     pub(crate) entities: Vec<Entity>,
+@@ -157,7 +161,7 @@ struct ClusterableObjectCounts {
+ #[derive(Component, Debug, Clone, Reflect, ExtractComponent)]
+ #[reflect(Component, Debug, Clone)]
+ #[require(Transform, Visibility, VisibilityClass)]
+-#[component(on_add = visibility::add_visibility_class::<LightVisibilityClass>)]
++#[component(on_add = visibility::add_visibility_class::<ClusterVisibilityClass>)]
+ pub struct ClusteredDecal {
+     /// The image that the clustered decal projects.
+     ///
+diff --git a/crates/bevy_pbr/src/light/directional_light.rs b/crates/bevy_pbr/src/light/directional_light.rs
+index dd2da1d975ed1..0b54b63cfe6a6 100644
+--- a/crates/bevy_pbr/src/light/directional_light.rs
++++ b/crates/bevy_pbr/src/light/directional_light.rs
+@@ -10,7 +10,8 @@ use bevy_image::Image;
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::Transform;
+ 
+-use crate::{cascade::CascadeShadowConfig, light_consts, Cascades, LightVisibilityClass};
++use super::{cascade::CascadeShadowConfig, light_consts, Cascades};
++use crate::cluster::ClusterVisibilityClass;
+ 
+ /// A Directional light.
+ ///
+@@ -63,7 +64,7 @@ use crate::{cascade::CascadeShadowConfig, light_consts, Cascades, LightVisibilit
+     Visibility,
+     VisibilityClass
+ )]
+-#[component(on_add = visibility::add_visibility_class::<LightVisibilityClass>)]
++#[component(on_add = visibility::add_visibility_class::<ClusterVisibilityClass>)]
+ pub struct DirectionalLight {
+     /// The color of the light.
+     ///
+diff --git a/crates/bevy_pbr/src/light/mod.rs b/crates/bevy_pbr/src/light/mod.rs
+index 53199d39f1c3c..a220b65439fe2 100644
+--- a/crates/bevy_pbr/src/light/mod.rs
++++ b/crates/bevy_pbr/src/light/mod.rs
+@@ -16,23 +16,24 @@ use bevy_transform::{components::GlobalTransform, TransformSystems};
+ use bevy_utils::Parallel;
+ use core::ops::DerefMut;
+ 
+-pub use crate::light::spot_light::{spot_light_clip_from_view, spot_light_world_from_view};
+-use crate::{
+-    add_clusters, assign_objects_to_clusters,
+-    cascade::{build_directional_light_cascades, clear_directional_light_cascades},
+-    CascadeShadowConfig, Cascades, VisibleClusterableObjects,
+-};
++use crate::cluster::{add_clusters, assign_objects_to_clusters, VisibleClusterableObjects};
+ 
+ mod ambient_light;
+ pub use ambient_light::AmbientLight;
+-
+ pub mod cascade;
++use cascade::{
++    build_directional_light_cascades, clear_directional_light_cascades, CascadeShadowConfig,
++    Cascades,
++};
+ mod point_light;
+ pub use point_light::{
+     update_point_light_frusta, PointLight, PointLightShadowMap, PointLightTexture,
+ };
+ mod spot_light;
+-pub use spot_light::{update_spot_light_frusta, SpotLight, SpotLightTexture};
++pub use spot_light::{
++    spot_light_clip_from_view, spot_light_world_from_view, update_spot_light_frusta, SpotLight,
++    SpotLightTexture,
++};
+ mod directional_light;
+ pub use directional_light::{
+     update_directional_light_frusta, DirectionalLight, DirectionalLightShadowMap,
+@@ -243,11 +244,6 @@ pub enum ShadowFilteringMethod {
+     Temporal,
+ }
+ 
+-/// The [`VisibilityClass`] used for all lights (point, directional, and spot).
+-///
+-/// [`VisibilityClass`]: bevy_camera::visibility::VisibilityClass
+-pub struct LightVisibilityClass;
+-
+ /// System sets used to run light-related systems.
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+ pub enum SimulationLightSystems {
+diff --git a/crates/bevy_pbr/src/light/point_light.rs b/crates/bevy_pbr/src/light/point_light.rs
+index 8ba108adccb17..84c024b7a2096 100644
+--- a/crates/bevy_pbr/src/light/point_light.rs
++++ b/crates/bevy_pbr/src/light/point_light.rs
+@@ -10,7 +10,7 @@ use bevy_math::Mat4;
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::{GlobalTransform, Transform};
+ 
+-use crate::{GlobalVisibleClusterableObjects, LightVisibilityClass};
++use crate::cluster::{ClusterVisibilityClass, GlobalVisibleClusterableObjects};
+ 
+ /// A light that emits light in all directions from a central point.
+ ///
+@@ -44,7 +44,7 @@ use crate::{GlobalVisibleClusterableObjects, LightVisibilityClass};
+     Visibility,
+     VisibilityClass
+ )]
+-#[component(on_add = visibility::add_visibility_class::<LightVisibilityClass>)]
++#[component(on_add = visibility::add_visibility_class::<ClusterVisibilityClass>)]
+ pub struct PointLight {
+     /// The color of this light source.
+     pub color: Color,
+diff --git a/crates/bevy_pbr/src/light/spot_light.rs b/crates/bevy_pbr/src/light/spot_light.rs
+index 0e09b1c509136..c75a3124d3115 100644
+--- a/crates/bevy_pbr/src/light/spot_light.rs
++++ b/crates/bevy_pbr/src/light/spot_light.rs
+@@ -11,7 +11,7 @@ use bevy_reflect::prelude::*;
+ use bevy_render::view::VisibleMeshEntities;
+ use bevy_transform::components::{GlobalTransform, Transform};
+ 
+-use crate::{GlobalVisibleClusterableObjects, LightVisibilityClass};
++use crate::cluster::{ClusterVisibilityClass, GlobalVisibleClusterableObjects};
+ 
+ /// A light that emits light in a given direction from a central point.
+ ///
+@@ -21,7 +21,7 @@ use crate::{GlobalVisibleClusterableObjects, LightVisibilityClass};
+ #[derive(Component, Debug, Clone, Copy, Reflect)]
+ #[reflect(Component, Default, Debug, Clone)]
+ #[require(Frustum, VisibleMeshEntities, Transform, Visibility, VisibilityClass)]
+-#[component(on_add = visibility::add_visibility_class::<LightVisibilityClass>)]
++#[component(on_add = visibility::add_visibility_class::<ClusterVisibilityClass>)]
+ pub struct SpotLight {
+     /// The color of the light.
+     ///
+diff --git a/release-content/migration-guides/LightVisibilityClass_rename.md b/release-content/migration-guides/LightVisibilityClass_rename.md
+new file mode 100644
+index 0000000000000..fcf1f4cb131f3
+--- /dev/null
++++ b/release-content/migration-guides/LightVisibilityClass_rename.md
+@@ -0,0 +1,8 @@
++---
++title: `LightVisibilityClass` renamed to `ClusterVisibilityClass`
++pull_requests: [19986]
++---
++
++When clustered decals were added, they used `LightVisibilityClass` to share the clustering infrastructure.
++This revealed that this visibility class wasn't really about lights, but about clustering.
++It has been renamed to `ClusterVisibilityClass` and moved to live alongside clustering-specific types.

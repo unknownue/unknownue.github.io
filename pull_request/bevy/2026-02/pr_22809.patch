@@ -1,0 +1,307 @@
+diff --git a/crates/bevy_gizmos_render/src/pipeline_3d.rs b/crates/bevy_gizmos_render/src/pipeline_3d.rs
+index 88ce897f79f9d..176d73940effc 100644
+--- a/crates/bevy_gizmos_render/src/pipeline_3d.rs
++++ b/crates/bevy_gizmos_render/src/pipeline_3d.rs
+@@ -6,23 +6,18 @@ use crate::{
+ use bevy_app::{App, Plugin};
+ use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+ use bevy_camera::visibility::RenderLayers;
+-use bevy_core_pipeline::{
+-    core_3d::{Transparent3d, CORE_3D_DEPTH_FORMAT},
+-    oit::OrderIndependentTransparencySettings,
+-    prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass},
+-};
++use bevy_core_pipeline::core_3d::{Transparent3d, CORE_3D_DEPTH_FORMAT};
+ use bevy_gizmos::config::{GizmoLineJoint, GizmoLineStyle, GizmoMeshConfig};
+ 
+ use bevy_ecs::{
+     error::BevyError,
+     prelude::Entity,
+-    query::Has,
+     resource::Resource,
+     schedule::IntoScheduleConfigs,
+     system::{Commands, Query, Res, ResMut},
+ };
+ use bevy_image::BevyDefault as _;
+-use bevy_pbr::{ExtractedAtmosphere, MeshPipeline, MeshPipelineKey, SetMeshViewBindGroup};
++use bevy_pbr::{MeshPipeline, MeshPipelineKey, SetMeshViewBindGroup, ViewKeyCache};
+ use bevy_render::{
+     render_asset::{prepare_assets, RenderAssets},
+     render_phase::{
+@@ -30,7 +25,7 @@ use bevy_render::{
+         ViewSortedRenderPhases,
+     },
+     render_resource::*,
+-    view::{ExtractedView, Msaa, ViewTarget},
++    view::{ExtractedView, ViewTarget},
+     Render, RenderApp, RenderSystems,
+ };
+ use bevy_render::{sync_world::MainEntity, RenderStartup};
+@@ -295,19 +290,8 @@ fn queue_line_gizmos_3d(
+     line_gizmos: Query<(Entity, &MainEntity, &GizmoMeshConfig)>,
+     line_gizmo_assets: Res<RenderAssets<GpuLineGizmo>>,
+     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+-    views: Query<(
+-        &ExtractedView,
+-        &Msaa,
+-        Option<&RenderLayers>,
+-        (
+-            Has<NormalPrepass>,
+-            Has<DepthPrepass>,
+-            Has<MotionVectorPrepass>,
+-            Has<DeferredPrepass>,
+-            Has<OrderIndependentTransparencySettings>,
+-            Has<ExtractedAtmosphere>,
+-        ),
+-    )>,
++    views: Query<(&ExtractedView, Option<&RenderLayers>)>,
++    view_key_cache: Res<ViewKeyCache>,
+ ) -> Result<(), BevyError> {
+     let draw_function = draw_functions.read().get_id::<DrawLineGizmo3d>().unwrap();
+     let draw_function_strip = draw_functions
+@@ -315,13 +299,7 @@ fn queue_line_gizmos_3d(
+         .get_id::<DrawLineGizmo3dStrip>()
+         .unwrap();
+ 
+-    for (
+-        view,
+-        msaa,
+-        render_layers,
+-        (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass, oit, atmosphere),
+-    ) in &views
+-    {
++    for (view, render_layers) in &views {
+         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
+         else {
+             continue;
+@@ -329,32 +307,9 @@ fn queue_line_gizmos_3d(
+ 
+         let render_layers = render_layers.unwrap_or_default();
+ 
+-        let mut view_key = MeshPipelineKey::from_msaa_samples(msaa.samples())
+-            | MeshPipelineKey::from_hdr(view.hdr);
+-
+-        if normal_prepass {
+-            view_key |= MeshPipelineKey::NORMAL_PREPASS;
+-        }
+-
+-        if depth_prepass {
+-            view_key |= MeshPipelineKey::DEPTH_PREPASS;
+-        }
+-
+-        if motion_vector_prepass {
+-            view_key |= MeshPipelineKey::MOTION_VECTOR_PREPASS;
+-        }
+-
+-        if deferred_prepass {
+-            view_key |= MeshPipelineKey::DEFERRED_PREPASS;
+-        }
+-
+-        if oit {
+-            view_key |= MeshPipelineKey::OIT_ENABLED;
+-        }
+-
+-        if atmosphere {
+-            view_key |= MeshPipelineKey::ATMOSPHERE;
+-        }
++        let Some(&view_key) = view_key_cache.get(&view.retained_view_entity) else {
++            continue;
++        };
+ 
+         for (entity, main_entity, config) in &line_gizmos {
+             if !config.render_layers.intersects(render_layers) {
+@@ -420,30 +375,15 @@ fn queue_line_joint_gizmos_3d(
+     line_gizmos: Query<(Entity, &MainEntity, &GizmoMeshConfig)>,
+     line_gizmo_assets: Res<RenderAssets<GpuLineGizmo>>,
+     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+-    views: Query<(
+-        &ExtractedView,
+-        &Msaa,
+-        Option<&RenderLayers>,
+-        (
+-            Has<NormalPrepass>,
+-            Has<DepthPrepass>,
+-            Has<MotionVectorPrepass>,
+-            Has<DeferredPrepass>,
+-        ),
+-    )>,
++    views: Query<(&ExtractedView, Option<&RenderLayers>)>,
++    view_key_cache: Res<ViewKeyCache>,
+ ) {
+     let draw_function = draw_functions
+         .read()
+         .get_id::<DrawLineJointGizmo3d>()
+         .unwrap();
+ 
+-    for (
+-        view,
+-        msaa,
+-        render_layers,
+-        (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass),
+-    ) in &views
+-    {
++    for (view, render_layers) in &views {
+         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
+         else {
+             continue;
+@@ -451,24 +391,9 @@ fn queue_line_joint_gizmos_3d(
+ 
+         let render_layers = render_layers.unwrap_or_default();
+ 
+-        let mut view_key = MeshPipelineKey::from_msaa_samples(msaa.samples())
+-            | MeshPipelineKey::from_hdr(view.hdr);
+-
+-        if normal_prepass {
+-            view_key |= MeshPipelineKey::NORMAL_PREPASS;
+-        }
+-
+-        if depth_prepass {
+-            view_key |= MeshPipelineKey::DEPTH_PREPASS;
+-        }
+-
+-        if motion_vector_prepass {
+-            view_key |= MeshPipelineKey::MOTION_VECTOR_PREPASS;
+-        }
+-
+-        if deferred_prepass {
+-            view_key |= MeshPipelineKey::DEFERRED_PREPASS;
+-        }
++        let Some(&view_key) = view_key_cache.get(&view.retained_view_entity) else {
++            continue;
++        };
+ 
+         for (entity, main_entity, config) in &line_gizmos {
+             if !config.render_layers.intersects(render_layers) {
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index c1070711d03bf..814c2a8a719a3 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -303,6 +303,8 @@ impl Plugin for MeshRenderPlugin {
+     }
+ }
+ 
++/// This resource caches [`MeshPipelineKey`]s for each view with pre-enabled features needed to properly
++/// setup the [`MeshViewBindGroup`] layout in specialized [`MeshPipeline`]s.
+ #[derive(Resource, Deref, DerefMut, Default, Debug, Clone)]
+ pub struct ViewKeyCache(HashMap<RetainedViewEntity, MeshPipelineKey>);
+ 
+diff --git a/examples/shader_advanced/custom_render_phase.rs b/examples/shader_advanced/custom_render_phase.rs
+index 82ba87e00dc37..23c8cd0e15cc0 100644
+--- a/examples/shader_advanced/custom_render_phase.rs
++++ b/examples/shader_advanced/custom_render_phase.rs
+@@ -14,7 +14,7 @@ use std::ops::Range;
+ 
+ use bevy::camera::Viewport;
+ use bevy::math::Affine3Ext;
+-use bevy::pbr::SetMeshViewEmptyBindGroup;
++use bevy::pbr::{SetMeshViewEmptyBindGroup, ViewKeyCache};
+ use bevy::{
+     camera::MainPassResolutionOverride,
+     core_pipeline::{core_3d::main_opaque_pass_3d, schedule::Core3d, Core3dSystems},
+@@ -497,19 +497,19 @@ fn queue_custom_meshes(
+     render_meshes: Res<RenderAssets<RenderMesh>>,
+     render_mesh_instances: Res<RenderMeshInstances>,
+     mut custom_render_phases: ResMut<ViewSortedRenderPhases<Stencil3d>>,
+-    mut views: Query<(&ExtractedView, &RenderVisibleEntities, &Msaa)>,
++    mut views: Query<(&ExtractedView, &RenderVisibleEntities)>,
++    view_key_cache: Res<ViewKeyCache>,
+     has_marker: Query<(), With<DrawStencil>>,
+ ) {
+-    for (view, visible_entities, msaa) in &mut views {
++    for (view, visible_entities) in &mut views {
+         let Some(custom_phase) = custom_render_phases.get_mut(&view.retained_view_entity) else {
+             continue;
+         };
+         let draw_custom = custom_draw_functions.read().id::<DrawMesh3dStencil>();
+ 
+-        // Create the key based on the view.
+-        // In this case we only care about MSAA and HDR
+-        let view_key = MeshPipelineKey::from_msaa_samples(msaa.samples())
+-            | MeshPipelineKey::from_hdr(view.hdr);
++        let Some(&view_key) = view_key_cache.get(&view.retained_view_entity) else {
++            continue;
++        };
+ 
+         let rangefinder = view.rangefinder3d();
+         // Since our phase can work on any 3d mesh we can reuse the default mesh 3d filter
+diff --git a/examples/shader_advanced/custom_shader_instancing.rs b/examples/shader_advanced/custom_shader_instancing.rs
+index b9d01fdf481e7..4f5943bf2f188 100644
+--- a/examples/shader_advanced/custom_shader_instancing.rs
++++ b/examples/shader_advanced/custom_shader_instancing.rs
+@@ -7,7 +7,7 @@
+ //! implementation using bevy's low level rendering api.
+ //! It's generally recommended to try the built-in instancing before going with this approach.
+ 
+-use bevy::pbr::SetMeshViewBindingArrayBindGroup;
++use bevy::pbr::{SetMeshViewBindingArrayBindGroup, ViewKeyCache};
+ use bevy::{
+     camera::visibility::NoFrustumCulling,
+     core_pipeline::core_3d::Transparent3d,
+@@ -130,19 +130,21 @@ fn queue_custom(
+     render_mesh_instances: Res<RenderMeshInstances>,
+     material_meshes: Query<(Entity, &MainEntity), With<InstanceMaterialData>>,
+     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+-    views: Query<(&ExtractedView, &Msaa)>,
++    views: Query<&ExtractedView>,
++    view_key_cache: Res<ViewKeyCache>,
+ ) {
+     let draw_custom = transparent_3d_draw_functions.read().id::<DrawCustom>();
+ 
+-    for (view, msaa) in &views {
++    for view in &views {
+         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
+         else {
+             continue;
+         };
+ 
+-        let msaa_key = MeshPipelineKey::from_msaa_samples(msaa.samples());
++        let Some(&view_key) = view_key_cache.get(&view.retained_view_entity) else {
++            continue;
++        };
+ 
+-        let view_key = msaa_key | MeshPipelineKey::from_hdr(view.hdr);
+         let rangefinder = view.rangefinder3d();
+         for (entity, main_entity) in &material_meshes {
+             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
+diff --git a/examples/shader_advanced/specialized_mesh_pipeline.rs b/examples/shader_advanced/specialized_mesh_pipeline.rs
+index ee5abdb54d647..63fc7b3863481 100644
+--- a/examples/shader_advanced/specialized_mesh_pipeline.rs
++++ b/examples/shader_advanced/specialized_mesh_pipeline.rs
+@@ -15,7 +15,7 @@ use bevy::{
+     mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology},
+     pbr::{
+         DrawMesh, MeshPipeline, MeshPipelineKey, MeshPipelineViewLayoutKey, RenderMeshInstances,
+-        SetMeshBindGroup, SetMeshViewBindGroup, SetMeshViewEmptyBindGroup,
++        SetMeshBindGroup, SetMeshViewBindGroup, SetMeshViewEmptyBindGroup, ViewKeyCache,
+     },
+     prelude::*,
+     render::{
+@@ -272,7 +272,8 @@ fn queue_custom_mesh_pipeline(
+         Res<DrawFunctions<Opaque3d>>,
+     ),
+     mut specialized_mesh_pipelines: ResMut<SpecializedMeshPipelines<CustomMeshPipeline>>,
+-    views: Query<(&RenderVisibleEntities, &ExtractedView, &Msaa)>,
++    views: Query<(&RenderVisibleEntities, &ExtractedView)>,
++    view_key_cache: Res<ViewKeyCache>,
+     (render_meshes, render_mesh_instances): (
+         Res<RenderAssets<RenderMesh>>,
+         Res<RenderMeshInstances>,
+@@ -289,14 +290,14 @@ fn queue_custom_mesh_pipeline(
+     // Render phases are per-view, so we need to iterate over all views so that
+     // the entity appears in them. (In this example, we have only one view, but
+     // it's good practice to loop over all views anyway.)
+-    for (view_visible_entities, view, msaa) in views.iter() {
++    for (view_visible_entities, view) in views.iter() {
+         let Some(opaque_phase) = opaque_render_phases.get_mut(&view.retained_view_entity) else {
+             continue;
+         };
+ 
+-        // Create the key based on the view. In this case we only care about MSAA and HDR
+-        let view_key = MeshPipelineKey::from_msaa_samples(msaa.samples())
+-            | MeshPipelineKey::from_hdr(view.hdr);
++        let Some(&view_key) = view_key_cache.get(&view.retained_view_entity) else {
++            continue;
++        };
+ 
+         // Find all the custom rendered entities that are visible from this
+         // view.

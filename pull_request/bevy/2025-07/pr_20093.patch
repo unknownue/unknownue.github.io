@@ -1,0 +1,363 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f047040bdc9f7..b1cfe08c05054 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3832,6 +3832,17 @@ description = "Demonstrates resizing and responding to resizing a window"
+ category = "Window"
+ wasm = true
+ 
++[[example]]
++name = "drag_to_scroll"
++path = "examples/ui/drag_to_scroll.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.drag_to_scroll]
++name = "Drag to Scroll"
++description = "This example tests scale factor, dragging and scrolling"
++category = "UI (User Interface)"
++wasm = true
++
+ [[example]]
+ name = "ui_material"
+ path = "examples/ui/ui_material.rs"
+diff --git a/crates/bevy_ui/src/layout/convert.rs b/crates/bevy_ui/src/layout/convert.rs
+index 53c03113b9b60..161fc12751650 100644
+--- a/crates/bevy_ui/src/layout/convert.rs
++++ b/crates/bevy_ui/src/layout/convert.rs
+@@ -73,7 +73,7 @@ pub fn from_node(node: &Node, context: &LayoutContext, ignore_border: bool) -> t
+             x: node.overflow.x.into(),
+             y: node.overflow.y.into(),
+         },
+-        scrollbar_width: 0.0,
++        scrollbar_width: node.scrollbar_width * context.scale_factor,
+         position: node.position_type.into(),
+         flex_direction: node.flex_direction.into(),
+         flex_wrap: node.flex_wrap.into(),
+@@ -503,6 +503,7 @@ mod tests {
+             aspect_ratio: None,
+             overflow: crate::Overflow::clip(),
+             overflow_clip_margin: crate::OverflowClipMargin::default(),
++            scrollbar_width: 7.,
+             column_gap: Val::ZERO,
+             row_gap: Val::ZERO,
+             grid_auto_flow: GridAutoFlow::ColumnDense,
+@@ -624,6 +625,7 @@ mod tests {
+         assert_eq!(taffy_style.max_size.width, taffy::style::Dimension::Auto);
+         assert_eq!(taffy_style.max_size.height, taffy::style::Dimension::ZERO);
+         assert_eq!(taffy_style.aspect_ratio, None);
++        assert_eq!(taffy_style.scrollbar_width, 7.);
+         assert_eq!(taffy_style.gap.width, taffy::style::LengthPercentage::ZERO);
+         assert_eq!(taffy_style.gap.height, taffy::style::LengthPercentage::ZERO);
+         assert_eq!(
+diff --git a/crates/bevy_ui/src/layout/mod.rs b/crates/bevy_ui/src/layout/mod.rs
+index 655ec17e90ac6..adbfb3d09bf52 100644
+--- a/crates/bevy_ui/src/layout/mod.rs
++++ b/crates/bevy_ui/src/layout/mod.rs
+@@ -10,7 +10,7 @@ use bevy_ecs::{
+     hierarchy::{ChildOf, Children},
+     lifecycle::RemovedComponents,
+     query::With,
+-    system::{Commands, Query, ResMut},
++    system::{Query, ResMut},
+     world::Ref,
+ };
+ 
+@@ -71,7 +71,6 @@ pub enum LayoutError {
+ 
+ /// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of all the UI nodes.
+ pub fn ui_layout_system(
+-    mut commands: Commands,
+     mut ui_surface: ResMut<UiSurface>,
+     ui_root_node_query: UiRootNodes,
+     mut node_query: Query<(
+@@ -172,7 +171,6 @@ with UI components as a child of an entity without UI components, your UI layout
+         );
+ 
+         update_uinode_geometry_recursive(
+-            &mut commands,
+             ui_root_entity,
+             &mut ui_surface,
+             true,
+@@ -188,7 +186,6 @@ with UI components as a child of an entity without UI components, your UI layout
+ 
+     // Returns the combined bounding box of the node and any of its overflowing children.
+     fn update_uinode_geometry_recursive(
+-        commands: &mut Commands,
+         entity: Entity,
+         ui_surface: &mut UiSurface,
+         inherited_use_rounding: bool,
+@@ -307,16 +304,19 @@ with UI components as a child of an entity without UI components, your UI layout
+                     .max(0.);
+             }
+ 
++            node.bypass_change_detection().scrollbar_size =
++                Vec2::new(layout.scrollbar_size.width, layout.scrollbar_size.height);
++
+             let scroll_position: Vec2 = maybe_scroll_position
+                 .map(|scroll_pos| {
+                     Vec2::new(
+                         if style.overflow.x == OverflowAxis::Scroll {
+-                            scroll_pos.x
++                            scroll_pos.x * inverse_target_scale_factor.recip()
+                         } else {
+                             0.0
+                         },
+                         if style.overflow.y == OverflowAxis::Scroll {
+-                            scroll_pos.y
++                            scroll_pos.y * inverse_target_scale_factor.recip()
+                         } else {
+                             0.0
+                         },
+@@ -324,24 +324,16 @@ with UI components as a child of an entity without UI components, your UI layout
+                 })
+                 .unwrap_or_default();
+ 
+-            let max_possible_offset = (content_size - layout_size).max(Vec2::ZERO);
+-            let clamped_scroll_position = scroll_position.clamp(
+-                Vec2::ZERO,
+-                max_possible_offset * inverse_target_scale_factor,
+-            );
++            let max_possible_offset =
++                (content_size - layout_size + node.scrollbar_size).max(Vec2::ZERO);
++            let clamped_scroll_position = scroll_position.clamp(Vec2::ZERO, max_possible_offset);
+ 
+-            if clamped_scroll_position != scroll_position {
+-                commands
+-                    .entity(entity)
+-                    .insert(ScrollPosition(clamped_scroll_position));
+-            }
++            let physical_scroll_position = clamped_scroll_position.floor();
+ 
+-            let physical_scroll_position =
+-                (clamped_scroll_position / inverse_target_scale_factor).round();
++            node.bypass_change_detection().scroll_position = physical_scroll_position;
+ 
+             for child_uinode in ui_children.iter_ui_children(entity) {
+                 update_uinode_geometry_recursive(
+-                    commands,
+                     child_uinode,
+                     ui_surface,
+                     use_rounding,
+diff --git a/crates/bevy_ui/src/ui_node.rs b/crates/bevy_ui/src/ui_node.rs
+index 7aed57931cb60..bda1b48bc4741 100644
+--- a/crates/bevy_ui/src/ui_node.rs
++++ b/crates/bevy_ui/src/ui_node.rs
+@@ -42,6 +42,14 @@ pub struct ComputedNode {
+     ///
+     /// Automatically calculated by [`super::layout::ui_layout_system`].
+     pub content_size: Vec2,
++    /// Space allocated for scrollbars.
++    ///
++    /// Automatically calculated by [`super::layout::ui_layout_system`].
++    pub scrollbar_size: Vec2,
++    /// Resolved offset of scrolled content
++    ///
++    /// Automatically calculated by [`super::layout::ui_layout_system`].
++    pub scroll_position: Vec2,
+     /// The width of this node's outline.
+     /// If this value is `Auto`, negative or `0.` then no outline will be rendered.
+     /// Outline updates bypass change detection.
+@@ -305,6 +313,8 @@ impl ComputedNode {
+         stack_index: 0,
+         size: Vec2::ZERO,
+         content_size: Vec2::ZERO,
++        scrollbar_size: Vec2::ZERO,
++        scroll_position: Vec2::ZERO,
+         outline_width: 0.,
+         outline_offset: 0.,
+         unrounded_size: Vec2::ZERO,
+@@ -419,6 +429,9 @@ pub struct Node {
+     /// <https://developer.mozilla.org/en-US/docs/Web/CSS/overflow>
+     pub overflow: Overflow,
+ 
++    /// How much space in logical pixels should be reserved for scrollbars when overflow is set to scroll or auto on an axis.
++    pub scrollbar_width: f32,
++
+     /// How the bounds of clipped content should be determined
+     ///
+     /// <https://developer.mozilla.org/en-US/docs/Web/CSS/overflow-clip-margin>
+@@ -703,6 +716,7 @@ impl Node {
+         aspect_ratio: None,
+         overflow: Overflow::DEFAULT,
+         overflow_clip_margin: OverflowClipMargin::DEFAULT,
++        scrollbar_width: 0.,
+         row_gap: Val::ZERO,
+         column_gap: Val::ZERO,
+         grid_auto_flow: GridAutoFlow::DEFAULT,
+diff --git a/crates/bevy_ui/src/update.rs b/crates/bevy_ui/src/update.rs
+index f8699fb7fca44..313b4af192f46 100644
+--- a/crates/bevy_ui/src/update.rs
++++ b/crates/bevy_ui/src/update.rs
+@@ -112,8 +112,8 @@ fn update_clipping(
+ 
+         clip_rect.min.x += clip_inset.left;
+         clip_rect.min.y += clip_inset.top;
+-        clip_rect.max.x -= clip_inset.right;
+-        clip_rect.max.y -= clip_inset.bottom;
++        clip_rect.max.x -= clip_inset.right + computed_node.scrollbar_size.x;
++        clip_rect.max.y -= clip_inset.bottom + computed_node.scrollbar_size.y;
+ 
+         clip_rect = clip_rect
+             .inflate(node.overflow_clip_margin.margin.max(0.) / computed_node.inverse_scale_factor);
+diff --git a/examples/README.md b/examples/README.md
+index 993299dfc6699..aabe0199054b2 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -553,6 +553,7 @@ Example | Description
+ [Core Widgets (w/Observers)](../examples/ui/core_widgets_observers.rs) | Demonstrates use of core (headless) widgets in Bevy UI, with Observers
+ [Directional Navigation](../examples/ui/directional_navigation.rs) | Demonstration of Directional Navigation between UI elements
+ [Display and Visibility](../examples/ui/display_and_visibility.rs) | Demonstrates how Display and Visibility work in the UI.
++[Drag to Scroll](../examples/ui/drag_to_scroll.rs) | This example tests scale factor, dragging and scrolling
+ [Flex Layout](../examples/ui/flex_layout.rs) | Demonstrates how the AlignItems and JustifyContent properties can be composed to layout nodes and position text
+ [Font Atlas Debug](../examples/ui/font_atlas_debug.rs) | Illustrates how FontAtlases are populated (used to optimize text rendering internally)
+ [Ghost Nodes](../examples/ui/ghost_nodes.rs) | Demonstrates the use of Ghost Nodes to skip entities in the UI layout hierarchy
+diff --git a/examples/ui/drag_to_scroll.rs b/examples/ui/drag_to_scroll.rs
+new file mode 100644
+index 0000000000000..b66d85c80056c
+--- /dev/null
++++ b/examples/ui/drag_to_scroll.rs
+@@ -0,0 +1,120 @@
++//! This example tests scale factor, dragging and scrolling
++
++use bevy::color::palettes::css::RED;
++use bevy::prelude::*;
++
++#[derive(Component)]
++struct DragNode;
++
++#[derive(Component)]
++struct ScrollableNode;
++
++#[derive(Component)]
++struct TileColor(Color);
++
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins)
++        .add_systems(Startup, setup)
++        .run();
++}
++
++#[derive(Component)]
++struct ScrollStart(Vec2);
++
++fn setup(mut commands: Commands) {
++    let w = 60;
++    let h = 40;
++
++    commands.spawn(Camera2d);
++    commands.insert_resource(UiScale(0.5));
++
++    commands
++        .spawn((
++            Node {
++                width: Val::Percent(100.),
++                height: Val::Percent(100.),
++                overflow: Overflow::scroll(),
++                ..Default::default()
++            },
++            ScrollPosition(Vec2::ZERO),
++            ScrollableNode,
++            ScrollStart(Vec2::ZERO),
++        ))
++        .observe(
++            |
++            drag: On<Pointer<Drag>>,
++             ui_scale: Res<UiScale>,
++             mut scroll_position_query: Query<(
++                &mut ScrollPosition,
++                &ScrollStart),
++                With<ScrollableNode>,
++             >| {
++                if let Ok((mut scroll_position, start)) = scroll_position_query.single_mut() {
++                    scroll_position.0 = (start.0 - drag.distance / ui_scale.0).max(Vec2::ZERO);
++                }
++            },
++        )
++        .observe(
++            |
++            on: On<Pointer<DragStart>>,
++             mut scroll_position_query: Query<(
++                &ComputedNode,
++                &mut ScrollStart),
++                With<ScrollableNode>,
++            >| {
++                if on.target() != on.original_target() {
++                    return;
++                }
++                if let Ok((computed_node, mut start)) = scroll_position_query.single_mut() {
++                    start.0 = computed_node.scroll_position * computed_node.inverse_scale_factor;
++                }
++            },
++        )
++
++        .with_children(|commands| {
++            commands
++            .spawn(Node {
++                display: Display::Grid,
++                grid_template_rows: RepeatedGridTrack::px(w as i32, 100.),
++                grid_template_columns: RepeatedGridTrack::px(h as i32, 100.),
++                ..Default::default()
++            })
++            .with_children(|commands| {
++                for y in 0..h {
++                    for x in 0..w {
++                        let tile_color = if (x + y) % 2 == 1 {
++                            let hue = ((x as f32 / w as f32) * 270.0) + ((y as f32 / h as f32) * 90.0);
++                            Color::hsl(hue, 1., 0.5)
++                        } else {
++                            Color::BLACK
++                        };
++                        commands
++                            .spawn((
++                                Node {
++                                    grid_row: GridPlacement::start(y + 1),
++                                    grid_column: GridPlacement::start(x + 1),
++                                    ..Default::default()
++                                },
++                                Pickable {
++                                    should_block_lower: false,
++                                    is_hoverable: true,
++                                },
++                                TileColor(tile_color),
++                                BackgroundColor(tile_color),
++                            ))
++                            .observe(|on_enter: On<Pointer<Over>>, mut query: Query<&mut BackgroundColor>, | {
++                                if let Ok(mut background_color) = query.get_mut(on_enter.target()) {
++                                    background_color.0 = RED.into();
++                                }
++                            })
++                            .observe(|on_enter: On<Pointer<Out>>, mut query: Query<(&mut BackgroundColor, &TileColor)>,| {
++                                if let Ok((mut background_color, tile_color)) = query.get_mut(on_enter.target()) {
++                                    background_color.0 = tile_color.0;
++                                }
++                            });
++                        }
++                }
++            });
++        });
++}
+diff --git a/release-content/migration-guides/UI_scroll_position_is_now_logical.md b/release-content/migration-guides/UI_scroll_position_is_now_logical.md
+new file mode 100644
+index 0000000000000..d0c61e487a240
+--- /dev/null
++++ b/release-content/migration-guides/UI_scroll_position_is_now_logical.md
+@@ -0,0 +1,5 @@
++---
++title: `ScrollPosition` now uses logical pixel units and is no longer overwritten during layout updates
++pull_requests: [20093]
++---
++`ScrollPosition` is no longer overwritten during layout updates. Instead the computed scroll position is stored in the new `scroll_position` field on `ComputedNode`.
+diff --git a/release-content/release-notes/automatic_scrollbar_space_allocation.md b/release-content/release-notes/automatic_scrollbar_space_allocation.md
+new file mode 100644
+index 0000000000000..9430281a1b130
+--- /dev/null
++++ b/release-content/release-notes/automatic_scrollbar_space_allocation.md
+@@ -0,0 +1,7 @@
++---
++title: Automatically allocate space for scrollbars
++authors: ["@ickshonpe"]
++pull_requests: [20093]
++---
++
++`Node` has a new field `scrollbar_width`. If `OverflowAxis::Scroll` is set for a UI Node's axis, a space for a scrollbars of width `scrollbar_width` will automatically be left in the layout.

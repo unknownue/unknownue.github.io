@@ -1,0 +1,456 @@
+diff --git a/crates/bevy_ui/src/layout/mod.rs b/crates/bevy_ui/src/layout/mod.rs
+index 68b8c69dbd9e9..674270a50f85b 100644
+--- a/crates/bevy_ui/src/layout/mod.rs
++++ b/crates/bevy_ui/src/layout/mod.rs
+@@ -359,25 +359,24 @@ pub fn ui_layout_system(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use crate::update::update_cameras_test_system;
+     use crate::{
+         layout::ui_surface::UiSurface, prelude::*, ui_layout_system,
+         update::propagate_ui_target_cameras, ContentSize, LayoutContext,
+     };
+     use bevy_app::{App, HierarchyPropagatePlugin, PostUpdate, PropagateSet};
+-    use bevy_camera::{Camera, Camera2d};
++    use bevy_camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo, Viewport};
+     use bevy_ecs::{prelude::*, system::RunSystemOnce};
+     use bevy_math::{Rect, UVec2, Vec2};
+     use bevy_platform::collections::HashMap;
+     use bevy_transform::systems::mark_dirty_trees;
+     use bevy_transform::systems::{propagate_parent_transforms, sync_simple_transforms};
+     use bevy_utils::prelude::default;
+-    use bevy_window::{PrimaryWindow, Window, WindowResolution};
++
+     use taffy::TraversePartialTree;
+ 
+     // these window dimensions are easy to convert to and from percentage values
+-    const WINDOW_WIDTH: u32 = 1000;
+-    const WINDOW_HEIGHT: u32 = 100;
++    const TARGET_WIDTH: u32 = 1000;
++    const TARGET_HEIGHT: u32 = 100;
+ 
+     fn setup_ui_test_app() -> App {
+         let mut app = App::new();
+@@ -397,9 +396,8 @@ mod tests {
+         app.add_systems(
+             PostUpdate,
+             (
+-                update_cameras_test_system,
+-                propagate_ui_target_cameras,
+                 ApplyDeferred,
++                propagate_ui_target_cameras,
+                 ui_layout_system,
+                 mark_dirty_trees,
+                 sync_simple_transforms,
+@@ -423,15 +421,24 @@ mod tests {
+         );
+ 
+         let world = app.world_mut();
+-        // spawn a dummy primary window and camera
++        // spawn a camera with a dummy render target
+         world.spawn((
+-            Window {
+-                resolution: WindowResolution::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+-                ..default()
++            Camera2d,
++            Camera {
++                computed: ComputedCameraValues {
++                    target_info: Some(RenderTargetInfo {
++                        physical_size: UVec2::new(TARGET_WIDTH, TARGET_HEIGHT),
++                        scale_factor: 1.,
++                    }),
++                    ..Default::default()
++                },
++                viewport: Some(Viewport {
++                    physical_size: UVec2::new(TARGET_WIDTH, TARGET_HEIGHT),
++                    ..default()
++                }),
++                ..Default::default()
+             },
+-            PrimaryWindow,
+         ));
+-        world.spawn(Camera2d);
+ 
+         app
+     }
+@@ -467,8 +474,8 @@ mod tests {
+ 
+         for ui_entity in [ui_root, ui_child] {
+             let layout = ui_surface.get_layout(ui_entity, true).unwrap().0;
+-            assert_eq!(layout.size.width, WINDOW_WIDTH as f32);
+-            assert_eq!(layout.size.height, WINDOW_HEIGHT as f32);
++            assert_eq!(layout.size.width, TARGET_WIDTH as f32);
++            assert_eq!(layout.size.height, TARGET_HEIGHT as f32);
+         }
+     }
+ 
+@@ -801,21 +808,14 @@ mod tests {
+         #[derive(Component)]
+         struct MovingUiNode;
+ 
+-        fn update_camera_viewports(
+-            primary_window_query: Query<&Window, With<PrimaryWindow>>,
+-            mut cameras: Query<&mut Camera>,
+-        ) {
+-            let primary_window = primary_window_query
+-                .single()
+-                .expect("missing primary window");
++        fn update_camera_viewports(mut cameras: Query<&mut Camera>) {
+             let camera_count = cameras.iter().len();
+             for (camera_index, mut camera) in cameras.iter_mut().enumerate() {
+-                let viewport_width =
+-                    primary_window.resolution.physical_width() / camera_count as u32;
+-                let viewport_height = primary_window.resolution.physical_height();
++                let target_size = camera.physical_target_size().unwrap();
++                let viewport_width = target_size.x / camera_count as u32;
+                 let physical_position = UVec2::new(viewport_width * camera_index as u32, 0);
+-                let physical_size = UVec2::new(viewport_width, viewport_height);
+-                camera.viewport = Some(bevy_camera::Viewport {
++                let physical_size = UVec2::new(target_size.x / camera_count as u32, target_size.y);
++                camera.viewport = Some(Viewport {
+                     physical_position,
+                     physical_size,
+                     ..default()
+@@ -885,6 +885,17 @@ mod tests {
+             Camera2d,
+             Camera {
+                 order: 1,
++                computed: ComputedCameraValues {
++                    target_info: Some(RenderTargetInfo {
++                        physical_size: UVec2::new(TARGET_WIDTH, TARGET_HEIGHT),
++                        scale_factor: 1.,
++                    }),
++                    ..default()
++                },
++                viewport: Some(Viewport {
++                    physical_size: UVec2::new(TARGET_WIDTH, TARGET_HEIGHT),
++                    ..default()
++                }),
+                 ..default()
+             },
+         ));
+diff --git a/crates/bevy_ui/src/update.rs b/crates/bevy_ui/src/update.rs
+index ff2317e9fecdd..67f91e01f0e4b 100644
+--- a/crates/bevy_ui/src/update.rs
++++ b/crates/bevy_ui/src/update.rs
+@@ -175,35 +175,6 @@ pub fn propagate_ui_target_cameras(
+     }
+ }
+ 
+-/// Update each `Camera`'s `RenderTargetInfo` from its associated `Window` render target.
+-/// Cameras with non-window render targets are ignored.
+-#[cfg(test)]
+-pub(crate) fn update_cameras_test_system(
+-    primary_window: Query<Entity, bevy_ecs::query::With<bevy_window::PrimaryWindow>>,
+-    window_query: Query<&bevy_window::Window>,
+-    mut camera_query: Query<(&mut Camera, &bevy_camera::RenderTarget)>,
+-) {
+-    let primary_window = primary_window.single().ok();
+-    for (mut camera, render_target) in camera_query.iter_mut() {
+-        let Some(camera_target) = render_target.normalize(primary_window) else {
+-            continue;
+-        };
+-        let bevy_camera::NormalizedRenderTarget::Window(window_ref) = camera_target else {
+-            continue;
+-        };
+-        let Ok(window) = window_query.get(bevy_ecs::entity::ContainsEntity::entity(&window_ref))
+-        else {
+-            continue;
+-        };
+-
+-        let render_target_info = bevy_camera::RenderTargetInfo {
+-            physical_size: window.physical_size(),
+-            scale_factor: window.scale_factor(),
+-        };
+-        camera.computed.target_info = Some(render_target_info);
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use crate::update::propagate_ui_target_cameras;
+@@ -217,15 +188,13 @@ mod tests {
+     use bevy_app::HierarchyPropagatePlugin;
+     use bevy_app::PostUpdate;
+     use bevy_app::PropagateSet;
++    use bevy_camera::Camera;
+     use bevy_camera::Camera2d;
+-    use bevy_camera::RenderTarget;
++    use bevy_camera::ComputedCameraValues;
++    use bevy_camera::RenderTargetInfo;
+     use bevy_ecs::hierarchy::ChildOf;
+-    use bevy_ecs::schedule::IntoScheduleConfigs;
+     use bevy_math::UVec2;
+-    use bevy_window::PrimaryWindow;
+-    use bevy_window::Window;
+-    use bevy_window::WindowRef;
+-    use bevy_window::WindowResolution;
++    use bevy_utils::default;
+ 
+     fn setup_test_app() -> App {
+         let mut app = App::new();
+@@ -248,14 +217,7 @@ mod tests {
+             PropagateSet::<ComputedUiRenderTargetInfo>::default(),
+         );
+ 
+-        app.add_systems(
+-            bevy_app::Update,
+-            (
+-                super::update_cameras_test_system,
+-                propagate_ui_target_cameras,
+-            )
+-                .chain(),
+-        );
++        app.add_systems(bevy_app::Update, propagate_ui_target_cameras);
+ 
+         app
+     }
+@@ -268,15 +230,21 @@ mod tests {
+         let scale_factor = 10.;
+         let physical_size = UVec2::new(1000, 500);
+ 
+-        world.spawn((
+-            Window {
+-                resolution: WindowResolution::from(physical_size).with_scale_factor_override(10.),
+-                ..Default::default()
+-            },
+-            PrimaryWindow,
+-        ));
+-
+-        let camera = world.spawn(Camera2d).id();
++        let camera = world
++            .spawn((
++                Camera2d,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size,
++                            scale_factor,
++                        }),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                },
++            ))
++            .id();
+ 
+         let uinode = world.spawn(Node::default()).id();
+ 
+@@ -307,24 +275,36 @@ mod tests {
+         let scale2 = 2.;
+         let size2 = UVec2::new(200, 200);
+ 
+-        world.spawn((
+-            Window {
+-                resolution: WindowResolution::from(size1).with_scale_factor_override(scale1),
+-                ..Default::default()
+-            },
+-            PrimaryWindow,
+-        ));
+-
+-        let window_2 = world
+-            .spawn((Window {
+-                resolution: WindowResolution::from(size2).with_scale_factor_override(scale2),
+-                ..Default::default()
+-            },))
++        let camera1 = world
++            .spawn((
++                Camera2d,
++                IsDefaultUiCamera,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size: size1,
++                            scale_factor: scale1,
++                        }),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                },
++            ))
+             .id();
+-
+-        let camera1 = world.spawn((Camera2d, IsDefaultUiCamera)).id();
+         let camera2 = world
+-            .spawn((Camera2d, RenderTarget::Window(WindowRef::Entity(window_2))))
++            .spawn((
++                Camera2d,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size: size2,
++                            scale_factor: scale2,
++                        }),
++                        ..Default::default()
++                    },
++                    ..default()
++                },
++            ))
+             .id();
+ 
+         let uinode1a = world.spawn(Node::default()).id();
+@@ -368,24 +348,36 @@ mod tests {
+         let scale2 = 2.;
+         let size2 = UVec2::new(200, 200);
+ 
+-        world.spawn((
+-            Window {
+-                resolution: WindowResolution::from(size1).with_scale_factor_override(scale1),
+-                ..Default::default()
+-            },
+-            PrimaryWindow,
+-        ));
+-
+-        let window_2 = world
+-            .spawn((Window {
+-                resolution: WindowResolution::from(size2).with_scale_factor_override(scale2),
+-                ..Default::default()
+-            },))
++        let camera1 = world
++            .spawn((
++                Camera2d,
++                IsDefaultUiCamera,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size: size1,
++                            scale_factor: scale1,
++                        }),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                },
++            ))
+             .id();
+-
+-        let camera1 = world.spawn((Camera2d, IsDefaultUiCamera)).id();
+         let camera2 = world
+-            .spawn((Camera2d, RenderTarget::Window(WindowRef::Entity(window_2))))
++            .spawn((
++                Camera2d,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size: size2,
++                            scale_factor: scale2,
++                        }),
++                        ..Default::default()
++                    },
++                    ..default()
++                },
++            ))
+             .id();
+ 
+         let uinode = world.spawn(Node::default()).id();
+@@ -459,24 +451,36 @@ mod tests {
+         let scale2 = 2.;
+         let size2 = UVec2::new(200, 200);
+ 
+-        world.spawn((
+-            Window {
+-                resolution: WindowResolution::from(size1).with_scale_factor_override(scale1),
+-                ..Default::default()
+-            },
+-            PrimaryWindow,
+-        ));
+-
+-        let window_2 = world
+-            .spawn((Window {
+-                resolution: WindowResolution::from(size2).with_scale_factor_override(scale2),
+-                ..Default::default()
+-            },))
++        let camera1 = world
++            .spawn((
++                Camera2d,
++                IsDefaultUiCamera,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size: size1,
++                            scale_factor: scale1,
++                        }),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                },
++            ))
+             .id();
+-
+-        let camera1 = world.spawn((Camera2d, IsDefaultUiCamera)).id();
+         let camera2 = world
+-            .spawn((Camera2d, RenderTarget::Window(WindowRef::Entity(window_2))))
++            .spawn((
++                Camera2d,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size: size2,
++                            scale_factor: scale2,
++                        }),
++                        ..Default::default()
++                    },
++                    ..default()
++                },
++            ))
+             .id();
+ 
+         // `UiTargetCamera` is ignored on non-root UI nodes
+@@ -569,15 +573,21 @@ mod tests {
+         let scale = 1.;
+         let size = UVec2::new(100, 100);
+ 
+-        world.spawn((
+-            Window {
+-                resolution: WindowResolution::from(size).with_scale_factor_override(scale),
+-                ..Default::default()
+-            },
+-            PrimaryWindow,
+-        ));
+-
+-        let camera = world.spawn(Camera2d).id();
++        let camera = world
++            .spawn((
++                Camera2d,
++                Camera {
++                    computed: ComputedCameraValues {
++                        target_info: Some(RenderTargetInfo {
++                            physical_size: size,
++                            scale_factor: scale,
++                        }),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                },
++            ))
++            .id();
+ 
+         let uinode = world.spawn(Node::default()).id();
+         world.spawn(Node::default()).with_children(|builder| {
+diff --git a/crates/bevy_ui/src/widget/viewport.rs b/crates/bevy_ui/src/widget/viewport.rs
+index 3b02e1748d84a..7b59d1dc1ba21 100644
+--- a/crates/bevy_ui/src/widget/viewport.rs
++++ b/crates/bevy_ui/src/widget/viewport.rs
+@@ -1,5 +1,10 @@
++#[cfg(feature = "bevy_picking")]
++use crate::UiGlobalTransform;
++use crate::{ComputedNode, Node};
+ use bevy_asset::Assets;
+-use bevy_camera::{Camera, RenderTarget};
++#[cfg(feature = "bevy_picking")]
++use bevy_camera::Camera;
++use bevy_camera::RenderTarget;
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -22,10 +27,6 @@ use bevy_picking::{
+ };
+ use bevy_reflect::Reflect;
+ 
+-#[cfg(feature = "bevy_picking")]
+-use crate::UiGlobalTransform;
+-use crate::{ComputedNode, Node};
+-
+ /// Component used to render a [`RenderTarget`]  to a node.
+ ///
+ /// # See Also

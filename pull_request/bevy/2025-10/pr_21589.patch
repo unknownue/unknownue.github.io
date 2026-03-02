@@ -1,0 +1,468 @@
+diff --git a/benches/benches/bevy_ecs/scheduling/run_condition.rs b/benches/benches/bevy_ecs/scheduling/run_condition.rs
+index 9c40cf396e047..083ed177d2f7a 100644
+--- a/benches/benches/bevy_ecs/scheduling/run_condition.rs
++++ b/benches/benches/bevy_ecs/scheduling/run_condition.rs
+@@ -55,7 +55,7 @@ pub fn run_condition_no(criterion: &mut Criterion) {
+     group.finish();
+ }
+ 
+-#[derive(Component, Resource)]
++#[derive(Component)]
+ struct TestBool(pub bool);
+ 
+ pub fn run_condition_yes_with_query(criterion: &mut Criterion) {
+@@ -86,14 +86,17 @@ pub fn run_condition_yes_with_query(criterion: &mut Criterion) {
+     group.finish();
+ }
+ 
++#[derive(Resource)]
++struct TestResource(pub bool);
++
+ pub fn run_condition_yes_with_resource(criterion: &mut Criterion) {
+     let mut world = World::new();
+-    world.insert_resource(TestBool(true));
++    world.insert_resource(TestResource(true));
+     let mut group = criterion.benchmark_group("run_condition/yes_using_resource");
+     group.warm_up_time(core::time::Duration::from_millis(500));
+     group.measurement_time(core::time::Duration::from_secs(3));
+     fn empty() {}
+-    fn yes_with_resource(res: Res<TestBool>) -> bool {
++    fn yes_with_resource(res: Res<TestResource>) -> bool {
+         res.0
+     }
+     for amount in [10, 100, 1_000] {
+diff --git a/crates/bevy_ecs/src/lib.rs b/crates/bevy_ecs/src/lib.rs
+index 2e9174bf2404c..d2f59ac29f83d 100644
+--- a/crates/bevy_ecs/src/lib.rs
++++ b/crates/bevy_ecs/src/lib.rs
+@@ -178,8 +178,10 @@ mod tests {
+     };
+     use std::sync::Mutex;
+ 
+-    #[derive(Component, Resource, Debug, PartialEq, Eq, Hash, Clone, Copy)]
++    #[derive(Component, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+     struct A(usize);
++    #[derive(Resource, Debug, PartialEq, Eq)]
++    struct ResA(usize);
+     #[derive(Component, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+     struct B(usize);
+     #[derive(Component, Debug, PartialEq, Eq, Clone, Copy)]
+@@ -1421,10 +1423,10 @@ mod tests {
+     #[test]
+     fn non_send_resource_points_to_distinct_data() {
+         let mut world = World::default();
+-        world.insert_resource(A(123));
+-        world.insert_non_send_resource(A(456));
+-        assert_eq!(*world.resource::<A>(), A(123));
+-        assert_eq!(*world.non_send_resource::<A>(), A(456));
++        world.insert_resource(ResA(123));
++        world.insert_non_send_resource(ResA(456));
++        assert_eq!(*world.resource::<ResA>(), ResA(123));
++        assert_eq!(*world.non_send_resource::<ResA>(), ResA(456));
+     }
+ 
+     #[test]
+@@ -1570,13 +1572,13 @@ mod tests {
+     #[test]
+     fn resource_scope() {
+         let mut world = World::default();
+-        assert!(world.try_resource_scope::<A, _>(|_, _| {}).is_none());
+-        world.insert_resource(A(0));
+-        world.resource_scope(|world: &mut World, mut value: Mut<A>| {
++        assert!(world.try_resource_scope::<ResA, _>(|_, _| {}).is_none());
++        world.insert_resource(ResA(0));
++        world.resource_scope(|world: &mut World, mut value: Mut<ResA>| {
+             value.0 += 1;
+-            assert!(!world.contains_resource::<A>());
++            assert!(!world.contains_resource::<ResA>());
+         });
+-        assert_eq!(world.resource::<A>().0, 1);
++        assert_eq!(world.resource::<ResA>().0, 1);
+     }
+ 
+     #[test]
+@@ -1636,7 +1638,7 @@ mod tests {
+     fn clear_entities() {
+         let mut world = World::default();
+ 
+-        world.insert_resource(A(0));
++        world.insert_resource(ResA(0));
+         world.spawn(A(1));
+         world.spawn(SparseStored(1));
+ 
+@@ -1666,7 +1668,7 @@ mod tests {
+             "world should not have any entities"
+         );
+         assert_eq!(
+-            world.resource::<A>().0,
++            world.resource::<ResA>().0,
+             0,
+             "world should still contain resources"
+         );
+diff --git a/crates/bevy_ecs/src/schedule/mod.rs b/crates/bevy_ecs/src/schedule/mod.rs
+index a03825f9eda56..2d935d32d1b63 100644
+--- a/crates/bevy_ecs/src/schedule/mod.rs
++++ b/crates/bevy_ecs/src/schedule/mod.rs
+@@ -795,9 +795,6 @@ mod tests {
+         #[derive(Message)]
+         struct E;
+ 
+-        #[derive(Resource, Component)]
+-        struct RC;
+-
+         fn empty_system() {}
+         fn res_system(_res: Res<R>) {}
+         fn resmut_system(_res: ResMut<R>) {}
+@@ -957,21 +954,6 @@ mod tests {
+             assert_eq!(schedule.graph().conflicting_systems().len(), 3);
+         }
+ 
+-        /// Test that when a struct is both a Resource and a Component, they do not
+-        /// conflict with each other.
+-        #[test]
+-        fn shared_resource_mut_component() {
+-            let mut world = World::new();
+-            world.insert_resource(RC);
+-
+-            let mut schedule = Schedule::default();
+-            schedule.add_systems((|_: ResMut<RC>| {}, |_: Query<&mut RC>| {}));
+-
+-            let _ = schedule.initialize(&mut world);
+-
+-            assert_eq!(schedule.graph().conflicting_systems().len(), 0);
+-        }
+-
+         #[test]
+         fn resource_mut_and_entity_ref() {
+             let mut world = World::new();
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index 35afc7a96a3ac..1385061bc2f7e 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -2477,16 +2477,19 @@ mod tests {
+         }
+     }
+ 
+-    #[derive(Component, Resource)]
++    #[derive(Component)]
+     struct W<T>(T);
+ 
++    #[derive(Resource)]
++    struct V<T>(T);
++
+     fn simple_command(world: &mut World) {
+         world.spawn((W(0u32), W(42u64)));
+     }
+ 
+     impl FromWorld for W<String> {
+         fn from_world(world: &mut World) -> Self {
+-            let v = world.resource::<W<usize>>();
++            let v = world.resource::<V<usize>>();
+             Self("*".repeat(v.0))
+         }
+     }
+@@ -2527,7 +2530,7 @@ mod tests {
+             .or_insert(W(42));
+         queue.apply(&mut world);
+         assert_eq!(42, world.get::<W<u64>>(entity).unwrap().0);
+-        world.insert_resource(W(5_usize));
++        world.insert_resource(V(5_usize));
+         let mut commands = Commands::new(&mut queue, &world);
+         commands.entity(entity).entry::<W<String>>().or_from_world();
+         queue.apply(&mut world);
+@@ -2744,22 +2747,22 @@ mod tests {
+         let mut queue = CommandQueue::default();
+         {
+             let mut commands = Commands::new(&mut queue, &world);
+-            commands.insert_resource(W(123i32));
+-            commands.insert_resource(W(456.0f64));
++            commands.insert_resource(V(123i32));
++            commands.insert_resource(V(456.0f64));
+         }
+ 
+         queue.apply(&mut world);
+-        assert!(world.contains_resource::<W<i32>>());
+-        assert!(world.contains_resource::<W<f64>>());
++        assert!(world.contains_resource::<V<i32>>());
++        assert!(world.contains_resource::<V<f64>>());
+ 
+         {
+             let mut commands = Commands::new(&mut queue, &world);
+             // test resource removal
+-            commands.remove_resource::<W<i32>>();
++            commands.remove_resource::<V<i32>>();
+         }
+         queue.apply(&mut world);
+-        assert!(!world.contains_resource::<W<i32>>());
+-        assert!(world.contains_resource::<W<f64>>());
++        assert!(!world.contains_resource::<V<i32>>());
++        assert!(world.contains_resource::<V<f64>>());
+     }
+ 
+     #[test]
+@@ -2832,17 +2835,17 @@ mod tests {
+         let mut queue_1 = CommandQueue::default();
+         {
+             let mut commands = Commands::new(&mut queue_1, &world);
+-            commands.insert_resource(W(123i32));
++            commands.insert_resource(V(123i32));
+         }
+         let mut queue_2 = CommandQueue::default();
+         {
+             let mut commands = Commands::new(&mut queue_2, &world);
+-            commands.insert_resource(W(456.0f64));
++            commands.insert_resource(V(456.0f64));
+         }
+         queue_1.append(&mut queue_2);
+         queue_1.apply(&mut world);
+-        assert!(world.contains_resource::<W<i32>>());
+-        assert!(world.contains_resource::<W<f64>>());
++        assert!(world.contains_resource::<V<i32>>());
++        assert!(world.contains_resource::<V<f64>>());
+     }
+ 
+     #[test]
+diff --git a/crates/bevy_ecs/src/system/mod.rs b/crates/bevy_ecs/src/system/mod.rs
+index 22b6db8e4e936..2b9fe4319b973 100644
+--- a/crates/bevy_ecs/src/system/mod.rs
++++ b/crates/bevy_ecs/src/system/mod.rs
+@@ -432,19 +432,32 @@ mod tests {
+         No,
+     }
+ 
+-    #[derive(Component, Resource, Debug, Eq, PartialEq, Default)]
++    #[derive(Component, Debug, Eq, PartialEq, Default)]
+     struct A;
+-    #[derive(Component, Resource)]
++    #[derive(Component)]
+     struct B;
+-    #[derive(Component, Resource)]
++    #[derive(Component)]
+     struct C;
+-    #[derive(Component, Resource)]
++    #[derive(Component)]
+     struct D;
+-    #[derive(Component, Resource)]
++    #[derive(Component)]
+     struct E;
+-    #[derive(Component, Resource)]
++    #[derive(Component)]
+     struct F;
+ 
++    #[derive(Resource)]
++    struct ResA;
++    #[derive(Resource)]
++    struct ResB;
++    #[derive(Resource)]
++    struct ResC;
++    #[derive(Resource)]
++    struct ResD;
++    #[derive(Resource)]
++    struct ResE;
++    #[derive(Resource)]
++    struct ResF;
++
+     #[derive(Component, Debug)]
+     struct W<T>(T);
+ 
+@@ -913,8 +926,8 @@ mod tests {
+     fn test_for_conflicting_resources<Marker, S: IntoSystem<(), (), Marker>>(sys: S) {
+         let mut world = World::default();
+         world.insert_resource(BufferRes::default());
+-        world.insert_resource(A);
+-        world.insert_resource(B);
++        world.insert_resource(ResA);
++        world.insert_resource(ResB);
+         run_system(&mut world, sys);
+     }
+ 
+@@ -941,7 +954,7 @@ mod tests {
+ 
+     #[test]
+     fn nonconflicting_system_resources() {
+-        fn sys(_: Local<BufferRes>, _: ResMut<BufferRes>, _: Local<A>, _: ResMut<A>) {}
++        fn sys(_: Local<BufferRes>, _: ResMut<BufferRes>, _: Local<A>, _: ResMut<ResA>) {}
+         test_for_conflicting_resources(sys);
+     }
+ 
+@@ -1156,9 +1169,9 @@ mod tests {
+ 
+     #[test]
+     fn get_system_conflicts() {
+-        fn sys_x(_: Res<A>, _: Res<B>, _: Query<(&C, &D)>) {}
++        fn sys_x(_: Res<ResA>, _: Res<ResB>, _: Query<(&C, &D)>) {}
+ 
+-        fn sys_y(_: Res<A>, _: ResMut<B>, _: Query<(&C, &mut D)>) {}
++        fn sys_y(_: Res<ResA>, _: ResMut<ResB>, _: Query<(&C, &mut D)>) {}
+ 
+         let mut world = World::default();
+         let mut x = IntoSystem::into_system(sys_x);
+@@ -1169,7 +1182,7 @@ mod tests {
+         let conflicts = x_access.get_conflicts(&y_access);
+         let b_id = world
+             .components()
+-            .get_resource_id(TypeId::of::<B>())
++            .get_resource_id(TypeId::of::<ResB>())
+             .unwrap();
+         let d_id = world.components().get_id(TypeId::of::<D>()).unwrap();
+         assert_eq!(conflicts, vec![b_id, d_id].into());
+@@ -1202,12 +1215,12 @@ mod tests {
+     #[test]
+     fn can_have_16_parameters() {
+         fn sys_x(
+-            _: Res<A>,
+-            _: Res<B>,
+-            _: Res<C>,
+-            _: Res<D>,
+-            _: Res<E>,
+-            _: Res<F>,
++            _: Res<ResA>,
++            _: Res<ResB>,
++            _: Res<ResC>,
++            _: Res<ResD>,
++            _: Res<ResE>,
++            _: Res<ResF>,
+             _: Query<&A>,
+             _: Query<&B>,
+             _: Query<&C>,
+@@ -1221,12 +1234,12 @@ mod tests {
+         }
+         fn sys_y(
+             _: (
+-                Res<A>,
+-                Res<B>,
+-                Res<C>,
+-                Res<D>,
+-                Res<E>,
+-                Res<F>,
++                Res<ResA>,
++                Res<ResB>,
++                Res<ResC>,
++                Res<ResD>,
++                Res<ResE>,
++                Res<ResF>,
+                 Query<&A>,
+                 Query<&B>,
+                 Query<&C>,
+@@ -1392,19 +1405,23 @@ mod tests {
+         reason = "This test exists to show that read-only world-only queries can return data that lives as long as `'world`."
+     )]
+     fn long_life_test() {
++        struct ResourceHolder<'w> {
++            value: &'w ResA,
++        }
++
+         struct Holder<'w> {
+             value: &'w A,
+         }
+ 
+         struct State {
+-            state: SystemState<Res<'static, A>>,
++            state: SystemState<Res<'static, ResA>>,
+             state_q: SystemState<Query<'static, 'static, &'static A>>,
+         }
+ 
+         impl State {
+-            fn hold_res<'w>(&mut self, world: &'w World) -> Holder<'w> {
++            fn hold_res<'w>(&mut self, world: &'w World) -> ResourceHolder<'w> {
+                 let a = self.state.get(world);
+-                Holder {
++                ResourceHolder {
+                     value: a.into_inner(),
+                 }
+             }
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index 8986ec812a462..456e9522bdcad 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -459,10 +459,9 @@ mod tests {
+ 
+     #[test]
+     fn run_system_once() {
++        #[derive(Resource)]
+         struct T(usize);
+ 
+-        impl Resource for T {}
+-
+         fn system(In(n): In<usize>, mut commands: Commands) -> usize {
+             commands.insert_resource(T(n));
+             n + 1
+@@ -522,8 +521,9 @@ mod tests {
+ 
+     #[test]
+     fn run_system_once_invalid_params() {
++        #[derive(Resource)]
+         struct T;
+-        impl Resource for T {}
++
+         fn system(_: Res<T>) {}
+ 
+         let mut world = World::default();
+diff --git a/crates/bevy_ecs/src/system/system_registry.rs b/crates/bevy_ecs/src/system/system_registry.rs
+index 576773bb70b6e..9719fb4311981 100644
+--- a/crates/bevy_ecs/src/system/system_registry.rs
++++ b/crates/bevy_ecs/src/system/system_registry.rs
+@@ -995,8 +995,9 @@ mod tests {
+         use crate::system::RegisteredSystemError;
+         use alloc::string::ToString;
+ 
++        #[derive(Resource)]
+         struct T;
+-        impl Resource for T {}
++
+         fn system(_: Res<T>) {}
+ 
+         let mut world = World::new();
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 024c127aab8b2..6bee7953b13a3 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -3735,7 +3735,7 @@ mod tests {
+         Drop(ID),
+     }
+ 
+-    #[derive(Resource, Component)]
++    #[derive(Component)]
+     struct MayPanicInDrop {
+         drop_log: Arc<Mutex<Vec<DropLogItem>>>,
+         expected_panic_flag: Arc<AtomicBool>,
+diff --git a/crates/bevy_scene/src/dynamic_scene_builder.rs b/crates/bevy_scene/src/dynamic_scene_builder.rs
+index feddacfdfb091..3acef88a1c8bb 100644
+--- a/crates/bevy_scene/src/dynamic_scene_builder.rs
++++ b/crates/bevy_scene/src/dynamic_scene_builder.rs
+@@ -703,19 +703,24 @@ mod tests {
+ 
+     #[test]
+     fn should_use_from_reflect() {
+-        #[derive(Resource, Component, Reflect)]
+-        #[reflect(Resource, Component)]
++        #[derive(Component, Reflect)]
++        #[reflect(Component)]
+         struct SomeType(i32);
+ 
++        #[derive(Resource, Reflect)]
++        #[reflect(Resource)]
++        struct SomeResource(i32);
++
+         let mut world = World::default();
+         let atr = AppTypeRegistry::default();
+         {
+             let mut register = atr.write();
+             register.register::<SomeType>();
++            register.register::<SomeResource>();
+         }
+         world.insert_resource(atr);
+ 
+-        world.insert_resource(SomeType(123));
++        world.insert_resource(SomeResource(123));
+         let entity = world.spawn(SomeType(123)).id();
+ 
+         let scene = DynamicSceneBuilder::from_world(&world)
+@@ -733,6 +738,6 @@ mod tests {
+         assert!(resource
+             .try_as_reflect()
+             .expect("resource should be concrete due to `FromReflect`")
+-            .is::<SomeType>());
++            .is::<SomeResource>());
+     }
+ }

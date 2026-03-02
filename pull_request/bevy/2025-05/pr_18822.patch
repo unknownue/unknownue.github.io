@@ -1,0 +1,454 @@
+diff --git a/crates/bevy_platform/Cargo.toml b/crates/bevy_platform/Cargo.toml
+index bd6402b36a96b..bd44eb00739a5 100644
+--- a/crates/bevy_platform/Cargo.toml
++++ b/crates/bevy_platform/Cargo.toml
+@@ -46,7 +46,6 @@ critical-section = ["dep:critical-section", "portable-atomic/critical-section"]
+ web = ["dep:web-time", "dep:getrandom"]
+ 
+ [dependencies]
+-cfg-if = "1.0.0"
+ critical-section = { version = "1.2.0", default-features = false, optional = true }
+ spin = { version = "0.9.8", default-features = false, features = [
+   "mutex",
+diff --git a/crates/bevy_platform/src/cfg.rs b/crates/bevy_platform/src/cfg.rs
+new file mode 100644
+index 0000000000000..6f86ce187350e
+--- /dev/null
++++ b/crates/bevy_platform/src/cfg.rs
+@@ -0,0 +1,264 @@
++//! Provides helpful configuration macros, allowing detection of platform features such as
++//! [`alloc`](crate::cfg::alloc) or [`std`](crate::cfg::std) without explicit features.
++
++/// Provides a `match`-like expression similar to [`cfg_if`] and based on the experimental
++/// [`cfg_match`].
++/// The name `switch` is used to avoid conflict with the `match` keyword.
++/// Arms are evaluated top to bottom, and an optional wildcard arm can be provided if no match
++/// can be made.
++///
++/// An arm can either be:
++/// - a `cfg(...)` pattern (e.g., `feature = "foo"`)
++/// - a wildcard `_`
++/// - an alias defined using [`define_alias`]
++///
++/// Common aliases are provided by [`cfg`](crate::cfg).
++/// Note that aliases are evaluated from the context of the defining crate, not the consumer.
++///
++/// # Examples
++///
++/// ```
++/// # use bevy_platform::cfg;
++/// # fn log(_: &str) {}
++/// # fn foo(_: &str) {}
++/// #
++/// cfg::switch! {
++///     #[cfg(feature = "foo")] => {
++///         foo("We have the `foo` feature!")
++///     }
++///     cfg::std => {
++///         extern crate std;
++///         std::println!("No `foo`, but we have `std`!");
++///     }
++///     _ => {
++///         log("Don't have `std` or `foo`");
++///     }
++/// }
++/// ```
++///
++/// [`cfg_if`]: https://crates.io/crates/cfg-if
++/// [`cfg_match`]: https://github.com/rust-lang/rust/issues/115585
++#[doc(inline)]
++pub use crate::switch;
++
++/// Defines an alias for a particular configuration.
++/// This has two advantages over directly using `#[cfg(...)]`:
++///
++/// 1. Complex configurations can be abbreviated to more meaningful shorthand.
++/// 2. Features are evaluated in the context of the _defining_ crate, not the consuming.
++///
++/// The second advantage is a particularly powerful tool, as it allows consuming crates to use
++/// functionality in a defining crate regardless of what crate in the dependency graph enabled the
++/// relevant feature.
++///
++/// For example, consider a crate `foo` that depends on another crate `bar`.
++/// `bar` has a feature "`faster_algorithms`".
++/// If `bar` defines a "`faster_algorithms`" alias:
++///
++/// ```ignore
++/// define_alias! {
++///     #[cfg(feature = "faster_algorithms")] => { faster_algorithms }
++/// }
++/// ```
++///
++/// Now, `foo` can gate its usage of those faster algorithms on the alias, avoiding the need to
++/// expose its own "`faster_algorithms`" feature.
++/// This also avoids the unfortunate situation where one crate activates "`faster_algorithms`" on
++/// `bar` without activating that same feature on `foo`.
++///
++/// Once an alias is defined, there are 4 ways you can use it:
++///
++/// 1. Evaluate with no contents to return a `bool` indicating if the alias is active.
++///    ```
++///    # use bevy_platform::cfg;
++///    if cfg::std!() {
++///        // Have `std`!
++///    } else {
++///        // No `std`...
++///    }
++///    ```
++/// 2. Pass a single code block which will only be compiled if the alias is active.
++///    ```
++///    # use bevy_platform::cfg;
++///    cfg::std! {
++///        // Have `std`!
++///    # ()
++///    }
++///    ```
++/// 3. Pass a single `if { ... } else { ... }` expression to conditionally compile either the first
++///    or the second code block.
++///    ```
++///    # use bevy_platform::cfg;
++///    cfg::std! {
++///        if {
++///            // Have `std`!
++///        } else {
++///            // No `std`...
++///        }
++///    }
++///    ```
++/// 4. Use in a [`switch`] arm for more complex conditional compilation.
++///    ```
++///    # use bevy_platform::cfg;
++///    cfg::switch! {
++///        cfg::std => {
++///            // Have `std`!
++///        }
++///        cfg::alloc => {
++///            // No `std`, but do have `alloc`!
++///        }
++///        _ => {
++///            // No `std` or `alloc`...
++///        }
++///    }
++///    ```
++#[doc(inline)]
++pub use crate::define_alias;
++
++/// Macro which represents an enabled compilation condition.
++#[doc(inline)]
++pub use crate::enabled;
++
++/// Macro which represents a disabled compilation condition.
++#[doc(inline)]
++pub use crate::disabled;
++
++#[doc(hidden)]
++#[macro_export]
++macro_rules! switch {
++    ({ $($tt:tt)* }) => {{
++        $crate::switch! { $($tt)* }
++    }};
++    (_ => { $($output:tt)* }) => {
++        $($output)*
++    };
++    (
++        $cond:path => $output:tt
++        $($( $rest:tt )+)?
++    ) => {
++        $cond! {
++            if {
++                $crate::switch! { _ => $output }
++            } else {
++                $(
++                    $crate::switch! { $($rest)+ }
++                )?
++            }
++        }
++    };
++    (
++        #[cfg($cfg:meta)] => $output:tt
++        $($( $rest:tt )+)?
++    ) => {
++        #[cfg($cfg)]
++        $crate::switch! { _ => $output }
++        $(
++            #[cfg(not($cfg))]
++            $crate::switch! { $($rest)+ }
++        )?
++    };
++}
++
++#[doc(hidden)]
++#[macro_export]
++macro_rules! disabled {
++    () => { false };
++    (if { $($p:tt)* } else { $($n:tt)* }) => { $($n)* };
++    ($($p:tt)*) => {};
++}
++
++#[doc(hidden)]
++#[macro_export]
++macro_rules! enabled {
++    () => { true };
++    (if { $($p:tt)* } else { $($n:tt)* }) => { $($p)* };
++    ($($p:tt)*) => { $($p)* };
++}
++
++#[doc(hidden)]
++#[macro_export]
++macro_rules! define_alias {
++    (
++        #[cfg($meta:meta)] => $p:ident
++        $(, $( $rest:tt )+)?
++    ) => {
++        $crate::define_alias! {
++            #[cfg($meta)] => { $p }
++            $(
++                $($rest)+
++            )?
++        }
++    };
++    (
++        #[cfg($meta:meta)] => $p:ident,
++        $($( $rest:tt )+)?
++    ) => {
++        $crate::define_alias! {
++            #[cfg($meta)] => { $p }
++            $(
++                $($rest)+
++            )?
++        }
++    };
++    (
++        #[cfg($meta:meta)] => {
++            $(#[$p_meta:meta])*
++            $p:ident
++        }
++        $($( $rest:tt )+)?
++    ) => {
++        $crate::switch! {
++            #[cfg($meta)] => {
++                $(#[$p_meta])*
++                #[doc(inline)]
++                ///
++                #[doc = concat!("This macro passes the provided code because `#[cfg(", stringify!($meta), ")]` is currently active.")]
++                pub use $crate::enabled as $p;
++            }
++            _ => {
++                $(#[$p_meta])*
++                #[doc(inline)]
++                ///
++                #[doc = concat!("This macro suppresses the provided code because `#[cfg(", stringify!($meta), ")]` is _not_ currently active.")]
++                pub use $crate::disabled as $p;
++            }
++        }
++
++        $(
++            $crate::define_alias! {
++                $($rest)+
++            }
++        )?
++    }
++}
++
++define_alias! {
++    #[cfg(feature = "alloc")] => {
++        /// Indicates the `alloc` crate is available and can be used.
++        alloc
++    }
++    #[cfg(feature = "std")] => {
++        /// Indicates the `std` crate is available and can be used.
++        std
++    }
++    #[cfg(panic = "unwind")] => {
++        /// Indicates that a [`panic`] will be unwound, and can be potentially caught.
++        panic_unwind
++    }
++    #[cfg(panic = "abort")] => {
++        /// Indicates that a [`panic`] will lead to an abort, and cannot be caught.
++        panic_abort
++    }
++    #[cfg(all(target_arch = "wasm32", feature = "web"))] => {
++        /// Indicates that this target has access to browser APIs.
++        web
++    }
++    #[cfg(all(feature = "alloc", target_has_atomic = "ptr"))] => {
++        /// Indicates that this target has access to a native implementation of `Arc`.
++        arc
++    }
++    #[cfg(feature = "critical-section")] => {
++        /// Indicates `critical-section` is available.
++        critical_section
++    }
++}
+diff --git a/crates/bevy_platform/src/lib.rs b/crates/bevy_platform/src/lib.rs
+index 96f2f9a21cf9c..668442f29929f 100644
+--- a/crates/bevy_platform/src/lib.rs
++++ b/crates/bevy_platform/src/lib.rs
+@@ -9,20 +9,22 @@
+ //!
+ //! [Bevy]: https://bevyengine.org/
+ 
+-#[cfg(feature = "std")]
+-extern crate std;
++cfg::std! {
++    extern crate std;
++}
++
++cfg::alloc! {
++    extern crate alloc;
+ 
+-#[cfg(feature = "alloc")]
+-extern crate alloc;
++    pub mod collections;
++}
+ 
++pub mod cfg;
+ pub mod hash;
+ pub mod sync;
+ pub mod thread;
+ pub mod time;
+ 
+-#[cfg(feature = "alloc")]
+-pub mod collections;
+-
+ /// Frequently used items which would typically be included in most contexts.
+ ///
+ /// When adding `no_std` support to a crate for the first time, often there's a substantial refactor
+@@ -33,10 +35,11 @@ pub mod collections;
+ /// This prelude aims to ease the transition by re-exporting items from `alloc` which would
+ /// otherwise be included in the `std` implicit prelude.
+ pub mod prelude {
+-    #[cfg(feature = "alloc")]
+-    pub use alloc::{
+-        borrow::ToOwned, boxed::Box, format, string::String, string::ToString, vec, vec::Vec,
+-    };
++    crate::cfg::alloc! {
++        pub use alloc::{
++            borrow::ToOwned, boxed::Box, format, string::String, string::ToString, vec, vec::Vec,
++        };
++    }
+ 
+     // Items from `std::prelude` that are missing in this module:
+     // * dbg
+diff --git a/crates/bevy_platform/src/sync/mod.rs b/crates/bevy_platform/src/sync/mod.rs
+index 8fb7a2fbffaae..79ceff7ee82c2 100644
+--- a/crates/bevy_platform/src/sync/mod.rs
++++ b/crates/bevy_platform/src/sync/mod.rs
+@@ -14,8 +14,17 @@ pub use once::{Once, OnceLock, OnceState};
+ pub use poison::{LockResult, PoisonError, TryLockError, TryLockResult};
+ pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+ 
+-#[cfg(feature = "alloc")]
+-pub use arc::{Arc, Weak};
++crate::cfg::alloc! {
++    pub use arc::{Arc, Weak};
++
++    crate::cfg::arc! {
++        if {
++            use alloc::sync as arc;
++        } else {
++            use portable_atomic_util as arc;
++        }
++    }
++}
+ 
+ pub mod atomic;
+ 
+@@ -25,9 +34,3 @@ mod mutex;
+ mod once;
+ mod poison;
+ mod rwlock;
+-
+-#[cfg(all(feature = "alloc", not(target_has_atomic = "ptr")))]
+-use portable_atomic_util as arc;
+-
+-#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+-use alloc::sync as arc;
+diff --git a/crates/bevy_platform/src/thread.rs b/crates/bevy_platform/src/thread.rs
+index e1d593c90b4d3..6e4650382ef8a 100644
+--- a/crates/bevy_platform/src/thread.rs
++++ b/crates/bevy_platform/src/thread.rs
+@@ -2,11 +2,13 @@
+ 
+ pub use thread::sleep;
+ 
+-cfg_if::cfg_if! {
++crate::cfg::switch! {
+     // TODO: use browser timeouts based on ScheduleRunnerPlugin::build
+-    if #[cfg(feature = "std")] {
++    // crate::cfg::web => { ... }
++    crate::cfg::std => {
+         use std::thread;
+-    } else {
++    }
++    _ => {
+         mod fallback {
+             use core::{hint::spin_loop, time::Duration};
+ 
+diff --git a/crates/bevy_platform/src/time/fallback.rs b/crates/bevy_platform/src/time/fallback.rs
+index c438e6e3795a4..c649f6a49deb6 100644
+--- a/crates/bevy_platform/src/time/fallback.rs
++++ b/crates/bevy_platform/src/time/fallback.rs
+@@ -149,28 +149,31 @@ impl fmt::Debug for Instant {
+ }
+ 
+ fn unset_getter() -> Duration {
+-    cfg_if::cfg_if! {
+-        if #[cfg(target_arch = "x86")] {
++    crate::cfg::switch! {
++        #[cfg(target_arch = "x86")] => {
+             // SAFETY: standard technique for getting a nanosecond counter on x86
+             let nanos = unsafe {
+                 core::arch::x86::_rdtsc()
+             };
+-            Duration::from_nanos(nanos)
+-        } else if #[cfg(target_arch = "x86_64")] {
++            return Duration::from_nanos(nanos);
++        }
++        #[cfg(target_arch = "x86_64")] => {
+             // SAFETY: standard technique for getting a nanosecond counter on x86_64
+             let nanos = unsafe {
+                 core::arch::x86_64::_rdtsc()
+             };
+-            Duration::from_nanos(nanos)
+-        } else if #[cfg(target_arch = "aarch64")] {
++            return Duration::from_nanos(nanos);
++        }
++        #[cfg(target_arch = "aarch64")] => {
+             // SAFETY: standard technique for getting a nanosecond counter of aarch64
+             let nanos = unsafe {
+                 let mut ticks: u64;
+                 core::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks);
+                 ticks
+             };
+-            Duration::from_nanos(nanos)
+-        } else {
++            return Duration::from_nanos(nanos);
++        }
++        _ => {
+             panic!("An elapsed time getter has not been provided to `Instant`. Please use `Instant::set_elapsed(...)` before calling `Instant::now()`")
+         }
+     }
+diff --git a/crates/bevy_platform/src/time/mod.rs b/crates/bevy_platform/src/time/mod.rs
+index 260d8e4aea124..10b9d3d1314a1 100644
+--- a/crates/bevy_platform/src/time/mod.rs
++++ b/crates/bevy_platform/src/time/mod.rs
+@@ -2,12 +2,14 @@
+ 
+ pub use time::Instant;
+ 
+-cfg_if::cfg_if! {
+-    if #[cfg(all(target_arch = "wasm32", feature = "web"))] {
++crate::cfg::switch! {
++    crate::cfg::web => {
+         use web_time as time;
+-    } else if #[cfg(feature = "std")] {
++    }
++    crate::cfg::std => {
+         use std::time;
+-    } else {
++    }
++    _ => {
+         mod fallback;
+ 
+         use fallback as time;

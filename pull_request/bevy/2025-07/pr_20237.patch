@@ -1,0 +1,308 @@
+diff --git a/crates/bevy_feathers/Cargo.toml b/crates/bevy_feathers/Cargo.toml
+index 07d883704ac73..5402b4f822768 100644
+--- a/crates/bevy_feathers/Cargo.toml
++++ b/crates/bevy_feathers/Cargo.toml
+@@ -21,11 +21,13 @@ bevy_log = { path = "../bevy_log", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev" }
+ bevy_platform = { path = "../bevy_platform", version = "0.17.0-dev" }
++bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
+ bevy_ui = { path = "../bevy_ui", version = "0.17.0-dev", features = [
+   "bevy_ui_picking_backend",
+ ] }
++bevy_ui_render = { path = "../bevy_ui_render", version = "0.17.0-dev" }
+ bevy_window = { path = "../bevy_window", version = "0.17.0-dev" }
+ bevy_winit = { path = "../bevy_winit", version = "0.17.0-dev" }
+ 
+diff --git a/crates/bevy_feathers/src/alpha_pattern.rs b/crates/bevy_feathers/src/alpha_pattern.rs
+new file mode 100644
+index 0000000000000..5401006a49176
+--- /dev/null
++++ b/crates/bevy_feathers/src/alpha_pattern.rs
+@@ -0,0 +1,59 @@
++use bevy_app::Plugin;
++use bevy_asset::{Asset, Assets, Handle};
++use bevy_ecs::{
++    component::Component,
++    lifecycle::Add,
++    observer::On,
++    resource::Resource,
++    system::{Query, Res},
++    world::FromWorld,
++};
++use bevy_reflect::TypePath;
++use bevy_render::render_resource::{AsBindGroup, ShaderRef};
++use bevy_ui_render::ui_material::{MaterialNode, UiMaterial};
++
++#[derive(AsBindGroup, Asset, TypePath, Default, Debug, Clone)]
++pub(crate) struct AlphaPatternMaterial {}
++
++impl UiMaterial for AlphaPatternMaterial {
++    fn fragment_shader() -> ShaderRef {
++        "embedded://bevy_feathers/assets/shaders/alpha_pattern.wgsl".into()
++    }
++}
++
++#[derive(Resource)]
++pub(crate) struct AlphaPatternResource(pub(crate) Handle<AlphaPatternMaterial>);
++
++impl FromWorld for AlphaPatternResource {
++    fn from_world(world: &mut bevy_ecs::world::World) -> Self {
++        let mut ui_materials = world
++            .get_resource_mut::<Assets<AlphaPatternMaterial>>()
++            .unwrap();
++        Self(ui_materials.add(AlphaPatternMaterial::default()))
++    }
++}
++
++/// Marker that tells us we want to fill in the [`MaterialNode`] with the alpha material.
++#[derive(Component, Default, Clone)]
++pub(crate) struct AlphaPattern;
++
++/// Observer to fill in the material handle (since we don't have access to the materials asset
++/// in the template)
++fn on_add_alpha_pattern(
++    ev: On<Add, AlphaPattern>,
++    mut q_material_node: Query<&mut MaterialNode<AlphaPatternMaterial>>,
++    r_material: Res<AlphaPatternResource>,
++) {
++    if let Ok(mut material) = q_material_node.get_mut(ev.target()) {
++        material.0 = r_material.0.clone();
++    }
++}
++
++/// Plugin which registers the systems for updating the button styles.
++pub struct AlphaPatternPlugin;
++
++impl Plugin for AlphaPatternPlugin {
++    fn build(&self, app: &mut bevy_app::App) {
++        app.add_observer(on_add_alpha_pattern);
++    }
++}
+diff --git a/crates/bevy_feathers/src/assets/shaders/alpha_pattern.wgsl b/crates/bevy_feathers/src/assets/shaders/alpha_pattern.wgsl
+new file mode 100644
+index 0000000000000..053645ed5b89c
+--- /dev/null
++++ b/crates/bevy_feathers/src/assets/shaders/alpha_pattern.wgsl
+@@ -0,0 +1,39 @@
++// This shader draws a checkerboard pattern
++#import bevy_ui::ui_vertex_output::UiVertexOutput
++
++@fragment
++fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
++    let uv = (in.uv - vec2<f32>(0.5, 0.5)) * in.size / 16.;
++    let check = select(0.0, 1.0, (fract(uv.x) < 0.5) != (fract(uv.y) < 0.5));
++    let bg = mix(vec3<f32>(0.2, 0.2, 0.2), vec3<f32>(0.6, 0.6, 0.6), check);
++
++    let size = vec2<f32>(in.size.x, in.size.y);
++    let external_distance = sd_rounded_box((in.uv - 0.5) * size, size, in.border_radius);
++    let alpha = smoothstep(0.5, -0.5, external_distance);
++
++    return vec4<f32>(bg, alpha);
++}
++
++// From: https://github.com/bevyengine/bevy/pull/8973
++// The returned value is the shortest distance from the given point to the boundary of the rounded box.
++// Negative values indicate that the point is inside the rounded box, positive values that the point is outside, and zero is exactly on the boundary.
++// arguments
++// point -> The function will return the distance from this point to the closest point on the boundary.
++// size -> The maximum width and height of the box.
++// corner_radii -> The radius of each rounded corner. Ordered counter clockwise starting top left:
++//                      x = top left, y = top right, z = bottom right, w = bottom left.
++fn sd_rounded_box(point: vec2<f32>, size: vec2<f32>, corner_radii: vec4<f32>) -> f32 {
++    // if 0.0 < y then select bottom left (w) and bottom right corner radius (z)
++    // else select top left (x) and top right corner radius (y)
++    let rs = select(corner_radii.xy, corner_radii.wz, 0.0 < point.y);
++    // w and z are swapped so that both pairs are in left to right order, otherwise this second select statement would return the incorrect value for the bottom pair.
++    let radius = select(rs.x, rs.y, 0.0 < point.x);
++    // Vector from the corner closest to the point, to the point
++    let corner_to_point = abs(point) - 0.5 * size;
++    // Vector from the center of the radius circle to the point
++    let q = corner_to_point + radius;
++    // length from center of the radius circle to the point, 0s a component if the point is not within the quadrant of the radius circle that is part of the curved corner.
++    let l = length(max(q, vec2(0.0)));
++    let m = min(max(q.x, q.y), 0.0);
++    return l + m - radius;
++}
+diff --git a/crates/bevy_feathers/src/controls/color_swatch.rs b/crates/bevy_feathers/src/controls/color_swatch.rs
+new file mode 100644
+index 0000000000000..b43497805f6cd
+--- /dev/null
++++ b/crates/bevy_feathers/src/controls/color_swatch.rs
+@@ -0,0 +1,53 @@
++use bevy_asset::Handle;
++use bevy_color::Alpha;
++use bevy_ecs::{bundle::Bundle, children, component::Component, spawn::SpawnRelated};
++use bevy_ui::{BackgroundColor, BorderRadius, Node, PositionType, Val};
++use bevy_ui_render::ui_material::MaterialNode;
++
++use crate::{
++    alpha_pattern::{AlphaPattern, AlphaPatternMaterial},
++    constants::size,
++    palette,
++};
++
++/// Marker identifying a color swatch.
++#[derive(Component, Default, Clone)]
++pub struct ColorSwatch;
++
++/// Marker identifying the color swatch foreground, the piece that actually displays the color
++/// in front of the alpha pattern. This exists so that users can reach in and change the color
++/// dynamically.
++#[derive(Component, Default, Clone)]
++pub struct ColorSwatchFg;
++
++/// Template function to spawn a color swatch.
++///
++/// # Arguments
++/// * `overrides` - a bundle of components that are merged in with the normal swatch components.
++pub fn color_swatch<B: Bundle>(overrides: B) -> impl Bundle {
++    (
++        Node {
++            height: size::ROW_HEIGHT,
++            min_width: size::ROW_HEIGHT,
++            ..Default::default()
++        },
++        ColorSwatch,
++        AlphaPattern,
++        MaterialNode::<AlphaPatternMaterial>(Handle::default()),
++        BorderRadius::all(Val::Px(5.0)),
++        overrides,
++        children![(
++            Node {
++                position_type: PositionType::Absolute,
++                left: Val::Px(0.),
++                top: Val::Px(0.),
++                bottom: Val::Px(0.),
++                right: Val::Px(0.),
++                ..Default::default()
++            },
++            ColorSwatchFg,
++            BackgroundColor(palette::ACCENT.with_alpha(0.5)),
++            BorderRadius::all(Val::Px(5.0))
++        ),],
++    )
++}
+diff --git a/crates/bevy_feathers/src/controls/mod.rs b/crates/bevy_feathers/src/controls/mod.rs
+index ecad39707b925..32bcf2bfc80c6 100644
+--- a/crates/bevy_feathers/src/controls/mod.rs
++++ b/crates/bevy_feathers/src/controls/mod.rs
+@@ -3,22 +3,27 @@ use bevy_app::Plugin;
+ 
+ mod button;
+ mod checkbox;
++mod color_swatch;
+ mod radio;
+ mod slider;
+ mod toggle_switch;
+ 
+ pub use button::{button, ButtonPlugin, ButtonProps, ButtonVariant};
+ pub use checkbox::{checkbox, CheckboxPlugin, CheckboxProps};
++pub use color_swatch::{color_swatch, ColorSwatch, ColorSwatchFg};
+ pub use radio::{radio, RadioPlugin};
+ pub use slider::{slider, SliderPlugin, SliderProps};
+ pub use toggle_switch::{toggle_switch, ToggleSwitchPlugin, ToggleSwitchProps};
+ 
++use crate::alpha_pattern::AlphaPatternPlugin;
++
+ /// Plugin which registers all `bevy_feathers` controls.
+ pub struct ControlsPlugin;
+ 
+ impl Plugin for ControlsPlugin {
+     fn build(&self, app: &mut bevy_app::App) {
+         app.add_plugins((
++            AlphaPatternPlugin,
+             ButtonPlugin,
+             CheckboxPlugin,
+             RadioPlugin,
+diff --git a/crates/bevy_feathers/src/lib.rs b/crates/bevy_feathers/src/lib.rs
+index ab02304a85b30..88ae6c03276e5 100644
+--- a/crates/bevy_feathers/src/lib.rs
++++ b/crates/bevy_feathers/src/lib.rs
+@@ -22,14 +22,17 @@ use bevy_app::{HierarchyPropagatePlugin, Plugin, PostUpdate};
+ use bevy_asset::embedded_asset;
+ use bevy_ecs::query::With;
+ use bevy_text::{TextColor, TextFont};
++use bevy_ui_render::UiMaterialPlugin;
+ use bevy_winit::cursor::CursorIcon;
+ 
+ use crate::{
++    alpha_pattern::{AlphaPatternMaterial, AlphaPatternResource},
+     controls::ControlsPlugin,
+     cursor::{CursorIconPlugin, DefaultCursorIcon},
+     theme::{ThemedText, UiTheme},
+ };
+ 
++mod alpha_pattern;
+ pub mod constants;
+ pub mod controls;
+ pub mod cursor;
+@@ -48,17 +51,22 @@ impl Plugin for FeathersPlugin {
+     fn build(&self, app: &mut bevy_app::App) {
+         app.init_resource::<UiTheme>();
+ 
++        // Embedded font
+         embedded_asset!(app, "assets/fonts/FiraSans-Bold.ttf");
+         embedded_asset!(app, "assets/fonts/FiraSans-BoldItalic.ttf");
+         embedded_asset!(app, "assets/fonts/FiraSans-Regular.ttf");
+         embedded_asset!(app, "assets/fonts/FiraSans-Italic.ttf");
+         embedded_asset!(app, "assets/fonts/FiraMono-Medium.ttf");
+ 
++        // Embedded shader
++        embedded_asset!(app, "assets/shaders/alpha_pattern.wgsl");
++
+         app.add_plugins((
+             ControlsPlugin,
+             CursorIconPlugin,
+             HierarchyPropagatePlugin::<TextColor, With<ThemedText>>::default(),
+             HierarchyPropagatePlugin::<TextFont, With<ThemedText>>::default(),
++            UiMaterialPlugin::<AlphaPatternMaterial>::default(),
+         ));
+ 
+         app.insert_resource(DefaultCursorIcon(CursorIcon::System(
+@@ -70,5 +78,7 @@ impl Plugin for FeathersPlugin {
+             .add_observer(theme::on_changed_border)
+             .add_observer(theme::on_changed_font_color)
+             .add_observer(font_styles::on_changed_font);
++
++        app.init_resource::<AlphaPatternResource>();
+     }
+ }
+diff --git a/examples/ui/feathers.rs b/examples/ui/feathers.rs
+index 2e8a68320ec94..94af8279e8853 100644
+--- a/examples/ui/feathers.rs
++++ b/examples/ui/feathers.rs
+@@ -7,8 +7,8 @@ use bevy::{
+     },
+     feathers::{
+         controls::{
+-            button, checkbox, radio, slider, toggle_switch, ButtonProps, ButtonVariant,
+-            CheckboxProps, SliderProps, ToggleSwitchProps,
++            button, checkbox, color_swatch, radio, slider, toggle_switch, ButtonProps,
++            ButtonVariant, CheckboxProps, SliderProps, ToggleSwitchProps,
+         },
+         dark_theme::create_dark_theme,
+         rounded_corners::RoundedCorners,
+@@ -276,6 +276,7 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                     },
+                     (SliderStep(10.), SliderPrecision(2)),
+                 ),
++                color_swatch(()),
+             ]
+         ),],
+     )
+diff --git a/release-content/release-notes/feathers.md b/release-content/release-notes/feathers.md
+index 16d0cd5b709e7..34166b3f4de27 100644
+--- a/release-content/release-notes/feathers.md
++++ b/release-content/release-notes/feathers.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Bevy Feathers
+ authors: ["@viridia", "@Atlas16A"]
+-pull_requests: [19730, 19900, 19928]
++pull_requests: [19730, 19900, 19928, 20237]
+ ---
+ 
+ To make it easier for Bevy engine developers and third-party tool creators to make comfortable, visually cohesive tooling,

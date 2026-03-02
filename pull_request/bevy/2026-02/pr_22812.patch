@@ -1,0 +1,132 @@
+diff --git a/crates/bevy_gizmos/src/config.rs b/crates/bevy_gizmos/src/config.rs
+index 33344817a12fb..7db5bf8ca68e2 100644
+--- a/crates/bevy_gizmos/src/config.rs
++++ b/crates/bevy_gizmos/src/config.rs
+@@ -110,13 +110,31 @@ impl GizmoConfigStore {
+     }
+ 
+     /// Returns [`GizmoConfig`] and [`GizmoConfigGroup`] associated with [`GizmoConfigGroup`] `T`
++    ///
++    /// # Panics
++    /// If the config does not exist for [`GizmoConfigGroup`] `T`
++    ///
++    /// For a non-panicking version, see [`get_config`].
++    ///
++    /// [`get_config`]: Self::get_config
+     pub fn config<T: GizmoConfigGroup>(&self) -> (&GizmoConfig, &T) {
+-        let Some((config, ext)) = self.get_config_dyn(&TypeId::of::<T>()) else {
++        let Some(configs) = self.get_config() else {
+             panic!("Requested config {} does not exist in `GizmoConfigStore`! Did you forget to add it using `app.init_gizmo_group<T>()`?", T::type_path());
+         };
++        configs
++    }
++
++    /// Returns Some([`GizmoConfig`] and [`GizmoConfigGroup`] associated with [`GizmoConfigGroup`] `T` if they exist,
++    /// else None.
++    ///
++    /// If the configs will always be present, use [`config`].
++    ///
++    /// [`config`]: Self::config
++    pub fn get_config<T: GizmoConfigGroup>(&self) -> Option<(&GizmoConfig, &T)> {
++        let (config, ext) = self.get_config_dyn(&TypeId::of::<T>())?;
+         // hash map invariant guarantees that &dyn Reflect is of correct type T
+         let ext = ext.as_any().downcast_ref().unwrap();
+-        (config, ext)
++        Some((config, ext))
+     }
+ 
+     /// Returns mutable [`GizmoConfig`] and [`GizmoConfigGroup`] associated with [`TypeId`] of a [`GizmoConfigGroup`]
+@@ -129,13 +147,31 @@ impl GizmoConfigStore {
+     }
+ 
+     /// Returns mutable [`GizmoConfig`] and [`GizmoConfigGroup`] associated with [`GizmoConfigGroup`] `T`
++    ///
++    /// # Panics
++    /// If the config does not exist for [`GizmoConfigGroup`] `T`
++    ///
++    /// For a non-panicking version, see [`get_config_mut`].
++    ///
++    /// [`get_config_mut`]: Self::get_config_mut
+     pub fn config_mut<T: GizmoConfigGroup>(&mut self) -> (&mut GizmoConfig, &mut T) {
+-        let Some((config, ext)) = self.get_config_mut_dyn(&TypeId::of::<T>()) else {
++        let Some(configs) = self.get_config_mut() else {
+             panic!("Requested config {} does not exist in `GizmoConfigStore`! Did you forget to add it using `app.init_gizmo_group<T>()`?", T::type_path());
+         };
++        configs
++    }
++
++    /// Returns mutable Some([`GizmoConfig`] and [`GizmoConfigGroup`]) associated with [`GizmoConfigGroup`] `T` if they exist,
++    /// else None
++    ///
++    /// If the configs will always be present, use [`config_mut`].
++    ///
++    /// [`config_mut`]: Self::config_mut
++    pub fn get_config_mut<T: GizmoConfigGroup>(&mut self) -> Option<(&mut GizmoConfig, &mut T)> {
++        let (config, ext) = self.get_config_mut_dyn(&TypeId::of::<T>())?;
+         // hash map invariant guarantees that &dyn Reflect is of correct type T
+         let ext = ext.as_any_mut().downcast_mut().unwrap();
+-        (config, ext)
++        Some((config, ext))
+     }
+ 
+     /// Returns an iterator over all [`GizmoConfig`]s.
+diff --git a/crates/bevy_gizmos/src/gizmos.rs b/crates/bevy_gizmos/src/gizmos.rs
+index cb368561787a5..7ebd14669a5d4 100644
+--- a/crates/bevy_gizmos/src/gizmos.rs
++++ b/crates/bevy_gizmos/src/gizmos.rs
+@@ -230,9 +230,28 @@ where
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+     ) -> Result<(), SystemParamValidationError> {
+-        // SAFETY: Delegated to existing `SystemParam` implementations.
++        // SAFETY: Delegated to existing `SystemParam` implementation.
+         unsafe {
+-            GizmosState::<Config, Clear>::validate_param(&mut state.state, system_meta, world)
++            GizmosState::<Config, Clear>::validate_param(&mut state.state, system_meta, world)?;
++        }
++
++        // SAFETY: Delegated to existing `SystemParam` implementation.
++        let (_, f1) = unsafe {
++            GizmosState::<Config, Clear>::get_param(
++                &mut state.state,
++                system_meta,
++                world,
++                world.change_tick(),
++            )
++        };
++        // This if-block is to accommodate an Option<Gizmos> SystemParam.
++        // The user may decide not to initialize a gizmo group, so its config will not exist.
++        if f1.get_config::<Config>().is_none() {
++            Err(SystemParamValidationError::invalid::<Self>(
++                format!("Requested config {} does not exist in `GizmoConfigStore`! Did you forget to add it using `app.init_gizmo_group<T>()`?", 
++                Config::type_path())))
++        } else {
++            Ok(())
+         }
+     }
+ 
+@@ -348,11 +367,19 @@ where
+     Clear: 'static + Send + Sync,
+ {
+     fn queue(&mut self, _system_meta: &SystemMeta, mut world: DeferredWorld) {
+-        let mut storage = world.resource_mut::<GizmoStorage<Config, Clear>>();
+-        storage.list_positions.append(&mut self.list_positions);
+-        storage.list_colors.append(&mut self.list_colors);
+-        storage.strip_positions.append(&mut self.strip_positions);
+-        storage.strip_colors.append(&mut self.strip_colors);
++        if let Some(mut storage) = world.get_resource_mut::<GizmoStorage<Config, Clear>>() {
++            storage.list_positions.append(&mut self.list_positions);
++            storage.list_colors.append(&mut self.list_colors);
++            storage.strip_positions.append(&mut self.strip_positions);
++            storage.strip_colors.append(&mut self.strip_colors);
++        } else {
++            // Prevent the buffer from growing indefinitely if GizmoStorage
++            // for the config group has not been initialized
++            self.list_positions.clear();
++            self.list_colors.clear();
++            self.strip_positions.clear();
++            self.strip_colors.clear();
++        }
+     }
+ }
+ 

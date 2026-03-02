@@ -1,0 +1,604 @@
+diff --git a/crates/bevy_ecs/src/component.rs b/crates/bevy_ecs/src/component.rs
+index 4ebf1decd9b16..27b51ede6ff15 100644
+--- a/crates/bevy_ecs/src/component.rs
++++ b/crates/bevy_ecs/src/component.rs
+@@ -2381,12 +2381,12 @@ impl Tick {
+     ///
+     /// Returns `true` if wrapping was performed. Otherwise, returns `false`.
+     #[inline]
+-    pub fn check_tick(&mut self, tick: Tick) -> bool {
+-        let age = tick.relative_to(*self);
++    pub fn check_tick(&mut self, check: CheckChangeTicks) -> bool {
++        let age = check.present_tick().relative_to(*self);
+         // This comparison assumes that `age` has not overflowed `u32::MAX` before, which will be true
+         // so long as this check always runs before that can happen.
+         if age.get() > Self::MAX.get() {
+-            *self = tick.relative_to(Self::MAX);
++            *self = check.present_tick().relative_to(Self::MAX);
+             true
+         } else {
+             false
+@@ -2415,16 +2415,16 @@ impl Tick {
+ /// struct CustomSchedule(Schedule);
+ ///
+ /// # let mut world = World::new();
+-/// world.add_observer(|tick: On<CheckChangeTicks>, mut schedule: ResMut<CustomSchedule>| {
+-///     schedule.0.check_change_ticks(tick.get());
++/// world.add_observer(|check: On<CheckChangeTicks>, mut schedule: ResMut<CustomSchedule>| {
++///     schedule.0.check_change_ticks(*check);
+ /// });
+ /// ```
+ #[derive(Debug, Clone, Copy, Event)]
+ pub struct CheckChangeTicks(pub(crate) Tick);
+ 
+ impl CheckChangeTicks {
+-    /// Get the `Tick` that can be used as the parameter of [`Tick::check_tick`].
+-    pub fn get(self) -> Tick {
++    /// Get the present `Tick` that other ticks get compared to.
++    pub fn present_tick(self) -> Tick {
+         self.0
+     }
+ }
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index 0e22fddbc8340..02d9698917840 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -76,7 +76,7 @@ pub use unique_vec::{UniqueEntityEquivalentVec, UniqueEntityVec};
+ use crate::{
+     archetype::{ArchetypeId, ArchetypeRow},
+     change_detection::MaybeLocation,
+-    component::Tick,
++    component::{CheckChangeTicks, Tick},
+     storage::{SparseSetIndex, TableId, TableRow},
+ };
+ use alloc::vec::Vec;
+@@ -1216,9 +1216,9 @@ impl Entities {
+     }
+ 
+     #[inline]
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         for meta in &mut self.meta {
+-            meta.spawned_or_despawned.at.check_tick(change_tick);
++            meta.spawned_or_despawned.at.check_tick(check);
+         }
+     }
+ 
+diff --git a/crates/bevy_ecs/src/schedule/executor/mod.rs b/crates/bevy_ecs/src/schedule/executor/mod.rs
+index 710b88db6c23f..c1fac6a9f1f3d 100644
+--- a/crates/bevy_ecs/src/schedule/executor/mod.rs
++++ b/crates/bevy_ecs/src/schedule/executor/mod.rs
+@@ -15,7 +15,7 @@ pub use self::multi_threaded::{MainThreadExecutor, MultiThreadedExecutor};
+ use fixedbitset::FixedBitSet;
+ 
+ use crate::{
+-    component::{ComponentId, Tick},
++    component::{CheckChangeTicks, ComponentId, Tick},
+     error::{BevyError, ErrorContext, Result},
+     prelude::{IntoSystemSet, SystemSet},
+     query::FilteredAccessSet,
+@@ -204,7 +204,7 @@ impl System for ApplyDeferred {
+         FilteredAccessSet::new()
+     }
+ 
+-    fn check_change_tick(&mut self, _change_tick: Tick) {}
++    fn check_change_tick(&mut self, _check: CheckChangeTicks) {}
+ 
+     fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+         vec![SystemTypeSet::<Self>::new().intern()]
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index 73c710a4553c1..0e4f530be0397 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -25,8 +25,9 @@ use thiserror::Error;
+ #[cfg(feature = "trace")]
+ use tracing::info_span;
+ 
++use crate::component::CheckChangeTicks;
+ use crate::{
+-    component::{ComponentId, Components, Tick},
++    component::{ComponentId, Components},
+     prelude::Component,
+     query::FilteredAccessSet,
+     resource::Resource,
+@@ -112,7 +113,7 @@ impl Schedules {
+     /// Iterates the change ticks of all systems in all stored schedules and clamps any older than
+     /// [`MAX_CHANGE_AGE`](crate::change_detection::MAX_CHANGE_AGE).
+     /// This prevents overflow and thus prevents false positives.
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         #[cfg(feature = "trace")]
+         let _all_span = info_span!("check stored schedule ticks").entered();
+         #[cfg_attr(
+@@ -127,7 +128,7 @@ impl Schedules {
+             let name = format!("{label:?}");
+             #[cfg(feature = "trace")]
+             let _one_span = info_span!("check schedule ticks", name = &name).entered();
+-            schedule.check_change_ticks(change_tick);
++            schedule.check_change_ticks(check);
+         }
+     }
+ 
+@@ -559,22 +560,22 @@ impl Schedule {
+     /// Iterates the change ticks of all systems in the schedule and clamps any older than
+     /// [`MAX_CHANGE_AGE`](crate::change_detection::MAX_CHANGE_AGE).
+     /// This prevents overflow and thus prevents false positives.
+-    pub fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         for SystemWithAccess { system, .. } in &mut self.executable.systems {
+             if !is_apply_deferred(system) {
+-                system.check_change_tick(change_tick);
++                system.check_change_tick(check);
+             }
+         }
+ 
+         for conditions in &mut self.executable.system_conditions {
+             for system in conditions {
+-                system.condition.check_change_tick(change_tick);
++                system.condition.check_change_tick(check);
+             }
+         }
+ 
+         for conditions in &mut self.executable.set_conditions {
+             for system in conditions {
+-                system.condition.check_change_tick(change_tick);
++                system.condition.check_change_tick(check);
+             }
+         }
+     }
+diff --git a/crates/bevy_ecs/src/storage/resource.rs b/crates/bevy_ecs/src/storage/resource.rs
+index fa58610bdf361..fc9100069c466 100644
+--- a/crates/bevy_ecs/src/storage/resource.rs
++++ b/crates/bevy_ecs/src/storage/resource.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     change_detection::{MaybeLocation, MutUntyped, TicksMut},
+-    component::{ComponentId, ComponentTicks, Components, Tick, TickCells},
++    component::{CheckChangeTicks, ComponentId, ComponentTicks, Components, Tick, TickCells},
+     storage::{blob_vec::BlobVec, SparseSet},
+ };
+ use alloc::string::String;
+@@ -298,9 +298,9 @@ impl<const SEND: bool> ResourceData<SEND> {
+         }
+     }
+ 
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
+-        self.added_ticks.get_mut().check_tick(change_tick);
+-        self.changed_ticks.get_mut().check_tick(change_tick);
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
++        self.added_ticks.get_mut().check_tick(check);
++        self.changed_ticks.get_mut().check_tick(check);
+     }
+ }
+ 
+@@ -393,9 +393,9 @@ impl<const SEND: bool> Resources<SEND> {
+         })
+     }
+ 
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         for info in self.resources.values_mut() {
+-            info.check_change_ticks(change_tick);
++            info.check_change_ticks(check);
+         }
+     }
+ }
+diff --git a/crates/bevy_ecs/src/storage/sparse_set.rs b/crates/bevy_ecs/src/storage/sparse_set.rs
+index 42adcd89dc3b3..bb28f967af377 100644
+--- a/crates/bevy_ecs/src/storage/sparse_set.rs
++++ b/crates/bevy_ecs/src/storage/sparse_set.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     change_detection::MaybeLocation,
+-    component::{ComponentId, ComponentInfo, ComponentTicks, Tick, TickCells},
++    component::{CheckChangeTicks, ComponentId, ComponentInfo, ComponentTicks, Tick, TickCells},
+     entity::{Entity, EntityRow},
+     storage::{Column, TableRow},
+ };
+@@ -360,8 +360,8 @@ impl ComponentSparseSet {
+         }
+     }
+ 
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
+-        self.dense.check_change_ticks(change_tick);
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
++        self.dense.check_change_ticks(check);
+     }
+ }
+ 
+@@ -650,9 +650,9 @@ impl SparseSets {
+         }
+     }
+ 
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         for set in self.sets.values_mut() {
+-            set.check_change_ticks(change_tick);
++            set.check_change_ticks(check);
+         }
+     }
+ }
+diff --git a/crates/bevy_ecs/src/storage/table/column.rs b/crates/bevy_ecs/src/storage/table/column.rs
+index 78fafe0a2612d..acf531d9b9d1c 100644
+--- a/crates/bevy_ecs/src/storage/table/column.rs
++++ b/crates/bevy_ecs/src/storage/table/column.rs
+@@ -228,20 +228,20 @@ impl ThinColumn {
+     /// # Safety
+     /// `len` is the actual length of this column
+     #[inline]
+-    pub(crate) unsafe fn check_change_ticks(&mut self, len: usize, change_tick: Tick) {
++    pub(crate) unsafe fn check_change_ticks(&mut self, len: usize, check: CheckChangeTicks) {
+         for i in 0..len {
+             // SAFETY:
+             // - `i` < `len`
+             // we have a mutable reference to `self`
+             unsafe { self.added_ticks.get_unchecked_mut(i) }
+                 .get_mut()
+-                .check_tick(change_tick);
++                .check_tick(check);
+             // SAFETY:
+             // - `i` < `len`
+             // we have a mutable reference to `self`
+             unsafe { self.changed_ticks.get_unchecked_mut(i) }
+                 .get_mut()
+-                .check_tick(change_tick);
++                .check_tick(check);
+         }
+     }
+ 
+@@ -646,12 +646,12 @@ impl Column {
+     }
+ 
+     #[inline]
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         for component_ticks in &mut self.added_ticks {
+-            component_ticks.get_mut().check_tick(change_tick);
++            component_ticks.get_mut().check_tick(check);
+         }
+         for component_ticks in &mut self.changed_ticks {
+-            component_ticks.get_mut().check_tick(change_tick);
++            component_ticks.get_mut().check_tick(check);
+         }
+     }
+ 
+diff --git a/crates/bevy_ecs/src/storage/table/mod.rs b/crates/bevy_ecs/src/storage/table/mod.rs
+index 5f09d4226f544..be75c58f03828 100644
+--- a/crates/bevy_ecs/src/storage/table/mod.rs
++++ b/crates/bevy_ecs/src/storage/table/mod.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     change_detection::MaybeLocation,
+-    component::{ComponentId, ComponentInfo, ComponentTicks, Components, Tick},
++    component::{CheckChangeTicks, ComponentId, ComponentInfo, ComponentTicks, Components, Tick},
+     entity::Entity,
+     query::DebugCheckedUnwrap,
+     storage::{blob_vec::BlobVec, ImmutableSparseSet, SparseSet},
+@@ -629,11 +629,11 @@ impl Table {
+     }
+ 
+     /// Call [`Tick::check_tick`] on all of the ticks in the [`Table`]
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         let len = self.entity_count() as usize;
+         for col in self.columns.values_mut() {
+             // SAFETY: `len` is the actual length of the column
+-            unsafe { col.check_change_ticks(len, change_tick) };
++            unsafe { col.check_change_ticks(len, check) };
+         }
+     }
+ 
+@@ -793,9 +793,9 @@ impl Tables {
+         }
+     }
+ 
+-    pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
++    pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         for table in &mut self.tables {
+-            table.check_change_ticks(change_tick);
++            table.check_change_ticks(check);
+         }
+     }
+ }
+diff --git a/crates/bevy_ecs/src/system/adapter_system.rs b/crates/bevy_ecs/src/system/adapter_system.rs
+index 6573f851b927c..ff63a3e8ce996 100644
+--- a/crates/bevy_ecs/src/system/adapter_system.rs
++++ b/crates/bevy_ecs/src/system/adapter_system.rs
+@@ -176,8 +176,8 @@ where
+         self.system.initialize(world)
+     }
+ 
+-    fn check_change_tick(&mut self, change_tick: crate::component::Tick) {
+-        self.system.check_change_tick(change_tick);
++    fn check_change_tick(&mut self, check: crate::component::CheckChangeTicks) {
++        self.system.check_change_tick(check);
+     }
+ 
+     fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index f892507ed6df6..976d654a5979a 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, format, vec::Vec};
+ use core::marker::PhantomData;
+ 
+ use crate::{
+-    component::{ComponentId, Tick},
++    component::{CheckChangeTicks, ComponentId, Tick},
+     prelude::World,
+     query::FilteredAccessSet,
+     schedule::InternedSystemSet,
+@@ -200,9 +200,9 @@ where
+         a_access
+     }
+ 
+-    fn check_change_tick(&mut self, change_tick: Tick) {
+-        self.a.check_change_tick(change_tick);
+-        self.b.check_change_tick(change_tick);
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
++        self.a.check_change_tick(check);
++        self.b.check_change_tick(check);
+     }
+ 
+     fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+@@ -406,9 +406,9 @@ where
+         a_access
+     }
+ 
+-    fn check_change_tick(&mut self, change_tick: Tick) {
+-        self.a.check_change_tick(change_tick);
+-        self.b.check_change_tick(change_tick);
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
++        self.a.check_change_tick(check);
++        self.b.check_change_tick(check);
+     }
+ 
+     fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+diff --git a/crates/bevy_ecs/src/system/exclusive_function_system.rs b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+index 32d76649b8cae..c6bdb002c29b2 100644
+--- a/crates/bevy_ecs/src/system/exclusive_function_system.rs
++++ b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    component::{ComponentId, Tick},
++    component::{CheckChangeTicks, ComponentId, Tick},
+     query::FilteredAccessSet,
+     schedule::{InternedSystemSet, SystemSet},
+     system::{
+@@ -177,10 +177,10 @@ where
+     }
+ 
+     #[inline]
+-    fn check_change_tick(&mut self, change_tick: Tick) {
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
+         check_system_change_tick(
+             &mut self.system_meta.last_run,
+-            change_tick,
++            check,
+             self.system_meta.name.as_ref(),
+         );
+     }
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index 22ecef2104233..13e531648dcc6 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    component::{ComponentId, Tick},
++    component::{CheckChangeTicks, ComponentId, Tick},
+     prelude::FromWorld,
+     query::FilteredAccessSet,
+     schedule::{InternedSystemSet, SystemSet},
+@@ -708,10 +708,10 @@ where
+     }
+ 
+     #[inline]
+-    fn check_change_tick(&mut self, change_tick: Tick) {
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
+         check_system_change_tick(
+             &mut self.system_meta.last_run,
+-            change_tick,
++            check,
+             self.system_meta.name.as_ref(),
+         );
+     }
+diff --git a/crates/bevy_ecs/src/system/observer_system.rs b/crates/bevy_ecs/src/system/observer_system.rs
+index 9c69b95dd3013..e99a86b64c30e 100644
+--- a/crates/bevy_ecs/src/system/observer_system.rs
++++ b/crates/bevy_ecs/src/system/observer_system.rs
+@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, vec::Vec};
+ use core::marker::PhantomData;
+ 
+ use crate::{
+-    component::{ComponentId, Tick},
++    component::{CheckChangeTicks, ComponentId, Tick},
+     error::Result,
+     never::Never,
+     prelude::{Bundle, On},
+@@ -161,8 +161,8 @@ where
+     }
+ 
+     #[inline]
+-    fn check_change_tick(&mut self, change_tick: Tick) {
+-        self.observer.check_change_tick(change_tick);
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
++        self.observer.check_change_tick(check);
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index 35682d7f3b580..ab2d9d31fb228 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -1,7 +1,7 @@
+ use alloc::{borrow::Cow, vec::Vec};
+ 
+ use crate::{
+-    component::{ComponentId, Tick},
++    component::{CheckChangeTicks, ComponentId, Tick},
+     error::Result,
+     query::FilteredAccessSet,
+     system::{input::SystemIn, BoxedSystem, System, SystemInput},
+@@ -78,8 +78,8 @@ impl<S: System<In = ()>> System for InfallibleSystemWrapper<S> {
+     }
+ 
+     #[inline]
+-    fn check_change_tick(&mut self, change_tick: Tick) {
+-        self.0.check_change_tick(change_tick);
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
++        self.0.check_change_tick(check);
+     }
+ 
+     #[inline]
+@@ -182,8 +182,8 @@ where
+         self.system.initialize(world)
+     }
+ 
+-    fn check_change_tick(&mut self, change_tick: Tick) {
+-        self.system.check_change_tick(change_tick);
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
++        self.system.check_change_tick(check);
+     }
+ 
+     fn get_last_run(&self) -> Tick {
+@@ -283,8 +283,8 @@ where
+         self.system.initialize(world)
+     }
+ 
+-    fn check_change_tick(&mut self, change_tick: Tick) {
+-        self.system.check_change_tick(change_tick);
++    fn check_change_tick(&mut self, check: CheckChangeTicks) {
++        self.system.check_change_tick(check);
+     }
+ 
+     fn get_last_run(&self) -> Tick {
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index d23f54e8f4bf4..3b4c99858f6ed 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -8,7 +8,7 @@ use log::warn;
+ use thiserror::Error;
+ 
+ use crate::{
+-    component::{ComponentId, Tick},
++    component::{CheckChangeTicks, ComponentId, Tick},
+     query::FilteredAccessSet,
+     schedule::InternedSystemSet,
+     system::{input::SystemInput, SystemIn},
+@@ -174,7 +174,7 @@ pub trait System: Send + Sync + 'static {
+     ///
+     /// This method must be called periodically to ensure that change detection behaves correctly.
+     /// When using bevy's default configuration, this will be called for you as needed.
+-    fn check_change_tick(&mut self, change_tick: Tick);
++    fn check_change_tick(&mut self, check: CheckChangeTicks);
+ 
+     /// Returns the system's default [system sets](crate::schedule::SystemSet).
+     ///
+@@ -224,9 +224,13 @@ pub unsafe trait ReadOnlySystem: System {
+ /// A convenience type alias for a boxed [`System`] trait object.
+ pub type BoxedSystem<In = (), Out = ()> = Box<dyn System<In = In, Out = Out>>;
+ 
+-pub(crate) fn check_system_change_tick(last_run: &mut Tick, this_run: Tick, system_name: &str) {
+-    if last_run.check_tick(this_run) {
+-        let age = this_run.relative_to(*last_run).get();
++pub(crate) fn check_system_change_tick(
++    last_run: &mut Tick,
++    check: CheckChangeTicks,
++    system_name: &str,
++) {
++    if last_run.check_tick(check) {
++        let age = check.present_tick().relative_to(*last_run).get();
+         warn!(
+             "System '{system_name}' has not run for {age} ticks. \
+             Changes older than {} ticks will not be detected.",
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 1774da9728362..dbc537fc8e2b5 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -2937,17 +2937,21 @@ impl World {
+     }
+ 
+     /// Iterates all component change ticks and clamps any older than [`MAX_CHANGE_AGE`](crate::change_detection::MAX_CHANGE_AGE).
+-    /// This prevents overflow and thus prevents false positives.
++    /// This also triggers [`CheckChangeTicks`] observers and returns the same event here.
+     ///
+-    /// **Note:** Does nothing if the [`World`] counter has not been incremented at least [`CHECK_TICK_THRESHOLD`]
++    /// Calling this method prevents [`Tick`]s overflowing and thus prevents false positives when comparing them.
++    ///
++    /// **Note:** Does nothing and returns `None` if the [`World`] counter has not been incremented at least [`CHECK_TICK_THRESHOLD`]
+     /// times since the previous pass.
+     // TODO: benchmark and optimize
+-    pub fn check_change_ticks(&mut self) {
++    pub fn check_change_ticks(&mut self) -> Option<CheckChangeTicks> {
+         let change_tick = self.change_tick();
+         if change_tick.relative_to(self.last_check_tick).get() < CHECK_TICK_THRESHOLD {
+-            return;
++            return None;
+         }
+ 
++        let check = CheckChangeTicks(change_tick);
++
+         let Storages {
+             ref mut tables,
+             ref mut sparse_sets,
+@@ -2957,19 +2961,22 @@ impl World {
+ 
+         #[cfg(feature = "trace")]
+         let _span = tracing::info_span!("check component ticks").entered();
+-        tables.check_change_ticks(change_tick);
+-        sparse_sets.check_change_ticks(change_tick);
+-        resources.check_change_ticks(change_tick);
+-        non_send_resources.check_change_ticks(change_tick);
+-        self.entities.check_change_ticks(change_tick);
++        tables.check_change_ticks(check);
++        sparse_sets.check_change_ticks(check);
++        resources.check_change_ticks(check);
++        non_send_resources.check_change_ticks(check);
++        self.entities.check_change_ticks(check);
+ 
+         if let Some(mut schedules) = self.get_resource_mut::<Schedules>() {
+-            schedules.check_change_ticks(change_tick);
++            schedules.check_change_ticks(check);
+         }
+ 
+-        self.trigger(CheckChangeTicks(change_tick));
++        self.trigger(check);
++        self.flush();
+ 
+         self.last_check_tick = change_tick;
++
++        Some(check)
+     }
+ 
+     /// Runs both [`clear_entities`](Self::clear_entities) and [`clear_resources`](Self::clear_resources),
+diff --git a/release-content/migration-guides/check_change_ticks.md b/release-content/migration-guides/check_change_ticks.md
+new file mode 100644
+index 0000000000000..109be4b12a317
+--- /dev/null
++++ b/release-content/migration-guides/check_change_ticks.md
+@@ -0,0 +1,25 @@
++---
++title: `CheckChangeTicks` parameter in `System::check_change_tick`
++pull_requests: [19274, 19600]
++---
++
++`System::check_change_tick` took a `Tick` parameter to update internal ticks. This is needed to keep queried components filtered by their change tick reliably not be matched if their last change or add and the system's last run was very long ago. This is also needed for similar methods involving the system's ticks for the same reason.
++
++This parameter is now a `CheckChangeTicks` type that can be passed to the now-public `Tick::check_tick` in case you maintain these yourself in manual `System` implementations.
++
++If you need a `CheckChangeTicks` value, for example because you call one of the above methods manually, you can observe it. Here is an example where it is used on a schedule stored in a resource, which will pass it on to the `System::check_change_tick` of its systems.
++
++```rs
++use bevy_ecs::prelude::*;
++use bevy_ecs::component::CheckChangeTicks;
++
++#[derive(Resource)]
++struct CustomSchedule(Schedule);
++
++let mut world = World::new();
++world.add_observer(|check: On<CheckChangeTicks>, mut schedule: ResMut<CustomSchedule>| {
++    schedule.0.check_change_ticks(*check);
++});
++```
++
++The observers are triggered by `World::check_change_ticks` which every schedule calls before running. This method also returns an `Option<CheckChangeTicks>` which is `Some` in case it was time to check the ticks.

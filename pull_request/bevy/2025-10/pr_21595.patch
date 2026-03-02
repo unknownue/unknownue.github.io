@@ -1,0 +1,589 @@
+diff --git a/crates/bevy_light/src/ambient_light.rs b/crates/bevy_light/src/ambient_light.rs
+index 92935e7e06d7a..d3c110efe3088 100644
+--- a/crates/bevy_light/src/ambient_light.rs
++++ b/crates/bevy_light/src/ambient_light.rs
+@@ -5,9 +5,43 @@ use bevy_reflect::prelude::*;
+ 
+ /// An ambient light, which lights the entire scene equally.
+ ///
+-/// This resource is inserted by the [`LightPlugin`] and by default it is set to a low ambient light.
++/// It can be added to a camera to override [`GlobalAmbientLight`], which is the default that is otherwise used.
++#[derive(Component, Clone, Debug, Reflect)]
++#[reflect(Component, Debug, Default, Clone)]
++#[require(Camera)]
++pub struct AmbientLight {
++    pub color: Color,
++
++    /// A direct scale factor multiplied with `color` before being passed to the shader.
++    ///
++    /// After applying this multiplier, the resulting value should be in units of [cd/m^2].
++    ///
++    /// [cd/m^2]: https://en.wikipedia.org/wiki/Candela_per_square_metre
++    pub brightness: f32,
++
++    /// Whether this ambient light has an effect on meshes with lightmaps.
++    ///
++    /// Set this to false if your lightmap baking tool bakes the ambient light
++    /// into the lightmaps, to avoid rendering that light twice.
++    ///
++    /// By default, this is set to true.
++    pub affects_lightmapped_meshes: bool,
++}
++
++impl Default for AmbientLight {
++    fn default() -> Self {
++        Self {
++            color: Color::WHITE,
++            brightness: 80.0,
++            affects_lightmapped_meshes: true,
++        }
++    }
++}
++
++/// The global ambient light, which lights the entire scene equally.
+ ///
+-/// It can also be added to a camera to override the resource (or default) ambient for that camera only.
++/// This resource is inserted by the [`LightPlugin`] and by default it is set to a low ambient light.
++/// Inserting an [`AmbientLight`] on a camera will override this default.
+ ///
+ /// # Examples
+ ///
+@@ -15,17 +49,16 @@ use bevy_reflect::prelude::*;
+ ///
+ /// ```
+ /// # use bevy_ecs::system::ResMut;
+-/// # use bevy_light::AmbientLight;
+-/// fn setup_ambient_light(mut ambient_light: ResMut<AmbientLight>) {
++/// # use bevy_light::GlobalAmbientLight;
++/// fn setup_ambient_light(mut ambient_light: ResMut<GlobalAmbientLight>) {
+ ///    ambient_light.brightness = 100.0;
+ /// }
+ /// ```
+ ///
+ /// [`LightPlugin`]: crate::LightPlugin
+-#[derive(Resource, Component, Clone, Debug, Reflect)]
+-#[reflect(Resource, Component, Debug, Default, Clone)]
+-#[require(Camera)]
+-pub struct AmbientLight {
++#[derive(Resource, Clone, Debug, Reflect)]
++#[reflect(Resource, Debug, Default, Clone)]
++pub struct GlobalAmbientLight {
+     pub color: Color,
+ 
+     /// A direct scale factor multiplied with `color` before being passed to the shader.
+@@ -44,7 +77,7 @@ pub struct AmbientLight {
+     pub affects_lightmapped_meshes: bool,
+ }
+ 
+-impl Default for AmbientLight {
++impl Default for GlobalAmbientLight {
+     fn default() -> Self {
+         Self {
+             color: Color::WHITE,
+@@ -54,8 +87,8 @@ impl Default for AmbientLight {
+     }
+ }
+ 
+-impl AmbientLight {
+-    pub const NONE: AmbientLight = AmbientLight {
++impl GlobalAmbientLight {
++    pub const NONE: GlobalAmbientLight = GlobalAmbientLight {
+         color: Color::WHITE,
+         brightness: 0.0,
+         affects_lightmapped_meshes: true,
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index b4904d386ba87..416a5565169e2 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -25,7 +25,7 @@ use cluster::{
+     VisibleClusterableObjects,
+ };
+ mod ambient_light;
+-pub use ambient_light::AmbientLight;
++pub use ambient_light::{AmbientLight, GlobalAmbientLight};
+ mod probe;
+ pub use probe::{
+     AtmosphereEnvironmentMapLight, EnvironmentMapLight, GeneratedEnvironmentMapLight,
+@@ -58,7 +58,7 @@ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+         light_consts, AmbientLight, DirectionalLight, EnvironmentMapLight,
+-        GeneratedEnvironmentMapLight, LightProbe, PointLight, SpotLight,
++        GeneratedEnvironmentMapLight, GlobalAmbientLight, LightProbe, PointLight, SpotLight,
+     };
+ }
+ 
+@@ -133,7 +133,7 @@ pub struct LightPlugin;
+ impl Plugin for LightPlugin {
+     fn build(&self, app: &mut App) {
+         app.init_resource::<GlobalVisibleClusterableObjects>()
+-            .init_resource::<AmbientLight>()
++            .init_resource::<GlobalAmbientLight>()
+             .init_resource::<DirectionalLightShadowMap>()
+             .init_resource::<PointLightShadowMap>()
+             .configure_sets(
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 904be3164ec60..236a18124629d 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -25,8 +25,8 @@ use bevy_light::cluster::GlobalVisibleClusterableObjects;
+ use bevy_light::SunDisk;
+ use bevy_light::{
+     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
+-    Cascades, DirectionalLight, DirectionalLightShadowMap, NotShadowCaster, PointLight,
+-    PointLightShadowMap, ShadowFilteringMethod, SpotLight, VolumetricLight,
++    Cascades, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster,
++    PointLight, PointLightShadowMap, ShadowFilteringMethod, SpotLight, VolumetricLight,
+ };
+ use bevy_math::{ops, Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles};
+ use bevy_platform::collections::{HashMap, HashSet};
+@@ -248,8 +248,8 @@ pub fn extract_shadow_filtering_method(
+ // foreign trait ExtractResource on foreign type AmbientLight
+ pub fn extract_ambient_light_resource(
+     mut commands: Commands,
+-    main_resource: Extract<Option<Res<AmbientLight>>>,
+-    target_resource: Option<ResMut<AmbientLight>>,
++    main_resource: Extract<Option<Res<GlobalAmbientLight>>>,
++    target_resource: Option<ResMut<GlobalAmbientLight>>,
+ ) {
+     if let Some(main_resource) = main_resource.as_ref() {
+         if let Some(mut target_resource) = target_resource {
+@@ -720,7 +720,7 @@ pub fn prepare_lights(
+         ),
+         With<Camera3d>,
+     >,
+-    ambient_light: Res<AmbientLight>,
++    ambient_light: Res<GlobalAmbientLight>,
+     point_light_shadow_map: Res<PointLightShadowMap>,
+     directional_light_shadow_map: Res<DirectionalLightShadowMap>,
+     mut shadow_render_phases: ResMut<ViewBinnedRenderPhases<Shadow>>,
+@@ -1150,6 +1150,11 @@ pub fn prepare_lights(
+         );
+ 
+         let n_clusters = clusters.dimensions.x * clusters.dimensions.y * clusters.dimensions.z;
++        let ambient_light = AmbientLight {
++            color: ambient_light.color,
++            brightness: ambient_light.brightness,
++            affects_lightmapped_meshes: ambient_light.affects_lightmapped_meshes,
++        };
+         let ambient_light = maybe_ambient_override.unwrap_or(&ambient_light);
+ 
+         let mut gpu_directional_lights = [GpuDirectionalLight::default(); MAX_DIRECTIONAL_LIGHTS];
+diff --git a/examples/3d/auto_exposure.rs b/examples/3d/auto_exposure.rs
+index 5d9e42c9310c8..c5e0bf783262f 100644
+--- a/examples/3d/auto_exposure.rs
++++ b/examples/3d/auto_exposure.rs
+@@ -97,7 +97,7 @@ fn setup(
+         }
+     }
+ 
+-    commands.insert_resource(AmbientLight {
++    commands.insert_resource(GlobalAmbientLight {
+         color: Color::WHITE,
+         brightness: 0.0,
+         ..default()
+diff --git a/examples/3d/fog.rs b/examples/3d/fog.rs
+index 9a5e1315b8575..8d23035b738c2 100644
+--- a/examples/3d/fog.rs
++++ b/examples/3d/fog.rs
+@@ -29,7 +29,7 @@ use bevy::{
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight::NONE)
++        .insert_resource(GlobalAmbientLight::NONE)
+         .add_plugins(DefaultPlugins)
+         .add_systems(
+             Startup,
+diff --git a/examples/3d/fog_volumes.rs b/examples/3d/fog_volumes.rs
+index 2789644b2171a..9d52903e4e94a 100644
+--- a/examples/3d/fog_volumes.rs
++++ b/examples/3d/fog_volumes.rs
+@@ -22,7 +22,7 @@ fn main() {
+             }),
+             ..default()
+         }))
+-        .insert_resource(AmbientLight::NONE)
++        .insert_resource(GlobalAmbientLight::NONE)
+         .add_systems(Startup, setup)
+         .add_systems(Update, rotate_camera)
+         .run();
+diff --git a/examples/3d/irradiance_volumes.rs b/examples/3d/irradiance_volumes.rs
+index f7500c7e488a3..257cfb7354648 100644
+--- a/examples/3d/irradiance_volumes.rs
++++ b/examples/3d/irradiance_volumes.rs
+@@ -157,7 +157,7 @@ fn main() {
+         .add_plugins(MaterialPlugin::<VoxelVisualizationMaterial>::default())
+         .init_resource::<AppStatus>()
+         .init_resource::<ExampleAssets>()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::WHITE,
+             brightness: 0.0,
+             ..default()
+@@ -414,7 +414,7 @@ fn toggle_irradiance_volumes(
+     light_probe_query: Query<Entity, With<LightProbe>>,
+     mut app_status: ResMut<AppStatus>,
+     assets: Res<ExampleAssets>,
+-    mut ambient_light: ResMut<AmbientLight>,
++    mut ambient_light: ResMut<GlobalAmbientLight>,
+ ) {
+     if !keyboard.just_pressed(KeyCode::Space) {
+         return;
+diff --git a/examples/3d/lighting.rs b/examples/3d/lighting.rs
+index a23a68885abb3..71bc4a00c049e 100644
+--- a/examples/3d/lighting.rs
++++ b/examples/3d/lighting.rs
+@@ -120,7 +120,7 @@ fn setup(
+ 
+     // ambient light
+     // ambient lights' brightnesses are measured in candela per meter square, calculable as (color * brightness)
+-    commands.insert_resource(AmbientLight {
++    commands.insert_resource(GlobalAmbientLight {
+         color: ORANGE_RED.into(),
+         brightness: 200.0,
+         ..default()
+@@ -290,7 +290,7 @@ fn update_exposure(
+ 
+ fn toggle_ambient_light(
+     key_input: Res<ButtonInput<KeyCode>>,
+-    mut ambient_light: ResMut<AmbientLight>,
++    mut ambient_light: ResMut<GlobalAmbientLight>,
+     text: Single<Entity, With<Text>>,
+     mut writer: TextUiWriter,
+ ) {
+diff --git a/examples/3d/lightmaps.rs b/examples/3d/lightmaps.rs
+index c994741150ad3..862fe11c76500 100644
+--- a/examples/3d/lightmaps.rs
++++ b/examples/3d/lightmaps.rs
+@@ -27,7 +27,7 @@ fn main() {
+ 
+     let mut app = App::new();
+     app.add_plugins(DefaultPlugins)
+-        .insert_resource(AmbientLight::NONE);
++        .insert_resource(GlobalAmbientLight::NONE);
+ 
+     if args.deferred {
+         app.insert_resource(DefaultOpaqueRendererMethod::deferred());
+diff --git a/examples/3d/mixed_lighting.rs b/examples/3d/mixed_lighting.rs
+index 73ced56408eed..58594ad14e1c1 100644
+--- a/examples/3d/mixed_lighting.rs
++++ b/examples/3d/mixed_lighting.rs
+@@ -124,7 +124,7 @@ fn main() {
+             ..default()
+         }))
+         .add_plugins(MeshPickingPlugin)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: ClearColor::default().0,
+             brightness: 10000.0,
+             affects_lightmapped_meshes: true,
+diff --git a/examples/3d/motion_blur.rs b/examples/3d/motion_blur.rs
+index 92c5d8cd72cb7..ef9349ee7b19d 100644
+--- a/examples/3d/motion_blur.rs
++++ b/examples/3d/motion_blur.rs
+@@ -57,7 +57,7 @@ fn setup_scene(
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut materials: ResMut<Assets<StandardMaterial>>,
+ ) {
+-    commands.insert_resource(AmbientLight {
++    commands.insert_resource(GlobalAmbientLight {
+         color: Color::WHITE,
+         brightness: 300.0,
+         ..default()
+diff --git a/examples/3d/skybox.rs b/examples/3d/skybox.rs
+index 31fdcc8872262..aceef74cb11d3 100644
+--- a/examples/3d/skybox.rs
++++ b/examples/3d/skybox.rs
+@@ -85,7 +85,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+     // ambient light
+     // NOTE: The ambient light is used to scale how bright the environment map is so with a bright
+     // environment map, use an appropriate color and brightness to match
+-    commands.insert_resource(AmbientLight {
++    commands.insert_resource(GlobalAmbientLight {
+         color: Color::srgb_u8(210, 220, 240),
+         brightness: 1.0,
+         ..default()
+diff --git a/examples/3d/specular_tint.rs b/examples/3d/specular_tint.rs
+index 154226713201f..9712500081752 100644
+--- a/examples/3d/specular_tint.rs
++++ b/examples/3d/specular_tint.rs
+@@ -59,7 +59,7 @@ fn main() {
+         }))
+         .init_resource::<AppAssets>()
+         .init_resource::<AppStatus>()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::BLACK,
+             brightness: 0.0,
+             ..default()
+diff --git a/examples/3d/spherical_area_lights.rs b/examples/3d/spherical_area_lights.rs
+index c3e945a8f3492..f4b244debf0cc 100644
+--- a/examples/3d/spherical_area_lights.rs
++++ b/examples/3d/spherical_area_lights.rs
+@@ -4,7 +4,7 @@ use bevy::prelude::*;
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 60.0,
+             ..default()
+         })
+diff --git a/examples/3d/spotlight.rs b/examples/3d/spotlight.rs
+index efdb44680aee5..f3270fdefbfdb 100644
+--- a/examples/3d/spotlight.rs
++++ b/examples/3d/spotlight.rs
+@@ -21,7 +21,7 @@ Rotate Camera: Left and Right Arrows";
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 20.0,
+             ..default()
+         })
+diff --git a/examples/3d/ssao.rs b/examples/3d/ssao.rs
+index 129979b0fbb3d..d9f59aa4cce5a 100644
+--- a/examples/3d/ssao.rs
++++ b/examples/3d/ssao.rs
+@@ -11,7 +11,7 @@ use std::f32::consts::PI;
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 1000.,
+             ..default()
+         })
+diff --git a/examples/3d/transmission.rs b/examples/3d/transmission.rs
+index 5db06e04edad2..cd9754b70e3b3 100644
+--- a/examples/3d/transmission.rs
++++ b/examples/3d/transmission.rs
+@@ -47,7 +47,7 @@ fn main() {
+         .add_plugins(DefaultPlugins)
+         .insert_resource(ClearColor(Color::BLACK))
+         .insert_resource(PointLightShadowMap { size: 2048 })
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 0.0,
+             ..default()
+         })
+diff --git a/examples/3d/volumetric_fog.rs b/examples/3d/volumetric_fog.rs
+index c8c47ef73338d..53e99313e8489 100644
+--- a/examples/3d/volumetric_fog.rs
++++ b/examples/3d/volumetric_fog.rs
+@@ -47,7 +47,7 @@ fn main() {
+             blue: 0.02,
+             alpha: 1.0,
+         })))
+-        .insert_resource(AmbientLight::NONE)
++        .insert_resource(GlobalAmbientLight::NONE)
+         .init_resource::<AppSettings>()
+         .add_systems(Startup, setup)
+         .add_systems(Update, tweak_scene)
+diff --git a/examples/animation/animated_mesh.rs b/examples/animation/animated_mesh.rs
+index 466d53be2ff22..d23910352175e 100644
+--- a/examples/animation/animated_mesh.rs
++++ b/examples/animation/animated_mesh.rs
+@@ -9,7 +9,7 @@ const GLTF_PATH: &str = "models/animated/Fox.glb";
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::WHITE,
+             brightness: 2000.,
+             ..default()
+diff --git a/examples/animation/animated_mesh_control.rs b/examples/animation/animated_mesh_control.rs
+index 3029722c1aa66..0feaa2759c03a 100644
+--- a/examples/animation/animated_mesh_control.rs
++++ b/examples/animation/animated_mesh_control.rs
+@@ -8,7 +8,7 @@ const FOX_PATH: &str = "models/animated/Fox.glb";
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::WHITE,
+             brightness: 2000.,
+             ..default()
+diff --git a/examples/animation/animated_mesh_events.rs b/examples/animation/animated_mesh_events.rs
+index 5898807cf45a3..8de2d9c336665 100644
+--- a/examples/animation/animated_mesh_events.rs
++++ b/examples/animation/animated_mesh_events.rs
+@@ -15,7 +15,7 @@ const FOX_PATH: &str = "models/animated/Fox.glb";
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::WHITE,
+             brightness: 2000.,
+             ..default()
+diff --git a/examples/animation/animated_transform.rs b/examples/animation/animated_transform.rs
+index bd1b7b3c986e9..e46c9c525061c 100644
+--- a/examples/animation/animated_transform.rs
++++ b/examples/animation/animated_transform.rs
+@@ -10,7 +10,7 @@ use bevy::{
+ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::WHITE,
+             brightness: 150.0,
+             ..default()
+diff --git a/examples/animation/animation_graph.rs b/examples/animation/animation_graph.rs
+index bc4b8b2bdf3a1..7393105058283 100644
+--- a/examples/animation/animation_graph.rs
++++ b/examples/animation/animation_graph.rs
+@@ -88,7 +88,7 @@ fn main() {
+             (handle_weight_drag, update_ui, sync_weights).chain(),
+         )
+         .insert_resource(args)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: WHITE.into(),
+             brightness: 100.0,
+             ..default()
+diff --git a/examples/animation/animation_masks.rs b/examples/animation/animation_masks.rs
+index 4566d06034e33..f0f0818d6a222 100644
+--- a/examples/animation/animation_masks.rs
++++ b/examples/animation/animation_masks.rs
+@@ -105,7 +105,7 @@ fn main() {
+         .add_systems(Update, setup_animation_graph_once_loaded)
+         .add_systems(Update, handle_button_toggles)
+         .add_systems(Update, update_ui)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: WHITE.into(),
+             brightness: 100.0,
+             ..default()
+diff --git a/examples/animation/custom_skinned_mesh.rs b/examples/animation/custom_skinned_mesh.rs
+index c706e07be9b64..e45d21bbc2282 100644
+--- a/examples/animation/custom_skinned_mesh.rs
++++ b/examples/animation/custom_skinned_mesh.rs
+@@ -18,7 +18,7 @@ use rand_chacha::ChaCha8Rng;
+ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 3000.0,
+             ..default()
+         })
+diff --git a/examples/animation/morph_targets.rs b/examples/animation/morph_targets.rs
+index 27ae52e030ef8..ffb468f26592c 100644
+--- a/examples/animation/morph_targets.rs
++++ b/examples/animation/morph_targets.rs
+@@ -10,7 +10,7 @@ const GLTF_PATH: &str = "models/animated/MorphStressTest.gltf";
+ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 150.0,
+             ..default()
+         })
+diff --git a/examples/asset/multi_asset_sync.rs b/examples/asset/multi_asset_sync.rs
+index ef91c29144615..8330be603a2a3 100644
+--- a/examples/asset/multi_asset_sync.rs
++++ b/examples/asset/multi_asset_sync.rs
+@@ -17,7 +17,7 @@ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins)
+         .init_state::<LoadingState>()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::WHITE,
+             brightness: 2000.,
+             ..default()
+diff --git a/examples/gltf/custom_gltf_vertex_attribute.rs b/examples/gltf/custom_gltf_vertex_attribute.rs
+index cba292f7a1e5a..f523ae2cdf71b 100644
+--- a/examples/gltf/custom_gltf_vertex_attribute.rs
++++ b/examples/gltf/custom_gltf_vertex_attribute.rs
+@@ -23,7 +23,7 @@ const ATTRIBUTE_BARYCENTRIC: MeshVertexAttribute =
+ 
+ fn main() {
+     App::new()
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             color: Color::WHITE,
+             brightness: 1.0 / 5.0f32,
+             ..default()
+diff --git a/examples/gltf/gltf_skinned_mesh.rs b/examples/gltf/gltf_skinned_mesh.rs
+index aa88728df938a..48690dd2d329e 100644
+--- a/examples/gltf/gltf_skinned_mesh.rs
++++ b/examples/gltf/gltf_skinned_mesh.rs
+@@ -8,7 +8,7 @@ use bevy::{math::ops, mesh::skinning::SkinnedMesh, prelude::*};
+ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 750.0,
+             ..default()
+         })
+diff --git a/examples/math/render_primitives.rs b/examples/math/render_primitives.rs
+index b33700ea18157..726ef278cfbc3 100644
+--- a/examples/math/render_primitives.rs
++++ b/examples/math/render_primitives.rs
+@@ -281,7 +281,7 @@ fn setup_cameras(mut commands: Commands) {
+     ));
+ }
+ 
+-fn setup_ambient_light(mut ambient_light: ResMut<AmbientLight>) {
++fn setup_ambient_light(mut ambient_light: ResMut<GlobalAmbientLight>) {
+     ambient_light.brightness = 50.0;
+ }
+ 
+diff --git a/release-content/migration-guides/ambient_light_split.md b/release-content/migration-guides/ambient_light_split.md
+new file mode 100644
+index 0000000000000..ae974e835ea64
+--- /dev/null
++++ b/release-content/migration-guides/ambient_light_split.md
+@@ -0,0 +1,30 @@
++---
++title: "`AmbientLight` split into a component and a resource"
++pull_requests: [21585]
++---
++
++The `AmbientLight` used to be both a component *and* a resource.
++In 0.18, we've split this in two separate structs: `AmbientLight` and `GlobalAmbientLight`.
++The resource `GlobalAmbientLight` is the default ambient light for the entire world and automatically added by `LightPlugin`.
++Meanwhile, `AmbientLight` is a component that can be added to a `Camera` in order to override the default `GlobalAmbientLight`.
++When appropriate, rename `AmbientLight` to `GlobalAmbientLight`.
++
++Before:
++
++```rust
++app.insert_resource(AmbientLight {
++    color: Color::WHITE,
++    brightness: 2000.,
++    ..default()
++});
++```
++
++After:
++
++```rust
++app.insert_resource(GlobalAmbientLight {
++    color: Color::WHITE,
++    brightness: 2000.,
++    ..default()
++});
++```
+diff --git a/tests/3d/test_invalid_skinned_mesh.rs b/tests/3d/test_invalid_skinned_mesh.rs
+index a5e5b25feef2e..f371a06b7130e 100644
+--- a/tests/3d/test_invalid_skinned_mesh.rs
++++ b/tests/3d/test_invalid_skinned_mesh.rs
+@@ -16,7 +16,7 @@ use core::f32::consts::TAU;
+ fn main() {
+     App::new()
+         .add_plugins(DefaultPlugins)
+-        .insert_resource(AmbientLight {
++        .insert_resource(GlobalAmbientLight {
+             brightness: 20_000.0,
+             ..default()
+         })

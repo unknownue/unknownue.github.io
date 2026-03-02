@@ -1,0 +1,435 @@
+diff --git a/crates/bevy_ecs/src/bundle.rs b/crates/bevy_ecs/src/bundle.rs
+index 9871a33866ba4..e3e54c092f644 100644
+--- a/crates/bevy_ecs/src/bundle.rs
++++ b/crates/bevy_ecs/src/bundle.rs
+@@ -1736,7 +1736,8 @@ impl<'w> BundleSpawner<'w> {
+                 InsertMode::Replace,
+                 caller,
+             );
+-            entities.set_spawn_despawn(entity.index(), location, caller, self.change_tick);
++            entities.set(entity.index(), location);
++            entities.mark_spawn_despawn(entity.index(), caller, self.change_tick);
+             (location, after_effect)
+         };
+ 
+diff --git a/crates/bevy_ecs/src/change_detection.rs b/crates/bevy_ecs/src/change_detection.rs
+index fdb5d496c5680..85219d44caa17 100644
+--- a/crates/bevy_ecs/src/change_detection.rs
++++ b/crates/bevy_ecs/src/change_detection.rs
+@@ -1517,7 +1517,7 @@ impl MaybeLocation {
+     /// within a non-tracked function body.
+     #[inline]
+     #[track_caller]
+-    pub fn caller() -> Self {
++    pub const fn caller() -> Self {
+         // Note that this cannot use `new_with`, since `FnOnce` invocations cannot be annotated with `#[track_caller]`.
+         MaybeLocation {
+             #[cfg(feature = "track_location")]
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index 51daac36ebe90..7177b79a2e245 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -81,13 +81,7 @@ use crate::{
+ };
+ use alloc::vec::Vec;
+ use bevy_platform::sync::atomic::Ordering;
+-use core::{
+-    fmt,
+-    hash::Hash,
+-    mem::{self, MaybeUninit},
+-    num::NonZero,
+-    panic::Location,
+-};
++use core::{fmt, hash::Hash, mem, num::NonZero, panic::Location};
+ use log::warn;
+ 
+ #[cfg(feature = "serialize")]
+@@ -905,11 +899,8 @@ impl Entities {
+         }
+     }
+ 
+-    /// Updates the location of an [`Entity`]. This must be called when moving the components of
+-    /// the existing entity around in storage.
+-    ///
+-    /// For spawning and despawning entities, [`set_spawn_despawn`](Self::set_spawn_despawn) must
+-    /// be used instead.
++    /// Updates the location of an [`Entity`].
++    /// This must be called when moving the components of the existing entity around in storage.
+     ///
+     /// # Safety
+     ///  - `index` must be a valid entity index.
+@@ -922,34 +913,15 @@ impl Entities {
+         meta.location = location;
+     }
+ 
+-    /// Updates the location of an [`Entity`]. This must be called when moving the components of
+-    /// the spawned or despawned entity around in storage.
++    /// Mark an [`Entity`] as spawned or despawned in the given tick.
+     ///
+-    /// # Safety
+-    ///  - `index` must be a valid entity index.
+-    ///  - `location` must be valid for the entity at `index` or immediately made valid afterwards
+-    ///    before handing control to unknown code.
+-    #[inline]
+-    pub(crate) unsafe fn set_spawn_despawn(
+-        &mut self,
+-        index: u32,
+-        location: EntityLocation,
+-        by: MaybeLocation,
+-        at: Tick,
+-    ) {
+-        // SAFETY: Caller guarantees that `index` a valid entity index
+-        let meta = unsafe { self.meta.get_unchecked_mut(index as usize) };
+-        meta.location = location;
+-        meta.spawned_or_despawned = MaybeUninit::new(SpawnedOrDespawned { by, at });
+-    }
+-
+     /// # Safety
+     ///  - `index` must be a valid entity index.
+     #[inline]
+     pub(crate) unsafe fn mark_spawn_despawn(&mut self, index: u32, by: MaybeLocation, at: Tick) {
+         // SAFETY: Caller guarantees that `index` a valid entity index
+         let meta = unsafe { self.meta.get_unchecked_mut(index as usize) };
+-        meta.spawned_or_despawned = MaybeUninit::new(SpawnedOrDespawned { by, at });
++        meta.spawned_or_despawned = SpawnedOrDespawned { by, at };
+     }
+ 
+     /// Increments the `generation` of a freed [`Entity`]. The next entity ID allocated with this
+@@ -1005,7 +977,12 @@ impl Entities {
+     ///
+     /// Note: freshly-allocated entities (ones which don't come from the pending list) are guaranteed
+     /// to be initialized with the invalid archetype.
+-    pub unsafe fn flush(&mut self, mut init: impl FnMut(Entity, &mut EntityLocation)) {
++    pub unsafe fn flush(
++        &mut self,
++        mut init: impl FnMut(Entity, &mut EntityLocation),
++        by: MaybeLocation,
++        at: Tick,
++    ) {
+         let free_cursor = self.free_cursor.get_mut();
+         let current_free_cursor = *free_cursor;
+ 
+@@ -1022,6 +999,7 @@ impl Entities {
+                     Entity::from_raw_and_generation(row, meta.generation),
+                     &mut meta.location,
+                 );
++                meta.spawned_or_despawned = SpawnedOrDespawned { by, at };
+             }
+ 
+             *free_cursor = 0;
+@@ -1034,18 +1012,23 @@ impl Entities {
+                 Entity::from_raw_and_generation(row, meta.generation),
+                 &mut meta.location,
+             );
++            meta.spawned_or_despawned = SpawnedOrDespawned { by, at };
+         }
+     }
+ 
+     /// Flushes all reserved entities to an "invalid" state. Attempting to retrieve them will return `None`
+     /// unless they are later populated with a valid archetype.
+-    pub fn flush_as_invalid(&mut self) {
++    pub fn flush_as_invalid(&mut self, by: MaybeLocation, at: Tick) {
+         // SAFETY: as per `flush` safety docs, the archetype id can be set to [`ArchetypeId::INVALID`] if
+         // the [`Entity`] has not been assigned to an [`Archetype`][crate::archetype::Archetype], which is the case here
+         unsafe {
+-            self.flush(|_entity, location| {
+-                location.archetype_id = ArchetypeId::INVALID;
+-            });
++            self.flush(
++                |_entity, location| {
++                    location.archetype_id = ArchetypeId::INVALID;
++                },
++                by,
++                at,
++            );
+         }
+     }
+ 
+@@ -1092,8 +1075,10 @@ impl Entities {
+         self.len() == 0
+     }
+ 
+-    /// Returns the source code location from which this entity has last been spawned
+-    /// or despawned. Returns `None` if its index has been reused by another entity
++    /// Try to get the source code location from which this entity has last been
++    /// spawned, despawned or flushed.
++    ///
++    /// Returns `None` if its index has been reused by another entity
+     /// or if this entity has never existed.
+     pub fn entity_get_spawned_or_despawned_by(
+         &self,
+@@ -1105,17 +1090,21 @@ impl Entities {
+         })
+     }
+ 
+-    /// Returns the [`Tick`] at which this entity has last been spawned or despawned.
++    /// Try to get the [`Tick`] at which this entity has last been
++    /// spawned, despawned or flushed.
++    ///
+     /// Returns `None` if its index has been reused by another entity or if this entity
+-    /// has never existed.
++    /// has never been spawned.
+     pub fn entity_get_spawned_or_despawned_at(&self, entity: Entity) -> Option<Tick> {
+         self.entity_get_spawned_or_despawned(entity)
+             .map(|spawned_or_despawned| spawned_or_despawned.at)
+     }
+ 
+-    /// Returns the [`SpawnedOrDespawned`] related to the entity's last spawn or
+-    /// respawn. Returns `None` if its index has been reused by another entity or if
+-    /// this entity has never existed.
++    /// Try to get the [`SpawnedOrDespawned`] related to the entity's last spawn,
++    /// despawn or flush.
++    ///
++    /// Returns `None` if its index has been reused by another entity or if
++    /// this entity has never been spawned.
+     #[inline]
+     fn entity_get_spawned_or_despawned(&self, entity: Entity) -> Option<SpawnedOrDespawned> {
+         self.meta
+@@ -1125,10 +1114,7 @@ impl Entities {
+             (meta.generation == entity.generation)
+             || (meta.location.archetype_id == ArchetypeId::INVALID)
+             && (meta.generation == entity.generation.after_versions(1)))
+-            .map(|meta| {
+-                // SAFETY: valid archetype or non-min generation is proof this is init
+-                unsafe { meta.spawned_or_despawned.assume_init() }
+-            })
++            .map(|meta| meta.spawned_or_despawned)
+     }
+ 
+     /// Returns the source code location from which this entity has last been spawned
+@@ -1145,9 +1131,7 @@ impl Entities {
+     ) -> (MaybeLocation, Tick) {
+         // SAFETY: caller ensures entity is allocated
+         let meta = unsafe { self.meta.get_unchecked(entity.index() as usize) };
+-        // SAFETY: caller ensures entities of this index were at least spawned
+-        let spawned_or_despawned = unsafe { meta.spawned_or_despawned.assume_init() };
+-        (spawned_or_despawned.by, spawned_or_despawned.at)
++        (meta.spawned_or_despawned.by, meta.spawned_or_despawned.at)
+     }
+ 
+     #[inline]
+@@ -1156,9 +1140,7 @@ impl Entities {
+             if meta.generation != EntityGeneration::FIRST
+                 || meta.location.archetype_id != ArchetypeId::INVALID
+             {
+-                // SAFETY: non-min generation or valid archetype is proof this is init
+-                let spawned_or_despawned = unsafe { meta.spawned_or_despawned.assume_init_mut() };
+-                spawned_or_despawned.at.check_tick(change_tick);
++                meta.spawned_or_despawned.at.check_tick(change_tick);
+             }
+         }
+     }
+@@ -1220,10 +1202,10 @@ impl fmt::Display for EntityDoesNotExistDetails {
+ struct EntityMeta {
+     /// The current [`EntityGeneration`] of the [`EntityRow`].
+     pub generation: EntityGeneration,
+-    /// The current location of the [`EntityRow`]
++    /// The current location of the [`EntityRow`].
+     pub location: EntityLocation,
+-    /// Location of the last spawn or despawn of this entity
+-    spawned_or_despawned: MaybeUninit<SpawnedOrDespawned>,
++    /// Location and tick of the last spawn, despawn or flush of this entity.
++    spawned_or_despawned: SpawnedOrDespawned,
+ }
+ 
+ #[derive(Copy, Clone, Debug)]
+@@ -1237,7 +1219,10 @@ impl EntityMeta {
+     const EMPTY: EntityMeta = EntityMeta {
+         generation: EntityGeneration::FIRST,
+         location: EntityLocation::INVALID,
+-        spawned_or_despawned: MaybeUninit::uninit(),
++        spawned_or_despawned: SpawnedOrDespawned {
++            by: MaybeLocation::caller(),
++            at: Tick::new(0),
++        },
+     };
+ }
+ 
+@@ -1303,7 +1288,7 @@ mod tests {
+         let mut e = Entities::new();
+         e.reserve_entity();
+         // SAFETY: entity_location is left invalid
+-        unsafe { e.flush(|_, _| {}) };
++        unsafe { e.flush(|_, _| {}, MaybeLocation::caller(), Tick::default()) };
+         assert_eq!(e.len(), 1);
+     }
+ 
+@@ -1316,9 +1301,13 @@ mod tests {
+ 
+         // SAFETY: entity_location is left invalid
+         unsafe {
+-            entities.flush(|_entity, _location| {
+-                // do nothing ... leaving entity location invalid
+-            });
++            entities.flush(
++                |_entity, _location| {
++                    // do nothing ... leaving entity location invalid
++                },
++                MaybeLocation::caller(),
++                Tick::default(),
++            );
+         };
+ 
+         assert!(entities.contains(e));
+diff --git a/crates/bevy_ecs/src/world/entity_ref.rs b/crates/bevy_ecs/src/world/entity_ref.rs
+index 64610f8e4eac4..aa3e66ca143a3 100644
+--- a/crates/bevy_ecs/src/world/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_ref.rs
+@@ -2435,7 +2435,7 @@ impl<'w> EntityWorldMut<'w> {
+                 // SAFETY: swapped_entity is valid and the swapped entity's components are
+                 // moved to the new location immediately after.
+                 unsafe {
+-                    world.entities.set_spawn_despawn(
++                    world.entities.set(
+                         swapped_entity.index(),
+                         EntityLocation {
+                             archetype_id: swapped_location.archetype_id,
+@@ -2443,9 +2443,10 @@ impl<'w> EntityWorldMut<'w> {
+                             table_id: swapped_location.table_id,
+                             table_row: swapped_location.table_row,
+                         },
+-                        caller,
+-                        change_tick,
+                     );
++                    world
++                        .entities
++                        .mark_spawn_despawn(swapped_entity.index(), caller, change_tick);
+                 }
+             }
+             table_row = remove_result.table_row;
+@@ -2466,7 +2467,7 @@ impl<'w> EntityWorldMut<'w> {
+             // SAFETY: `moved_entity` is valid and the provided `EntityLocation` accurately reflects
+             //         the current location of the entity and its component data.
+             unsafe {
+-                world.entities.set_spawn_despawn(
++                world.entities.set(
+                     moved_entity.index(),
+                     EntityLocation {
+                         archetype_id: moved_location.archetype_id,
+@@ -2474,9 +2475,10 @@ impl<'w> EntityWorldMut<'w> {
+                         table_id: moved_location.table_id,
+                         table_row,
+                     },
+-                    caller,
+-                    change_tick,
+                 );
++                world
++                    .entities
++                    .mark_spawn_despawn(moved_entity.index(), caller, change_tick);
+             }
+             world.archetypes[moved_location.archetype_id]
+                 .set_entity_table_row(moved_location.archetype_row, table_row);
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 2a97b6a0bb49c..f146177ea0214 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -1186,8 +1186,9 @@ impl World {
+         // empty
+         let location = unsafe { archetype.allocate(entity, table_row) };
+         let change_tick = self.change_tick();
++        self.entities.set(entity.index(), location);
+         self.entities
+-            .set_spawn_despawn(entity.index(), location, caller, change_tick);
++            .mark_spawn_despawn(entity.index(), caller, change_tick);
+ 
+         EntityWorldMut::new(self, entity, location)
+     }
+@@ -2711,17 +2712,24 @@ impl World {
+     /// Empties queued entities and adds them to the empty [`Archetype`](crate::archetype::Archetype).
+     /// This should be called before doing operations that might operate on queued entities,
+     /// such as inserting a [`Component`].
++    #[track_caller]
+     pub(crate) fn flush_entities(&mut self) {
++        let by = MaybeLocation::caller();
++        let at = self.change_tick();
+         let empty_archetype = self.archetypes.empty_mut();
+         let table = &mut self.storages.tables[empty_archetype.table_id()];
+         // PERF: consider pre-allocating space for flushed entities
+         // SAFETY: entity is set to a valid location
+         unsafe {
+-            self.entities.flush(|entity, location| {
+-                // SAFETY: no components are allocated by archetype.allocate() because the archetype
+-                // is empty
+-                *location = empty_archetype.allocate(entity, table.allocate(entity));
+-            });
++            self.entities.flush(
++                |entity, location| {
++                    // SAFETY: no components are allocated by archetype.allocate() because the archetype
++                    // is empty
++                    *location = empty_archetype.allocate(entity, table.allocate(entity));
++                },
++                by,
++                at,
++            );
+         }
+     }
+ 
+@@ -2756,6 +2764,7 @@ impl World {
+     ///
+     /// Queued entities will be spawned, and then commands will be applied.
+     #[inline]
++    #[track_caller]
+     pub fn flush(&mut self) {
+         self.flush_entities();
+         self.flush_components();
+diff --git a/release-content/migration-guides/flush.md b/release-content/migration-guides/flush.md
+new file mode 100644
+index 0000000000000..4b1cfb029738c
+--- /dev/null
++++ b/release-content/migration-guides/flush.md
+@@ -0,0 +1,9 @@
++---
++title: Flushing
++pull_requests: [19350]
++---
++
++`Entities::flush` now also asks for metadata about the flush operation
++that will be stored for the flushed entities. For the source location,
++`MaybeLocation::caller()` can be used; the tick should be retrieved
++from the world.
+diff --git a/release-content/release-notes/entity-spawn-ticks.md b/release-content/release-notes/entity-spawn-ticks.md
+index 54c6d664fe424..c90500f1a1470 100644
+--- a/release-content/release-notes/entity-spawn-ticks.md
++++ b/release-content/release-notes/entity-spawn-ticks.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Entity Spawn Ticks
+-authors: ["@urben1680"]
+-pull_requests: [19047]
++authors: ["@urben1680", "@specificprotagonist"]
++pull_requests: [19047, 19350]
+ ---
+ 
+ Keeping track which entities have been spawned since the last time a system ran could only be done indirectly by inserting marker components and do your logic on entities that match an `Added<MyMarker>` filter or in `MyMarker`'s `on_add` hook.
+@@ -23,12 +23,11 @@ fn print_spawn_details(query: Query<(Entity, SpawnDetails)>) {
+             print!("new ");
+         }
+         print!(
+-            "entity {:?} spawned at {:?}",
+-            entity,
++            "entity {entity:?} spawned at {:?}",
+             spawn_details.spawned_at()
+         );
+         match spawn_details.spawned_by().into_option() {
+-            Some(location) => println!(" by {:?}", location),
++            Some(location) => println!(" by {location:?}"),
+             None => println!()
+         }    
+     }
+@@ -44,8 +43,8 @@ Note that this, like `Added<T>` and `Changed<T>`, is a non-archetypal filter. Th
+ Because of this, these systems have roughly the same performance:
+ 
+ ```rs
+-fn system1(q: Query<Entity, Spawned>) {
+-    for entity in &q { /* entity spawned */ }
++fn system1(query: Query<Entity, Spawned>) {
++    for entity in &query { /* entity spawned */ }
+ }
+ 
+ fn system2(query: Query<(Entity, SpawnDetails)>) {
+@@ -80,4 +79,4 @@ fn filter_spawned_after(
+ 
+ The tick is stored in `Entities`. It's method `entity_get_spawned_or_despawned_at` not only returns when a living entity spawned at, it also returns when a despawned entity found it's bitter end.
+ 
+-Note however that despawned entities can be replaced by bevy at any following spawn. Then this method returns `None` for the despawned entity. The same is true if the entity is not even spawned yet, only allocated.
++Note however that despawned entities can be replaced by Bevy at any following spawn. Then this method returns `None` for the despawned entity. The same is true if the entity is not even spawned yet, only allocated.

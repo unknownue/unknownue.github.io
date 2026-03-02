@@ -1,0 +1,650 @@
+diff --git a/crates/bevy_animation/src/lib.rs b/crates/bevy_animation/src/lib.rs
+index a848ee47f8d2f..386eb614be3a3 100644
+--- a/crates/bevy_animation/src/lib.rs
++++ b/crates/bevy_animation/src/lib.rs
+@@ -1245,7 +1245,7 @@ impl Plugin for AnimationPlugin {
+                     // `PostUpdate`. For now, we just disable ambiguity testing
+                     // for this system.
+                     animate_targets
+-                        .before(bevy_mesh::InheritWeights)
++                        .before(bevy_mesh::InheritWeightSystems)
+                         .ambiguous_with_all(),
+                     trigger_untargeted_animation_events,
+                     expire_completed_transitions,
+diff --git a/crates/bevy_anti_aliasing/Cargo.toml b/crates/bevy_anti_aliasing/Cargo.toml
+index 663d168b88535..764f51405911c 100644
+--- a/crates/bevy_anti_aliasing/Cargo.toml
++++ b/crates/bevy_anti_aliasing/Cargo.toml
+@@ -12,7 +12,7 @@ keywords = ["bevy"]
+ trace = []
+ webgl = []
+ webgpu = []
+-smaa_luts = ["bevy_render/ktx2", "bevy_image/ktx2", "bevy_image/zstd"]
++smaa_luts = ["bevy_image/ktx2", "bevy_image/zstd"]
+ 
+ [dependencies]
+ # bevy
+diff --git a/crates/bevy_camera/src/lib.rs b/crates/bevy_camera/src/lib.rs
+index e698e635dab7c..1d5ab008599d8 100644
+--- a/crates/bevy_camera/src/lib.rs
++++ b/crates/bevy_camera/src/lib.rs
+@@ -6,6 +6,7 @@ pub mod primitives;
+ mod projection;
+ pub mod visibility;
+ 
++use bevy_ecs::schedule::SystemSet;
+ pub use camera::*;
+ pub use clear_color::*;
+ pub use components::*;
+@@ -37,3 +38,11 @@ pub mod prelude {
+         PerspectiveProjection, Projection,
+     };
+ }
++
++/// Label for `camera_system<T>`, shared across all `T`.
++#[derive(SystemSet, Clone, Eq, PartialEq, Hash, Debug)]
++pub struct CameraUpdateSystems;
++
++/// Deprecated alias for [`CameraUpdateSystems`].
++#[deprecated(since = "0.17.0", note = "Renamed to `CameraUpdateSystems`.")]
++pub type CameraUpdateSystem = CameraUpdateSystems;
+diff --git a/crates/bevy_camera/src/projection.rs b/crates/bevy_camera/src/projection.rs
+index 1d2bfdab27561..f95959c43986c 100644
+--- a/crates/bevy_camera/src/projection.rs
++++ b/crates/bevy_camera/src/projection.rs
+@@ -27,14 +27,6 @@ impl Plugin for CameraProjectionPlugin {
+     }
+ }
+ 
+-/// Label for `camera_system<T>`, shared across all `T`.
+-#[derive(SystemSet, Clone, Eq, PartialEq, Hash, Debug)]
+-pub struct CameraUpdateSystems;
+-
+-/// Deprecated alias for [`CameraUpdateSystems`].
+-#[deprecated(since = "0.17.0", note = "Renamed to `CameraUpdateSystems`.")]
+-pub type CameraUpdateSystem = CameraUpdateSystems;
+-
+ /// Describes a type that can generate a projection matrix, allowing it to be added to a
+ /// [`Camera`]'s [`Projection`] component.
+ ///
+diff --git a/crates/bevy_core_pipeline/Cargo.toml b/crates/bevy_core_pipeline/Cargo.toml
+index 05a1b7ce37986..3907fb499964a 100644
+--- a/crates/bevy_core_pipeline/Cargo.toml
++++ b/crates/bevy_core_pipeline/Cargo.toml
+@@ -16,7 +16,7 @@ keywords = ["bevy"]
+ trace = []
+ webgl = []
+ webgpu = []
+-tonemapping_luts = ["bevy_render/ktx2", "bevy_image/ktx2", "bevy_image/zstd"]
++tonemapping_luts = ["bevy_image/ktx2", "bevy_image/zstd"]
+ 
+ [dependencies]
+ # bevy
+diff --git a/crates/bevy_image/src/image.rs b/crates/bevy_image/src/image.rs
+index c3c248dc4d0c5..eb0b9d1884c0a 100644
+--- a/crates/bevy_image/src/image.rs
++++ b/crates/bevy_image/src/image.rs
+@@ -1,15 +1,18 @@
++use crate::ImageLoader;
++
+ #[cfg(feature = "basis-universal")]
+ use super::basis::*;
+ #[cfg(feature = "dds")]
+ use super::dds::*;
+ #[cfg(feature = "ktx2")]
+ use super::ktx2::*;
++use bevy_app::{App, Plugin};
+ #[cfg(not(feature = "bevy_reflect"))]
+ use bevy_reflect::TypePath;
+ #[cfg(feature = "bevy_reflect")]
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ 
+-use bevy_asset::{Asset, RenderAssetUsages};
++use bevy_asset::{uuid_handle, Asset, AssetApp, Assets, Handle, RenderAssetUsages};
+ use bevy_color::{Color, ColorToComponents, Gray, LinearRgba, Srgba, Xyza};
+ use bevy_ecs::resource::Resource;
+ use bevy_math::{AspectRatio, UVec2, UVec3, Vec2};
+@@ -35,6 +38,84 @@ impl BevyDefault for TextureFormat {
+     }
+ }
+ 
++/// A handle to a 1 x 1 transparent white image.
++///
++/// Like [`Handle<Image>::default`], this is a handle to a fallback image asset.
++/// While that handle points to an opaque white 1 x 1 image, this handle points to a transparent 1 x 1 white image.
++// Number randomly selected by fair WolframAlpha query. Totally arbitrary.
++pub const TRANSPARENT_IMAGE_HANDLE: Handle<Image> =
++    uuid_handle!("d18ad97e-a322-4981-9505-44c59a4b5e46");
++
++/// Adds the [`Image`] as an asset and makes sure that they are extracted and prepared for the GPU.
++pub struct ImagePlugin {
++    /// The default image sampler to use when [`ImageSampler`] is set to `Default`.
++    pub default_sampler: ImageSamplerDescriptor,
++}
++
++impl Default for ImagePlugin {
++    fn default() -> Self {
++        ImagePlugin::default_linear()
++    }
++}
++
++impl ImagePlugin {
++    /// Creates image settings with linear sampling by default.
++    pub fn default_linear() -> ImagePlugin {
++        ImagePlugin {
++            default_sampler: ImageSamplerDescriptor::linear(),
++        }
++    }
++
++    /// Creates image settings with nearest sampling by default.
++    pub fn default_nearest() -> ImagePlugin {
++        ImagePlugin {
++            default_sampler: ImageSamplerDescriptor::nearest(),
++        }
++    }
++}
++
++impl Plugin for ImagePlugin {
++    fn build(&self, app: &mut App) {
++        #[cfg(feature = "exr")]
++        app.init_asset_loader::<crate::ExrTextureLoader>();
++
++        #[cfg(feature = "hdr")]
++        app.init_asset_loader::<crate::HdrTextureLoader>();
++
++        app.init_asset::<Image>();
++        #[cfg(feature = "bevy_reflect")]
++        app.register_asset_reflect::<Image>();
++
++        let mut image_assets = app.world_mut().resource_mut::<Assets<Image>>();
++
++        image_assets
++            .insert(&Handle::default(), Image::default())
++            .unwrap();
++        image_assets
++            .insert(&TRANSPARENT_IMAGE_HANDLE, Image::transparent())
++            .unwrap();
++
++        #[cfg(feature = "compressed_image_saver")]
++        if let Some(processor) = app
++            .world()
++            .get_resource::<bevy_asset::processor::AssetProcessor>()
++        {
++            processor.register_processor::<bevy_asset::processor::LoadTransformAndSave<
++                ImageLoader,
++                bevy_asset::transformer::IdentityAssetTransformer<Image>,
++                crate::CompressedImageSaver,
++            >>(crate::CompressedImageSaver.into());
++            processor.set_default_processor::<bevy_asset::processor::LoadTransformAndSave<
++                ImageLoader,
++                bevy_asset::transformer::IdentityAssetTransformer<Image>,
++                crate::CompressedImageSaver,
++            >>("png");
++        }
++
++        app.preregister_asset_loader::<ImageLoader>(ImageLoader::SUPPORTED_FILE_EXTENSIONS);
++    }
++}
++
+ pub const TEXTURE_ASSET_INDEX: u64 = 0;
+ pub const SAMPLER_ASSET_INDEX: u64 = 1;
+ 
+diff --git a/crates/bevy_image/src/lib.rs b/crates/bevy_image/src/lib.rs
+index 3ab8ff91fe33f..d17e8e092b915 100644
+--- a/crates/bevy_image/src/lib.rs
++++ b/crates/bevy_image/src/lib.rs
+@@ -6,7 +6,7 @@ pub mod prelude {
+     pub use crate::{
+         dynamic_texture_atlas_builder::DynamicTextureAtlasBuilder,
+         texture_atlas::{TextureAtlas, TextureAtlasLayout, TextureAtlasSources},
+-        BevyDefault as _, Image, ImageFormat, TextureAtlasBuilder, TextureError,
++        BevyDefault as _, Image, ImageFormat, ImagePlugin, TextureAtlasBuilder, TextureError,
+     };
+ }
+ 
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index c662a4858dad8..1ff92d7087422 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -29,16 +29,7 @@ detailed_trace = ["bevy_ecs/detailed_trace", "bevy_render?/detailed_trace"]
+ sysinfo_plugin = ["bevy_diagnostic/sysinfo_plugin"]
+ 
+ # Enables compressed KTX2 UASTC texture output on the asset processor
+-compressed_image_saver = [
+-  "bevy_image/compressed_image_saver",
+-  "bevy_render/compressed_image_saver",
+-]
+-
+-# Texture formats that have specific rendering support (HDR enabled by default)
+-basis-universal = ["bevy_image/basis-universal", "bevy_render/basis-universal"]
+-exr = ["bevy_image/exr", "bevy_render/exr"]
+-hdr = ["bevy_image/hdr", "bevy_render/hdr"]
+-ktx2 = ["bevy_image/ktx2", "bevy_render/ktx2"]
++compressed_image_saver = ["bevy_image/compressed_image_saver"]
+ 
+ # For ktx2 supercompression
+ zlib = ["bevy_image/zlib"]
+@@ -46,7 +37,8 @@ zstd = ["bevy_image/zstd"]
+ zstd_rust = ["bevy_image/zstd_rust"]
+ zstd_c = ["bevy_image/zstd_c"]
+ 
+-# Image format support (PNG enabled by default)
++# Image format support (HDR and PNG enabled by default)
++basis-universal = ["bevy_image/basis-universal"]
+ bmp = ["bevy_image/bmp"]
+ ff = ["bevy_image/ff"]
+ gif = ["bevy_image/gif"]
+@@ -59,6 +51,9 @@ tga = ["bevy_image/tga"]
+ tiff = ["bevy_image/tiff"]
+ webp = ["bevy_image/webp"]
+ dds = ["bevy_image/dds"]
++exr = ["bevy_image/exr"]
++hdr = ["bevy_image/hdr"]
++ktx2 = ["bevy_image/ktx2"]
+ 
+ # Enable SPIR-V passthrough
+ spirv_shader_passthrough = ["bevy_render/spirv_shader_passthrough"]
+@@ -89,11 +84,14 @@ symphonia-wav = ["bevy_audio/symphonia-wav"]
+ 
+ # Shader formats
+ shader_format_glsl = [
+-  "bevy_render/shader_format_glsl",
++  "bevy_shader/shader_format_glsl",
+   "bevy_pbr?/shader_format_glsl",
+ ]
+-shader_format_spirv = ["bevy_render/shader_format_spirv"]
+-shader_format_wesl = ["bevy_render/shader_format_wesl"]
++shader_format_spirv = [
++  "bevy_shader/shader_format_spirv",
++  "bevy_render?/shader_format_spirv",
++]
++shader_format_wesl = ["bevy_shader/shader_format_wesl"]
+ 
+ serialize = [
+   "bevy_a11y?/serialize",
+diff --git a/crates/bevy_internal/src/default_plugins.rs b/crates/bevy_internal/src/default_plugins.rs
+index cdb59921dcc74..5a7b4773e4d4a 100644
+--- a/crates/bevy_internal/src/default_plugins.rs
++++ b/crates/bevy_internal/src/default_plugins.rs
+@@ -31,8 +31,8 @@ plugin_group! {
+         bevy_render:::RenderPlugin,
+         // NOTE: Load this after renderer initialization so that it knows about the supported
+         // compressed texture formats.
+-        #[cfg(feature = "bevy_render")]
+-        bevy_render::texture:::ImagePlugin,
++        #[cfg(feature = "bevy_image")]
++        bevy_image:::ImagePlugin,
+         #[cfg(feature = "bevy_render")]
+         #[custom(cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded")))]
+         bevy_render::pipelined_rendering:::PipelinedRenderingPlugin,
+diff --git a/crates/bevy_mesh/src/lib.rs b/crates/bevy_mesh/src/lib.rs
+index c97fb21422a6e..848e9de505c30 100644
+--- a/crates/bevy_mesh/src/lib.rs
++++ b/crates/bevy_mesh/src/lib.rs
+@@ -71,4 +71,4 @@ impl BaseMeshPipelineKey {
+ 
+ /// `bevy_render::mesh::inherit_weights` runs in this `SystemSet`
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+-pub struct InheritWeights;
++pub struct InheritWeightSystems;
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index 40f2bee2eceb6..84d1b3e4da5c1 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -18,8 +18,8 @@ experimental_pbr_pcss = ["bevy_light/experimental_pbr_pcss"]
+ pbr_specular_textures = []
+ pbr_clustered_decals = []
+ pbr_light_textures = []
+-bluenoise_texture = ["bevy_render/ktx2", "bevy_image/ktx2", "bevy_image/zstd"]
+-shader_format_glsl = ["bevy_render/shader_format_glsl"]
++bluenoise_texture = ["bevy_image/ktx2", "bevy_image/zstd"]
++shader_format_glsl = ["bevy_shader/shader_format_glsl"]
+ trace = ["bevy_render/trace"]
+ # Enables the meshlet renderer for dense high-poly scenes (experimental)
+ meshlet = ["dep:lz4_flex", "dep:range-alloc", "dep:bevy_tasks"]
+diff --git a/crates/bevy_render/Cargo.toml b/crates/bevy_render/Cargo.toml
+index 276f91e793bf4..152791442d7db 100644
+--- a/crates/bevy_render/Cargo.toml
++++ b/crates/bevy_render/Cargo.toml
+@@ -21,20 +21,9 @@ keywords = ["bevy"]
+ # wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "..." }
+ decoupled_naga = ["bevy_shader/decoupled_naga"]
+ 
+-# Enables compressed KTX2 UASTC texture output on the asset processor
+-compressed_image_saver = ["bevy_image/compressed_image_saver"]
+-
+-# Texture formats (require more than just image support)
+-basis-universal = ["bevy_image/basis-universal"]
+-exr = ["bevy_image/exr"]
+-hdr = ["bevy_image/hdr"]
+-ktx2 = ["bevy_image/ktx2"]
+-
+ multi_threaded = ["bevy_tasks/multi_threaded"]
+ 
+-shader_format_glsl = ["bevy_shader/shader_format_glsl"]
+ shader_format_spirv = ["bevy_shader/shader_format_spirv", "wgpu/spirv"]
+-shader_format_wesl = ["bevy_shader/shader_format_wesl"]
+ 
+ # Enable SPIR-V shader passthrough
+ spirv_shader_passthrough = ["wgpu/spirv"]
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index 82d55d9baf5ed..c6159bdd2a301 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -72,11 +72,8 @@ mod wgpu_wrapper;
+ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+-        alpha::AlphaMode,
+-        camera::NormalizedRenderTargetExt as _,
+-        texture::{ImagePlugin, ManualTextureViews},
+-        view::Msaa,
+-        ExtractSchedule,
++        alpha::AlphaMode, camera::NormalizedRenderTargetExt as _, texture::ManualTextureViews,
++        view::Msaa, ExtractSchedule,
+     };
+ }
+ 
+@@ -91,6 +88,7 @@ use crate::{
+     renderer::{render_system, RenderInstance},
+     settings::RenderCreation,
+     storage::StoragePlugin,
++    texture::TexturePlugin,
+     view::{ViewPlugin, WindowRenderPlugin},
+ };
+ use alloc::sync::Arc;
+@@ -424,6 +422,7 @@ impl Plugin for RenderPlugin {
+             MeshPlugin,
+             GlobalsPlugin,
+             MorphPlugin,
++            TexturePlugin,
+             BatchingPlugin {
+                 debug_flags: self.debug_flags,
+             },
+diff --git a/crates/bevy_render/src/mesh/mod.rs b/crates/bevy_render/src/mesh/mod.rs
+index a2bbfec58c3c1..cbc22c841f352 100644
+--- a/crates/bevy_render/src/mesh/mod.rs
++++ b/crates/bevy_render/src/mesh/mod.rs
+@@ -51,7 +51,7 @@ impl Plugin for MeshPlugin {
+ pub struct MorphPlugin;
+ impl Plugin for MorphPlugin {
+     fn build(&self, app: &mut App) {
+-        app.add_systems(PostUpdate, inherit_weights.in_set(InheritWeights));
++        app.add_systems(PostUpdate, inherit_weights.in_set(InheritWeightSystems));
+     }
+ }
+ 
+diff --git a/crates/bevy_render/src/render_resource/texture.rs b/crates/bevy_render/src/render_resource/texture.rs
+index 035e1ecca3183..e7be4177ef02b 100644
+--- a/crates/bevy_render/src/render_resource/texture.rs
++++ b/crates/bevy_render/src/render_resource/texture.rs
+@@ -160,7 +160,7 @@ impl Deref for Sampler {
+ /// A rendering resource for the default image sampler which is set during renderer
+ /// initialization.
+ ///
+-/// The [`ImagePlugin`](crate::texture::ImagePlugin) can be set during app initialization to change the default
++/// The [`ImagePlugin`](bevy_image::ImagePlugin) can be set during app initialization to change the default
+ /// image sampler.
+ #[derive(Resource, Debug, Clone, Deref, DerefMut)]
+ pub struct DefaultImageSampler(pub(crate) Sampler);
+diff --git a/crates/bevy_render/src/texture/mod.rs b/crates/bevy_render/src/texture/mod.rs
+index 133a4b207e2fe..3d451b5d351df 100644
+--- a/crates/bevy_render/src/texture/mod.rs
++++ b/crates/bevy_render/src/texture/mod.rs
+@@ -5,14 +5,7 @@ mod texture_attachment;
+ mod texture_cache;
+ 
+ pub use crate::render_resource::DefaultImageSampler;
+-#[cfg(feature = "compressed_image_saver")]
+-use bevy_image::CompressedImageSaver;
+-#[cfg(feature = "hdr")]
+-use bevy_image::HdrTextureLoader;
+-use bevy_image::{
+-    CompressedImageFormatSupport, CompressedImageFormats, Image, ImageLoader,
+-    ImageSamplerDescriptor,
+-};
++use bevy_image::{CompressedImageFormatSupport, CompressedImageFormats, ImageLoader, ImagePlugin};
+ pub use fallback_image::*;
+ pub use gpu_image::*;
+ pub use manual_texture_view::*;
+@@ -24,103 +17,26 @@ use crate::{
+     renderer::RenderDevice, Render, RenderApp, RenderSystems,
+ };
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{uuid_handle, AssetApp, Assets, Handle};
++use bevy_asset::AssetApp;
+ use bevy_ecs::prelude::*;
+ use tracing::warn;
+ 
+-/// A handle to a 1 x 1 transparent white image.
+-///
+-/// Like [`Handle<Image>::default`], this is a handle to a fallback image asset.
+-/// While that handle points to an opaque white 1 x 1 image, this handle points to a transparent 1 x 1 white image.
+-// Number randomly selected by fair WolframAlpha query. Totally arbitrary.
+-pub const TRANSPARENT_IMAGE_HANDLE: Handle<Image> =
+-    uuid_handle!("d18ad97e-a322-4981-9505-44c59a4b5e46");
+-
+-// TODO: replace Texture names with Image names?
+-/// Adds the [`Image`] as an asset and makes sure that they are extracted and prepared for the GPU.
+-pub struct ImagePlugin {
+-    /// The default image sampler to use when [`bevy_image::ImageSampler`] is set to `Default`.
+-    pub default_sampler: ImageSamplerDescriptor,
+-}
+-
+-impl Default for ImagePlugin {
+-    fn default() -> Self {
+-        ImagePlugin::default_linear()
+-    }
+-}
+-
+-impl ImagePlugin {
+-    /// Creates image settings with linear sampling by default.
+-    pub fn default_linear() -> ImagePlugin {
+-        ImagePlugin {
+-            default_sampler: ImageSamplerDescriptor::linear(),
+-        }
+-    }
+-
+-    /// Creates image settings with nearest sampling by default.
+-    pub fn default_nearest() -> ImagePlugin {
+-        ImagePlugin {
+-            default_sampler: ImageSamplerDescriptor::nearest(),
+-        }
+-    }
+-}
++#[derive(Default)]
++pub struct TexturePlugin;
+ 
+-impl Plugin for ImagePlugin {
++impl Plugin for TexturePlugin {
+     fn build(&self, app: &mut App) {
+-        #[cfg(feature = "exr")]
+-        {
+-            app.init_asset_loader::<bevy_image::ExrTextureLoader>();
+-        }
+-
+-        #[cfg(feature = "hdr")]
+-        {
+-            app.init_asset_loader::<HdrTextureLoader>();
+-        }
+-
+         app.add_plugins((
+             RenderAssetPlugin::<GpuImage>::default(),
+             ExtractResourcePlugin::<ManualTextureViews>::default(),
+         ))
+-        .init_resource::<ManualTextureViews>()
+-        .init_asset::<Image>()
+-        .register_asset_reflect::<Image>();
+-
+-        let mut image_assets = app.world_mut().resource_mut::<Assets<Image>>();
+-
+-        image_assets
+-            .insert(&Handle::default(), Image::default())
+-            .unwrap();
+-        image_assets
+-            .insert(&TRANSPARENT_IMAGE_HANDLE, Image::transparent())
+-            .unwrap();
+-
+-        #[cfg(feature = "compressed_image_saver")]
+-        if let Some(processor) = app
+-            .world()
+-            .get_resource::<bevy_asset::processor::AssetProcessor>()
+-        {
+-            processor.register_processor::<bevy_asset::processor::LoadTransformAndSave<
+-                ImageLoader,
+-                bevy_asset::transformer::IdentityAssetTransformer<Image>,
+-                CompressedImageSaver,
+-            >>(CompressedImageSaver.into());
+-            processor.set_default_processor::<bevy_asset::processor::LoadTransformAndSave<
+-                ImageLoader,
+-                bevy_asset::transformer::IdentityAssetTransformer<Image>,
+-                CompressedImageSaver,
+-            >>("png");
+-        }
+-
++        .init_resource::<ManualTextureViews>();
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app.init_resource::<TextureCache>().add_systems(
+                 Render,
+                 update_texture_cache_system.in_set(RenderSystems::Cleanup),
+             );
+         }
+-
+-        if !ImageLoader::SUPPORTED_FILE_EXTENSIONS.is_empty() {
+-            app.preregister_asset_loader::<ImageLoader>(ImageLoader::SUPPORTED_FILE_EXTENSIONS);
+-        }
+     }
+ 
+     fn finish(&self, app: &mut App) {
+@@ -137,11 +53,14 @@ impl Plugin for ImagePlugin {
+ 
+             app.register_asset_loader(ImageLoader::new(supported_compressed_formats));
+         }
++        let default_sampler = app.get_added_plugins::<ImagePlugin>()[0]
++            .default_sampler
++            .clone();
+ 
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             let default_sampler = {
+                 let device = render_app.world().resource::<RenderDevice>();
+-                device.create_sampler(&self.default_sampler.as_wgpu())
++                device.create_sampler(&default_sampler.as_wgpu())
+             };
+             render_app
+                 .insert_resource(DefaultImageSampler(default_sampler))
+diff --git a/crates/bevy_ui/Cargo.toml b/crates/bevy_ui/Cargo.toml
+index 71bc02bc7abe2..a2b748433dc27 100644
+--- a/crates/bevy_ui/Cargo.toml
++++ b/crates/bevy_ui/Cargo.toml
+@@ -22,7 +22,6 @@ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
+ bevy_input = { path = "../bevy_input", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+-bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev" }
+ bevy_text = { path = "../bevy_text", version = "0.17.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev", optional = true }
+@@ -43,6 +42,9 @@ smallvec = { version = "1", default-features = false }
+ accesskit = "0.21"
+ tracing = { version = "0.1", default-features = false, features = ["std"] }
+ 
++[dev-dependencies]
++bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
++
+ [features]
+ default = []
+ serialize = [
+diff --git a/crates/bevy_ui/src/widget/image.rs b/crates/bevy_ui/src/widget/image.rs
+index 6f0ed85ab7cc0..581cd5bb7033c 100644
+--- a/crates/bevy_ui/src/widget/image.rs
++++ b/crates/bevy_ui/src/widget/image.rs
+@@ -2,10 +2,9 @@ use crate::{ComputedUiTargetCamera, ContentSize, Measure, MeasureArgs, Node, Nod
+ use bevy_asset::{Assets, Handle};
+ use bevy_color::Color;
+ use bevy_ecs::prelude::*;
+-use bevy_image::prelude::*;
++use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
+ use bevy_math::{Rect, UVec2, Vec2};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::texture::TRANSPARENT_IMAGE_HANDLE;
+ use bevy_sprite::TextureSlicer;
+ use taffy::{MaybeMath, MaybeResolve};
+ 
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index 70d2f42089248..2ea085a253780 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -36,29 +36,21 @@ use bevy_core_pipeline::core_2d::graph::{Core2d, Node2d};
+ use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
+ use bevy_ecs::prelude::*;
+ use bevy_ecs::system::SystemParam;
+-use bevy_image::prelude::*;
++use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
+ use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2};
+-use bevy_render::render_graph::{NodeRunError, RenderGraphContext};
+-use bevy_render::render_phase::ViewSortedRenderPhases;
+-use bevy_render::renderer::RenderContext;
+-use bevy_render::sync_world::MainEntity;
+-use bevy_render::texture::TRANSPARENT_IMAGE_HANDLE;
+-use bevy_render::view::{Hdr, RetainedViewEntity};
+-use bevy_render::RenderStartup;
+ use bevy_render::{
+     render_asset::RenderAssets,
+-    render_graph::{Node as RenderGraphNode, RenderGraph},
+-    render_phase::{sort_phase_system, AddRenderCommand, DrawFunctions},
++    render_graph::{Node as RenderGraphNode, NodeRunError, RenderGraph, RenderGraphContext},
++    render_phase::{
++        sort_phase_system, AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
++        ViewSortedRenderPhases,
++    },
+     render_resource::*,
+-    renderer::{RenderDevice, RenderQueue},
+-    view::{ExtractedView, ViewUniforms},
+-    Extract, RenderApp, RenderSystems,
+-};
+-use bevy_render::{
+-    render_phase::{PhaseItem, PhaseItemExtraIndex},
+-    sync_world::{RenderEntity, TemporaryRenderEntity},
++    renderer::{RenderContext, RenderDevice, RenderQueue},
++    sync_world::{MainEntity, RenderEntity, TemporaryRenderEntity},
+     texture::GpuImage,
+-    ExtractSchedule, Render,
++    view::{ExtractedView, Hdr, RetainedViewEntity, ViewUniforms},
++    Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_sprite::{BorderRect, SpriteAssetEvents};
+ #[cfg(feature = "bevy_ui_debug")]
+diff --git a/release-content/migration-guides/bevy_render_reorganization.md b/release-content/migration-guides/bevy_render_reorganization.md
+index c8be2c52df533..564076454aff2 100644
+--- a/release-content/migration-guides/bevy_render_reorganization.md
++++ b/release-content/migration-guides/bevy_render_reorganization.md
+@@ -1,6 +1,6 @@
+ ---
+ title: "`bevy_render` reorganization"
+-pull_requests: [20485, 20496, 20493, 20492, 20491, 20488, 20487, 20486, 20483, 20480, 20479, 20478, 20477, 20473, 20472, 20471, 20470, 20392, 20390, 20388, 20345, 20344, 20330, 20051, 20000, 19997, 19991, 19985, 19973, 19965, 19963, 19962, 19960, 19959, 19958, 19957, 19956, 19955, 19954, 19953, 19949, 19943, 16620, 16619, 15700, 15666, 15650]
++pull_requests: [20502, 20498, 20485, 20496, 20493, 20492, 20491, 20488, 20487, 20486, 20483, 20480, 20479, 20478, 20477, 20473, 20472, 20471, 20470, 20392, 20390, 20388, 20345, 20344, 20330, 20051, 20000, 19997, 19991, 19985, 19973, 19965, 19963, 19962, 19960, 19959, 19958, 19957, 19956, 19955, 19954, 19953, 19949, 19943, 16620, 16619, 15700, 15666, 15650]
+ ---
+ 
+ You must now import `bevy_render::NormalizedRenderTargetExt` to use methods on `NormalizedRenderTarget`
+@@ -20,7 +20,7 @@ Import them directly or from `bevy::light` now.
+ Mesh types such as `Mesh`, `Mesh3d`, `Mesh2d`, `MorphWeights`, `MeshBuilder`, and `Meshable` have been moved to a new crate, `bevy_mesh`.
+ Import them directly or from `bevy::mesh` now.
+ 
+-Image types such as `Image`, `ImageFormat`, `ImageSampler`, `ImageAddressMode`, `ImageSamplerDescriptor`, `ImageCompareFunction`, and `ImageSamplerBorderColor` have been moved to a new crate, `bevy_image`.
++Image types such as `Image`, `ImagePlugin`, `ImageFormat`, `ImageSampler`, `ImageAddressMode`, `ImageSamplerDescriptor`, `ImageCompareFunction`, and `ImageSamplerBorderColor` have been moved to a new crate, `bevy_image`.
+ Import them directly or from `bevy::image` now.
+ 
+ `RenderAssetUsages` is no longer re-exported by `bevy_render`.
+diff --git a/release-content/release-notes/scene-type-crates.md b/release-content/release-notes/scene-type-crates.md
+index b0ba5a70408e9..5027e95c86d73 100644
+--- a/release-content/release-notes/scene-type-crates.md
++++ b/release-content/release-notes/scene-type-crates.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Define scenes without depending on bevy_render
+ authors: ["@atlv24"]
+-pull_requests: [20485, 20496, 20493, 20492, 20491, 20488, 20487, 20486, 20483, 20480, 20479, 20478, 20477, 20473, 20472, 20471, 20470, 20392, 20390, 20388, 20345, 20344, 20330, 20051, 20000, 19997, 19991, 19985, 19973, 19965, 19963, 19962, 19960, 19959, 19958, 19957, 19956, 19955, 19954, 19953, 19949, 19943, 16620, 16619, 15700, 15666, 15650]
++pull_requests: [20502, 20498, 20485, 20496, 20493, 20492, 20491, 20488, 20487, 20486, 20483, 20480, 20479, 20478, 20477, 20473, 20472, 20471, 20470, 20392, 20390, 20388, 20345, 20344, 20330, 20051, 20000, 19997, 19991, 19985, 19973, 19965, 19963, 19962, 19960, 19959, 19958, 19957, 19956, 19955, 19954, 19953, 19949, 19943, 16620, 16619, 15700, 15666, 15650]
+ ---
+ 
+ It is now possible to use cameras, lights, shaders, images, and meshes without depending on the Bevy renderer. This makes it possible for 3rd party custom renderers to be drop-in replacements for rendering existing scenes.

@@ -1,0 +1,1092 @@
+diff --git a/crates/bevy_camera/src/primitives.rs b/crates/bevy_camera/src/primitives.rs
+index c5d547accc3b1..2964001f415e5 100644
+--- a/crates/bevy_camera/src/primitives.rs
++++ b/crates/bevy_camera/src/primitives.rs
+@@ -180,13 +180,40 @@ impl From<Sphere> for Aabb {
+     }
+ }
+ 
+-#[derive(Clone, Debug, Default)]
++/// A sphere, defined by a center and a radius.
++///
++/// This is typically used as a component on an entity to represent the local
++/// space occupied by this entity, as an alternative to [`Aabb`]. The *frustum
++/// culling* process uses this component to determine whether an entity is in
++/// the view of a [`crate::Camera`].
++///
++/// Bevy will automatically add this component to point and spot lights, as
++/// their ranges are most easily approximated by a sphere. The engine will keep
++/// this entity updated as the range and/or transform of such lights changes.
++///
++/// If both [`Aabb`] and [`Sphere`] are present on an entity, [`Aabb`] takes
++/// precedence.
++#[derive(Component, Clone, Copy, Debug, Default, Reflect)]
++#[reflect(Component, Clone, Debug, Default)]
+ pub struct Sphere {
++    /// The center of the sphere.
++    ///
++    /// If this is used as a component, [`Self::center`] is in local space. That
++    /// is, it doesn't take the world-space position of the object into account.
+     pub center: Vec3A,
++
++    /// The radius of the sphere.
++    ///
++    /// If this is used as a component, [`Self::radius`] is in local space. That
++    /// is, it doesn't take the world-space scale of the object into account.
+     pub radius: f32,
+ }
+ 
+ impl Sphere {
++    /// Returns true if this sphere intersects the given oriented bounding box.
++    ///
++    /// The oriented bounding box (OBB) to test against is produced by
++    /// transforming the given AABB according to the supplied matrix.
+     #[inline]
+     pub fn intersects_obb(&self, aabb: &Aabb, world_from_local: &Affine3A) -> bool {
+         let aabb_center_world = world_from_local.transform_point3a(aabb.center);
+diff --git a/crates/bevy_camera/src/visibility/mod.rs b/crates/bevy_camera/src/visibility/mod.rs
+index 1f148c12aa193..8f9352dc4b8a2 100644
+--- a/crates/bevy_camera/src/visibility/mod.rs
++++ b/crates/bevy_camera/src/visibility/mod.rs
+@@ -657,6 +657,7 @@ pub fn check_visibility(
+         Option<&VisibilityClass>,
+         Option<&RenderLayers>,
+         Option<&Aabb>,
++        Option<&Sphere>,
+         &GlobalTransform,
+         Has<NoFrustumCulling>,
+         Has<VisibilityRange>,
+@@ -685,6 +686,7 @@ pub fn check_visibility(
+                     visibility_class,
+                     maybe_entity_mask,
+                     maybe_model_aabb,
++                    maybe_model_sphere,
+                     transform,
+                     no_frustum_culling,
+                     has_visibility_range,
+@@ -711,23 +713,26 @@ pub fn check_visibility(
+                     return;
+                 }
+ 
+-                // If we have an aabb, do frustum culling
+-                if !no_frustum_culling
+-                    && !no_cpu_culling_camera
+-                    && !no_cpu_culling_entity
+-                    && let Some(model_aabb) = maybe_model_aabb
+-                {
+-                    let world_from_local = transform.affine();
+-                    let model_sphere = Sphere {
+-                        center: world_from_local.transform_point3a(model_aabb.center),
+-                        radius: transform.radius_vec3a(model_aabb.half_extents),
+-                    };
+-                    // Do quick sphere-based frustum culling
+-                    if !frustum.intersects_sphere(&model_sphere, false) {
+-                        return;
+-                    }
+-                    // Do aabb-based frustum culling
+-                    if !frustum.intersects_obb(model_aabb, &world_from_local, true, false) {
++                // If we have an aabb or a bounding sphere, do frustum culling
++                if !no_frustum_culling && !no_cpu_culling_camera && !no_cpu_culling_entity {
++                    if let Some(model_aabb) = maybe_model_aabb {
++                        let world_from_local = transform.affine();
++                        let model_sphere = Sphere {
++                            center: world_from_local.transform_point3a(model_aabb.center),
++                            radius: transform.radius_vec3a(model_aabb.half_extents),
++                        };
++                        // Do quick sphere-based frustum culling
++                        if !frustum.intersects_sphere(&model_sphere, false) {
++                            return;
++                        }
++                        // Do aabb-based frustum culling
++                        if !frustum.intersects_obb(model_aabb, &world_from_local, true, false) {
++                            return;
++                        }
++                    } else if let Some(model_sphere) = maybe_model_sphere
++                        && !frustum.intersects_sphere(model_sphere, false)
++                    {
++                        // Do sphere-based frustum culling in this case
+                         return;
+                     }
+                 }
+diff --git a/crates/bevy_light/src/cluster/assign.rs b/crates/bevy_light/src/cluster/assign.rs
+index c8b4fee438c07..16659bdbfd65f 100644
+--- a/crates/bevy_light/src/cluster/assign.rs
++++ b/crates/bevy_light/src/cluster/assign.rs
+@@ -2,13 +2,13 @@
+ 
+ use bevy_camera::{
+     primitives::{Aabb, Frustum, Sphere},
+-    visibility::{RenderLayers, ViewVisibility},
++    visibility::RenderLayers,
+     Camera,
+ };
+ use bevy_ecs::{
+     entity::Entity,
+     query::{Has, With},
+-    system::{Commands, Local, Query, Res, ResMut},
++    system::{Commands, Local, Query, Res},
+ };
+ use bevy_math::{
+     ops::{self, sin_cos},
+@@ -20,7 +20,7 @@ use tracing::warn;
+ 
+ use super::{
+     ClusterConfig, ClusterFarZMode, ClusteredDecal, Clusters, GlobalClusterSettings,
+-    GlobalVisibleClusterableObjects, VisibleClusterableObjects,
++    VisibleClusterableObjects,
+ };
+ use crate::{
+     cluster::ObjectsInCluster, EnvironmentMapLight, LightProbe, PointLight, SpotLight,
+@@ -128,7 +128,6 @@ impl ClusterableObjectType {
+ /// NOTE: Run this before `update_point_light_frusta`!
+ pub(crate) fn assign_objects_to_clusters(
+     mut commands: Commands,
+-    mut global_clusterable_objects: ResMut<GlobalVisibleClusterableObjects>,
+     mut views: Query<(
+         Entity,
+         &GlobalTransform,
+@@ -145,7 +144,6 @@ pub(crate) fn assign_objects_to_clusters(
+         &PointLight,
+         Option<&RenderLayers>,
+         Option<&VolumetricLight>,
+-        &ViewVisibility,
+     )>,
+     spot_lights_query: Query<(
+         Entity,
+@@ -153,7 +151,6 @@ pub(crate) fn assign_objects_to_clusters(
+         &SpotLight,
+         Option<&RenderLayers>,
+         Option<&VolumetricLight>,
+-        &ViewVisibility,
+     )>,
+     light_probes_query: Query<
+         (Entity, &GlobalTransform, Has<EnvironmentMapLight>),
+@@ -169,48 +166,37 @@ pub(crate) fn assign_objects_to_clusters(
+         return;
+     };
+ 
+-    global_clusterable_objects.entities.clear();
+     clusterable_objects.clear();
+     // collect just the relevant query data into a persisted vec to avoid reallocating each frame
+-    clusterable_objects.extend(
+-        point_lights_query
+-            .iter()
+-            .filter(|(.., visibility)| visibility.get())
+-            .map(
+-                |(entity, transform, point_light, maybe_layers, volumetric, _visibility)| {
+-                    ClusterableObjectAssignmentData {
+-                        entity,
+-                        transform: GlobalTransform::from_translation(transform.translation()),
+-                        range: point_light.range,
+-                        object_type: ClusterableObjectType::PointLight {
+-                            shadow_maps_enabled: point_light.shadow_maps_enabled,
+-                            volumetric: volumetric.is_some(),
+-                        },
+-                        render_layers: maybe_layers.unwrap_or_default().clone(),
+-                    }
++    clusterable_objects.extend(point_lights_query.iter().map(
++        |(entity, transform, point_light, maybe_layers, volumetric)| {
++            ClusterableObjectAssignmentData {
++                entity,
++                transform: GlobalTransform::from_translation(transform.translation()),
++                range: point_light.range,
++                object_type: ClusterableObjectType::PointLight {
++                    shadow_maps_enabled: point_light.shadow_maps_enabled,
++                    volumetric: volumetric.is_some(),
+                 },
+-            ),
+-    );
+-    clusterable_objects.extend(
+-        spot_lights_query
+-            .iter()
+-            .filter(|(.., visibility)| visibility.get())
+-            .map(
+-                |(entity, transform, spot_light, maybe_layers, volumetric, _visibility)| {
+-                    ClusterableObjectAssignmentData {
+-                        entity,
+-                        transform: *transform,
+-                        range: spot_light.range,
+-                        object_type: ClusterableObjectType::SpotLight {
+-                            outer_angle: spot_light.outer_angle,
+-                            shadow_maps_enabled: spot_light.shadow_maps_enabled,
+-                            volumetric: volumetric.is_some(),
+-                        },
+-                        render_layers: maybe_layers.unwrap_or_default().clone(),
+-                    }
++                render_layers: maybe_layers.unwrap_or_default().clone(),
++            }
++        },
++    ));
++    clusterable_objects.extend(spot_lights_query.iter().map(
++        |(entity, transform, spot_light, maybe_layers, volumetric)| {
++            ClusterableObjectAssignmentData {
++                entity,
++                transform: *transform,
++                range: spot_light.range,
++                object_type: ClusterableObjectType::SpotLight {
++                    outer_angle: spot_light.outer_angle,
++                    shadow_maps_enabled: spot_light.shadow_maps_enabled,
++                    volumetric: volumetric.is_some(),
+                 },
+-            ),
+-    );
++                render_layers: maybe_layers.unwrap_or_default().clone(),
++            }
++        },
++    ));
+ 
+     // Gather up light probes, but only if we're clustering them.
+     //
+@@ -555,9 +541,6 @@ pub(crate) fn assign_objects_to_clusters(
+ 
+                     // NOTE: The clusterable object intersects the frustum so it
+                     // must be visible and part of the global set
+-                    global_clusterable_objects
+-                        .entities
+-                        .insert(clusterable_object.entity);
+                     visible_clusterable_objects
+                         .add(clusterable_object.entity, &clusterable_object.object_type);
+ 
+@@ -645,7 +628,7 @@ pub(crate) fn assign_objects_to_clusters(
+                         Some(cluster_coordinates.y)
+                     };
+                     for z in min_cluster.z..=max_cluster.z {
+-                        let mut z_object = view_clusterable_object_sphere.clone();
++                        let mut z_object = view_clusterable_object_sphere;
+                         if z_center.is_none() || z != z_center.unwrap() {
+                             // The z plane closer to the clusterable object has the
+                             // larger radius circle where the light sphere
+@@ -664,7 +647,7 @@ pub(crate) fn assign_objects_to_clusters(
+                             }
+                         }
+                         for y in min_cluster.y..=max_cluster.y {
+-                            let mut y_object = z_object.clone();
++                            let mut y_object = z_object;
+                             if y_center.is_none() || y != y_center.unwrap() {
+                                 // The y plane closer to the clusterable object has
+                                 // the larger radius circle where the light sphere
+diff --git a/crates/bevy_light/src/cluster/mod.rs b/crates/bevy_light/src/cluster/mod.rs
+index 7615548471a44..d1abf86605209 100644
+--- a/crates/bevy_light/src/cluster/mod.rs
++++ b/crates/bevy_light/src/cluster/mod.rs
+@@ -3,19 +3,29 @@
+ use core::any::TypeId;
+ 
+ use bevy_asset::Handle;
+-use bevy_camera::visibility::{self, Visibility, VisibilityClass};
++use bevy_camera::{
++    prelude::ViewVisibility,
++    primitives::Aabb,
++    visibility::{self, Visibility, VisibilityClass},
++};
+ use bevy_ecs::{
+-    component::Component, entity::Entity, reflect::ReflectComponent, resource::Resource,
++    component::Component,
++    entity::Entity,
++    query::{Or, With, Without},
++    reflect::ReflectComponent,
++    resource::Resource,
++    system::{Commands, Query},
+ };
+ use bevy_image::Image;
+-use bevy_math::{AspectRatio, UVec2, UVec3, Vec3Swizzles as _};
+-use bevy_platform::collections::HashSet;
++use bevy_math::{AspectRatio, UVec2, UVec3, Vec3A, Vec3Swizzles as _};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_transform::components::Transform;
+ use bevy_utils::TypeIdMap;
+ use tracing::warn;
+ 
+-use crate::{cluster::assign::ClusterableObjectType, EnvironmentMapLight, IrradianceVolume};
++use crate::{
++    cluster::assign::ClusterableObjectType, EnvironmentMapLight, IrradianceVolume, LightProbe,
++};
+ 
+ pub mod assign;
+ 
+@@ -147,12 +157,6 @@ pub struct ObjectsInCluster {
+     pub counts: ClusterableObjectCounts,
+ }
+ 
+-/// A resource that stores all clusterable objects visible in any view.
+-#[derive(Resource, Default)]
+-pub struct GlobalVisibleClusterableObjects {
+-    pub(crate) entities: HashSet<Entity>,
+-}
+-
+ /// Stores the number of each type of clusterable object in a single cluster.
+ ///
+ /// Note that `reflection_probes` and `irradiance_volumes` won't be clustered if
+@@ -189,7 +193,7 @@ pub struct ClusterableObjectCounts {
+ /// with forward or deferred rendering and don't require a prepass.
+ #[derive(Component, Debug, Clone, Default, Reflect)]
+ #[reflect(Component, Debug, Clone, Default)]
+-#[require(Transform, Visibility, VisibilityClass)]
++#[require(Transform, ViewVisibility, Visibility, VisibilityClass)]
+ #[component(on_add = visibility::add_visibility_class::<ClusterVisibilityClass>)]
+ pub struct ClusteredDecal {
+     /// The image that the clustered decal projects onto the base color of the
+@@ -445,16 +449,21 @@ impl VisibleClusterableObjects {
+     }
+ }
+ 
+-impl GlobalVisibleClusterableObjects {
+-    /// Iterates over all the visible clusterable objects in an arbitrary order.
+-    #[inline]
+-    pub fn iter(&self) -> impl Iterator<Item = &Entity> {
+-        self.entities.iter()
+-    }
+-
+-    /// Checks whether the given entity is a visible clusterable object.
+-    #[inline]
+-    pub fn contains(&self, entity: Entity) -> bool {
+-        self.entities.contains(&entity)
++/// A system that adds AABBs to light probes and decals so that the visibility
++/// determination works for them.
++pub fn add_light_probe_and_decal_aabbs(
++    mut commands: Commands,
++    light_probes_and_decals_query: Query<
++        Entity,
++        (Or<(With<ClusteredDecal>, With<LightProbe>)>, Without<Aabb>),
++    >,
++) {
++    for entity in &light_probes_and_decals_query {
++        commands.entity(entity).insert(Aabb {
++            center: Vec3A::ZERO,
++            // Light probes are always unit-cube sized, the transform scale is what gives them their size.
++            // Scale should not be included in the Aabb because it gets transformed by the GlobalTransform.
++            half_extents: Vec3A::splat(0.5),
++        });
+     }
+ }
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index 3486fce14038f..f9acc99f4c3d0 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -27,9 +27,7 @@ use core::ops::DerefMut;
+ 
+ pub mod cluster;
+ pub use cluster::ClusteredDecal;
+-use cluster::{
+-    assign::assign_objects_to_clusters, GlobalVisibleClusterableObjects, VisibleClusterableObjects,
+-};
++use cluster::{assign::assign_objects_to_clusters, VisibleClusterableObjects};
+ mod ambient_light;
+ pub use ambient_light::{AmbientLight, GlobalAmbientLight};
+ use bevy_camera::visibility::SetViewVisibility;
+@@ -81,7 +79,11 @@ pub mod prelude {
+ }
+ 
+ use crate::{
+-    atmosphere::ScatteringMedium, cluster::Clusters, directional_light::validate_shadow_map_size,
++    atmosphere::ScatteringMedium,
++    cluster::{add_light_probe_and_decal_aabbs, Clusters},
++    directional_light::validate_shadow_map_size,
++    point_light::update_point_light_bounding_spheres,
++    spot_light::update_spot_light_bounding_spheres,
+ };
+ 
+ /// Constants for operating with the light units: lumens, and lux.
+@@ -157,8 +159,7 @@ pub struct LightPlugin;
+ 
+ impl Plugin for LightPlugin {
+     fn build(&self, app: &mut App) {
+-        app.init_resource::<GlobalVisibleClusterableObjects>()
+-            .init_resource::<GlobalAmbientLight>()
++        app.init_resource::<GlobalAmbientLight>()
+             .init_resource::<DirectionalLightShadowMap>()
+             .init_resource::<PointLightShadowMap>()
+             .init_asset::<ScatteringMedium>()
+@@ -217,6 +218,13 @@ impl Plugin for LightPlugin {
+                         // entity visibility and mark as visible before they can be hidden.
+                         .after(VisibilitySystems::CheckVisibility)
+                         .before(VisibilitySystems::MarkNewlyHiddenEntitiesInvisible),
++                    (
++                        update_point_light_bounding_spheres,
++                        update_spot_light_bounding_spheres,
++                        add_light_probe_and_decal_aabbs,
++                    )
++                        .in_set(SimulationLightSystems::UpdateBounds)
++                        .before(VisibilitySystems::UpdateFrusta),
+                     build_directional_light_cascades
+                         .in_set(SimulationLightSystems::UpdateDirectionalLightCascades)
+                         .after(TransformSystems::Propagate)
+@@ -295,6 +303,8 @@ pub enum ShadowFilteringMethod {
+ /// System sets used to run light-related systems.
+ #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+ pub enum SimulationLightSystems {
++    /// The set that adds AABBs and bounding spheres to clustered objects.
++    UpdateBounds,
+     /// After this set, all lights have been clustered.
+     AssignLightsToClusters,
+     /// After this set, all directional light cascades are up to date.
+@@ -546,8 +556,13 @@ pub fn check_point_light_mesh_visibility(
+                 maybe_view_mask,
+             )) = point_lights.get_mut(light_entity)
+             {
+-                for visible_entities in cubemap_visible_entities.iter_mut() {
+-                    visible_entities.entities.clear();
++                if cubemap_visible_entities
++                    .iter()
++                    .any(|visible_entities| !visible_entities.is_empty())
++                {
++                    for visible_entities in cubemap_visible_entities.iter_mut() {
++                        visible_entities.entities.clear();
++                    }
+                 }
+ 
+                 // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
+diff --git a/crates/bevy_light/src/point_light.rs b/crates/bevy_light/src/point_light.rs
+index f667de569755a..f0c12f8ef19e4 100644
+--- a/crates/bevy_light/src/point_light.rs
++++ b/crates/bevy_light/src/point_light.rs
+@@ -1,7 +1,7 @@
+ use bevy_asset::Handle;
+ use bevy_camera::{
+-    primitives::{CubeMapFace, CubemapFrusta, CubemapLayout, Frustum, CUBE_MAP_FACES},
+-    visibility::{self, CubemapVisibleEntities, Visibility, VisibilityClass},
++    primitives::{CubeMapFace, CubemapFrusta, CubemapLayout, Frustum, Sphere, CUBE_MAP_FACES},
++    visibility::{self, CubemapVisibleEntities, ViewVisibility, Visibility, VisibilityClass},
+ };
+ use bevy_color::Color;
+ use bevy_ecs::prelude::*;
+@@ -10,10 +10,7 @@ use bevy_math::{primitives::ViewFrustum, Mat4};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::{GlobalTransform, Transform};
+ 
+-use crate::{
+-    cluster::{ClusterVisibilityClass, GlobalVisibleClusterableObjects},
+-    light_consts,
+-};
++use crate::{cluster::ClusterVisibilityClass, light_consts};
+ 
+ /// A light that emits light in all directions from a central point.
+ ///
+@@ -192,17 +189,39 @@ impl Default for PointLightShadowMap {
+     }
+ }
+ 
++/// A system that updates the bounding [`Sphere`] for changed point lights.
++///
++/// The [`Sphere`] component is used for frustum culling.
++pub fn update_point_light_bounding_spheres(
++    mut commands: Commands,
++    point_lights_query: Query<
++        (Entity, &PointLight, &GlobalTransform),
++        Or<(Changed<PointLight>, Changed<GlobalTransform>)>,
++    >,
++) {
++    for (point_light_entity, point_light, global_transform) in &point_lights_query {
++        commands.entity(point_light_entity).insert(Sphere {
++            center: global_transform.translation_vec3a(),
++            radius: point_light.range,
++        });
++    }
++}
++
+ // NOTE: Run this after assign_lights_to_clusters!
+ /// Updates the frusta for all visible shadow mapped [`PointLight`]s.
+ pub fn update_point_light_frusta(
+-    global_lights: Res<GlobalVisibleClusterableObjects>,
+-    mut views: Query<(Entity, &GlobalTransform, &PointLight, &mut CubemapFrusta)>,
+-    changed_lights: Query<
+-        Entity,
++    mut views: Query<
+         (
+-            With<PointLight>,
+-            Or<(Changed<GlobalTransform>, Changed<PointLight>)>,
++            &GlobalTransform,
++            &PointLight,
++            &mut CubemapFrusta,
++            &ViewVisibility,
+         ),
++        Or<(
++            Changed<GlobalTransform>,
++            Changed<PointLight>,
++            Changed<ViewVisibility>,
++        )>,
+     >,
+ ) {
+     let view_rotations = CUBE_MAP_FACES
+@@ -210,19 +229,13 @@ pub fn update_point_light_frusta(
+         .map(|CubeMapFace { target, up }| Transform::IDENTITY.looking_at(*target, *up))
+         .collect::<Vec<_>>();
+ 
+-    for (entity, transform, point_light, mut cubemap_frusta) in &mut views {
+-        // If this light hasn't changed, and neither has the set of global_lights,
+-        // then we can skip this calculation.
+-        if !global_lights.is_changed() && !changed_lights.contains(entity) {
+-            continue;
+-        }
+-
++    for (transform, point_light, mut cubemap_frusta, view_visibility) in &mut views {
+         // The frusta are used for culling meshes to the light for shadow mapping
+         // so if shadow mapping is disabled for this light, then the frusta are
+         // not needed.
+         // Also, if the light is not relevant for any cluster, it will not be in the
+         // global lights set and so there is no need to update its frusta.
+-        if !point_light.shadow_maps_enabled || !global_lights.entities.contains(&entity) {
++        if !point_light.shadow_maps_enabled || !view_visibility.get() {
+             continue;
+         }
+ 
+diff --git a/crates/bevy_light/src/probe.rs b/crates/bevy_light/src/probe.rs
+index 50d9df8202a66..4aaa3847b4d18 100644
+--- a/crates/bevy_light/src/probe.rs
++++ b/crates/bevy_light/src/probe.rs
+@@ -1,5 +1,5 @@
+ use bevy_asset::{Assets, Handle, RenderAssetUsages};
+-use bevy_camera::visibility::Visibility;
++use bevy_camera::visibility::{self, ViewVisibility, Visibility, VisibilityClass};
+ use bevy_color::{Color, ColorToComponents, Srgba};
+ use bevy_ecs::prelude::*;
+ use bevy_image::Image;
+@@ -10,6 +10,8 @@ use wgpu_types::{
+     Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+ };
+ 
++use crate::cluster::ClusterVisibilityClass;
++
+ /// A marker component for a light probe, which is a cuboid region that provides
+ /// global illumination to all fragments inside it.
+ ///
+@@ -67,7 +69,8 @@ use wgpu_types::{
+ /// with other engines should be aware of this terminology difference.
+ #[derive(Component, Debug, Clone, Copy, Default, Reflect)]
+ #[reflect(Component, Default, Debug, Clone)]
+-#[require(Transform, Visibility)]
++#[require(Transform, ViewVisibility, Visibility, VisibilityClass)]
++#[component(on_add = visibility::add_visibility_class::<ClusterVisibilityClass>)]
+ pub struct LightProbe {
+     /// The distance over which the effect of the light probe becomes weaker, on
+     /// each axis.
+diff --git a/crates/bevy_light/src/spot_light.rs b/crates/bevy_light/src/spot_light.rs
+index 1daffd03116e9..f9e4710c48b71 100644
+--- a/crates/bevy_light/src/spot_light.rs
++++ b/crates/bevy_light/src/spot_light.rs
+@@ -1,7 +1,7 @@
+ use bevy_asset::Handle;
+ use bevy_camera::{
+-    primitives::Frustum,
+-    visibility::{self, Visibility, VisibilityClass, VisibleMeshEntities},
++    primitives::{Frustum, Sphere},
++    visibility::{self, ViewVisibility, Visibility, VisibilityClass, VisibleMeshEntities},
+ };
+ use bevy_color::Color;
+ use bevy_ecs::prelude::*;
+@@ -10,7 +10,7 @@ use bevy_math::{primitives::ViewFrustum, Affine3A, Dir3, Mat3, Mat4, Vec3};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::{GlobalTransform, Transform};
+ 
+-use crate::cluster::{ClusterVisibilityClass, GlobalVisibleClusterableObjects};
++use crate::cluster::ClusterVisibilityClass;
+ 
+ /// A light that emits light in a given direction from a central point.
+ ///
+@@ -210,21 +210,42 @@ pub struct SpotLightTexture {
+     pub image: Handle<Image>,
+ }
+ 
++/// A system that updates the bounding [`Sphere`] for changed spot lights.
++///
++/// The [`Sphere`] component is used for frustum culling.
++pub fn update_spot_light_bounding_spheres(
++    mut commands: Commands,
++    spot_lights_query: Query<
++        (Entity, &SpotLight, &GlobalTransform),
++        Or<(Changed<SpotLight>, Changed<GlobalTransform>)>,
++    >,
++) {
++    for (spot_light_entity, spot_light, global_transform) in &spot_lights_query {
++        commands.entity(spot_light_entity).insert(Sphere {
++            center: global_transform.translation_vec3a(),
++            radius: spot_light.range,
++        });
++    }
++}
++
+ /// Updates the frusta for all visible shadow mapped [`SpotLight`]s.
+ pub fn update_spot_light_frusta(
+-    global_lights: Res<GlobalVisibleClusterableObjects>,
+     mut views: Query<
+-        (Entity, &GlobalTransform, &SpotLight, &mut Frustum),
+-        Or<(Changed<GlobalTransform>, Changed<SpotLight>)>,
++        (&GlobalTransform, &SpotLight, &mut Frustum, &ViewVisibility),
++        Or<(
++            Changed<GlobalTransform>,
++            Changed<SpotLight>,
++            Changed<ViewVisibility>,
++        )>,
+     >,
+ ) {
+-    for (entity, transform, spot_light, mut frustum) in &mut views {
++    for (transform, spot_light, mut frustum, view_visibility) in &mut views {
+         // The frusta are used for culling meshes to the light for shadow mapping
+         // so if shadow mapping is disabled for this light, then the frusta are
+         // not needed.
+         // Also, if the light is not relevant for any cluster, it will not be in the
+         // global lights set and so there is no need to update its frusta.
+-        if !spot_light.shadow_maps_enabled || !global_lights.entities.contains(&entity) {
++        if !spot_light.shadow_maps_enabled || !view_visibility.get() {
+             continue;
+         }
+ 
+diff --git a/crates/bevy_pbr/src/cluster.rs b/crates/bevy_pbr/src/cluster.rs
+index e4f6f76fc0141..ebe397f6e381b 100644
+--- a/crates/bevy_pbr/src/cluster.rs
++++ b/crates/bevy_pbr/src/cluster.rs
+@@ -4,7 +4,7 @@ use bevy_camera::Camera;
+ use bevy_ecs::{entity::EntityHashMap, prelude::*};
+ use bevy_light::{
+     cluster::{ClusterableObjectCounts, Clusters, GlobalClusterSettings},
+-    ClusteredDecal, EnvironmentMapLight, IrradianceVolume, LightProbe, PointLight, SpotLight,
++    ClusteredDecal, EnvironmentMapLight, IrradianceVolume, PointLight, SpotLight,
+ };
+ use bevy_math::{uvec4, UVec3, UVec4, Vec4};
+ use bevy_render::{
+@@ -296,6 +296,8 @@ pub fn extract_clusters(
+         Query<
+             (
+                 Option<&RenderEntity>,
++                Has<PointLight>,
++                Has<SpotLight>,
+                 Has<EnvironmentMapLight>,
+                 Has<IrradianceVolume>,
+                 Has<ClusteredDecal>,
+@@ -303,7 +305,8 @@ pub fn extract_clusters(
+             Or<(
+                 With<PointLight>,
+                 With<SpotLight>,
+-                With<LightProbe>,
++                With<EnvironmentMapLight>,
++                With<IrradianceVolume>,
+                 With<ClusteredDecal>,
+             )>,
+         >,
+@@ -326,6 +329,8 @@ pub fn extract_clusters(
+             for clusterable_entity in cluster_objects.iter() {
+                 let Ok((
+                     maybe_render_entity,
++                    is_point_light,
++                    is_spot_light,
+                     is_reflection_probe,
+                     is_irradiance_volume,
+                     is_clustered_decal,
+@@ -341,7 +346,7 @@ pub fn extract_clusters(
+                 if let Some(render_entity) = maybe_render_entity {
+                     if is_clustered_decal {
+                         data.push(ExtractedClusterableObjectElement::Decal(**render_entity));
+-                    } else {
++                    } else if is_point_light || is_spot_light {
+                         data.push(ExtractedClusterableObjectElement::Light(**render_entity));
+                     }
+                 }
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 56c45fae27b85..4012b062d6823 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -21,7 +21,6 @@ use bevy_ecs::{
+ };
+ use bevy_light::cascade::Cascade;
+ use bevy_light::cluster::assign::{calculate_cluster_factors, ClusterableObjectType};
+-use bevy_light::cluster::GlobalVisibleClusterableObjects;
+ use bevy_light::SunDisk;
+ use bevy_light::{
+     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
+@@ -44,7 +43,7 @@ use bevy_render::erased_render_asset::ErasedRenderAssets;
+ use bevy_render::occlusion_culling::{
+     OcclusionCulling, OcclusionCullingSubview, OcclusionCullingSubviewEntities,
+ };
+-use bevy_render::sync_world::MainEntityHashMap;
++use bevy_render::sync_world::{MainEntityHashMap, MainEntityHashSet};
+ use bevy_render::{
+     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
+     camera::SortedCameras,
+@@ -293,41 +292,49 @@ pub fn extract_lights(
+     mut commands: Commands,
+     point_light_shadow_map: Extract<Res<PointLightShadowMap>>,
+     directional_light_shadow_map: Extract<Res<DirectionalLightShadowMap>>,
+-    global_visible_clusterable: Extract<Res<GlobalVisibleClusterableObjects>>,
+-    previous_point_lights: Query<
+-        Entity,
+-        (
+-            With<RenderCubemapVisibleEntities>,
+-            With<ExtractedPointLight>,
+-        ),
+-    >,
+-    previous_spot_lights: Query<
+-        Entity,
+-        (With<RenderVisibleMeshEntities>, With<ExtractedPointLight>),
+-    >,
+     point_lights: Extract<
+-        Query<(
+-            Entity,
+-            RenderEntity,
+-            &PointLight,
+-            &CubemapVisibleEntities,
+-            &GlobalTransform,
+-            &ViewVisibility,
+-            &CubemapFrusta,
+-            Option<&VolumetricLight>,
+-        )>,
++        Query<
++            (
++                Entity,
++                RenderEntity,
++                &PointLight,
++                &CubemapVisibleEntities,
++                &GlobalTransform,
++                &ViewVisibility,
++                &CubemapFrusta,
++                Option<&VolumetricLight>,
++            ),
++            Or<(
++                Changed<PointLight>,
++                Changed<CubemapVisibleEntities>,
++                Changed<GlobalTransform>,
++                Changed<ViewVisibility>,
++                Changed<CubemapFrusta>,
++                Changed<VolumetricLight>,
++            )>,
++        >,
+     >,
+     spot_lights: Extract<
+-        Query<(
+-            Entity,
+-            RenderEntity,
+-            &SpotLight,
+-            &VisibleMeshEntities,
+-            &GlobalTransform,
+-            &ViewVisibility,
+-            &Frustum,
+-            Option<&VolumetricLight>,
+-        )>,
++        Query<
++            (
++                Entity,
++                RenderEntity,
++                &SpotLight,
++                &VisibleMeshEntities,
++                &GlobalTransform,
++                &ViewVisibility,
++                &Frustum,
++                Option<&VolumetricLight>,
++            ),
++            Or<(
++                Changed<SpotLight>,
++                Changed<VisibleMeshEntities>,
++                Changed<GlobalTransform>,
++                Changed<ViewVisibility>,
++                Changed<Frustum>,
++                Changed<VolumetricLight>,
++            )>,
++        >,
+     >,
+     directional_lights: Extract<
+         Query<
+@@ -346,12 +353,30 @@ pub fn extract_lights(
+                 Has<OcclusionCulling>,
+                 Option<&SunDisk>,
+             ),
+-            Without<SpotLight>,
++            (
++                Without<SpotLight>,
++                Or<(
++                    Changed<DirectionalLight>,
++                    Changed<CascadesVisibleEntities>,
++                    Changed<Cascades>,
++                    Changed<CascadeShadowConfig>,
++                    Changed<CascadesFrusta>,
++                    Changed<GlobalTransform>,
++                    Changed<ViewVisibility>,
++                    Changed<RenderLayers>,
++                    Changed<VolumetricLight>,
++                    Changed<OcclusionCulling>,
++                    Changed<SunDisk>,
++                )>,
++            ),
+         >,
+     >,
+     mapper: Extract<Query<RenderEntity>>,
+-    mut previous_point_lights_len: Local<usize>,
+-    mut previous_spot_lights_len: Local<usize>,
++    (mut removed_point_lights, mut removed_spot_lights, mut removed_directional_lights): (
++        Extract<RemovedComponents<PointLight>>,
++        Extract<RemovedComponents<SpotLight>>,
++        Extract<RemovedComponents<DirectionalLight>>,
++    ),
+ ) {
+     // NOTE: These shadow map resources are extracted here as they are used here too so this avoids
+     // races between scheduling of ExtractResourceSystems and this system.
+@@ -362,21 +387,6 @@ pub fn extract_lights(
+         commands.insert_resource(directional_light_shadow_map.clone());
+     }
+ 
+-    // Clear previous visible entities for all point/spot lights as they might not be in the
+-    // `global_visible_clusterable` list anymore.
+-    commands.try_insert_batch(
+-        previous_point_lights
+-            .iter()
+-            .map(|render_entity| (render_entity, RenderCubemapVisibleEntities::default()))
+-            .collect::<Vec<_>>(),
+-    );
+-    commands.try_insert_batch(
+-        previous_spot_lights
+-            .iter()
+-            .map(|render_entity| (render_entity, RenderVisibleMeshEntities::default()))
+-            .collect::<Vec<_>>(),
+-    );
+-
+     // This is the point light shadow map texel size for one face of the cube as a distance of 1.0
+     // world unit from the light.
+     // point_light_texel_size = 2.0 * 1.0 * tan(PI / 4.0) / cube face width in texels
+@@ -386,24 +396,34 @@ pub fn extract_lights(
+     // https://catlikecoding.com/unity/tutorials/custom-srp/point-and-spot-shadows/
+     let point_light_texel_size = 2.0 / point_light_shadow_map.size as f32;
+ 
+-    let mut point_lights_values = Vec::with_capacity(*previous_point_lights_len);
+-    for entity in global_visible_clusterable.iter().copied() {
+-        let Ok((
+-            main_entity,
+-            render_entity,
+-            point_light,
+-            cubemap_visible_entities,
+-            transform,
+-            view_visibility,
+-            frusta,
+-            volumetric_light,
+-        )) = point_lights.get(entity)
+-        else {
+-            continue;
+-        };
++    // Keep track of all entities of a type that we updated this frame, so that
++    // we don't incorrectly remove the components later even if they show up in
++    // `RemovedComponents`.
++    let mut seen_point_light_main_entities = MainEntityHashSet::default();
++    let mut seen_spot_light_main_entities = MainEntityHashSet::default();
++    let mut seen_directional_light_main_entities = MainEntityHashSet::default();
++
++    let mut point_lights_values = vec![];
++    for (
++        main_entity,
++        render_entity,
++        point_light,
++        cubemap_visible_entities,
++        transform,
++        view_visibility,
++        frusta,
++        volumetric_light,
++    ) in point_lights.iter()
++    {
++        seen_point_light_main_entities.insert(main_entity.into());
++
+         if !view_visibility.get() {
++            if let Ok(mut entity_commands) = commands.get_entity(render_entity) {
++                entity_commands.remove::<ExtractedPointLight>();
++            }
+             continue;
+         }
++
+         let render_cubemap_visible_entities = RenderCubemapVisibleEntities {
+             data: cubemap_visible_entities
+                 .iter()
+@@ -448,71 +468,72 @@ pub fn extract_lights(
+             ),
+         ));
+     }
+-    *previous_point_lights_len = point_lights_values.len();
+     commands.try_insert_batch(point_lights_values);
+ 
+-    let mut spot_lights_values = Vec::with_capacity(*previous_spot_lights_len);
+-    for entity in global_visible_clusterable.iter().copied() {
+-        if let Ok((
+-            main_entity,
+-            render_entity,
+-            spot_light,
+-            visible_entities,
+-            transform,
+-            view_visibility,
+-            frustum,
+-            volumetric_light,
+-        )) = spot_lights.get(entity)
+-        {
+-            if !view_visibility.get() {
+-                continue;
++    let mut spot_lights_values = vec![];
++    for (
++        main_entity,
++        render_entity,
++        spot_light,
++        visible_entities,
++        transform,
++        view_visibility,
++        frustum,
++        volumetric_light,
++    ) in spot_lights.iter()
++    {
++        seen_spot_light_main_entities.insert(main_entity.into());
++
++        if !view_visibility.get() {
++            if let Ok(mut entity_commands) = commands.get_entity(render_entity) {
++                entity_commands.remove::<ExtractedPointLight>();
+             }
+-            let render_visible_entities =
+-                create_render_visible_mesh_entities(&mapper, visible_entities);
++            continue;
++        }
+ 
+-            let texel_size =
+-                2.0 * ops::tan(spot_light.outer_angle) / directional_light_shadow_map.size as f32;
++        let render_visible_entities =
++            create_render_visible_mesh_entities(&mapper, visible_entities);
+ 
+-            spot_lights_values.push((
+-                render_entity,
+-                (
+-                    ExtractedPointLight {
+-                        color: spot_light.color.into(),
+-                        // NOTE: Map from luminous power in lumens to luminous intensity in lumens per steradian
+-                        // for a point light. See https://google.github.io/filament/Filament.html#mjx-eqn-pointLightLuminousPower
+-                        // for details.
+-                        // Note: Filament uses a divisor of PI for spot lights. We choose to use the same 4*PI divisor
+-                        // in both cases so that toggling between point light and spot light keeps lit areas lit equally,
+-                        // which seems least surprising for users
+-                        intensity: spot_light.intensity / (4.0 * core::f32::consts::PI),
+-                        range: spot_light.range,
+-                        radius: spot_light.radius,
+-                        transform: *transform,
+-                        shadow_maps_enabled: spot_light.shadow_maps_enabled,
+-                        contact_shadows_enabled: spot_light.contact_shadows_enabled,
+-                        shadow_depth_bias: spot_light.shadow_depth_bias,
+-                        // The factor of SQRT_2 is for the worst-case diagonal offset
+-                        shadow_normal_bias: spot_light.shadow_normal_bias
+-                            * texel_size
+-                            * core::f32::consts::SQRT_2,
+-                        shadow_map_near_z: spot_light.shadow_map_near_z,
+-                        spot_light_angles: Some((spot_light.inner_angle, spot_light.outer_angle)),
+-                        volumetric: volumetric_light.is_some(),
+-                        affects_lightmapped_mesh_diffuse: spot_light
+-                            .affects_lightmapped_mesh_diffuse,
+-                        #[cfg(feature = "experimental_pbr_pcss")]
+-                        soft_shadows_enabled: spot_light.soft_shadows_enabled,
+-                        #[cfg(not(feature = "experimental_pbr_pcss"))]
+-                        soft_shadows_enabled: false,
+-                    },
+-                    render_visible_entities,
+-                    *frustum,
+-                    MainEntity::from(main_entity),
+-                ),
+-            ));
+-        }
++        let texel_size =
++            2.0 * ops::tan(spot_light.outer_angle) / directional_light_shadow_map.size as f32;
++
++        spot_lights_values.push((
++            render_entity,
++            (
++                ExtractedPointLight {
++                    color: spot_light.color.into(),
++                    // NOTE: Map from luminous power in lumens to luminous intensity in lumens per steradian
++                    // for a point light. See https://google.github.io/filament/Filament.html#mjx-eqn-pointLightLuminousPower
++                    // for details.
++                    // Note: Filament uses a divisor of PI for spot lights. We choose to use the same 4*PI divisor
++                    // in both cases so that toggling between point light and spot light keeps lit areas lit equally,
++                    // which seems least surprising for users
++                    intensity: spot_light.intensity / (4.0 * core::f32::consts::PI),
++                    range: spot_light.range,
++                    radius: spot_light.radius,
++                    transform: *transform,
++                    shadow_maps_enabled: spot_light.shadow_maps_enabled,
++                    contact_shadows_enabled: spot_light.contact_shadows_enabled,
++                    shadow_depth_bias: spot_light.shadow_depth_bias,
++                    // The factor of SQRT_2 is for the worst-case diagonal offset
++                    shadow_normal_bias: spot_light.shadow_normal_bias
++                        * texel_size
++                        * core::f32::consts::SQRT_2,
++                    shadow_map_near_z: spot_light.shadow_map_near_z,
++                    spot_light_angles: Some((spot_light.inner_angle, spot_light.outer_angle)),
++                    volumetric: volumetric_light.is_some(),
++                    affects_lightmapped_mesh_diffuse: spot_light.affects_lightmapped_mesh_diffuse,
++                    #[cfg(feature = "experimental_pbr_pcss")]
++                    soft_shadows_enabled: spot_light.soft_shadows_enabled,
++                    #[cfg(not(feature = "experimental_pbr_pcss"))]
++                    soft_shadows_enabled: false,
++                },
++                render_visible_entities,
++                *frustum,
++                MainEntity::from(main_entity),
++            ),
++        ));
+     }
+-    *previous_spot_lights_len = spot_lights_values.len();
+     commands.try_insert_batch(spot_lights_values);
+ 
+     for (
+@@ -531,6 +552,8 @@ pub fn extract_lights(
+         sun_disk,
+     ) in &directional_lights
+     {
++        seen_directional_light_main_entities.insert(main_entity.into());
++
+         if !view_visibility.get() {
+             commands
+                 .get_entity(entity)
+@@ -605,6 +628,58 @@ pub fn extract_lights(
+                 MainEntity::from(main_entity),
+             ));
+     }
++
++    // Remove extracted light components from entities that have had their
++    // light components removed.
++    remove_components::<PointLight, ExtractedPointLight>(
++        &mut commands,
++        &mapper,
++        &mut removed_point_lights,
++        &seen_point_light_main_entities,
++    );
++    remove_components::<SpotLight, ExtractedPointLight>(
++        &mut commands,
++        &mapper,
++        &mut removed_spot_lights,
++        &seen_spot_light_main_entities,
++    );
++    remove_components::<DirectionalLight, ExtractedDirectionalLight>(
++        &mut commands,
++        &mapper,
++        &mut removed_directional_lights,
++        &seen_directional_light_main_entities,
++    );
++
++    // A helper function that removes a render-world component `RWC` when a
++    // main-world component `MC` is removed.
++    //
++    // `seen_entities` is the list of all entities with that component that were
++    // updated this frame. It's needed because presence in the
++    // `RemovedComponents` table for the main-world component isn't enough to
++    // determine whether the render-world component can be removed, as the
++    // main-world component might have been removed and then re-added in the
++    // same frame.
++    fn remove_components<MC, RWC>(
++        commands: &mut Commands,
++        mapper: &Query<RenderEntity>,
++        removed_components: &mut RemovedComponents<MC>,
++        seen_entities: &MainEntityHashSet,
++    ) where
++        MC: Component,
++        RWC: Component,
++    {
++        // As usual, only remove components if we didn't process them in the
++        // outer extraction function, because of the possibility that the
++        // component might have been removed and re-added in the same frame.
++        for main_entity in removed_components.read() {
++            if !seen_entities.contains(&MainEntity::from(main_entity))
++                && let Ok(render_entity) = mapper.get(main_entity)
++                && let Ok(mut entity_commands) = commands.get_entity(render_entity)
++            {
++                entity_commands.remove::<RWC>();
++            }
++        }
++    }
+ }
+ 
+ fn create_render_visible_mesh_entities(

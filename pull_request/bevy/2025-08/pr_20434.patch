@@ -1,0 +1,214 @@
+diff --git a/crates/bevy_light/src/directional_light.rs b/crates/bevy_light/src/directional_light.rs
+index 39e52fb5f02e8..b7e97a3a78536 100644
+--- a/crates/bevy_light/src/directional_light.rs
++++ b/crates/bevy_light/src/directional_light.rs
+@@ -240,3 +240,53 @@ pub fn update_directional_light_frusta(
+             .collect();
+     }
+ }
++
++/// Add to a [`DirectionalLight`] to control rendering of the visible solar disk in the sky.
++/// Affects only the disk’s appearance, not the light’s illuminance or shadows.
++/// Requires a `bevy::pbr::Atmosphere` component on a [`Camera3d`](bevy_camera::Camera3d) to have any effect.
++///
++/// By default, the atmosphere is rendered with [`SunDisk::EARTH`], which approximates the
++/// apparent size and brightness of the Sun as seen from Earth. You can also disable the sun
++/// disk entirely with [`SunDisk::OFF`].
++#[derive(Component, Clone)]
++#[require(DirectionalLight)]
++pub struct SunDisk {
++    /// The angular size (diameter) of the sun disk in radians, as observed from the scene.
++    pub angular_size: f32,
++    /// Multiplier for the brightness of the sun disk.
++    ///
++    /// `0.0` disables the disk entirely (atmospheric scattering still occurs),
++    /// `1.0` is the default physical intensity, and values `>1.0` overexpose it.
++    pub intensity: f32,
++}
++
++impl SunDisk {
++    /// Earth-like parameters for the sun disk.
++    ///
++    /// Uses the mean apparent size (~32 arcminutes) of the Sun at 1 AU distance
++    /// with default intensity.
++    pub const EARTH: SunDisk = SunDisk {
++        angular_size: 0.00930842,
++        intensity: 1.0,
++    };
++
++    /// No visible sun disk.
++    ///
++    /// Keeps scattering and directional light illumination, but hides the disk itself.
++    pub const OFF: SunDisk = SunDisk {
++        angular_size: 0.0,
++        intensity: 0.0,
++    };
++}
++
++impl Default for SunDisk {
++    fn default() -> Self {
++        Self::EARTH
++    }
++}
++
++impl Default for &SunDisk {
++    fn default() -> Self {
++        &SunDisk::EARTH
++    }
++}
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index a2843acfe6f3f..caf132c42f54a 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -48,7 +48,7 @@ pub use spot_light::{
+ mod directional_light;
+ pub use directional_light::{
+     update_directional_light_frusta, DirectionalLight, DirectionalLightShadowMap,
+-    DirectionalLightTexture,
++    DirectionalLightTexture, SunDisk,
+ };
+ 
+ /// The light prelude.
+diff --git a/crates/bevy_pbr/src/atmosphere/functions.wgsl b/crates/bevy_pbr/src/atmosphere/functions.wgsl
+index 86b1a94b7e8d0..68d508ec006d1 100644
+--- a/crates/bevy_pbr/src/atmosphere/functions.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/functions.wgsl
+@@ -36,7 +36,6 @@
+ 
+ 
+ // CONSTANTS
+-
+ const FRAC_PI: f32 = 0.3183098862; // 1 / π
+ const FRAC_2_PI: f32 = 0.15915494309;  // 1 / (2π)
+ const FRAC_3_16_PI: f32 = 0.0596831036594607509; // 3 / (16π)
+@@ -275,8 +274,6 @@ fn sample_local_inscattering(local_atmosphere: AtmosphereSample, ray_dir: vec3<f
+     return inscattering;
+ }
+ 
+-const SUN_ANGULAR_SIZE: f32 = 0.0174533; // angular diameter of sun in radians
+-
+ fn sample_sun_radiance(ray_dir_ws: vec3<f32>) -> vec3<f32> {
+     let r = view_radius();
+     let mu_view = ray_dir_ws.y;
+@@ -285,11 +282,15 @@ fn sample_sun_radiance(ray_dir_ws: vec3<f32>) -> vec3<f32> {
+     for (var light_i: u32 = 0u; light_i < lights.n_directional_lights; light_i++) {
+         let light = &lights.directional_lights[light_i];
+         let neg_LdotV = dot((*light).direction_to_light, ray_dir_ws);
+-        let angle_to_sun = fast_acos(neg_LdotV);
+-        let pixel_size = fwidth(angle_to_sun);
+-        let factor = smoothstep(0.0, -pixel_size * ROOT_2, angle_to_sun - SUN_ANGULAR_SIZE * 0.5);
+-        let sun_solid_angle = (SUN_ANGULAR_SIZE * SUN_ANGULAR_SIZE) * 4.0 * FRAC_PI;
+-        sun_radiance += ((*light).color.rgb / sun_solid_angle) * factor * shadow_factor;
++        let angle_to_sun = fast_acos(clamp(neg_LdotV, -1.0, 1.0));
++        let w = max(0.5 * fwidth(angle_to_sun), 1e-6);
++        let sun_angular_size = (*light).sun_disk_angular_size;
++        let sun_intensity = (*light).sun_disk_intensity;
++        if sun_angular_size > 0.0 && sun_intensity > 0.0 {
++            let factor = 1 - smoothstep(sun_angular_size * 0.5 - w, sun_angular_size * 0.5 + w, angle_to_sun);
++            let sun_solid_angle = (sun_angular_size * sun_angular_size) * 0.25 * PI;
++            sun_radiance += ((*light).color.rgb / sun_solid_angle) * sun_intensity * factor * shadow_factor;
++        }
+     }
+     return sun_radiance;
+ }
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 41792b38a62a1..bb3f18ecb9eed 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -22,6 +22,7 @@ use bevy_ecs::{
+ use bevy_light::cascade::Cascade;
+ use bevy_light::cluster::assign::{calculate_cluster_factors, ClusterableObjectType};
+ use bevy_light::cluster::GlobalVisibleClusterableObjects;
++use bevy_light::SunDisk;
+ use bevy_light::{
+     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
+     Cascades, DirectionalLight, DirectionalLightShadowMap, NotShadowCaster, PointLight,
+@@ -103,6 +104,8 @@ pub struct ExtractedDirectionalLight {
+     pub soft_shadow_size: Option<f32>,
+     /// True if this light is using two-phase occlusion culling.
+     pub occlusion_culling: bool,
++    pub sun_disk_angular_size: f32,
++    pub sun_disk_intensity: f32,
+ }
+ 
+ // NOTE: These must match the bit flags in bevy_pbr/src/render/mesh_view_types.wgsl!
+@@ -138,6 +141,8 @@ pub struct GpuDirectionalLight {
+     cascades_overlap_proportion: f32,
+     depth_texture_base_index: u32,
+     decal_index: u32,
++    sun_disk_angular_size: f32,
++    sun_disk_intensity: f32,
+ }
+ 
+ // NOTE: These must match the bit flags in bevy_pbr/src/render/mesh_view_types.wgsl!
+@@ -279,6 +284,7 @@ pub fn extract_lights(
+                 Option<&RenderLayers>,
+                 Option<&VolumetricLight>,
+                 Has<OcclusionCulling>,
++                Option<&SunDisk>,
+             ),
+             Without<SpotLight>,
+         >,
+@@ -460,6 +466,7 @@ pub fn extract_lights(
+         maybe_layers,
+         volumetric_light,
+         occlusion_culling,
++        sun_disk,
+     ) in &directional_lights
+     {
+         if !view_visibility.get() {
+@@ -526,6 +533,8 @@ pub fn extract_lights(
+                     frusta: extracted_frusta,
+                     render_layers: maybe_layers.unwrap_or_default().clone(),
+                     occlusion_culling,
++                    sun_disk_angular_size: sun_disk.unwrap_or_default().angular_size,
++                    sun_disk_intensity: sun_disk.unwrap_or_default().intensity,
+                 },
+                 RenderCascadesVisibleEntities {
+                     entities: cascade_visible_entities,
+@@ -1152,6 +1161,8 @@ pub fn prepare_lights(
+                 num_cascades: num_cascades as u32,
+                 cascades_overlap_proportion: light.cascade_shadow_config.overlap_proportion,
+                 depth_texture_base_index: num_directional_cascades_enabled_for_this_view as u32,
++                sun_disk_angular_size: light.sun_disk_angular_size,
++                sun_disk_intensity: light.sun_disk_intensity,
+                 decal_index: decals
+                     .as_ref()
+                     .and_then(|decals| decals.get(*light_entity))
+diff --git a/crates/bevy_pbr/src/render/mesh_view_types.wgsl b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+index aaf9d0ef7d7e1..19f87b37946a4 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_types.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+@@ -41,6 +41,8 @@ struct DirectionalLight {
+     cascades_overlap_proportion: f32,
+     depth_texture_base_index: u32,
+     decal_index: u32,
++    sun_disk_angular_size: f32,
++    sun_disk_intensity: f32,
+ };
+ 
+ const DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT: u32                  = 1u << 0u;
+diff --git a/crates/bevy_solari/src/scene/binder.rs b/crates/bevy_solari/src/scene/binder.rs
+index 124d5d05dc2fc..e2ba4d751e862 100644
+--- a/crates/bevy_solari/src/scene/binder.rs
++++ b/crates/bevy_solari/src/scene/binder.rs
+@@ -23,10 +23,6 @@ use core::{f32::consts::TAU, hash::Hash, num::NonZeroU32, ops::Deref};
+ const MAX_MESH_SLAB_COUNT: NonZeroU32 = NonZeroU32::new(500).unwrap();
+ const MAX_TEXTURE_COUNT: NonZeroU32 = NonZeroU32::new(5_000).unwrap();
+ 
+-/// Average angular diameter of the sun as seen from earth.
+-/// <https://en.wikipedia.org/wiki/Angular_diameter#Use_in_astronomy>
+-const SUN_ANGULAR_DIAMETER_RADIANS: f32 = 0.00930842;
+-
+ const TEXTURE_MAP_NONE: u32 = u32::MAX;
+ const LIGHT_NOT_PRESENT_THIS_FRAME: u32 = u32::MAX;
+ 
+@@ -407,7 +403,7 @@ struct GpuDirectionalLight {
+ 
+ impl GpuDirectionalLight {
+     fn new(directional_light: &ExtractedDirectionalLight) -> Self {
+-        let cos_theta_max = cos(SUN_ANGULAR_DIAMETER_RADIANS / 2.0);
++        let cos_theta_max = cos(directional_light.sun_disk_angular_size / 2.0);
+         let solid_angle = TAU * (1.0 - cos_theta_max);
+         let luminance =
+             (directional_light.color.to_vec3() * directional_light.illuminance) / solid_angle;

@@ -1,0 +1,416 @@
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index f968d36e50ea5..e07ebf9d3a475 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -124,6 +124,7 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+         }
+     }
+     let generics = ast.generics;
++    let generics_ty_list = generics.type_params().map(|p| p.ident.clone());
+     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+     let struct_name = &ast.ident;
+ 
+@@ -132,20 +133,17 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+         // - ComponentId is returned in field-definition-order. [get_components] uses field-definition-order
+         // - `Bundle::get_components` is exactly once for each member. Rely's on the Component -> Bundle implementation to properly pass
+         //   the correct `StorageType` into the callback.
+-        #[allow(deprecated)]
+         unsafe impl #impl_generics #ecs_path::bundle::Bundle for #struct_name #ty_generics #where_clause {
+             fn component_ids(
+                 components: &mut #ecs_path::component::ComponentsRegistrator,
+-                ids: &mut impl FnMut(#ecs_path::component::ComponentId)
+-            ) {
+-                #(<#active_field_types as #ecs_path::bundle::Bundle>::component_ids(components, ids);)*
++            ) -> impl Iterator<Item = #ecs_path::component::ComponentId> + use<#(#generics_ty_list,)*> {
++                core::iter::empty()#(.chain(<#active_field_types as #ecs_path::bundle::Bundle>::component_ids(components)))*
+             }
+ 
+             fn get_component_ids(
+                 components: &#ecs_path::component::Components,
+-                ids: &mut impl FnMut(Option<#ecs_path::component::ComponentId>)
+-            ) {
+-                #(<#active_field_types as #ecs_path::bundle::Bundle>::get_component_ids(components, &mut *ids);)*
++            ) -> impl Iterator<Item = Option<#ecs_path::component::ComponentId>> {
++                core::iter::empty()#(.chain(<#active_field_types as #ecs_path::bundle::Bundle>::get_component_ids(components)))*
+             }
+         }
+     };
+@@ -185,7 +183,6 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
+     let from_components_impl = attributes.impl_from_components.then(|| quote! {
+         // SAFETY:
+         // - ComponentId is returned in field-definition-order. [from_components] uses field-definition-order
+-        #[allow(deprecated)]
+         unsafe impl #impl_generics #ecs_path::bundle::BundleFromComponents for #struct_name #ty_generics #where_clause {
+             #[allow(unused_variables, non_snake_case)]
+             unsafe fn from_components<__T, __F>(ctx: &mut __T, func: &mut __F) -> Self
+diff --git a/crates/bevy_ecs/src/bundle/impls.rs b/crates/bevy_ecs/src/bundle/impls.rs
+index d4ab96414c19c..c8d9160dc2135 100644
+--- a/crates/bevy_ecs/src/bundle/impls.rs
++++ b/crates/bevy_ecs/src/bundle/impls.rs
+@@ -1,4 +1,4 @@
+-use core::any::TypeId;
++use core::{any::TypeId, iter};
+ 
+ use bevy_ptr::{MovingPtr, OwningPtr};
+ use core::mem::MaybeUninit;
+@@ -14,12 +14,14 @@ use crate::{
+ // - `Bundle::component_ids` calls `ids` for C's component id (and nothing else)
+ // - `Bundle::get_components` is called exactly once for C and passes the component's storage type based on its associated constant.
+ unsafe impl<C: Component> Bundle for C {
+-    fn component_ids(components: &mut ComponentsRegistrator, ids: &mut impl FnMut(ComponentId)) {
+-        ids(components.register_component::<C>());
++    fn component_ids(
++        components: &mut ComponentsRegistrator,
++    ) -> impl Iterator<Item = ComponentId> + use<C> {
++        iter::once(components.register_component::<C>())
+     }
+ 
+-    fn get_component_ids(components: &Components, ids: &mut impl FnMut(Option<ComponentId>)) {
+-        ids(components.get_id(TypeId::of::<C>()));
++    fn get_component_ids(components: &Components) -> impl Iterator<Item = Option<ComponentId>> {
++        iter::once(components.get_id(TypeId::of::<C>()))
+     }
+ }
+ 
+@@ -71,12 +73,12 @@ macro_rules! tuple_impl {
+         // - `Bundle::get_components` is called exactly once for each member. Relies on the above implementation to pass the correct
+         //   `StorageType` into the callback.
+         unsafe impl<$($name: Bundle),*> Bundle for ($($name,)*) {
+-            fn component_ids(components: &mut ComponentsRegistrator,  ids: &mut impl FnMut(ComponentId)){
+-                $(<$name as Bundle>::component_ids(components, ids);)*
++            fn component_ids<'a>(components: &'a mut ComponentsRegistrator) -> impl Iterator<Item = ComponentId> + use<$($name,)*> {
++                iter::empty()$(.chain(<$name as Bundle>::component_ids(components)))*
+             }
+ 
+-            fn get_component_ids(components: &Components, ids: &mut impl FnMut(Option<ComponentId>)){
+-                $(<$name as Bundle>::get_component_ids(components, ids);)*
++            fn get_component_ids(components: &Components) -> impl Iterator<Item = Option<ComponentId>> {
++                iter::empty()$(.chain(<$name as Bundle>::get_component_ids(components)))*
+             }
+         }
+ 
+diff --git a/crates/bevy_ecs/src/bundle/info.rs b/crates/bevy_ecs/src/bundle/info.rs
+index 5d0dbeddf63c8..b3de7f1e12aa5 100644
+--- a/crates/bevy_ecs/src/bundle/info.rs
++++ b/crates/bevy_ecs/src/bundle/info.rs
+@@ -435,8 +435,7 @@ impl Bundles {
+     ) -> BundleId {
+         let bundle_infos = &mut self.bundle_infos;
+         *self.bundle_ids.entry(TypeId::of::<T>()).or_insert_with(|| {
+-            let mut component_ids= Vec::new();
+-            T::component_ids(components, &mut |id| component_ids.push(id));
++            let component_ids = T::component_ids(components).collect::<Vec<_>>();
+             let id = BundleId(bundle_infos.len());
+             let bundle_info =
+                 // SAFETY: T::component_id ensures:
+diff --git a/crates/bevy_ecs/src/bundle/mod.rs b/crates/bevy_ecs/src/bundle/mod.rs
+index 17d894d40b660..b6a81ebd27328 100644
+--- a/crates/bevy_ecs/src/bundle/mod.rs
++++ b/crates/bevy_ecs/src/bundle/mod.rs
+@@ -199,11 +199,14 @@ use bevy_ptr::OwningPtr;
+ )]
+ pub unsafe trait Bundle: DynamicBundle + Send + Sync + 'static {
+     /// Gets this [`Bundle`]'s component ids, in the order of this bundle's [`Component`]s
++    /// This will register the component if it doesn't exist.
+     #[doc(hidden)]
+-    fn component_ids(components: &mut ComponentsRegistrator, ids: &mut impl FnMut(ComponentId));
++    fn component_ids(
++        components: &mut ComponentsRegistrator,
++    ) -> impl Iterator<Item = ComponentId> + use<Self>;
+ 
+-    /// Gets this [`Bundle`]'s component ids. This will be [`None`] if the component has not been registered.
+-    fn get_component_ids(components: &Components, ids: &mut impl FnMut(Option<ComponentId>));
++    /// Return a iterator over this [`Bundle`]'s component ids. This will be [`None`] if the component has not been registered.
++    fn get_component_ids(components: &Components) -> impl Iterator<Item = Option<ComponentId>>;
+ }
+ 
+ /// Creates a [`Bundle`] by taking it from internal storage.
+diff --git a/crates/bevy_ecs/src/lib.rs b/crates/bevy_ecs/src/lib.rs
+index b26f9a9d805af..b8835257a66dd 100644
+--- a/crates/bevy_ecs/src/lib.rs
++++ b/crates/bevy_ecs/src/lib.rs
+@@ -244,10 +244,8 @@ mod tests {
+             x: TableStored,
+             y: SparseStored,
+         }
+-        let mut ids = Vec::new();
+-        <FooBundle as Bundle>::component_ids(&mut world.components_registrator(), &mut |id| {
+-            ids.push(id);
+-        });
++        let ids: Vec<_> =
++            <FooBundle as Bundle>::component_ids(&mut world.components_registrator()).collect();
+ 
+         assert_eq!(
+             ids,
+@@ -294,10 +292,8 @@ mod tests {
+             b: B,
+         }
+ 
+-        let mut ids = Vec::new();
+-        <NestedBundle as Bundle>::component_ids(&mut world.components_registrator(), &mut |id| {
+-            ids.push(id);
+-        });
++        let ids: Vec<_> =
++            <NestedBundle as Bundle>::component_ids(&mut world.components_registrator()).collect();
+ 
+         assert_eq!(
+             ids,
+@@ -346,13 +342,9 @@ mod tests {
+             ignored: Ignored,
+         }
+ 
+-        let mut ids = Vec::new();
+-        <BundleWithIgnored as Bundle>::component_ids(
+-            &mut world.components_registrator(),
+-            &mut |id| {
+-                ids.push(id);
+-            },
+-        );
++        let ids: Vec<_> =
++            <BundleWithIgnored as Bundle>::component_ids(&mut world.components_registrator())
++                .collect();
+ 
+         assert_eq!(ids, &[world.register_component::<C>(),]);
+ 
+diff --git a/crates/bevy_ecs/src/observer/distributed_storage.rs b/crates/bevy_ecs/src/observer/distributed_storage.rs
+index 584713e5dc6ae..f2af97d313d17 100644
+--- a/crates/bevy_ecs/src/observer/distributed_storage.rs
++++ b/crates/bevy_ecs/src/observer/distributed_storage.rs
+@@ -426,10 +426,8 @@ fn hook_on_add<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+ ) {
+     world.commands().queue(move |world: &mut World| {
+         let event_key = world.register_event_key::<E>();
+-        let mut components = alloc::vec![];
+-        B::component_ids(&mut world.components_registrator(), &mut |id| {
+-            components.push(id);
+-        });
++        let components = B::component_ids(&mut world.components_registrator());
++
+         if let Some(mut observer) = world.get_mut::<Observer>(entity) {
+             observer.descriptor.event_keys.push(event_key);
+             observer.descriptor.components.extend(components);
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 8cdfe2baf679d..82f4976c49f1d 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -1243,26 +1243,24 @@ where
+     fn init_state(world: &mut World) -> Self::State {
+         let mut access = Access::new();
+         access.read_all_components();
+-        B::component_ids(&mut world.components_registrator(), &mut |id| {
++        for id in B::component_ids(&mut world.components_registrator()) {
+             access.remove_component_read(id);
+-        });
++        }
+         access
+     }
+ 
+     fn get_state(components: &Components) -> Option<Self::State> {
+         let mut access = Access::new();
+         access.read_all_components();
+-        B::get_component_ids(components, &mut |maybe_id| {
+-            // If the component isn't registered, we don't have a `ComponentId`
+-            // to use to exclude its access.
+-            // Rather than fail, just try to take additional access.
+-            // This is sound because access checks will run on the resulting access.
+-            // Since the component isn't registered, there are no entities with that
+-            // component, and the extra access will usually have no effect.
+-            if let Some(id) = maybe_id {
+-                access.remove_component_read(id);
+-            }
+-        });
++        // If the component isn't registered, we don't have a `ComponentId`
++        // to use to exclude its access.
++        // Rather than fail, just try to take additional access.
++        // This is sound because access checks will run on the resulting access.
++        // Since the component isn't registered, there are no entities with that
++        // component, and the extra access will usually have no effect.
++        for id in B::get_component_ids(components).flatten() {
++            access.remove_component_read(id);
++        }
+         Some(access)
+     }
+ 
+@@ -1359,26 +1357,24 @@ where
+     fn init_state(world: &mut World) -> Self::State {
+         let mut access = Access::new();
+         access.write_all_components();
+-        B::component_ids(&mut world.components_registrator(), &mut |id| {
++        for id in B::component_ids(&mut world.components_registrator()) {
+             access.remove_component_read(id);
+-        });
++        }
+         access
+     }
+ 
+     fn get_state(components: &Components) -> Option<Self::State> {
+         let mut access = Access::new();
+         access.write_all_components();
+-        B::get_component_ids(components, &mut |maybe_id| {
+-            // If the component isn't registered, we don't have a `ComponentId`
+-            // to use to exclude its access.
+-            // Rather than fail, just try to take additional access.
+-            // This is sound because access checks will run on the resulting access.
+-            // Since the component isn't registered, there are no entities with that
+-            // component, and the extra access will usually have no effect.
+-            if let Some(id) = maybe_id {
+-                access.remove_component_read(id);
+-            }
+-        });
++        // If the component isn't registered, we don't have a `ComponentId`
++        // to use to exclude its access.
++        // Rather than fail, just try to take additional access.
++        // This is sound because access checks will run on the resulting access.
++        // Since the component isn't registered, there are no entities with that
++        // component, and the extra access will usually have no effect.
++        for id in B::get_component_ids(components).flatten() {
++            access.remove_component_read(id);
++        }
+         Some(access)
+     }
+ 
+diff --git a/crates/bevy_ecs/src/spawn.rs b/crates/bevy_ecs/src/spawn.rs
+index 85f2f4cea01ba..c01897870f953 100644
+--- a/crates/bevy_ecs/src/spawn.rs
++++ b/crates/bevy_ecs/src/spawn.rs
+@@ -300,16 +300,14 @@ unsafe impl<R: Relationship, L: SpawnableList<R> + Send + Sync + 'static> Bundle
+ {
+     fn component_ids(
+         components: &mut crate::component::ComponentsRegistrator,
+-        ids: &mut impl FnMut(crate::component::ComponentId),
+-    ) {
+-        <R::RelationshipTarget as Bundle>::component_ids(components, ids);
++    ) -> impl Iterator<Item = crate::component::ComponentId> + use<R, L> {
++        <R::RelationshipTarget as Bundle>::component_ids(components)
+     }
+ 
+     fn get_component_ids(
+         components: &crate::component::Components,
+-        ids: &mut impl FnMut(Option<crate::component::ComponentId>),
+-    ) {
+-        <R::RelationshipTarget as Bundle>::get_component_ids(components, ids);
++    ) -> impl Iterator<Item = Option<crate::component::ComponentId>> {
++        <R::RelationshipTarget as Bundle>::get_component_ids(components)
+     }
+ }
+ 
+@@ -392,16 +390,14 @@ impl<R: Relationship, B: Bundle> DynamicBundle for SpawnOneRelated<R, B> {
+ unsafe impl<R: Relationship, B: Bundle> Bundle for SpawnOneRelated<R, B> {
+     fn component_ids(
+         components: &mut crate::component::ComponentsRegistrator,
+-        ids: &mut impl FnMut(crate::component::ComponentId),
+-    ) {
+-        <R::RelationshipTarget as Bundle>::component_ids(components, ids);
++    ) -> impl Iterator<Item = crate::component::ComponentId> + use<R, B> {
++        <R::RelationshipTarget as Bundle>::component_ids(components)
+     }
+ 
+     fn get_component_ids(
+         components: &crate::component::Components,
+-        ids: &mut impl FnMut(Option<crate::component::ComponentId>),
+-    ) {
+-        <R::RelationshipTarget as Bundle>::get_component_ids(components, ids);
++    ) -> impl Iterator<Item = Option<crate::component::ComponentId>> {
++        <R::RelationshipTarget as Bundle>::get_component_ids(components)
+     }
+ }
+ 
+diff --git a/crates/bevy_ecs/src/world/entity_access/except.rs b/crates/bevy_ecs/src/world/entity_access/except.rs
+index 24ff59e354f61..92d372e26bd81 100644
+--- a/crates/bevy_ecs/src/world/entity_access/except.rs
++++ b/crates/bevy_ecs/src/world/entity_access/except.rs
+@@ -490,10 +490,8 @@ where
+     B: Bundle,
+ {
+     let mut found = false;
+-    B::get_component_ids(components, &mut |maybe_id| {
+-        if let Some(id) = maybe_id {
+-            found = found || id == query_id;
+-        }
+-    });
++    for id in B::get_component_ids(components).flatten() {
++        found = found || id == query_id;
++    }
+     found
+ }
+diff --git a/crates/bevy_ui_widgets/src/observe.rs b/crates/bevy_ui_widgets/src/observe.rs
+index 6fb4d177a65ed..ec6388f2c59eb 100644
+--- a/crates/bevy_ui_widgets/src/observe.rs
++++ b/crates/bevy_ui_widgets/src/observe.rs
+@@ -27,17 +27,17 @@ unsafe impl<
+     #[inline]
+     fn component_ids(
+         _components: &mut bevy_ecs::component::ComponentsRegistrator,
+-        _ids: &mut impl FnMut(bevy_ecs::component::ComponentId),
+-    ) {
+-        // SAFETY: Empty function body
++    ) -> impl Iterator<Item = bevy_ecs::component::ComponentId> + use<E, B, M, I> {
++        // SAFETY: Empty iterator
++        core::iter::empty()
+     }
+ 
+     #[inline]
+     fn get_component_ids(
+         _components: &bevy_ecs::component::Components,
+-        _ids: &mut impl FnMut(Option<bevy_ecs::component::ComponentId>),
+-    ) {
+-        // SAFETY: Empty function body
++    ) -> impl Iterator<Item = Option<bevy_ecs::component::ComponentId>> {
++        // SAFETY: Empty iterator
++        core::iter::empty()
+     }
+ }
+ 
+diff --git a/release-content/migration-guides/bundle_component_ids.md b/release-content/migration-guides/bundle_component_ids.md
+new file mode 100644
+index 0000000000000..55c70331c45cd
+--- /dev/null
++++ b/release-content/migration-guides/bundle_component_ids.md
+@@ -0,0 +1,47 @@
++---
++title: Change  `Bundle::component_ids` and `Bundle::get_component_ids` to return an iterator.
++pull_requests: [14791, 15458, 15269]
++---
++
++`Bundle::component_ids` and `Bundle::get_component_ids` were changed to return an iterator over
++`ComponentId` and `Option<ComponentId>` respectively. In some cases this can avoid allocating.
++
++```rust
++// For implementors
++// Before
++unsafe impl<C: Component> Bundle for C {
++    fn component_ids(components: &mut ComponentsRegistrator, ids: &mut impl FnMut(ComponentId)) {
++        ids(components.register_component::<C>());
++    }
++
++    fn get_component_ids(components: &Components, ids: &mut impl FnMut(Option<ComponentId>)) {
++        ids(components.get_id(TypeId::of::<C>()));
++    }
++}
++
++// After
++unsafe impl<C: Component> Bundle for C {
++    fn component_ids<(
++        components: &mut ComponentsRegistrator,
++    // we use a `use` here to explicitly not capture the lifetime of `components`
++    ) -> impl Iterator<Item = ComponentId> + use<C> {
++        iter::once(components.register_component::<C>())
++    }
++
++    fn get_component_ids(components: &Components) -> impl Iterator<Item = Option<ComponentId>> {
++        iter::once(components.get_id(TypeId::of::<C>()))
++    }
++}
++```
++
++```rust
++// For Consumers
++// Before
++let mut components = vec![];
++MyBundle::component_ids(&mut world.components_registrator(), &mut |id| {
++    components.push(id);
++});
++
++// After
++let components: Vec<_> = B::component_ids(&mut world.components_registrator()).collect();
++```

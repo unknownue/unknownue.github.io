@@ -1,0 +1,1081 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d039936d83779..02f725c6512e8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -732,6 +732,7 @@ event-listener = "5.3.0"
+ anyhow = "1"
+ accesskit = "0.21"
+ nonmax = "0.5"
++gltf = "1.4"
+ 
+ [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+ ureq = { version = "3.0.8", features = ["json"] }
+@@ -4178,6 +4179,28 @@ description = "Loads and renders a glTF file as a scene, including the gltf extr
+ category = "glTF"
+ wasm = true
+ 
++[[example]]
++name = "gltf_extension_animation_graph"
++path = "examples/gltf/gltf_extension_animation_graph.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.gltf_extension_animation_graph]
++name = "glTF extension AnimationGraph"
++description = "Uses glTF data to build an AnimationGraph via extension processing"
++category = "glTF"
++wasm = true
++
++[[example]]
++name = "gltf_extension_mesh_2d"
++path = "examples/gltf/gltf_extension_mesh_2d.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.gltf_extension_mesh_2d]
++name = "glTF extension processing to build Mesh2ds from glTF data"
++description = "Uses glTF extension data to convert incoming Mesh3d/MeshMaterial3d assets to 2d"
++category = "glTF"
++wasm = true
++
+ [[example]]
+ name = "query_gltf_primitives"
+ path = "examples/gltf/query_gltf_primitives.rs"
+diff --git a/assets/models/barycentric/barycentric.gltf b/assets/models/barycentric/barycentric.gltf
+index eecb2bb52cf95..092c28eb7bdf9 100644
+--- a/assets/models/barycentric/barycentric.gltf
++++ b/assets/models/barycentric/barycentric.gltf
+@@ -1,4 +1,18 @@
+ {
++  "scene": 0,
++  "scenes": [
++    {
++      "nodes": [
++        0
++      ]
++    }
++  ],
++  "nodes": [
++    {
++      "name": "box",
++      "mesh": 0
++    }
++  ],
+   "accessors": [
+     {
+       "bufferView": 0,
+diff --git a/crates/bevy_gltf/Cargo.toml b/crates/bevy_gltf/Cargo.toml
+index bd906090b96da..34e1c56b73d98 100644
+--- a/crates/bevy_gltf/Cargo.toml
++++ b/crates/bevy_gltf/Cargo.toml
+@@ -55,6 +55,7 @@ gltf = { version = "1.4.0", default-features = false, features = [
+   "names",
+   "utils",
+ ] }
++async-lock = { version = "3.0", default-features = false }
+ thiserror = { version = "2", default-features = false }
+ base64 = "0.22.0"
+ fixedbitset = "0.5"
+diff --git a/crates/bevy_gltf/src/lib.rs b/crates/bevy_gltf/src/lib.rs
+index bb01fb034fc30..ea9ec7659405e 100644
+--- a/crates/bevy_gltf/src/lib.rs
++++ b/crates/bevy_gltf/src/lib.rs
+@@ -155,6 +155,8 @@ pub mod prelude {
+     pub use crate::{assets::Gltf, assets::GltfExtras, label::GltfAssetLabel};
+ }
+ 
++use crate::extensions::GltfExtensionHandlers;
++
+ pub use {assets::*, label::GltfAssetLabel, loader::*};
+ 
+ // Has to store an Arc<Mutex<...>> as there is no other way to mutate fields of asset loaders.
+@@ -249,7 +251,8 @@ impl Plugin for GltfPlugin {
+             .init_asset::<GltfPrimitive>()
+             .init_asset::<GltfMesh>()
+             .init_asset::<GltfSkin>()
+-            .preregister_asset_loader::<GltfLoader>(&["gltf", "glb"]);
++            .preregister_asset_loader::<GltfLoader>(&["gltf", "glb"])
++            .init_resource::<GltfExtensionHandlers>();
+     }
+ 
+     fn finish(&self, app: &mut App) {
+@@ -267,11 +270,14 @@ impl Plugin for GltfPlugin {
+         let default_sampler = default_sampler_resource.get_internal();
+         app.insert_resource(default_sampler_resource);
+ 
++        let extensions = app.world().resource::<GltfExtensionHandlers>();
++
+         app.register_asset_loader(GltfLoader {
+             supported_compressed_formats,
+             custom_vertex_attributes: self.custom_vertex_attributes.clone(),
+             default_sampler,
+             default_use_model_forward_direction: self.use_model_forward_direction,
++            extensions: extensions.0.clone(),
+         });
+     }
+ }
+diff --git a/crates/bevy_gltf/src/loader/extensions/mod.rs b/crates/bevy_gltf/src/loader/extensions/mod.rs
+index 14863fa4538c5..32ec5ce6a7fb5 100644
+--- a/crates/bevy_gltf/src/loader/extensions/mod.rs
++++ b/crates/bevy_gltf/src/loader/extensions/mod.rs
+@@ -4,7 +4,270 @@ mod khr_materials_anisotropy;
+ mod khr_materials_clearcoat;
+ mod khr_materials_specular;
+ 
++use alloc::sync::Arc;
++use async_lock::RwLock;
++
++use bevy_animation::AnimationClip;
++use bevy_asset::{Handle, LoadContext};
++use bevy_ecs::{
++    entity::Entity,
++    resource::Resource,
++    world::{EntityWorldMut, World},
++};
++use bevy_pbr::StandardMaterial;
++use bevy_platform::collections::{HashMap, HashSet};
++use gltf::Node;
++
++use crate::GltfMesh;
++
+ pub(crate) use self::{
+     khr_materials_anisotropy::AnisotropyExtension, khr_materials_clearcoat::ClearcoatExtension,
+     khr_materials_specular::SpecularExtension,
+ };
++
++/// Stores the `GltfExtensionHandler` implementations so that they
++/// can be added by users and also passed to the glTF loader
++#[derive(Resource, Default)]
++pub struct GltfExtensionHandlers(pub Arc<RwLock<Vec<Box<dyn GltfExtensionHandler>>>>);
++
++/// glTF Extensions can attach data to any objects in a glTF file.
++/// This is done by inserting data in the `extensions` sub-object, and
++/// data in the extensions sub-object is keyed by the id of the extension.
++/// For example: `KHR_materials_variants`, `EXT_meshopt_compression`, or `BEVY_my_tool`
++///
++/// A list of publicly known extensions and their ids can be found
++/// in the [KhronosGroup/glTF](https://github.com/KhronosGroup/glTF/blob/main/extensions/README.md)
++/// git repo. Vendors reserve prefixes, such as the `BEVY` prefix,
++/// which is also listed in the [KhronosGroup repo](https://github.com/KhronosGroup/glTF/blob/main/extensions/Prefixes.md).
++///
++/// The `GltfExtensionHandler` trait should be implemented to participate in
++/// processing glTF files as they load, and exposes glTF extension data via
++/// a series of hook callbacks.
++///
++/// The type a `GltfExtensionHandler` is implemented for can define data
++/// which will be cloned for each new glTF load. This enables stateful
++/// handling of glTF extension data during a single load.
++pub trait GltfExtensionHandler: Send + Sync {
++    /// Required for dyn cloning
++    fn dyn_clone(&self) -> Box<dyn GltfExtensionHandler>;
++
++    /// When loading a glTF file, a glTF object that could contain extension
++    /// data will cause the relevant hook to execute once for each id in this list.
++    /// Each invocation will receive the extension data for one of the extension ids,
++    /// along with the `extension_id` itself so implementors can differentiate
++    /// between different calls and parse data correctly.
++    ///
++    /// The hooks are always called, even if there is no extension data
++    /// for a specified id. This is useful for scenarios where additional
++    /// extension data isn't required, but processing should still happen.
++    ///
++    /// Most implementors will pick one extension for this list, causing the
++    /// relevant hooks to fire once per object. An implementor that does not
++    /// wish to receive any data but still wants hooks to be called can use
++    /// an empty string `""` as the extension id, which is also the default
++    /// value if the function is not implemented by an implementor. If the
++    /// empty string is used, all extension data in hooks will be `None`.
++    ///
++    /// Some implementors will choose to list multiple extensions here.
++    /// This is an advanced use case and the alternative of having multiple
++    /// independent handlers should be considered as an option first.
++    /// If multiple extension ids are listed here, the hooks will fire once
++    /// for each extension id, and each successive call will receive the data for
++    /// a separate extension. The extension id is also included in hook arguments
++    /// for this reason, so multiple extension id implementors can differentiate
++    /// between the data received.
++    fn extension_ids(&self) -> &'static [&'static str] {
++        &[""]
++    }
++
++    /// Called when the "global" data for an extension
++    /// at the root of a glTF file is encountered.
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_root_data(&mut self, extension_id: &str, value: Option<&serde_json::Value>) {}
++
++    #[cfg(feature = "bevy_animation")]
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    /// Called when an individual animation is processed
++    fn on_animation(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        gltf_animation: &gltf::Animation,
++        name: Option<&str>,
++        handle: Handle<AnimationClip>,
++    ) {
++    }
++
++    #[cfg(feature = "bevy_animation")]
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    /// Called when all animations have been collected.
++    /// `animations` is the glTF ordered list of `Handle<AnimationClip>`s
++    /// `named_animations` is a `HashMap` from animation name to `Handle<AnimationClip>`
++    /// `animation_roots` is the glTF index of the animation root object
++    fn on_animations_collected(
++        &mut self,
++        load_context: &mut LoadContext<'_>,
++        animations: &[Handle<AnimationClip>],
++        named_animations: &HashMap<Box<str>, Handle<AnimationClip>>,
++        animation_roots: &HashSet<usize>,
++    ) {
++    }
++
++    /// Called when an individual texture is processed
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_texture(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        texture: Handle<bevy_image::Image>,
++    ) {
++    }
++
++    /// Called when an individual material is processed
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_material(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
++        gltf_material: &gltf::Material,
++        name: Option<&str>,
++        material: Handle<StandardMaterial>,
++    ) {
++    }
++
++    /// Called when an individual glTF Mesh is processed
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_gltf_mesh(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
++        gltf_mesh: &gltf::Mesh,
++        name: Option<&str>,
++        mesh: Handle<GltfMesh>,
++    ) {
++    }
++
++    /// mesh and material are spawned as a single Entity,
++    /// which means an extension would have to decide for
++    /// itself how to merge the extension data.
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_spawn_mesh_and_material(
++        &mut self,
++        load_context: &mut LoadContext<'_>,
++        primitive: &gltf::Primitive,
++        mesh: &gltf::Mesh,
++        material: &gltf::Material,
++        entity: &mut EntityWorldMut,
++    ) {
++    }
++
++    /// Called when an individual Scene is done processing
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_scene_completed(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        scene: &gltf::Scene,
++        name: Option<&str>,
++        world_root_id: Entity,
++        scene_world: &mut World,
++        load_context: &mut LoadContext<'_>,
++    ) {
++    }
++
++    /// Called when a node is processed
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_gltf_node(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
++        gltf_node: &Node,
++        entity: &mut EntityWorldMut,
++    ) {
++    }
++
++    /// Called with a `DirectionalLight` node is spawned
++    /// which is typically created as a result of
++    /// `KHR_lights_punctual`
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_spawn_light_directional(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
++        gltf_node: &Node,
++        entity: &mut EntityWorldMut,
++    ) {
++    }
++    /// Called with a `PointLight` node is spawned
++    /// which is typically created as a result of
++    /// `KHR_lights_punctual`
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_spawn_light_point(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
++        gltf_node: &Node,
++        entity: &mut EntityWorldMut,
++    ) {
++    }
++    /// Called with a `SpotLight` node is spawned
++    /// which is typically created as a result of
++    /// `KHR_lights_punctual`
++    #[expect(
++        unused,
++        reason = "default trait implementations do not use the arguments because they are no-ops"
++    )]
++    fn on_spawn_light_spot(
++        &mut self,
++        extension_id: &str,
++        extension_data: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
++        gltf_node: &Node,
++        entity: &mut EntityWorldMut,
++    ) {
++    }
++}
++
++impl Clone for Box<dyn GltfExtensionHandler> {
++    fn clone(&self) -> Self {
++        self.dyn_clone()
++    }
++}
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index 7c6c0eaa56ca9..9bbbe3311e876 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -1,7 +1,8 @@
+-mod extensions;
++pub mod extensions;
+ mod gltf_ext;
+ 
+ use alloc::sync::Arc;
++use async_lock::RwLock;
+ use std::{io::Error, sync::Mutex};
+ 
+ #[cfg(feature = "bevy_animation")]
+@@ -160,6 +161,10 @@ pub struct GltfLoader {
+     ///
+     /// The default is `false`.
+     pub default_use_model_forward_direction: bool,
++    /// glTF extension data processors.
++    /// These are Bevy-side processors designed to access glTF
++    /// extension data during the loading process.
++    pub extensions: Arc<RwLock<Vec<Box<dyn extensions::GltfExtensionHandler>>>>,
+ }
+ 
+ /// Specifies optional settings for processing gltfs at load time. By default, all recognized contents of
+@@ -246,6 +251,18 @@ impl GltfLoader {
+     ) -> Result<Gltf, GltfError> {
+         let gltf = gltf::Gltf::from_slice(bytes)?;
+ 
++        // clone extensions to start with a fresh processing state
++        let mut extensions = loader.extensions.read().await.clone();
++
++        // Extensions can have data on the "root" of the glTF data.
++        // Let extensions process the root data for the extension ids
++        // they've subscribed to.
++        for extension in extensions.iter_mut() {
++            for id in extension.extension_ids() {
++                extension.on_root_data(id, gltf.extension_value(id));
++            }
++        }
++
+         let file_name = load_context
+             .path()
+             .path()
+@@ -577,8 +594,35 @@ impl GltfLoader {
+                 if let Some(name) = animation.name() {
+                     named_animations.insert(name.into(), handle.clone());
+                 }
++
++                // let extensions handle extension data placed on animations
++                for extension in extensions.iter_mut() {
++                    for id in extension.extension_ids() {
++                        extension.on_animation(
++                            id,
++                            animation.extension_value(id),
++                            &animation,
++                            animation.name(),
++                            handle.clone(),
++                        );
++                    }
++                }
++
+                 animations.push(handle);
+             }
++
++            // let extensions process the collection of animation data
++            // this only happens once for each GltfExtensionHandler because
++            // it is a hook for Bevy's finalized representation of the animations
++            for extension in extensions.iter_mut() {
++                extension.on_animations_collected(
++                    load_context,
++                    &animations,
++                    &named_animations,
++                    &animation_roots,
++                );
++            }
++
+             (animations, named_animations, animation_roots)
+         } else {
+             Default::default()
+@@ -594,11 +638,11 @@ impl GltfLoader {
+         // In theory we could store a mapping between texture.index() and handle to use
+         // later in the loader when looking up handles for materials. However this would mean
+         // that the material's load context would no longer track those images as dependencies.
+-        let mut _texture_handles = Vec::new();
++        let mut texture_handles = Vec::new();
+         if gltf.textures().len() == 1 || cfg!(target_arch = "wasm32") {
+             for texture in gltf.textures() {
+                 let image = load_image(
+-                    texture,
++                    texture.clone(),
+                     &buffer_data,
+                     &linear_textures,
+                     load_context.path(),
+@@ -607,7 +651,17 @@ impl GltfLoader {
+                     settings,
+                 )
+                 .await?;
+-                image.process_loaded_texture(load_context, &mut _texture_handles);
++                image.process_loaded_texture(load_context, &mut texture_handles);
++                // let extensions handle texture data
++                for extension in extensions.iter_mut() {
++                    for id in extension.extension_ids() {
++                        extension.on_texture(
++                            id,
++                            texture.extension_value(id),
++                            texture_handles.iter().last().unwrap().clone(),
++                        );
++                    }
++                }
+             }
+         } else {
+             #[cfg(not(target_arch = "wasm32"))]
+@@ -617,8 +671,9 @@ impl GltfLoader {
+                         let asset_path = load_context.path().clone();
+                         let linear_textures = &linear_textures;
+                         let buffer_data = &buffer_data;
++                        let extension_data = gltf_texture.extensions().map(ToOwned::to_owned);
+                         scope.spawn(async move {
+-                            load_image(
++                            let result = load_image(
+                                 gltf_texture,
+                                 buffer_data,
+                                 linear_textures,
+@@ -627,14 +682,27 @@ impl GltfLoader {
+                                 default_sampler,
+                                 settings,
+                             )
+-                            .await
++                            .await;
++                            (extension_data, result)
+                         });
+                     });
+                 })
+                 .into_iter()
+-                .for_each(|result| match result {
++                .for_each(|(extension_data, result)| match result {
+                     Ok(image) => {
+-                        image.process_loaded_texture(load_context, &mut _texture_handles);
++                        image.process_loaded_texture(load_context, &mut texture_handles);
++                        // let extensions handle texture data
++                        // We do this differently here because of the IoTaskPool vs
++                        // gltf::Texture lifetimes
++                        for extension in extensions.iter_mut() {
++                            for id in extension.extension_ids() {
++                                extension.on_texture(
++                                    id,
++                                    extension_data.as_ref().and_then(|map| map.get(*id)),
++                                    texture_handles.iter().last().unwrap().clone(),
++                                );
++                            }
++                        }
+                     }
+                     Err(err) => {
+                         warn!("Error loading glTF texture: {}", err);
+@@ -652,6 +720,21 @@ impl GltfLoader {
+                 if let Some(name) = material.name() {
+                     named_materials.insert(name.into(), handle.clone());
+                 }
++
++                // let extensions handle material data
++                for extension in extensions.iter_mut() {
++                    for id in extension.extension_ids() {
++                        extension.on_material(
++                            id,
++                            material.extension_value(id),
++                            load_context,
++                            &material,
++                            material.name(),
++                            handle.clone(),
++                        );
++                    }
++                }
++
+                 materials.push(handle);
+             }
+         }
+@@ -815,6 +898,19 @@ impl GltfLoader {
+             if let Some(name) = gltf_mesh.name() {
+                 named_meshes.insert(name.into(), handle.clone());
+             }
++            for extension in extensions.iter_mut() {
++                for id in extension.extension_ids() {
++                    extension.on_gltf_mesh(
++                        id,
++                        gltf_mesh.extension_value(id),
++                        load_context,
++                        &gltf_mesh,
++                        gltf_mesh.name(),
++                        handle.clone(),
++                    );
++                }
++            }
++
+             meshes.push(handle);
+         }
+ 
+@@ -969,6 +1065,7 @@ impl GltfLoader {
+                             None,
+                             &gltf.document,
+                             convert_coordinates,
++                            &mut extensions,
+                         );
+                         if result.is_err() {
+                             err = Some(result);
+@@ -1014,6 +1111,22 @@ impl GltfLoader {
+                     joints: joint_entities,
+                 });
+             }
++
++            // let extensions handle scene extension data
++            for extension in extensions.iter_mut() {
++                for id in extension.extension_ids() {
++                    extension.on_scene_completed(
++                        id,
++                        scene.extension_value(id),
++                        &scene,
++                        scene.name(),
++                        world_root_id,
++                        &mut world,
++                        &mut scene_load_context,
++                    );
++                }
++            }
++
+             let loaded_scene = scene_load_context.finish(Scene::new(world));
+             let scene_handle = load_context.add_loaded_labeled_asset(
+                 GltfAssetLabel::Scene(scene.index()).to_string(),
+@@ -1413,6 +1526,7 @@ fn load_node(
+     #[cfg(feature = "bevy_animation")] mut animation_context: Option<AnimationContext>,
+     document: &Document,
+     convert_coordinates: bool,
++    extensions: &mut [Box<dyn extensions::GltfExtensionHandler>],
+ ) -> Result<(), GltfError> {
+     let mut gltf_error = None;
+     let transform = node_transform(gltf_node, convert_coordinates);
+@@ -1604,6 +1718,18 @@ fn load_node(
+                 if let Some(skin) = gltf_node.skin() {
+                     entity_to_skin_index_map.insert(mesh_entity.id(), skin.index());
+                 }
++
++                // enable extension processing for a Bevy-created construct
++                // that is the Mesh and Material merged on a single entity
++                for extension in extensions.iter_mut() {
++                    extension.on_spawn_mesh_and_material(
++                        load_context,
++                        &primitive,
++                        &mesh,
++                        &material,
++                        &mut mesh_entity,
++                    );
++                }
+             }
+         }
+ 
+@@ -1627,6 +1753,17 @@ fn load_node(
+                             value: extras.get().to_string(),
+                         });
+                     }
++                    for extension in extensions.iter_mut() {
++                        for id in extension.extension_ids() {
++                            extension.on_spawn_light_directional(
++                                id,
++                                gltf_node.extension_value(id),
++                                load_context,
++                                gltf_node,
++                                &mut entity,
++                            );
++                        }
++                    }
+                 }
+                 gltf::khr_lights_punctual::Kind::Point => {
+                     let mut entity = parent.spawn(PointLight {
+@@ -1647,6 +1784,17 @@ fn load_node(
+                             value: extras.get().to_string(),
+                         });
+                     }
++                    for extension in extensions.iter_mut() {
++                        for id in extension.extension_ids() {
++                            extension.on_spawn_light_point(
++                                id,
++                                gltf_node.extension_value(id),
++                                load_context,
++                                gltf_node,
++                                &mut entity,
++                            );
++                        }
++                    }
+                 }
+                 gltf::khr_lights_punctual::Kind::Spot {
+                     inner_cone_angle,
+@@ -1672,6 +1820,17 @@ fn load_node(
+                             value: extras.get().to_string(),
+                         });
+                     }
++                    for extension in extensions.iter_mut() {
++                        for id in extension.extension_ids() {
++                            extension.on_spawn_light_spot(
++                                id,
++                                gltf_node.extension_value(id),
++                                load_context,
++                                gltf_node,
++                                &mut entity,
++                            );
++                        }
++                    }
+                 }
+             }
+         }
+@@ -1694,6 +1853,7 @@ fn load_node(
+                 animation_context.clone(),
+                 document,
+                 convert_coordinates,
++                extensions,
+             ) {
+                 gltf_error = Some(err);
+                 return;
+@@ -1714,6 +1874,18 @@ fn load_node(
+         node.insert(MorphWeights::new(weights, first_mesh)?);
+     }
+ 
++    // let extensions process node data
++    // This can be *many* kinds of object, so we also
++    // give access to the gltf_node, which is needed for
++    // accessing Mesh and Material extension data, which
++    // are merged onto the same entity in Bevy
++    for extension in extensions.iter_mut() {
++        for id in extension.extension_ids() {
++            let data = gltf_node.extension_value(id);
++            extension.on_gltf_node(id, data, load_context, gltf_node, &mut node);
++        }
++    }
++
+     if let Some(err) = gltf_error {
+         Err(err)
+     } else {
+diff --git a/examples/README.md b/examples/README.md
+index 440c54d0c2bdb..0018bf4bbe081 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -634,6 +634,8 @@ Example | Description
+ [Query glTF primitives](../examples/gltf/query_gltf_primitives.rs) | Query primitives in a glTF scene
+ [Update glTF Scene](../examples/gltf/update_gltf_scene.rs) | Update a scene from a glTF file, either by spawning the scene as a child of another entity, or by accessing the entities of the scene
+ [glTF Skinned Mesh](../examples/gltf/gltf_skinned_mesh.rs) | Skinned mesh example with mesh and joints data loaded from a glTF file
++[glTF extension AnimationGraph](../examples/gltf/gltf_extension_animation_graph.rs) | Uses glTF data to build an AnimationGraph via extension processing
++[glTF extension processing to build Mesh2ds from glTF data](../examples/gltf/gltf_extension_mesh_2d.rs) | Uses glTF extension data to convert incoming Mesh3d/MeshMaterial3d assets to 2d
+ 
+ ## Tests
+ 
+diff --git a/examples/gltf/gltf_extension_animation_graph.rs b/examples/gltf/gltf_extension_animation_graph.rs
+new file mode 100644
+index 0000000000000..dea4112a980b9
+--- /dev/null
++++ b/examples/gltf/gltf_extension_animation_graph.rs
+@@ -0,0 +1,202 @@
++//! Uses glTF extension processing to play an animation on a skinned glTF model of a fox.
++
++use std::f32::consts::PI;
++
++use bevy::{
++    asset::LoadContext,
++    ecs::entity::EntityHashSet,
++    gltf::extensions::{GltfExtensionHandler, GltfExtensionHandlers},
++    light::CascadeShadowConfigBuilder,
++    platform::collections::{HashMap, HashSet},
++    prelude::*,
++    scene::SceneInstanceReady,
++};
++
++/// An example asset that contains a mesh and animation.
++const GLTF_PATH: &str = "models/animated/Fox.glb";
++
++fn main() {
++    App::new()
++        .insert_resource(GlobalAmbientLight {
++            color: Color::WHITE,
++            brightness: 2000.,
++            ..default()
++        })
++        .add_plugins((DefaultPlugins, GltfExtensionHandlerAnimationPlugin))
++        .add_systems(
++            Startup,
++            (setup_mesh_and_animation, setup_camera_and_environment),
++        )
++        .run();
++}
++
++/// A component that stores a reference to an animation we want to play. This is
++/// created when we start loading the mesh (see `setup_mesh_and_animation`) and
++/// read when the mesh has spawned (see `play_animation_once_loaded`).
++#[derive(Component, Reflect)]
++#[reflect(Component)]
++struct AnimationToPlay {
++    graph_handle: Handle<AnimationGraph>,
++    index: AnimationNodeIndex,
++}
++
++fn setup_mesh_and_animation(mut commands: Commands, asset_server: Res<AssetServer>) {
++    // Spawn an entity with our components, and connect it to an observer that
++    // will trigger when the scene is loaded and spawned.
++    commands
++        .spawn(SceneRoot(
++            asset_server.load(GltfAssetLabel::Scene(0).from_asset(GLTF_PATH)),
++        ))
++        .observe(play_animation_when_ready);
++}
++
++fn play_animation_when_ready(
++    scene_ready: On<SceneInstanceReady>,
++    mut commands: Commands,
++    children: Query<&Children>,
++    mut players: Query<(&mut AnimationPlayer, &AnimationToPlay)>,
++) {
++    for child in children.iter_descendants(scene_ready.entity) {
++        let Ok((mut player, animation_to_play)) = players.get_mut(child) else {
++            continue;
++        };
++
++        // Tell the animation player to start the animation and keep
++        // repeating it.
++        //
++        // If you want to try stopping and switching animations, see the
++        // `animated_mesh_control.rs` example.
++        player.play(animation_to_play.index).repeat();
++
++        // Add the animation graph. This only needs to be done once to
++        // connect the animation player to the mesh.
++        commands
++            .entity(child)
++            .insert(AnimationGraphHandle(animation_to_play.graph_handle.clone()));
++    }
++}
++
++/// Spawn a camera and a simple environment with a ground plane and light.
++fn setup_camera_and_environment(
++    mut commands: Commands,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
++) {
++    // Camera
++    commands.spawn((
++        Camera3d::default(),
++        Transform::from_xyz(100.0, 100.0, 150.0).looking_at(Vec3::new(0.0, 20.0, 0.0), Vec3::Y),
++    ));
++
++    // Plane
++    commands.spawn((
++        Mesh3d(meshes.add(Plane3d::default().mesh().size(500000.0, 500000.0))),
++        MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
++    ));
++
++    // Light
++    commands.spawn((
++        Transform::from_rotation(Quat::from_euler(EulerRot::ZYX, 0.0, 1.0, -PI / 4.)),
++        DirectionalLight {
++            shadows_enabled: true,
++            ..default()
++        },
++        CascadeShadowConfigBuilder {
++            first_cascade_far_bound: 200.0,
++            maximum_distance: 400.0,
++            ..default()
++        }
++        .build(),
++    ));
++}
++
++struct GltfExtensionHandlerAnimationPlugin;
++
++impl Plugin for GltfExtensionHandlerAnimationPlugin {
++    fn build(&self, app: &mut App) {
++        app.world_mut()
++            .resource_mut::<GltfExtensionHandlers>()
++            .0
++            .write_blocking()
++            .push(Box::new(GltfExtensionHandlerAnimation::default()));
++    }
++}
++
++#[derive(Default, Clone)]
++struct GltfExtensionHandlerAnimation {
++    animation_root_indices: HashSet<usize>,
++    animation_root_entities: EntityHashSet,
++    clip: Option<Handle<AnimationClip>>,
++}
++
++impl GltfExtensionHandler for GltfExtensionHandlerAnimation {
++    fn dyn_clone(&self) -> Box<dyn GltfExtensionHandler> {
++        Box::new((*self).clone())
++    }
++
++    #[cfg(feature = "bevy_animation")]
++    fn on_animation(
++        &mut self,
++        _extension_id: &str,
++        _value: Option<&serde_json::Value>,
++        _gltf_animation: &gltf::Animation,
++        name: Option<&str>,
++        handle: Handle<AnimationClip>,
++    ) {
++        if name.is_some_and(|v| v == "Walk") {
++            self.clip = Some(handle.clone());
++        }
++    }
++    #[cfg(feature = "bevy_animation")]
++    fn on_animations_collected(
++        &mut self,
++        _load_context: &mut LoadContext<'_>,
++        _animations: &[Handle<AnimationClip>],
++        _named_animations: &HashMap<Box<str>, Handle<AnimationClip>>,
++        animation_roots: &HashSet<usize>,
++    ) {
++        self.animation_root_indices = animation_roots.clone();
++    }
++
++    fn on_gltf_node(
++        &mut self,
++        _extension_id: &str,
++        _value: Option<&serde_json::Value>,
++        _load_context: &mut LoadContext<'_>,
++        gltf_node: &gltf::Node,
++        entity: &mut EntityWorldMut,
++    ) {
++        if self.animation_root_indices.contains(&gltf_node.index()) {
++            self.animation_root_entities.insert(entity.id());
++        }
++    }
++
++    /// Called when an individual Scene is done processing
++    fn on_scene_completed(
++        &mut self,
++        _extension_id: &str,
++        _value: Option<&serde_json::Value>,
++        _scene: &gltf::Scene,
++        _name: Option<&str>,
++        _world_root_id: Entity,
++        world: &mut World,
++        load_context: &mut LoadContext<'_>,
++    ) {
++        // Create an AnimationGraph from the desired clip
++        let (graph, index) = AnimationGraph::from_clip(self.clip.clone().unwrap());
++        // Store the animation graph as an asset with an arbitrary label
++        // We only have one graph, so this label will be unique
++        let graph_handle =
++            load_context.add_labeled_asset("MyAnimationGraphLabel".to_string(), graph);
++
++        // Create a component that stores a reference to our animation
++        let animation_to_play = AnimationToPlay {
++            graph_handle,
++            index,
++        };
++
++        // Insert the `AnimationToPlay` component on the first animation root
++        let mut entity = world.entity_mut(*self.animation_root_entities.iter().next().unwrap());
++        entity.insert(animation_to_play);
++    }
++}
+diff --git a/examples/gltf/gltf_extension_mesh_2d.rs b/examples/gltf/gltf_extension_mesh_2d.rs
+new file mode 100644
+index 0000000000000..552c544deab20
+--- /dev/null
++++ b/examples/gltf/gltf_extension_mesh_2d.rs
+@@ -0,0 +1,129 @@
++//! Uses glTF extension processing to convert incoming 3d Meshes to 2d Meshes
++
++use bevy::{
++    asset::LoadContext,
++    gltf::extensions::{GltfExtensionHandler, GltfExtensionHandlers},
++    gltf::GltfPlugin,
++    mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef},
++    prelude::*,
++    reflect::TypePath,
++    render::render_resource::*,
++    shader::ShaderRef,
++    sprite_render::{Material2d, Material2dKey, Material2dPlugin},
++};
++
++/// This example uses a shader source file from the assets subdirectory
++const SHADER_ASSET_PATH: &str = "shaders/custom_gltf_2d.wgsl";
++
++/// This vertex attribute supplies barycentric coordinates for each triangle.
++///
++/// Each component of the vector corresponds to one corner of a triangle. It's
++/// equal to 1.0 in that corner and 0.0 in the other two. Hence, its value in
++/// the fragment shader indicates proximity to a corner or the opposite edge.
++const ATTRIBUTE_BARYCENTRIC: MeshVertexAttribute =
++    MeshVertexAttribute::new("Barycentric", 2137464976, VertexFormat::Float32x3);
++
++fn main() {
++    App::new()
++        .insert_resource(GlobalAmbientLight {
++            color: Color::WHITE,
++            brightness: 2000.,
++            ..default()
++        })
++        .add_plugins((
++            DefaultPlugins.set(
++                GltfPlugin::default()
++                    // Map a custom glTF attribute name to a `MeshVertexAttribute`.
++                    // The glTF file used here has an attribute name with *two*
++                    // underscores: __BARYCENTRIC
++                    // One is stripped to do the comparison here.
++                    .add_custom_vertex_attribute("_BARYCENTRIC", ATTRIBUTE_BARYCENTRIC),
++            ),
++            GltfToMesh2dPlugin,
++        ))
++        .add_systems(Startup, setup)
++        .run();
++}
++
++fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
++    commands.spawn((
++        SceneRoot(
++            asset_server
++                .load(GltfAssetLabel::Scene(0).from_asset("models/barycentric/barycentric.gltf")),
++        ),
++        Transform::from_scale(150. * Vec3::ONE),
++    ));
++    commands.spawn(Camera2d);
++}
++
++struct GltfToMesh2dPlugin;
++
++impl Plugin for GltfToMesh2dPlugin {
++    fn build(&self, app: &mut App) {
++        app.world_mut()
++            .resource_mut::<GltfExtensionHandlers>()
++            .0
++            .write_blocking()
++            .push(Box::new(GltfExtensionHandlerToMesh2d));
++
++        app.add_plugins(Material2dPlugin::<CustomMaterial>::default());
++    }
++}
++
++#[derive(Default, Clone)]
++struct GltfExtensionHandlerToMesh2d;
++
++impl GltfExtensionHandler for GltfExtensionHandlerToMesh2d {
++    fn dyn_clone(&self) -> Box<dyn GltfExtensionHandler> {
++        Box::new((*self).clone())
++    }
++
++    fn on_spawn_mesh_and_material(
++        &mut self,
++        load_context: &mut LoadContext<'_>,
++        _primitive: &gltf::Primitive,
++        _mesh: &gltf::Mesh,
++        _material: &gltf::Material,
++        entity: &mut EntityWorldMut,
++    ) {
++        if let Some(mesh3d) = entity.get::<Mesh3d>()
++            && let Some(_) = entity.get::<MeshMaterial3d<StandardMaterial>>()
++        {
++            let material_handle =
++                load_context.add_labeled_asset("AColorMaterial".to_string(), CustomMaterial {});
++            let mesh_handle = mesh3d.0.clone();
++            entity
++                .remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>)>()
++                .insert((Mesh2d(mesh_handle), MeshMaterial2d(material_handle.clone())));
++        }
++    }
++}
++
++/// This custom material uses barycentric coordinates from
++/// `ATTRIBUTE_BARYCENTRIC` to shade a white border around each triangle. The
++/// thickness of the border is animated using the global time shader uniform.
++#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
++struct CustomMaterial {}
++
++impl Material2d for CustomMaterial {
++    fn vertex_shader() -> ShaderRef {
++        SHADER_ASSET_PATH.into()
++    }
++    fn fragment_shader() -> ShaderRef {
++        SHADER_ASSET_PATH.into()
++    }
++
++    fn specialize(
++        descriptor: &mut RenderPipelineDescriptor,
++        layout: &MeshVertexBufferLayoutRef,
++        _key: Material2dKey<Self>,
++    ) -> Result<(), SpecializedMeshPipelineError> {
++        let vertex_layout = layout.0.get_layout(&[
++            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
++            Mesh::ATTRIBUTE_COLOR.at_shader_location(1),
++            ATTRIBUTE_BARYCENTRIC.at_shader_location(2),
++        ])?;
++        descriptor.vertex.buffers = vec![vertex_layout];
++        Ok(())
++    }
++}

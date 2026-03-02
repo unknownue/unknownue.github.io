@@ -1,0 +1,146 @@
+diff --git a/crates/bevy_asset/Cargo.toml b/crates/bevy_asset/Cargo.toml
+index 2476f967280b5..810299fc7349a 100644
+--- a/crates/bevy_asset/Cargo.toml
++++ b/crates/bevy_asset/Cargo.toml
+@@ -88,6 +88,9 @@ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev", default-featu
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ notify-debouncer-full = { version = "0.5.0", default-features = false, optional = true }
+ 
++[dev-dependencies]
++async-channel = "2"
++
+ [lints]
+ workspace = true
+ 
+diff --git a/crates/bevy_asset/src/io/gated.rs b/crates/bevy_asset/src/io/gated.rs
+index fa4f0f0d3fd30..7d2759974fe5c 100644
+--- a/crates/bevy_asset/src/io/gated.rs
++++ b/crates/bevy_asset/src/io/gated.rs
+@@ -1,7 +1,7 @@
+ use crate::io::{AssetReader, AssetReaderError, PathStream, Reader};
+ use alloc::{boxed::Box, sync::Arc};
++use async_channel::{Receiver, Sender};
+ use bevy_platform::collections::HashMap;
+-use crossbeam_channel::{Receiver, Sender};
+ use parking_lot::RwLock;
+ use std::path::Path;
+ 
+@@ -35,8 +35,8 @@ impl GateOpener {
+         let mut gates = self.gates.write();
+         let gates = gates
+             .entry_ref(path.as_ref())
+-            .or_insert_with(crossbeam_channel::unbounded);
+-        gates.0.send(()).unwrap();
++            .or_insert_with(async_channel::unbounded);
++        gates.0.send_blocking(()).unwrap();
+     }
+ }
+ 
+@@ -61,10 +61,10 @@ impl<R: AssetReader> AssetReader for GatedReader<R> {
+             let mut gates = self.gates.write();
+             let gates = gates
+                 .entry_ref(path.as_ref())
+-                .or_insert_with(crossbeam_channel::unbounded);
++                .or_insert_with(async_channel::unbounded);
+             gates.1.clone()
+         };
+-        receiver.recv().unwrap();
++        receiver.recv().await.unwrap();
+         let result = self.reader.read(path).await?;
+         Ok(result)
+     }
+diff --git a/crates/bevy_asset/src/io/mod.rs b/crates/bevy_asset/src/io/mod.rs
+index aa7256bbd927b..7bce061b2cf9d 100644
+--- a/crates/bevy_asset/src/io/mod.rs
++++ b/crates/bevy_asset/src/io/mod.rs
+@@ -10,12 +10,14 @@ pub mod android;
+ pub mod embedded;
+ #[cfg(not(target_arch = "wasm32"))]
+ pub mod file;
+-pub mod gated;
+ pub mod memory;
+ pub mod processor_gated;
+ #[cfg(target_arch = "wasm32")]
+ pub mod wasm;
+ 
++#[cfg(test)]
++pub mod gated;
++
+ mod source;
+ 
+ pub use futures_lite::AsyncWriteExt;
+diff --git a/crates/bevy_asset/src/lib.rs b/crates/bevy_asset/src/lib.rs
+index ed3204cc30b06..926d86e3a86ea 100644
+--- a/crates/bevy_asset/src/lib.rs
++++ b/crates/bevy_asset/src/lib.rs
+@@ -893,10 +893,6 @@ mod tests {
+ 
+     #[test]
+     fn load_dependencies() {
+-        // The particular usage of GatedReader in this test will cause deadlocking if running single-threaded
+-        #[cfg(not(feature = "multi_threaded"))]
+-        panic!("This test requires the \"multi_threaded\" feature, otherwise it will deadlock.\ncargo test --package bevy_asset --features multi_threaded");
+-
+         let dir = Dir::default();
+ 
+         let a_path = "a.cool.ron";
+@@ -1201,10 +1197,6 @@ mod tests {
+ 
+     #[test]
+     fn failure_load_states() {
+-        // The particular usage of GatedReader in this test will cause deadlocking if running single-threaded
+-        #[cfg(not(feature = "multi_threaded"))]
+-        panic!("This test requires the \"multi_threaded\" feature, otherwise it will deadlock.\ncargo test --package bevy_asset --features multi_threaded");
+-
+         let dir = Dir::default();
+ 
+         let a_path = "a.cool.ron";
+@@ -1334,10 +1326,6 @@ mod tests {
+ 
+     #[test]
+     fn dependency_load_states() {
+-        // The particular usage of GatedReader in this test will cause deadlocking if running single-threaded
+-        #[cfg(not(feature = "multi_threaded"))]
+-        panic!("This test requires the \"multi_threaded\" feature, otherwise it will deadlock.\ncargo test --package bevy_asset --features multi_threaded");
+-
+         let a_path = "a.cool.ron";
+         let a_ron = r#"
+ (
+@@ -1473,10 +1461,6 @@ mod tests {
+ 
+     #[test]
+     fn manual_asset_management() {
+-        // The particular usage of GatedReader in this test will cause deadlocking if running single-threaded
+-        #[cfg(not(feature = "multi_threaded"))]
+-        panic!("This test requires the \"multi_threaded\" feature, otherwise it will deadlock.\ncargo test --package bevy_asset --features multi_threaded");
+-
+         let dir = Dir::default();
+         let dep_path = "dep.cool.ron";
+ 
+@@ -1574,10 +1558,6 @@ mod tests {
+ 
+     #[test]
+     fn load_folder() {
+-        // The particular usage of GatedReader in this test will cause deadlocking if running single-threaded
+-        #[cfg(not(feature = "multi_threaded"))]
+-        panic!("This test requires the \"multi_threaded\" feature, otherwise it will deadlock.\ncargo test --package bevy_asset --features multi_threaded");
+-
+         let dir = Dir::default();
+ 
+         let a_path = "text/a.cool.ron";
+diff --git a/release-content/migration-guides/gated_reader.md b/release-content/migration-guides/gated_reader.md
+new file mode 100644
+index 0000000000000..873598677882f
+--- /dev/null
++++ b/release-content/migration-guides/gated_reader.md
+@@ -0,0 +1,10 @@
++---
++title: `GatedReader` and `GatedOpener` are now private.
++pull_requests: [18473]
++---
++
++The `GatedReader` and `GatedOpener` for `bevy_asset` have been made private. These were really only
++for testing, but were being compiled even in release builds. Now they are guarded by `#[cfg(test)]`!
++
++If you were using this in your own tests, you could fork the `GatedReader` (it still exists in the
++Bevy repo!) into your own code, or write your own version (if more useful to you).

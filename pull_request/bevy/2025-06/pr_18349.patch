@@ -1,0 +1,400 @@
+diff --git a/crates/bevy_anti_aliasing/src/experimental/mod.rs b/crates/bevy_anti_aliasing/src/experimental/mod.rs
+deleted file mode 100644
+index a8dc522c56293..0000000000000
+--- a/crates/bevy_anti_aliasing/src/experimental/mod.rs
++++ /dev/null
+@@ -1,9 +0,0 @@
+-//! Experimental rendering features.
+-//!
+-//! Experimental features are features with known problems, missing features,
+-//! compatibility issues, low performance, and/or future breaking changes, but
+-//! are included nonetheless for testing purposes.
+-
+-pub mod taa {
+-    pub use crate::taa::{TemporalAntiAliasNode, TemporalAntiAliasPlugin, TemporalAntiAliasing};
+-}
+diff --git a/crates/bevy_anti_aliasing/src/lib.rs b/crates/bevy_anti_aliasing/src/lib.rs
+index be09a2e5b2665..a46fea4a9a744 100644
+--- a/crates/bevy_anti_aliasing/src/lib.rs
++++ b/crates/bevy_anti_aliasing/src/lib.rs
+@@ -10,18 +10,17 @@ use bevy_app::Plugin;
+ use contrast_adaptive_sharpening::CasPlugin;
+ use fxaa::FxaaPlugin;
+ use smaa::SmaaPlugin;
++use taa::TemporalAntiAliasPlugin;
+ 
+ pub mod contrast_adaptive_sharpening;
+-pub mod experimental;
+ pub mod fxaa;
+ pub mod smaa;
+-
+-mod taa;
++pub mod taa;
+ 
+ #[derive(Default)]
+ pub struct AntiAliasingPlugin;
+ impl Plugin for AntiAliasingPlugin {
+     fn build(&self, app: &mut bevy_app::App) {
+-        app.add_plugins((FxaaPlugin, CasPlugin, SmaaPlugin));
++        app.add_plugins((FxaaPlugin, SmaaPlugin, TemporalAntiAliasPlugin, CasPlugin));
+     }
+ }
+diff --git a/crates/bevy_anti_aliasing/src/taa/mod.rs b/crates/bevy_anti_aliasing/src/taa/mod.rs
+index efc5051680a51..0f706146b18e9 100644
+--- a/crates/bevy_anti_aliasing/src/taa/mod.rs
++++ b/crates/bevy_anti_aliasing/src/taa/mod.rs
+@@ -62,7 +62,7 @@ impl Plugin for TemporalAntiAliasPlugin {
+             .add_systems(
+                 Render,
+                 (
+-                    prepare_taa_jitter_and_mip_bias.in_set(RenderSystems::ManageViews),
++                    prepare_taa_jitter.in_set(RenderSystems::ManageViews),
+                     prepare_taa_pipelines.in_set(RenderSystems::Prepare),
+                     prepare_taa_history_textures.in_set(RenderSystems::PrepareResources),
+                 ),
+@@ -113,7 +113,6 @@ impl Plugin for TemporalAntiAliasPlugin {
+ ///
+ /// # Usage Notes
+ ///
+-/// The [`TemporalAntiAliasPlugin`] must be added to your app.
+ /// Any camera with this component must also disable [`Msaa`] by setting it to [`Msaa::Off`].
+ ///
+ /// [Currently](https://github.com/bevyengine/bevy/issues/8423), TAA cannot be used with [`bevy_render::camera::OrthographicProjection`].
+@@ -126,11 +125,9 @@ impl Plugin for TemporalAntiAliasPlugin {
+ ///
+ /// 1. Write particle motion vectors to the motion vectors prepass texture
+ /// 2. Render particles after TAA
+-///
+-/// If no [`MipBias`] component is attached to the camera, TAA will add a `MipBias(-1.0)` component.
+ #[derive(Component, Reflect, Clone)]
+ #[reflect(Component, Default, Clone)]
+-#[require(TemporalJitter, DepthPrepass, MotionVectorPrepass)]
++#[require(TemporalJitter, MipBias, DepthPrepass, MotionVectorPrepass)]
+ #[doc(alias = "Taa")]
+ pub struct TemporalAntiAliasing {
+     /// Set to true to delete the saved temporal history (past frames).
+@@ -345,16 +342,11 @@ impl SpecializedRenderPipeline for TaaPipeline {
+ }
+ 
+ fn extract_taa_settings(mut commands: Commands, mut main_world: ResMut<MainWorld>) {
+-    let mut cameras_3d = main_world.query_filtered::<(
++    let mut cameras_3d = main_world.query::<(
+         RenderEntity,
+         &Camera,
+         &Projection,
+-        &mut TemporalAntiAliasing,
+-    ), (
+-        With<Camera3d>,
+-        With<TemporalJitter>,
+-        With<DepthPrepass>,
+-        With<MotionVectorPrepass>,
++        Option<&mut TemporalAntiAliasing>,
+     )>();
+ 
+     for (entity, camera, camera_projection, mut taa_settings) in
+@@ -364,14 +356,12 @@ fn extract_taa_settings(mut commands: Commands, mut main_world: ResMut<MainWorld
+         let mut entity_commands = commands
+             .get_entity(entity)
+             .expect("Camera entity wasn't synced.");
+-        if camera.is_active && has_perspective_projection {
+-            entity_commands.insert(taa_settings.clone());
+-            taa_settings.reset = false;
++        if taa_settings.is_some() && camera.is_active && has_perspective_projection {
++            entity_commands.insert(taa_settings.as_deref().unwrap().clone());
++            taa_settings.as_mut().unwrap().reset = false;
+         } else {
+-            // TODO: needs better strategy for cleaning up
+             entity_commands.remove::<(
+                 TemporalAntiAliasing,
+-                // components added in prepare systems (because `TemporalAntiAliasNode` does not query extracted components)
+                 TemporalAntiAliasHistoryTextures,
+                 TemporalAntiAliasPipelineId,
+             )>();
+@@ -379,13 +369,22 @@ fn extract_taa_settings(mut commands: Commands, mut main_world: ResMut<MainWorld
+     }
+ }
+ 
+-fn prepare_taa_jitter_and_mip_bias(
++fn prepare_taa_jitter(
+     frame_count: Res<FrameCount>,
+-    mut query: Query<(Entity, &mut TemporalJitter, Option<&MipBias>), With<TemporalAntiAliasing>>,
+-    mut commands: Commands,
++    mut query: Query<
++        &mut TemporalJitter,
++        (
++            With<TemporalAntiAliasing>,
++            With<Camera3d>,
++            With<TemporalJitter>,
++            With<DepthPrepass>,
++            With<MotionVectorPrepass>,
++        ),
++    >,
+ ) {
+-    // Halton sequence (2, 3) - 0.5, skipping i = 0
++    // Halton sequence (2, 3) - 0.5
+     let halton_sequence = [
++        vec2(0.0, 0.0),
+         vec2(0.0, -0.16666666),
+         vec2(-0.25, 0.16666669),
+         vec2(0.25, -0.3888889),
+@@ -393,17 +392,12 @@ fn prepare_taa_jitter_and_mip_bias(
+         vec2(0.125, 0.2777778),
+         vec2(-0.125, -0.2777778),
+         vec2(0.375, 0.055555582),
+-        vec2(-0.4375, 0.3888889),
+     ];
+ 
+     let offset = halton_sequence[frame_count.0 as usize % halton_sequence.len()];
+ 
+-    for (entity, mut jitter, mip_bias) in &mut query {
++    for mut jitter in &mut query {
+         jitter.offset = offset;
+-
+-        if mip_bias.is_none() {
+-            commands.entity(entity).insert(MipBias(-1.0));
+-        }
+     }
+ }
+ 
+diff --git a/crates/bevy_render/src/camera/camera.rs b/crates/bevy_render/src/camera/camera.rs
+index 2828486fd4d68..f19f57fa5f9dd 100644
+--- a/crates/bevy_render/src/camera/camera.rs
++++ b/crates/bevy_render/src/camera/camera.rs
+@@ -1101,6 +1101,7 @@ pub fn extract_cameras(
+             Option<&ColorGrading>,
+             Option<&Exposure>,
+             Option<&TemporalJitter>,
++            Option<&MipBias>,
+             Option<&RenderLayers>,
+             Option<&Projection>,
+             Has<NoIndirectDrawing>,
+@@ -1123,6 +1124,7 @@ pub fn extract_cameras(
+         color_grading,
+         exposure,
+         temporal_jitter,
++        mip_bias,
+         render_layers,
+         projection,
+         no_indirect_drawing,
+@@ -1134,6 +1136,7 @@ pub fn extract_cameras(
+                 ExtractedView,
+                 RenderVisibleEntities,
+                 TemporalJitter,
++                MipBias,
+                 RenderLayers,
+                 Projection,
+                 NoIndirectDrawing,
+@@ -1220,14 +1223,26 @@ pub fn extract_cameras(
+ 
+             if let Some(temporal_jitter) = temporal_jitter {
+                 commands.insert(temporal_jitter.clone());
++            } else {
++                commands.remove::<TemporalJitter>();
++            }
++
++            if let Some(mip_bias) = mip_bias {
++                commands.insert(mip_bias.clone());
++            } else {
++                commands.remove::<MipBias>();
+             }
+ 
+             if let Some(render_layers) = render_layers {
+                 commands.insert(render_layers.clone());
++            } else {
++                commands.remove::<RenderLayers>();
+             }
+ 
+             if let Some(perspective) = projection {
+                 commands.insert(perspective.clone());
++            } else {
++                commands.remove::<Projection>();
+             }
+ 
+             if no_indirect_drawing
+@@ -1237,6 +1252,8 @@ pub fn extract_cameras(
+                 )
+             {
+                 commands.insert(NoIndirectDrawing);
++            } else {
++                commands.remove::<NoIndirectDrawing>();
+             }
+         };
+     }
+@@ -1337,6 +1354,12 @@ impl TemporalJitter {
+ /// Camera component specifying a mip bias to apply when sampling from material textures.
+ ///
+ /// Often used in conjunction with antialiasing post-process effects to reduce textures blurriness.
+-#[derive(Default, Component, Reflect)]
++#[derive(Component, Reflect, Clone)]
+ #[reflect(Default, Component)]
+ pub struct MipBias(pub f32);
++
++impl Default for MipBias {
++    fn default() -> Self {
++        Self(-1.0)
++    }
++}
+diff --git a/examples/3d/anti_aliasing.rs b/examples/3d/anti_aliasing.rs
+index 1f693ce23886a..fd93625c0e634 100644
+--- a/examples/3d/anti_aliasing.rs
++++ b/examples/3d/anti_aliasing.rs
+@@ -5,16 +5,16 @@ use std::{f32::consts::PI, fmt::Write};
+ use bevy::{
+     anti_aliasing::{
+         contrast_adaptive_sharpening::ContrastAdaptiveSharpening,
+-        experimental::taa::{TemporalAntiAliasPlugin, TemporalAntiAliasing},
+         fxaa::{Fxaa, Sensitivity},
+         smaa::{Smaa, SmaaPreset},
++        taa::TemporalAntiAliasing,
+     },
+     core_pipeline::prepass::{DepthPrepass, MotionVectorPrepass},
+     image::{ImageSampler, ImageSamplerDescriptor},
+     pbr::CascadeShadowConfigBuilder,
+     prelude::*,
+     render::{
+-        camera::TemporalJitter,
++        camera::{MipBias, TemporalJitter},
+         render_asset::RenderAssetUsages,
+         render_resource::{Extent3d, TextureDimension, TextureFormat},
+         view::Hdr,
+@@ -23,7 +23,7 @@ use bevy::{
+ 
+ fn main() {
+     App::new()
+-        .add_plugins((DefaultPlugins, TemporalAntiAliasPlugin))
++        .add_plugins(DefaultPlugins)
+         .add_systems(Startup, setup)
+         .add_systems(Update, (modify_aa, modify_sharpening, update_ui))
+         .run();
+@@ -32,6 +32,7 @@ fn main() {
+ type TaaComponents = (
+     TemporalAntiAliasing,
+     TemporalJitter,
++    MipBias,
+     DepthPrepass,
+     MotionVectorPrepass,
+ );
+diff --git a/examples/3d/pcss.rs b/examples/3d/pcss.rs
+index 922781829cc7b..b2715f0b576ad 100644
+--- a/examples/3d/pcss.rs
++++ b/examples/3d/pcss.rs
+@@ -3,7 +3,7 @@
+ use std::f32::consts::PI;
+ 
+ use bevy::{
+-    anti_aliasing::experimental::taa::{TemporalAntiAliasPlugin, TemporalAntiAliasing},
++    anti_aliasing::taa::TemporalAntiAliasing,
+     core_pipeline::{
+         prepass::{DepthPrepass, MotionVectorPrepass},
+         Skybox,
+@@ -120,7 +120,6 @@ fn main() {
+             }),
+             ..default()
+         }))
+-        .add_plugins(TemporalAntiAliasPlugin)
+         .add_event::<WidgetClickEvent<AppSetting>>()
+         .add_systems(Startup, setup)
+         .add_systems(Update, widgets::handle_ui_interactions::<AppSetting>)
+diff --git a/examples/3d/scrolling_fog.rs b/examples/3d/scrolling_fog.rs
+index 3438417fb4bf6..7ec53e1fadc38 100644
+--- a/examples/3d/scrolling_fog.rs
++++ b/examples/3d/scrolling_fog.rs
+@@ -11,7 +11,7 @@
+ //! interactions change based on the density of the fog.
+ 
+ use bevy::{
+-    anti_aliasing::experimental::taa::{TemporalAntiAliasPlugin, TemporalAntiAliasing},
++    anti_aliasing::taa::TemporalAntiAliasing,
+     core_pipeline::bloom::Bloom,
+     image::{
+         ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler,
+@@ -32,7 +32,6 @@ fn main() {
+             ..default()
+         }))
+         .insert_resource(DirectionalLightShadowMap { size: 4096 })
+-        .add_plugins(TemporalAntiAliasPlugin)
+         .add_systems(Startup, setup)
+         .add_systems(Update, scroll_fog)
+         .run();
+diff --git a/examples/3d/ssao.rs b/examples/3d/ssao.rs
+index b33ab42090233..687288b1f5b39 100644
+--- a/examples/3d/ssao.rs
++++ b/examples/3d/ssao.rs
+@@ -1,7 +1,7 @@
+ //! A scene showcasing screen space ambient occlusion.
+ 
+ use bevy::{
+-    anti_aliasing::experimental::taa::{TemporalAntiAliasPlugin, TemporalAntiAliasing},
++    anti_aliasing::taa::TemporalAntiAliasing,
+     math::ops,
+     pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel},
+     prelude::*,
+@@ -15,7 +15,7 @@ fn main() {
+             brightness: 1000.,
+             ..default()
+         })
+-        .add_plugins((DefaultPlugins, TemporalAntiAliasPlugin))
++        .add_plugins(DefaultPlugins)
+         .add_systems(Startup, setup)
+         .add_systems(Update, update)
+         .run();
+diff --git a/examples/3d/transmission.rs b/examples/3d/transmission.rs
+index 36a78b1a6237d..ee62654ea632e 100644
+--- a/examples/3d/transmission.rs
++++ b/examples/3d/transmission.rs
+@@ -35,14 +35,17 @@ use bevy::{
+     },
+ };
+ 
++// *Note:* TAA is not _required_ for specular transmission, but
++// it _greatly enhances_ the look of the resulting blur effects.
++// Sadly, it's not available under WebGL.
+ #[cfg(any(feature = "webgpu", not(target_arch = "wasm32")))]
+-use bevy::anti_aliasing::experimental::taa::{TemporalAntiAliasPlugin, TemporalAntiAliasing};
++use bevy::anti_aliasing::taa::TemporalAntiAliasing;
++
+ use rand::random;
+ 
+ fn main() {
+-    let mut app = App::new();
+-
+-    app.add_plugins(DefaultPlugins)
++    App::new()
++        .add_plugins(DefaultPlugins)
+         .insert_resource(ClearColor(Color::BLACK))
+         .insert_resource(PointLightShadowMap { size: 2048 })
+         .insert_resource(AmbientLight {
+@@ -50,15 +53,8 @@ fn main() {
+             ..default()
+         })
+         .add_systems(Startup, setup)
+-        .add_systems(Update, (example_control_system, flicker_system));
+-
+-    // *Note:* TAA is not _required_ for specular transmission, but
+-    // it _greatly enhances_ the look of the resulting blur effects.
+-    // Sadly, it's not available under WebGL.
+-    #[cfg(any(feature = "webgpu", not(target_arch = "wasm32")))]
+-    app.add_plugins(TemporalAntiAliasPlugin);
+-
+-    app.run();
++        .add_systems(Update, (example_control_system, flicker_system))
++        .run();
+ }
+ 
+ /// set up a simple 3D scene
+diff --git a/release-content/migration-guides/taa_non_experimental.md b/release-content/migration-guides/taa_non_experimental.md
+new file mode 100644
+index 0000000000000..5c65cd295b9eb
+--- /dev/null
++++ b/release-content/migration-guides/taa_non_experimental.md
+@@ -0,0 +1,10 @@
++---
++title: TAA is no longer experimental
++pull_requests: [18349]
++---
++
++TAA is no longer experimental.
++
++`TemporalAntiAliasPlugin` no longer needs to be added to your app to use TAA. It is now part of DefaultPlugins/AntiAliasingPlugin.
++
++`TemporalAntiAliasing` now uses `MipBias` as a required component in the main world, instead of overriding it manually in the render world.

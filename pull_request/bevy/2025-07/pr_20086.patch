@@ -1,0 +1,652 @@
+diff --git a/crates/bevy_core_widgets/src/core_button.rs b/crates/bevy_core_widgets/src/core_button.rs
+index 8c4ec9b22ed9f..5ef0d33ef0c30 100644
+--- a/crates/bevy_core_widgets/src/core_button.rs
++++ b/crates/bevy_core_widgets/src/core_button.rs
+@@ -2,6 +2,7 @@ use accesskit::Role;
+ use bevy_a11y::AccessibilityNode;
+ use bevy_app::{App, Plugin};
+ use bevy_ecs::query::Has;
++use bevy_ecs::system::In;
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -15,7 +16,7 @@ use bevy_input_focus::FocusedInput;
+ use bevy_picking::events::{Cancel, Click, DragEnd, Pointer, Press, Release};
+ use bevy_ui::{InteractionDisabled, Pressed};
+ 
+-use crate::{Callback, Notify};
++use crate::{Activate, Callback, Notify};
+ 
+ /// Headless button widget. This widget maintains a "pressed" state, which is used to
+ /// indicate whether the button is currently being pressed by the user. It emits a `ButtonClicked`
+@@ -25,7 +26,7 @@ use crate::{Callback, Notify};
+ pub struct CoreButton {
+     /// Callback to invoke when the button is clicked, or when the `Enter` or `Space` key
+     /// is pressed while the button is focused.
+-    pub on_activate: Callback,
++    pub on_activate: Callback<In<Activate>>,
+ }
+ 
+ fn button_on_key_event(
+@@ -41,7 +42,7 @@ fn button_on_key_event(
+                 && (event.key_code == KeyCode::Enter || event.key_code == KeyCode::Space)
+             {
+                 trigger.propagate(false);
+-                commands.notify(&bstate.on_activate);
++                commands.notify_with(&bstate.on_activate, Activate(trigger.target()));
+             }
+         }
+     }
+@@ -55,7 +56,7 @@ fn button_on_pointer_click(
+     if let Ok((bstate, pressed, disabled)) = q_state.get_mut(trigger.target()) {
+         trigger.propagate(false);
+         if pressed && !disabled {
+-            commands.notify(&bstate.on_activate);
++            commands.notify_with(&bstate.on_activate, Activate(trigger.target()));
+         }
+     }
+ }
+diff --git a/crates/bevy_core_widgets/src/core_checkbox.rs b/crates/bevy_core_widgets/src/core_checkbox.rs
+index 05edc53c4421c..01e3e61e49acd 100644
+--- a/crates/bevy_core_widgets/src/core_checkbox.rs
++++ b/crates/bevy_core_widgets/src/core_checkbox.rs
+@@ -15,7 +15,7 @@ use bevy_input_focus::{FocusedInput, InputFocus, InputFocusVisible};
+ use bevy_picking::events::{Click, Pointer};
+ use bevy_ui::{Checkable, Checked, InteractionDisabled};
+ 
+-use crate::{Callback, Notify as _};
++use crate::{Callback, Notify as _, ValueChange};
+ 
+ /// Headless widget implementation for checkboxes. The [`Checked`] component represents the current
+ /// state of the checkbox. The `on_change` field is an optional system id that will be run when the
+@@ -34,7 +34,7 @@ pub struct CoreCheckbox {
+     /// One-shot system that is run when the checkbox state needs to be changed. If this value is
+     /// `Callback::Ignore`, then the checkbox will update it's own internal [`Checked`] state
+     /// without notification.
+-    pub on_change: Callback<In<bool>>,
++    pub on_change: Callback<In<ValueChange<bool>>>,
+ }
+ 
+ fn checkbox_on_key_input(
+@@ -162,7 +162,13 @@ fn set_checkbox_state(
+     new_state: bool,
+ ) {
+     if !matches!(checkbox.on_change, Callback::Ignore) {
+-        commands.notify_with(&checkbox.on_change, new_state);
++        commands.notify_with(
++            &checkbox.on_change,
++            ValueChange {
++                source: entity.into(),
++                value: new_state,
++            },
++        );
+     } else if new_state {
+         commands.entity(entity.into()).insert(Checked);
+     } else {
+diff --git a/crates/bevy_core_widgets/src/core_radio.rs b/crates/bevy_core_widgets/src/core_radio.rs
+index a6c99a0d0410c..0aeebe9825cf0 100644
+--- a/crates/bevy_core_widgets/src/core_radio.rs
++++ b/crates/bevy_core_widgets/src/core_radio.rs
+@@ -6,7 +6,6 @@ use bevy_ecs::query::Has;
+ use bevy_ecs::system::In;
+ use bevy_ecs::{
+     component::Component,
+-    entity::Entity,
+     observer::On,
+     query::With,
+     system::{Commands, Query},
+@@ -17,7 +16,7 @@ use bevy_input_focus::FocusedInput;
+ use bevy_picking::events::{Click, Pointer};
+ use bevy_ui::{Checkable, Checked, InteractionDisabled};
+ 
+-use crate::{Callback, Notify};
++use crate::{Activate, Callback, Notify};
+ 
+ /// Headless widget implementation for a "radio button group". This component is used to group
+ /// multiple [`CoreRadio`] components together, allowing them to behave as a single unit. It
+@@ -38,7 +37,7 @@ use crate::{Callback, Notify};
+ #[require(AccessibilityNode(accesskit::Node::new(Role::RadioGroup)))]
+ pub struct CoreRadioGroup {
+     /// Callback which is called when the selected radio button changes.
+-    pub on_change: Callback<In<Entity>>,
++    pub on_change: Callback<In<Activate>>,
+ }
+ 
+ /// Headless widget implementation for radio buttons. These should be enclosed within a
+@@ -133,7 +132,7 @@ fn radio_group_on_key_input(
+             let (next_id, _) = radio_buttons[next_index];
+ 
+             // Trigger the on_change event for the newly checked radio button
+-            commands.notify_with(on_change, next_id);
++            commands.notify_with(on_change, Activate(next_id));
+         }
+     }
+ }
+@@ -201,7 +200,7 @@ fn radio_group_on_button_click(
+         }
+ 
+         // Trigger the on_change event for the newly checked radio button
+-        commands.notify_with(on_change, radio_id);
++        commands.notify_with(on_change, Activate(radio_id));
+     }
+ }
+ 
+diff --git a/crates/bevy_core_widgets/src/core_slider.rs b/crates/bevy_core_widgets/src/core_slider.rs
+index 07efc7e80074d..9f38065e374bc 100644
+--- a/crates/bevy_core_widgets/src/core_slider.rs
++++ b/crates/bevy_core_widgets/src/core_slider.rs
+@@ -23,7 +23,7 @@ use bevy_math::ops;
+ use bevy_picking::events::{Drag, DragEnd, DragStart, Pointer, Press};
+ use bevy_ui::{ComputedNode, ComputedNodeTarget, InteractionDisabled, UiGlobalTransform, UiScale};
+ 
+-use crate::{Callback, Notify};
++use crate::{Callback, Notify, ValueChange};
+ 
+ /// Defines how the slider should behave when you click on the track (not the thumb).
+ #[derive(Debug, Default, PartialEq, Clone, Copy)]
+@@ -78,7 +78,7 @@ pub struct CoreSlider {
+     /// Callback which is called when the slider is dragged or the value is changed via other user
+     /// interaction. If this value is `Callback::Ignore`, then the slider will update it's own
+     /// internal [`SliderValue`] state without notification.
+-    pub on_change: Callback<In<f32>>,
++    pub on_change: Callback<In<ValueChange<f32>>>,
+     /// Set the track-clicking behavior for this slider.
+     pub track_click: TrackClick,
+     // TODO: Think about whether we want a "vertical" option.
+@@ -298,7 +298,13 @@ pub(crate) fn slider_on_pointer_down(
+                 .entity(trigger.target())
+                 .insert(SliderValue(new_value));
+         } else {
+-            commands.notify_with(&slider.on_change, new_value);
++            commands.notify_with(
++                &slider.on_change,
++                ValueChange {
++                    source: trigger.target(),
++                    value: new_value,
++                },
++            );
+         }
+     }
+ }
+@@ -370,7 +376,13 @@ pub(crate) fn slider_on_drag(
+                     .entity(trigger.target())
+                     .insert(SliderValue(rounded_value));
+             } else {
+-                commands.notify_with(&slider.on_change, rounded_value);
++                commands.notify_with(
++                    &slider.on_change,
++                    ValueChange {
++                        source: trigger.target(),
++                        value: rounded_value,
++                    },
++                );
+             }
+         }
+     }
+@@ -417,7 +429,13 @@ fn slider_on_key_input(
+                     .entity(trigger.target())
+                     .insert(SliderValue(new_value));
+             } else {
+-                commands.notify_with(&slider.on_change, new_value);
++                commands.notify_with(
++                    &slider.on_change,
++                    ValueChange {
++                        source: trigger.target(),
++                        value: new_value,
++                    },
++                );
+             }
+         }
+     }
+@@ -509,7 +527,13 @@ fn slider_on_set_value(
+                 .entity(trigger.target())
+                 .insert(SliderValue(new_value));
+         } else {
+-            commands.notify_with(&slider.on_change, new_value);
++            commands.notify_with(
++                &slider.on_change,
++                ValueChange {
++                    source: trigger.target(),
++                    value: new_value,
++                },
++            );
+         }
+     }
+ }
+diff --git a/crates/bevy_core_widgets/src/lib.rs b/crates/bevy_core_widgets/src/lib.rs
+index eb05a18ba669c..9a20b59c13032 100644
+--- a/crates/bevy_core_widgets/src/lib.rs
++++ b/crates/bevy_core_widgets/src/lib.rs
+@@ -23,6 +23,7 @@ mod core_slider;
+ 
+ use bevy_app::{PluginGroup, PluginGroupBuilder};
+ 
++use bevy_ecs::entity::Entity;
+ pub use callback::{Callback, Notify};
+ pub use core_button::{CoreButton, CoreButtonPlugin};
+ pub use core_checkbox::{CoreCheckbox, CoreCheckboxPlugin, SetChecked, ToggleChecked};
+@@ -50,3 +51,16 @@ impl PluginGroup for CoreWidgetsPlugins {
+             .add(CoreSliderPlugin)
+     }
+ }
++
++/// Notification sent by a button or menu item.
++#[derive(Copy, Clone, Debug, PartialEq)]
++pub struct Activate(pub Entity);
++
++/// Notification sent by a widget that edits a scalar value.
++#[derive(Copy, Clone, Debug, PartialEq)]
++pub struct ValueChange<T> {
++    /// The id of the widget that produced this value.
++    pub source: Entity,
++    /// The new value.
++    pub value: T,
++}
+diff --git a/crates/bevy_feathers/src/controls/button.rs b/crates/bevy_feathers/src/controls/button.rs
+index 5b6ad7117b3e8..ad479f1ec5202 100644
+--- a/crates/bevy_feathers/src/controls/button.rs
++++ b/crates/bevy_feathers/src/controls/button.rs
+@@ -1,5 +1,5 @@
+ use bevy_app::{Plugin, PreUpdate};
+-use bevy_core_widgets::{Callback, CoreButton};
++use bevy_core_widgets::{Activate, Callback, CoreButton};
+ use bevy_ecs::{
+     bundle::Bundle,
+     component::Component,
+@@ -9,7 +9,7 @@ use bevy_ecs::{
+     query::{Added, Changed, Has, Or},
+     schedule::IntoScheduleConfigs,
+     spawn::{SpawnRelated, SpawnableList},
+-    system::{Commands, Query},
++    system::{Commands, In, Query},
+ };
+ use bevy_input_focus::tab_navigation::TabIndex;
+ use bevy_picking::{hover::Hovered, PickingSystems};
+@@ -45,7 +45,7 @@ pub struct ButtonProps {
+     /// Rounded corners options
+     pub corners: RoundedCorners,
+     /// Click handler
+-    pub on_click: Callback,
++    pub on_click: Callback<In<Activate>>,
+ }
+ 
+ /// Template function to spawn a button.
+diff --git a/crates/bevy_feathers/src/controls/checkbox.rs b/crates/bevy_feathers/src/controls/checkbox.rs
+index f81e357c21a99..db37f82623c09 100644
+--- a/crates/bevy_feathers/src/controls/checkbox.rs
++++ b/crates/bevy_feathers/src/controls/checkbox.rs
+@@ -1,5 +1,5 @@
+ use bevy_app::{Plugin, PreUpdate};
+-use bevy_core_widgets::{Callback, CoreCheckbox};
++use bevy_core_widgets::{Callback, CoreCheckbox, ValueChange};
+ use bevy_ecs::{
+     bundle::Bundle,
+     children,
+@@ -34,7 +34,7 @@ use crate::{
+ #[derive(Default)]
+ pub struct CheckboxProps {
+     /// Change handler
+-    pub on_change: Callback<In<bool>>,
++    pub on_change: Callback<In<ValueChange<bool>>>,
+ }
+ 
+ /// Marker for the checkbox frame (contains both checkbox and label)
+diff --git a/crates/bevy_feathers/src/controls/slider.rs b/crates/bevy_feathers/src/controls/slider.rs
+index fa1978e06cf5f..228801b85cf3e 100644
+--- a/crates/bevy_feathers/src/controls/slider.rs
++++ b/crates/bevy_feathers/src/controls/slider.rs
+@@ -2,7 +2,7 @@ use core::f32::consts::PI;
+ 
+ use bevy_app::{Plugin, PreUpdate};
+ use bevy_color::Color;
+-use bevy_core_widgets::{Callback, CoreSlider, SliderRange, SliderValue, TrackClick};
++use bevy_core_widgets::{Callback, CoreSlider, SliderRange, SliderValue, TrackClick, ValueChange};
+ use bevy_ecs::{
+     bundle::Bundle,
+     children,
+@@ -42,7 +42,7 @@ pub struct SliderProps {
+     /// Slider maximum value
+     pub max: f32,
+     /// On-change handler
+-    pub on_change: Callback<In<f32>>,
++    pub on_change: Callback<In<ValueChange<f32>>>,
+ }
+ 
+ impl Default for SliderProps {
+diff --git a/crates/bevy_feathers/src/controls/toggle_switch.rs b/crates/bevy_feathers/src/controls/toggle_switch.rs
+index bc473d8d815dd..e3437a829d6a5 100644
+--- a/crates/bevy_feathers/src/controls/toggle_switch.rs
++++ b/crates/bevy_feathers/src/controls/toggle_switch.rs
+@@ -1,7 +1,7 @@
+ use accesskit::Role;
+ use bevy_a11y::AccessibilityNode;
+ use bevy_app::{Plugin, PreUpdate};
+-use bevy_core_widgets::{Callback, CoreCheckbox};
++use bevy_core_widgets::{Callback, CoreCheckbox, ValueChange};
+ use bevy_ecs::{
+     bundle::Bundle,
+     children,
+@@ -30,7 +30,7 @@ use crate::{
+ #[derive(Default)]
+ pub struct ToggleSwitchProps {
+     /// Change handler
+-    pub on_change: Callback<In<bool>>,
++    pub on_change: Callback<In<ValueChange<bool>>>,
+ }
+ 
+ /// Marker for the toggle switch outline
+diff --git a/examples/ui/core_widgets.rs b/examples/ui/core_widgets.rs
+index 7f99bdd848826..5685b88283956 100644
+--- a/examples/ui/core_widgets.rs
++++ b/examples/ui/core_widgets.rs
+@@ -3,9 +3,9 @@
+ use bevy::{
+     color::palettes::basic::*,
+     core_widgets::{
+-        Callback, CoreButton, CoreCheckbox, CoreRadio, CoreRadioGroup, CoreSlider,
++        Activate, Callback, CoreButton, CoreCheckbox, CoreRadio, CoreRadioGroup, CoreSlider,
+         CoreSliderDragState, CoreSliderThumb, CoreWidgetsPlugins, SliderRange, SliderValue,
+-        TrackClick,
++        TrackClick, ValueChange,
+     },
+     input_focus::{
+         tab_navigation::{TabGroup, TabIndex, TabNavigationPlugin},
+@@ -120,24 +120,24 @@ fn update_widget_values(
+ 
+ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+     // System to print a value when the button is clicked.
+-    let on_click = commands.register_system(|| {
++    let on_click = commands.register_system(|_: In<Activate>| {
+         info!("Button clicked!");
+     });
+ 
+     // System to update a resource when the slider value changes. Note that we could have
+     // updated the slider value directly, but we want to demonstrate externalizing the state.
+     let on_change_value = commands.register_system(
+-        |value: In<f32>, mut widget_states: ResMut<DemoWidgetStates>| {
+-            widget_states.slider_value = *value;
++        |value: In<ValueChange<f32>>, mut widget_states: ResMut<DemoWidgetStates>| {
++            widget_states.slider_value = value.0.value;
+         },
+     );
+ 
+     // System to update a resource when the radio group changes.
+     let on_change_radio = commands.register_system(
+-        |value: In<Entity>,
++        |value: In<Activate>,
+          mut widget_states: ResMut<DemoWidgetStates>,
+          q_radios: Query<&DemoRadio>| {
+-            if let Ok(radio) = q_radios.get(*value) {
++            if let Ok(radio) = q_radios.get(value.0 .0) {
+                 widget_states.slider_click = radio.0;
+             }
+         },
+@@ -155,9 +155,9 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+ 
+ fn demo_root(
+     asset_server: &AssetServer,
+-    on_click: Callback,
+-    on_change_value: Callback<In<f32>>,
+-    on_change_radio: Callback<In<Entity>>,
++    on_click: Callback<In<Activate>>,
++    on_change_value: Callback<In<ValueChange<f32>>>,
++    on_change_radio: Callback<In<Activate>>,
+ ) -> impl Bundle {
+     (
+         Node {
+@@ -181,7 +181,7 @@ fn demo_root(
+     )
+ }
+ 
+-fn button(asset_server: &AssetServer, on_click: Callback) -> impl Bundle {
++fn button(asset_server: &AssetServer, on_click: Callback<In<Activate>>) -> impl Bundle {
+     (
+         Node {
+             width: Val::Px(150.0),
+@@ -324,7 +324,12 @@ fn set_button_style(
+ }
+ 
+ /// Create a demo slider
+-fn slider(min: f32, max: f32, value: f32, on_change: Callback<In<f32>>) -> impl Bundle {
++fn slider(
++    min: f32,
++    max: f32,
++    value: f32,
++    on_change: Callback<In<ValueChange<f32>>>,
++) -> impl Bundle {
+     (
+         Node {
+             display: Display::Flex,
+@@ -469,7 +474,7 @@ fn thumb_color(disabled: bool, hovered: bool) -> Color {
+ fn checkbox(
+     asset_server: &AssetServer,
+     caption: &str,
+-    on_change: Callback<In<bool>>,
++    on_change: Callback<In<ValueChange<bool>>>,
+ ) -> impl Bundle {
+     (
+         Node {
+@@ -662,7 +667,7 @@ fn set_checkbox_or_radio_style(
+ }
+ 
+ /// Create a demo radio group
+-fn radio_group(asset_server: &AssetServer, on_change: Callback<In<Entity>>) -> impl Bundle {
++fn radio_group(asset_server: &AssetServer, on_change: Callback<In<Activate>>) -> impl Bundle {
+     (
+         Node {
+             display: Display::Flex,
+diff --git a/examples/ui/core_widgets_observers.rs b/examples/ui/core_widgets_observers.rs
+index c12edee08dde5..4c9d95097c072 100644
+--- a/examples/ui/core_widgets_observers.rs
++++ b/examples/ui/core_widgets_observers.rs
+@@ -3,8 +3,8 @@
+ use bevy::{
+     color::palettes::basic::*,
+     core_widgets::{
+-        Callback, CoreButton, CoreCheckbox, CoreSlider, CoreSliderThumb, CoreWidgetsPlugins,
+-        SliderRange, SliderValue,
++        Activate, Callback, CoreButton, CoreCheckbox, CoreSlider, CoreSliderThumb,
++        CoreWidgetsPlugins, SliderRange, SliderValue, ValueChange,
+     },
+     ecs::system::SystemId,
+     input_focus::{
+@@ -85,15 +85,15 @@ struct DemoWidgetStates {
+ 
+ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+     // System to print a value when the button is clicked.
+-    let on_click = commands.register_system(|| {
++    let on_click = commands.register_system(|_: In<Activate>| {
+         info!("Button clicked!");
+     });
+ 
+     // System to update a resource when the slider value changes. Note that we could have
+     // updated the slider value directly, but we want to demonstrate externalizing the state.
+     let on_change_value = commands.register_system(
+-        |value: In<f32>, mut widget_states: ResMut<DemoWidgetStates>| {
+-            widget_states.slider_value = *value;
++        |value: In<ValueChange<f32>>, mut widget_states: ResMut<DemoWidgetStates>| {
++            widget_states.slider_value = value.0.value;
+         },
+     );
+ 
+@@ -104,8 +104,8 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+ 
+ fn demo_root(
+     asset_server: &AssetServer,
+-    on_click: SystemId,
+-    on_change_value: SystemId<In<f32>>,
++    on_click: SystemId<In<Activate>>,
++    on_change_value: SystemId<In<ValueChange<f32>>>,
+ ) -> impl Bundle {
+     (
+         Node {
+@@ -128,7 +128,7 @@ fn demo_root(
+     )
+ }
+ 
+-fn button(asset_server: &AssetServer, on_click: Callback) -> impl Bundle {
++fn button(asset_server: &AssetServer, on_click: Callback<In<Activate>>) -> impl Bundle {
+     (
+         Node {
+             width: Val::Px(150.0),
+@@ -351,7 +351,12 @@ fn set_button_style(
+ }
+ 
+ /// Create a demo slider
+-fn slider(min: f32, max: f32, value: f32, on_change: Callback<In<f32>>) -> impl Bundle {
++fn slider(
++    min: f32,
++    max: f32,
++    value: f32,
++    on_change: Callback<In<ValueChange<f32>>>,
++) -> impl Bundle {
+     (
+         Node {
+             display: Display::Flex,
+@@ -517,7 +522,7 @@ fn thumb_color(disabled: bool, hovered: bool) -> Color {
+ fn checkbox(
+     asset_server: &AssetServer,
+     caption: &str,
+-    on_change: Callback<In<bool>>,
++    on_change: Callback<In<ValueChange<bool>>>,
+ ) -> impl Bundle {
+     (
+         Node {
+diff --git a/examples/ui/feathers.rs b/examples/ui/feathers.rs
+index 5b580483b6775..2e8a68320ec94 100644
+--- a/examples/ui/feathers.rs
++++ b/examples/ui/feathers.rs
+@@ -2,7 +2,8 @@
+ 
+ use bevy::{
+     core_widgets::{
+-        Callback, CoreRadio, CoreRadioGroup, CoreWidgetsPlugins, SliderPrecision, SliderStep,
++        Activate, Callback, CoreRadio, CoreRadioGroup, CoreWidgetsPlugins, SliderPrecision,
++        SliderStep,
+     },
+     feathers::{
+         controls::{
+@@ -49,9 +50,9 @@ fn setup(mut commands: Commands) {
+ fn demo_root(commands: &mut Commands) -> impl Bundle {
+     // Update radio button states based on notification from radio group.
+     let radio_exclusion = commands.register_system(
+-        |ent: In<Entity>, q_radio: Query<Entity, With<CoreRadio>>, mut commands: Commands| {
++        |ent: In<Activate>, q_radio: Query<Entity, With<CoreRadio>>, mut commands: Commands| {
+             for radio in q_radio.iter() {
+-                if radio == *ent {
++                if radio == ent.0 .0 {
+                     commands.entity(radio).insert(Checked);
+                 } else {
+                     commands.entity(radio).remove::<Checked>();
+@@ -98,9 +99,11 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                     children![
+                         button(
+                             ButtonProps {
+-                                on_click: Callback::System(commands.register_system(|| {
+-                                    info!("Normal button clicked!");
+-                                })),
++                                on_click: Callback::System(commands.register_system(
++                                    |_: In<Activate>| {
++                                        info!("Normal button clicked!");
++                                    }
++                                )),
+                                 ..default()
+                             },
+                             (),
+@@ -108,9 +111,11 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                         ),
+                         button(
+                             ButtonProps {
+-                                on_click: Callback::System(commands.register_system(|| {
+-                                    info!("Disabled button clicked!");
+-                                })),
++                                on_click: Callback::System(commands.register_system(
++                                    |_: In<Activate>| {
++                                        info!("Disabled button clicked!");
++                                    }
++                                )),
+                                 ..default()
+                             },
+                             InteractionDisabled,
+@@ -118,9 +123,11 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                         ),
+                         button(
+                             ButtonProps {
+-                                on_click: Callback::System(commands.register_system(|| {
+-                                    info!("Primary button clicked!");
+-                                })),
++                                on_click: Callback::System(commands.register_system(
++                                    |_: In<Activate>| {
++                                        info!("Primary button clicked!");
++                                    }
++                                )),
+                                 variant: ButtonVariant::Primary,
+                                 ..default()
+                             },
+@@ -141,9 +148,11 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                     children![
+                         button(
+                             ButtonProps {
+-                                on_click: Callback::System(commands.register_system(|| {
+-                                    info!("Left button clicked!");
+-                                })),
++                                on_click: Callback::System(commands.register_system(
++                                    |_: In<Activate>| {
++                                        info!("Left button clicked!");
++                                    }
++                                )),
+                                 corners: RoundedCorners::Left,
+                                 ..default()
+                             },
+@@ -152,9 +161,11 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                         ),
+                         button(
+                             ButtonProps {
+-                                on_click: Callback::System(commands.register_system(|| {
+-                                    info!("Center button clicked!");
+-                                })),
++                                on_click: Callback::System(commands.register_system(
++                                    |_: In<Activate>| {
++                                        info!("Center button clicked!");
++                                    }
++                                )),
+                                 corners: RoundedCorners::None,
+                                 ..default()
+                             },
+@@ -163,9 +174,11 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                         ),
+                         button(
+                             ButtonProps {
+-                                on_click: Callback::System(commands.register_system(|| {
+-                                    info!("Right button clicked!");
+-                                })),
++                                on_click: Callback::System(commands.register_system(
++                                    |_: In<Activate>| {
++                                        info!("Right button clicked!");
++                                    }
++                                )),
+                                 variant: ButtonVariant::Primary,
+                                 corners: RoundedCorners::Right,
+                             },
+@@ -176,7 +189,7 @@ fn demo_root(commands: &mut Commands) -> impl Bundle {
+                 ),
+                 button(
+                     ButtonProps {
+-                        on_click: Callback::System(commands.register_system(|| {
++                        on_click: Callback::System(commands.register_system(|_: In<Activate>| {
+                             info!("Wide button clicked!");
+                         })),
+                         ..default()
+diff --git a/release-content/release-notes/headless-widgets.md b/release-content/release-notes/headless-widgets.md
+index 68f3978fbc6ed..b812385e5b450 100644
+--- a/release-content/release-notes/headless-widgets.md
++++ b/release-content/release-notes/headless-widgets.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Headless Widgets
+ authors: ["@viridia", "@ickshonpe", "@alice-i-cecile"]
+-pull_requests: [19366, 19584, 19665, 19778, 19803, 20032, 20036]
++pull_requests: [19366, 19584, 19665, 19778, 19803, 20032, 20036, 20086]
+ ---
+ 
+ Bevy's `Button` and `Interaction` components have been around for a long time. Unfortunately

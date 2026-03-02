@@ -1,0 +1,1170 @@
+diff --git a/crates/bevy_animation/macros/src/animation_event.rs b/crates/bevy_animation/macros/src/animation_event.rs
+index b4abf9fc85f07..5f77d9c737c47 100644
+--- a/crates/bevy_animation/macros/src/animation_event.rs
++++ b/crates/bevy_animation/macros/src/animation_event.rs
+@@ -5,9 +5,11 @@ use syn::{parse_macro_input, DeriveInput};
+ 
+ pub fn derive_animation_event(input: TokenStream) -> TokenStream {
+     let ast = parse_macro_input!(input as DeriveInput);
+-    let manifest = BevyManifest::shared();
+-    let bevy_ecs = manifest.get_path("bevy_ecs");
+-    let bevy_animation = manifest.get_path("bevy_animation");
++    let (bevy_ecs, bevy_animation) = BevyManifest::shared(|manifest| {
++        let bevy_ecs = manifest.get_path("bevy_ecs");
++        let bevy_animation = manifest.get_path("bevy_animation");
++        (bevy_ecs, bevy_animation)
++    });
+ 
+     let generics = ast.generics;
+     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+diff --git a/crates/bevy_asset/Cargo.toml b/crates/bevy_asset/Cargo.toml
+index bde2ad5e033c3..6dbb223feb117 100644
+--- a/crates/bevy_asset/Cargo.toml
++++ b/crates/bevy_asset/Cargo.toml
+@@ -53,10 +53,6 @@ either = { version = "1.13", default-features = false }
+ futures-io = { version = "0.3", default-features = false }
+ futures-lite = { version = "2.0.1", default-features = false }
+ blake3 = { version = "1.5", default-features = false }
+-parking_lot = { version = "0.12", default-features = false, features = [
+-  "arc_lock",
+-  "send_guard",
+-] }
+ ron = { version = "0.10", default-features = false }
+ serde = { version = "1", default-features = false, features = ["derive"] }
+ thiserror = { version = "2", default-features = false }
+diff --git a/crates/bevy_asset/macros/src/lib.rs b/crates/bevy_asset/macros/src/lib.rs
+index a7ea87b752b99..3e497ebd8c8d3 100644
+--- a/crates/bevy_asset/macros/src/lib.rs
++++ b/crates/bevy_asset/macros/src/lib.rs
+@@ -8,7 +8,7 @@ use quote::{format_ident, quote};
+ use syn::{parse_macro_input, Data, DeriveInput, Path};
+ 
+ pub(crate) fn bevy_asset_path() -> Path {
+-    BevyManifest::shared().get_path("bevy_asset")
++    BevyManifest::shared(|manifest| manifest.get_path("bevy_asset"))
+ }
+ 
+ const DEPENDENCY_ATTRIBUTE: &str = "dependency";
+diff --git a/crates/bevy_asset/src/assets.rs b/crates/bevy_asset/src/assets.rs
+index 19388a53e6812..60b8df2ba124d 100644
+--- a/crates/bevy_asset/src/assets.rs
++++ b/crates/bevy_asset/src/assets.rs
+@@ -572,7 +572,7 @@ impl<A: Asset> Assets<A> {
+         // that `asset_server.load` calls that occur during it block, which ensures that
+         // re-loads are kicked off appropriately. This function must be "transactional" relative
+         // to other asset info operations
+-        let mut infos = asset_server.data.infos.write();
++        let mut infos = asset_server.write_infos();
+         while let Ok(drop_event) = assets.handle_provider.drop_receiver.try_recv() {
+             let id = drop_event.id.typed();
+ 
+diff --git a/crates/bevy_asset/src/io/embedded/embedded_watcher.rs b/crates/bevy_asset/src/io/embedded/embedded_watcher.rs
+index b7773cb404e2c..b2e8e7c3fadbe 100644
+--- a/crates/bevy_asset/src/io/embedded/embedded_watcher.rs
++++ b/crates/bevy_asset/src/io/embedded/embedded_watcher.rs
+@@ -5,9 +5,9 @@ use crate::io::{
+ };
+ use alloc::{boxed::Box, sync::Arc, vec::Vec};
+ use bevy_platform::collections::HashMap;
++use bevy_platform::sync::{PoisonError, RwLock};
+ use core::time::Duration;
+ use notify_debouncer_full::{notify::RecommendedWatcher, Debouncer, RecommendedCache};
+-use parking_lot::RwLock;
+ use std::{
+     fs::File,
+     io::{BufReader, Read},
+@@ -64,7 +64,12 @@ impl FilesystemEventHandler for EmbeddedEventHandler {
+ 
+     fn get_path(&self, absolute_path: &Path) -> Option<(PathBuf, bool)> {
+         let (local_path, is_meta) = get_asset_path(&self.root, absolute_path);
+-        let final_path = self.root_paths.read().get(local_path.as_path())?.clone();
++        let final_path = self
++            .root_paths
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .get(local_path.as_path())?
++            .clone();
+         if is_meta {
+             warn!("Meta file asset hot-reloading is not supported yet: {final_path:?}");
+         }
+diff --git a/crates/bevy_asset/src/io/embedded/mod.rs b/crates/bevy_asset/src/io/embedded/mod.rs
+index c18bd73f0142f..f05b1cb240106 100644
+--- a/crates/bevy_asset/src/io/embedded/mod.rs
++++ b/crates/bevy_asset/src/io/embedded/mod.rs
+@@ -12,6 +12,8 @@ use crate::AssetServer;
+ use alloc::boxed::Box;
+ use bevy_app::App;
+ use bevy_ecs::{resource::Resource, world::World};
++#[cfg(feature = "embedded_watcher")]
++use bevy_platform::sync::{Arc, PoisonError, RwLock};
+ use std::path::{Path, PathBuf};
+ 
+ #[cfg(feature = "embedded_watcher")]
+@@ -30,9 +32,7 @@ pub const EMBEDDED: &str = "embedded";
+ pub struct EmbeddedAssetRegistry {
+     dir: Dir,
+     #[cfg(feature = "embedded_watcher")]
+-    root_paths: alloc::sync::Arc<
+-        parking_lot::RwLock<bevy_platform::collections::HashMap<Box<Path>, PathBuf>>,
+-    >,
++    root_paths: Arc<RwLock<bevy_platform::collections::HashMap<Box<Path>, PathBuf>>>,
+ }
+ 
+ impl EmbeddedAssetRegistry {
+@@ -51,6 +51,7 @@ impl EmbeddedAssetRegistry {
+         #[cfg(feature = "embedded_watcher")]
+         self.root_paths
+             .write()
++            .unwrap_or_else(PoisonError::into_inner)
+             .insert(full_path.into(), asset_path.to_owned());
+         self.dir.insert_asset(asset_path, value);
+     }
+@@ -70,6 +71,7 @@ impl EmbeddedAssetRegistry {
+         #[cfg(feature = "embedded_watcher")]
+         self.root_paths
+             .write()
++            .unwrap_or_else(PoisonError::into_inner)
+             .insert(full_path.into(), asset_path.to_owned());
+         self.dir.insert_meta(asset_path, value);
+     }
+diff --git a/crates/bevy_asset/src/io/gated.rs b/crates/bevy_asset/src/io/gated.rs
+index 7d2759974fe5c..6ce2b65b7cc2f 100644
+--- a/crates/bevy_asset/src/io/gated.rs
++++ b/crates/bevy_asset/src/io/gated.rs
+@@ -1,9 +1,8 @@
+ use crate::io::{AssetReader, AssetReaderError, PathStream, Reader};
+ use alloc::{boxed::Box, sync::Arc};
+ use async_channel::{Receiver, Sender};
+-use bevy_platform::collections::HashMap;
+-use parking_lot::RwLock;
+-use std::path::Path;
++use bevy_platform::{collections::HashMap, sync::RwLock};
++use std::{path::Path, sync::PoisonError};
+ 
+ /// A "gated" reader that will prevent asset reads from returning until
+ /// a given path has been "opened" using [`GateOpener`].
+@@ -32,7 +31,7 @@ impl GateOpener {
+     /// Opens the `path` "gate", allowing a _single_ [`AssetReader`] operation to return for that path.
+     /// If multiple operations are expected, call `open` the expected number of calls.
+     pub fn open<P: AsRef<Path>>(&self, path: P) {
+-        let mut gates = self.gates.write();
++        let mut gates = self.gates.write().unwrap_or_else(PoisonError::into_inner);
+         let gates = gates
+             .entry_ref(path.as_ref())
+             .or_insert_with(async_channel::unbounded);
+@@ -58,7 +57,7 @@ impl<R: AssetReader> GatedReader<R> {
+ impl<R: AssetReader> AssetReader for GatedReader<R> {
+     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+         let receiver = {
+-            let mut gates = self.gates.write();
++            let mut gates = self.gates.write().unwrap_or_else(PoisonError::into_inner);
+             let gates = gates
+                 .entry_ref(path.as_ref())
+                 .or_insert_with(async_channel::unbounded);
+diff --git a/crates/bevy_asset/src/io/memory.rs b/crates/bevy_asset/src/io/memory.rs
+index 4c56057ff9e3c..ac936b9be9a10 100644
+--- a/crates/bevy_asset/src/io/memory.rs
++++ b/crates/bevy_asset/src/io/memory.rs
+@@ -1,10 +1,12 @@
+ use crate::io::{AssetReader, AssetReaderError, PathStream, Reader};
+ use alloc::{borrow::ToOwned, boxed::Box, sync::Arc, vec::Vec};
+-use bevy_platform::collections::HashMap;
++use bevy_platform::{
++    collections::HashMap,
++    sync::{PoisonError, RwLock},
++};
+ use core::{pin::Pin, task::Poll};
+ use futures_io::AsyncRead;
+ use futures_lite::{ready, Stream};
+-use parking_lot::RwLock;
+ use std::path::{Path, PathBuf};
+ 
+ use super::AsyncSeekForward;
+@@ -44,13 +46,17 @@ impl Dir {
+         if let Some(parent) = path.parent() {
+             dir = self.get_or_insert_dir(parent);
+         }
+-        dir.0.write().assets.insert(
+-            path.file_name().unwrap().to_string_lossy().into(),
+-            Data {
+-                value: value.into(),
+-                path: path.to_owned(),
+-            },
+-        );
++        dir.0
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++            .assets
++            .insert(
++                path.file_name().unwrap().to_string_lossy().into(),
++                Data {
++                    value: value.into(),
++                    path: path.to_owned(),
++                },
++            );
+     }
+ 
+     /// Removes the stored asset at `path` and returns the `Data` stored if found and otherwise `None`.
+@@ -60,7 +66,11 @@ impl Dir {
+             dir = self.get_or_insert_dir(parent);
+         }
+         let key: Box<str> = path.file_name().unwrap().to_string_lossy().into();
+-        dir.0.write().assets.remove(&key)
++        dir.0
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++            .assets
++            .remove(&key)
+     }
+ 
+     pub fn insert_meta(&self, path: &Path, value: impl Into<Value>) {
+@@ -68,13 +78,17 @@ impl Dir {
+         if let Some(parent) = path.parent() {
+             dir = self.get_or_insert_dir(parent);
+         }
+-        dir.0.write().metadata.insert(
+-            path.file_name().unwrap().to_string_lossy().into(),
+-            Data {
+-                value: value.into(),
+-                path: path.to_owned(),
+-            },
+-        );
++        dir.0
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++            .metadata
++            .insert(
++                path.file_name().unwrap().to_string_lossy().into(),
++                Data {
++                    value: value.into(),
++                    path: path.to_owned(),
++                },
++            );
+     }
+ 
+     pub fn get_or_insert_dir(&self, path: &Path) -> Dir {
+@@ -84,7 +98,7 @@ impl Dir {
+             full_path.push(c);
+             let name = c.as_os_str().to_string_lossy().into();
+             dir = {
+-                let dirs = &mut dir.0.write().dirs;
++                let dirs = &mut dir.0.write().unwrap_or_else(PoisonError::into_inner).dirs;
+                 dirs.entry(name)
+                     .or_insert_with(|| Dir::new(full_path.clone()))
+                     .clone()
+@@ -98,7 +112,13 @@ impl Dir {
+         let mut dir = self.clone();
+         for p in path.components() {
+             let component = p.as_os_str().to_str().unwrap();
+-            let next_dir = dir.0.read().dirs.get(component)?.clone();
++            let next_dir = dir
++                .0
++                .read()
++                .unwrap_or_else(PoisonError::into_inner)
++                .dirs
++                .get(component)?
++                .clone();
+             dir = next_dir;
+         }
+         Some(dir)
+@@ -110,8 +130,14 @@ impl Dir {
+             dir = dir.get_dir(parent)?;
+         }
+ 
+-        path.file_name()
+-            .and_then(|f| dir.0.read().assets.get(f.to_str().unwrap()).cloned())
++        path.file_name().and_then(|f| {
++            dir.0
++                .read()
++                .unwrap_or_else(PoisonError::into_inner)
++                .assets
++                .get(f.to_str().unwrap())
++                .cloned()
++        })
+     }
+ 
+     pub fn get_metadata(&self, path: &Path) -> Option<Data> {
+@@ -120,12 +146,22 @@ impl Dir {
+             dir = dir.get_dir(parent)?;
+         }
+ 
+-        path.file_name()
+-            .and_then(|f| dir.0.read().metadata.get(f.to_str().unwrap()).cloned())
++        path.file_name().and_then(|f| {
++            dir.0
++                .read()
++                .unwrap_or_else(PoisonError::into_inner)
++                .metadata
++                .get(f.to_str().unwrap())
++                .cloned()
++        })
+     }
+ 
+     pub fn path(&self) -> PathBuf {
+-        self.0.read().path.to_owned()
++        self.0
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .path
++            .to_owned()
+     }
+ }
+ 
+@@ -153,7 +189,7 @@ impl Stream for DirStream {
+         _cx: &mut core::task::Context<'_>,
+     ) -> Poll<Option<Self::Item>> {
+         let this = self.get_mut();
+-        let dir = this.dir.0.read();
++        let dir = this.dir.0.read().unwrap_or_else(PoisonError::into_inner);
+ 
+         let dir_index = this.dir_index;
+         if let Some(dir_path) = dir
+diff --git a/crates/bevy_asset/src/lib.rs b/crates/bevy_asset/src/lib.rs
+index a8d5ad7d62f98..942036c2c4d7f 100644
+--- a/crates/bevy_asset/src/lib.rs
++++ b/crates/bevy_asset/src/lib.rs
+@@ -728,7 +728,10 @@ mod tests {
+         prelude::*,
+         schedule::{LogLevel, ScheduleBuildSettings},
+     };
+-    use bevy_platform::collections::{HashMap, HashSet};
++    use bevy_platform::{
++        collections::{HashMap, HashSet},
++        sync::Mutex,
++    };
+     use bevy_reflect::TypePath;
+     use core::time::Duration;
+     use crossbeam_channel::Sender;
+@@ -825,7 +828,7 @@ mod tests {
+     /// A dummy [`CoolText`] asset reader that only succeeds after `failure_count` times it's read from for each asset.
+     #[derive(Default, Clone)]
+     pub struct UnstableMemoryAssetReader {
+-        pub attempt_counters: Arc<std::sync::Mutex<HashMap<Box<Path>, usize>>>,
++        pub attempt_counters: Arc<Mutex<HashMap<Box<Path>, usize>>>,
+         pub load_delay: Duration,
+         memory_reader: MemoryAssetReader,
+         failure_count: usize,
+diff --git a/crates/bevy_asset/src/processor/mod.rs b/crates/bevy_asset/src/processor/mod.rs
+index 7b3d36e686b02..f5f071cfb9561 100644
+--- a/crates/bevy_asset/src/processor/mod.rs
++++ b/crates/bevy_asset/src/processor/mod.rs
+@@ -58,11 +58,13 @@ use crate::{
+ };
+ use alloc::{borrow::ToOwned, boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
+ use bevy_ecs::prelude::*;
+-use bevy_platform::collections::{HashMap, HashSet};
++use bevy_platform::{
++    collections::{HashMap, HashSet},
++    sync::{PoisonError, RwLock},
++};
+ use bevy_tasks::IoTaskPool;
+ use futures_io::ErrorKind;
+ use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
+-use parking_lot::RwLock;
+ use std::path::{Path, PathBuf};
+ use thiserror::Error;
+ use tracing::{debug, error, trace, warn};
+@@ -533,7 +535,7 @@ impl AssetProcessor {
+     async fn finish_processing_assets(&self) {
+         self.try_reprocessing_queued().await;
+         // clean up metadata in asset server
+-        self.server.data.infos.write().consume_handle_drop_events();
++        self.server.write_infos().consume_handle_drop_events();
+         self.set_state(ProcessorState::Finished).await;
+     }
+ 
+@@ -581,7 +583,11 @@ impl AssetProcessor {
+ 
+     /// Register a new asset processor.
+     pub fn register_processor<P: Process>(&self, processor: P) {
+-        let mut process_plans = self.data.processors.write();
++        let mut process_plans = self
++            .data
++            .processors
++            .write()
++            .unwrap_or_else(PoisonError::into_inner);
+         #[cfg(feature = "trace")]
+         let processor = InstrumentedAssetProcessor(processor);
+         process_plans.insert(core::any::type_name::<P>(), Arc::new(processor));
+@@ -589,20 +595,37 @@ impl AssetProcessor {
+ 
+     /// Set the default processor for the given `extension`. Make sure `P` is registered with [`AssetProcessor::register_processor`].
+     pub fn set_default_processor<P: Process>(&self, extension: &str) {
+-        let mut default_processors = self.data.default_processors.write();
++        let mut default_processors = self
++            .data
++            .default_processors
++            .write()
++            .unwrap_or_else(PoisonError::into_inner);
+         default_processors.insert(extension.into(), core::any::type_name::<P>());
+     }
+ 
+     /// Returns the default processor for the given `extension`, if it exists.
+     pub fn get_default_processor(&self, extension: &str) -> Option<Arc<dyn ErasedProcessor>> {
+-        let default_processors = self.data.default_processors.read();
++        let default_processors = self
++            .data
++            .default_processors
++            .read()
++            .unwrap_or_else(PoisonError::into_inner);
+         let key = default_processors.get(extension)?;
+-        self.data.processors.read().get(key).cloned()
++        self.data
++            .processors
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .get(key)
++            .cloned()
+     }
+ 
+     /// Returns the processor with the given `processor_type_name`, if it exists.
+     pub fn get_processor(&self, processor_type_name: &str) -> Option<Arc<dyn ErasedProcessor>> {
+-        let processors = self.data.processors.read();
++        let processors = self
++            .data
++            .processors
++            .read()
++            .unwrap_or_else(PoisonError::into_inner);
+         processors.get(processor_type_name).cloned()
+     }
+ 
+diff --git a/crates/bevy_asset/src/server/mod.rs b/crates/bevy_asset/src/server/mod.rs
+index cf412d419c228..cd046aa8a238c 100644
+--- a/crates/bevy_asset/src/server/mod.rs
++++ b/crates/bevy_asset/src/server/mod.rs
+@@ -26,7 +26,10 @@ use alloc::{
+ };
+ use atomicow::CowArc;
+ use bevy_ecs::prelude::*;
+-use bevy_platform::collections::HashSet;
++use bevy_platform::{
++    collections::HashSet,
++    sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
++};
+ use bevy_tasks::IoTaskPool;
+ use core::{any::TypeId, future::Future, panic::AssertUnwindSafe, task::Poll};
+ use crossbeam_channel::{Receiver, Sender};
+@@ -34,7 +37,6 @@ use either::Either;
+ use futures_lite::{FutureExt, StreamExt};
+ use info::*;
+ use loaders::*;
+-use parking_lot::{RwLock, RwLockWriteGuard};
+ use std::path::{Path, PathBuf};
+ use thiserror::Error;
+ use tracing::{error, info};
+@@ -143,6 +145,34 @@ impl AssetServer {
+         }
+     }
+ 
++    pub(crate) fn read_infos(&self) -> RwLockReadGuard<'_, AssetInfos> {
++        self.data
++            .infos
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++    }
++
++    pub(crate) fn write_infos(&self) -> RwLockWriteGuard<'_, AssetInfos> {
++        self.data
++            .infos
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++    }
++
++    fn read_loaders(&self) -> RwLockReadGuard<'_, AssetLoaders> {
++        self.data
++            .loaders
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++    }
++
++    fn write_loaders(&self) -> RwLockWriteGuard<'_, AssetLoaders> {
++        self.data
++            .loaders
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++    }
++
+     /// Retrieves the [`AssetSource`] for the given `source`.
+     pub fn get_source<'a>(
+         &self,
+@@ -153,12 +183,12 @@ impl AssetServer {
+ 
+     /// Returns true if the [`AssetServer`] watches for changes.
+     pub fn watching_for_changes(&self) -> bool {
+-        self.data.infos.read().watching_for_changes
++        self.read_infos().watching_for_changes
+     }
+ 
+     /// Registers a new [`AssetLoader`]. [`AssetLoader`]s must be registered before they can be used.
+     pub fn register_loader<L: AssetLoader>(&self, loader: L) {
+-        self.data.loaders.write().push(loader);
++        self.write_loaders().push(loader);
+     }
+ 
+     /// Registers a new [`Asset`] type. [`Asset`] types must be registered before assets of that type can be loaded.
+@@ -184,7 +214,7 @@ impl AssetServer {
+                 });
+         }
+ 
+-        let mut infos = self.data.infos.write();
++        let mut infos = self.write_infos();
+ 
+         infos
+             .dependency_loaded_event_sender
+@@ -196,8 +226,7 @@ impl AssetServer {
+     }
+ 
+     pub(crate) fn register_handle_provider(&self, handle_provider: AssetHandleProvider) {
+-        let mut infos = self.data.infos.write();
+-        infos
++        self.write_infos()
+             .handle_providers
+             .insert(handle_provider.type_id, handle_provider);
+     }
+@@ -211,9 +240,11 @@ impl AssetServer {
+             extensions: vec![extension.to_string()],
+         };
+ 
+-        let loader = { self.data.loaders.read().get_by_extension(extension) };
+-
+-        loader.ok_or_else(error)?.get().await.map_err(|_| error())
++        let loader = self
++            .read_loaders()
++            .get_by_extension(extension)
++            .ok_or_else(error)?;
++        loader.get().await.map_err(|_| error())
+     }
+ 
+     /// Returns the registered [`AssetLoader`] associated with the given [`core::any::type_name`], if it exists.
+@@ -225,9 +256,11 @@ impl AssetServer {
+             type_name: type_name.to_string(),
+         };
+ 
+-        let loader = { self.data.loaders.read().get_by_name(type_name) };
+-
+-        loader.ok_or_else(error)?.get().await.map_err(|_| error())
++        let loader = self
++            .read_loaders()
++            .get_by_name(type_name)
++            .ok_or_else(error)?;
++        loader.get().await.map_err(|_| error())
+     }
+ 
+     /// Retrieves the default [`AssetLoader`] for the given path, if one can be found.
+@@ -252,9 +285,8 @@ impl AssetServer {
+             MissingAssetLoaderForExtensionError { extensions }
+         };
+ 
+-        let loader = { self.data.loaders.read().get_by_path(&path) };
+-
+-        loader.ok_or_else(error)?.get().await.map_err(|_| error())
++        let loader = self.read_loaders().get_by_path(&path).ok_or_else(error)?;
++        loader.get().await.map_err(|_| error())
+     }
+ 
+     /// Retrieves the default [`AssetLoader`] for the given [`Asset`] [`TypeId`], if one can be found.
+@@ -264,9 +296,8 @@ impl AssetServer {
+     ) -> Result<Arc<dyn ErasedAssetLoader>, MissingAssetLoaderForTypeIdError> {
+         let error = || MissingAssetLoaderForTypeIdError { type_id };
+ 
+-        let loader = { self.data.loaders.read().get_by_type(type_id) };
+-
+-        loader.ok_or_else(error)?.get().await.map_err(|_| error())
++        let loader = self.read_loaders().get_by_type(type_id).ok_or_else(error)?;
++        loader.get().await.map_err(|_| error())
+     }
+ 
+     /// Retrieves the default [`AssetLoader`] for the given [`Asset`] type, if one can be found.
+@@ -473,7 +504,7 @@ impl AssetServer {
+             }
+         }
+ 
+-        let mut infos = self.data.infos.write();
++        let mut infos = self.write_infos();
+         let (handle, should_load) = infos.get_or_create_path_handle::<A>(
+             path.clone(),
+             HandleLoadingMode::Request,
+@@ -495,7 +526,7 @@ impl AssetServer {
+         guard: G,
+     ) -> UntypedHandle {
+         let path = path.into().into_owned();
+-        let mut infos = self.data.infos.write();
++        let mut infos = self.write_infos();
+         let (handle, should_load) = infos.get_or_create_path_handle_erased(
+             path.clone(),
+             type_id,
+@@ -570,7 +601,7 @@ impl AssetServer {
+                 CowArc::Owned(format!("{source}--{UNTYPED_SOURCE_SUFFIX}").into())
+             }
+         });
+-        let mut infos = self.data.infos.write();
++        let mut infos = self.write_infos();
+         let (handle, should_load) = infos.get_or_create_path_handle::<LoadedUntypedAsset>(
+             path.clone().with_source(untyped_source),
+             HandleLoadingMode::Request,
+@@ -697,7 +728,7 @@ impl AssetServer {
+             // id, as we would not need to resolve the asset type to generate the ID. See this
+             // issue: https://github.com/bevyengine/bevy/issues/10549
+ 
+-            let mut infos = self.data.infos.write();
++            let mut infos = self.write_infos();
+             let result = infos.get_or_create_path_handle_internal(
+                 path.clone(),
+                 path.label().is_none().then(|| loader.asset_type_id()),
+@@ -750,7 +781,7 @@ impl AssetServer {
+         // Dropping it would cancel the load of the base asset, which would make the load of this
+         // subasset never complete.
+         let (base_asset_id, _base_handle, base_path) = if path.label().is_some() {
+-            let mut infos = self.data.infos.write();
++            let mut infos = self.write_infos();
+             let base_path = path.without_label().into_owned();
+             let base_handle = infos
+                 .get_or_create_path_handle_erased(
+@@ -836,9 +867,7 @@ impl AssetServer {
+                 let mut reloaded = false;
+ 
+                 let requests = server
+-                    .data
+-                    .infos
+-                    .read()
++                    .read_infos()
+                     .get_path_handles(&path)
+                     .map(|handle| server.load_internal(Some(handle), path.clone(), true, None))
+                     .collect::<Vec<_>>();
+@@ -850,7 +879,7 @@ impl AssetServer {
+                     }
+                 }
+ 
+-                if !reloaded && server.data.infos.read().should_reload(&path) {
++                if !reloaded && server.read_infos().should_reload(&path) {
+                     match server.load_internal(None, path.clone(), true, None).await {
+                         Ok(_) => reloaded = true,
+                         Err(err) => error!("{}", err),
+@@ -888,7 +917,7 @@ impl AssetServer {
+     ) -> UntypedHandle {
+         let loaded_asset = asset.into();
+         let handle = if let Some(path) = path {
+-            let (handle, _) = self.data.infos.write().get_or_create_path_handle_erased(
++            let (handle, _) = self.write_infos().get_or_create_path_handle_erased(
+                 path,
+                 loaded_asset.asset_type_id(),
+                 Some(loaded_asset.asset_type_name()),
+@@ -897,7 +926,7 @@ impl AssetServer {
+             );
+             handle
+         } else {
+-            self.data.infos.write().create_loading_handle_untyped(
++            self.write_infos().create_loading_handle_untyped(
+                 loaded_asset.asset_type_id(),
+                 loaded_asset.asset_type_name(),
+             )
+@@ -918,7 +947,7 @@ impl AssetServer {
+         &self,
+         future: impl Future<Output = Result<A, E>> + Send + 'static,
+     ) -> Handle<A> {
+-        let mut infos = self.data.infos.write();
++        let mut infos = self.write_infos();
+         let handle =
+             infos.create_loading_handle_untyped(TypeId::of::<A>(), core::any::type_name::<A>());
+ 
+@@ -975,9 +1004,7 @@ impl AssetServer {
+     pub fn load_folder<'a>(&self, path: impl Into<AssetPath<'a>>) -> Handle<LoadedFolder> {
+         let path = path.into().into_owned();
+         let (handle, should_load) = self
+-            .data
+-            .infos
+-            .write()
++            .write_infos()
+             .get_or_create_path_handle::<LoadedFolder>(
+                 path.clone(),
+                 HandleLoadingMode::Request,
+@@ -1084,7 +1111,7 @@ impl AssetServer {
+         &self,
+         id: impl Into<UntypedAssetId>,
+     ) -> Option<(LoadState, DependencyLoadState, RecursiveDependencyLoadState)> {
+-        self.data.infos.read().get(id.into()).map(|i| {
++        self.read_infos().get(id.into()).map(|i| {
+             (
+                 i.load_state.clone(),
+                 i.dep_load_state.clone(),
+@@ -1099,9 +1126,7 @@ impl AssetServer {
+     /// its dependencies or recursive dependencies, see [`AssetServer::get_dependency_load_state`]
+     /// and [`AssetServer::get_recursive_dependency_load_state`] respectively.
+     pub fn get_load_state(&self, id: impl Into<UntypedAssetId>) -> Option<LoadState> {
+-        self.data
+-            .infos
+-            .read()
++        self.read_infos()
+             .get(id.into())
+             .map(|i| i.load_state.clone())
+     }
+@@ -1115,9 +1140,7 @@ impl AssetServer {
+         &self,
+         id: impl Into<UntypedAssetId>,
+     ) -> Option<DependencyLoadState> {
+-        self.data
+-            .infos
+-            .read()
++        self.read_infos()
+             .get(id.into())
+             .map(|i| i.dep_load_state.clone())
+     }
+@@ -1131,9 +1154,7 @@ impl AssetServer {
+         &self,
+         id: impl Into<UntypedAssetId>,
+     ) -> Option<RecursiveDependencyLoadState> {
+-        self.data
+-            .infos
+-            .read()
++        self.read_infos()
+             .get(id.into())
+             .map(|i| i.rec_dep_load_state.clone())
+     }
+@@ -1215,13 +1236,13 @@ impl AssetServer {
+     /// Get an `UntypedHandle` from an `UntypedAssetId`.
+     /// See [`AssetServer::get_id_handle`] for details.
+     pub fn get_id_handle_untyped(&self, id: UntypedAssetId) -> Option<UntypedHandle> {
+-        self.data.infos.read().get_id_handle(id)
++        self.read_infos().get_id_handle(id)
+     }
+ 
+     /// Returns `true` if the given `id` corresponds to an asset that is managed by this [`AssetServer`].
+     /// Otherwise, returns `false`.
+     pub fn is_managed(&self, id: impl Into<UntypedAssetId>) -> bool {
+-        self.data.infos.read().contains_key(id.into())
++        self.read_infos().contains_key(id.into())
+     }
+ 
+     /// Returns an active untyped asset id for the given path, if the asset at the given path has already started loading,
+@@ -1231,7 +1252,7 @@ impl AssetServer {
+     /// # See also
+     /// [`get_path_ids`][Self::get_path_ids] for all handles.
+     pub fn get_path_id<'a>(&self, path: impl Into<AssetPath<'a>>) -> Option<UntypedAssetId> {
+-        let infos = self.data.infos.read();
++        let infos = self.read_infos();
+         let path = path.into();
+         let mut ids = infos.get_path_ids(&path);
+         ids.next()
+@@ -1241,9 +1262,8 @@ impl AssetServer {
+     /// or are still "alive".
+     /// Multiple IDs will be returned in the event that a single path is used by multiple [`AssetLoader`]'s.
+     pub fn get_path_ids<'a>(&self, path: impl Into<AssetPath<'a>>) -> Vec<UntypedAssetId> {
+-        let infos = self.data.infos.read();
+         let path = path.into();
+-        infos.get_path_ids(&path).collect()
++        self.read_infos().get_path_ids(&path).collect()
+     }
+ 
+     /// Returns an active untyped handle for the given path, if the asset at the given path has already started loading,
+@@ -1253,19 +1273,16 @@ impl AssetServer {
+     /// # See also
+     /// [`get_handles_untyped`][Self::get_handles_untyped] for all handles.
+     pub fn get_handle_untyped<'a>(&self, path: impl Into<AssetPath<'a>>) -> Option<UntypedHandle> {
+-        let infos = self.data.infos.read();
+         let path = path.into();
+-        let mut handles = infos.get_path_handles(&path);
+-        handles.next()
++        self.read_infos().get_path_handles(&path).next()
+     }
+ 
+     /// Returns all active untyped handles for the given path, if the assets at the given path have already started loading,
+     /// or are still "alive".
+     /// Multiple handles will be returned in the event that a single path is used by multiple [`AssetLoader`]'s.
+     pub fn get_handles_untyped<'a>(&self, path: impl Into<AssetPath<'a>>) -> Vec<UntypedHandle> {
+-        let infos = self.data.infos.read();
+         let path = path.into();
+-        infos.get_path_handles(&path).collect()
++        self.read_infos().get_path_handles(&path).collect()
+     }
+ 
+     /// Returns an active untyped handle for the given path and [`TypeId`], if the asset at the given path has already started loading,
+@@ -1275,14 +1292,14 @@ impl AssetServer {
+         path: &AssetPath,
+         type_id: TypeId,
+     ) -> Option<UntypedHandle> {
+-        let infos = self.data.infos.read();
+         let path = path.into();
+-        infos.get_path_and_type_id_handle(&path, type_id)
++        self.read_infos()
++            .get_path_and_type_id_handle(&path, type_id)
+     }
+ 
+     /// Returns the path for the given `id`, if it has one.
+     pub fn get_path(&self, id: impl Into<UntypedAssetId>) -> Option<AssetPath<'_>> {
+-        let infos = self.data.infos.read();
++        let infos = self.read_infos();
+         let info = infos.get(id.into())?;
+         Some(info.path.as_ref()?.clone())
+     }
+@@ -1297,7 +1314,7 @@ impl AssetServer {
+     /// Assets loaded with matching extensions will be blocked until the
+     /// real loader is added.
+     pub fn preregister_loader<L: AssetLoader>(&self, extensions: &[&str]) {
+-        self.data.loaders.write().reserve::<L>(extensions);
++        self.write_loaders().reserve::<L>(extensions);
+     }
+ 
+     /// Retrieve a handle for the given path. This will create a handle (and [`AssetInfo`]) if it does not exist
+@@ -1306,8 +1323,7 @@ impl AssetServer {
+         path: impl Into<AssetPath<'a>>,
+         meta_transform: Option<MetaTransform>,
+     ) -> Handle<A> {
+-        let mut infos = self.data.infos.write();
+-        infos
++        self.write_infos()
+             .get_or_create_path_handle::<A>(
+                 path.into().into_owned(),
+                 HandleLoadingMode::NotLoading,
+@@ -1326,8 +1342,7 @@ impl AssetServer {
+         type_id: TypeId,
+         meta_transform: Option<MetaTransform>,
+     ) -> UntypedHandle {
+-        let mut infos = self.data.infos.write();
+-        infos
++        self.write_infos()
+             .get_or_create_path_handle_erased(
+                 path.into().into_owned(),
+                 type_id,
+@@ -1403,9 +1418,7 @@ impl AssetServer {
+                 Err(AssetReaderError::NotFound(_)) => {
+                     // TODO: Handle error transformation
+                     let loader = {
+-                        self.data
+-                            .loaders
+-                            .read()
++                        self.read_loaders()
+                             .find(None, asset_type_id, None, Some(asset_path))
+                     };
+ 
+@@ -1425,9 +1438,7 @@ impl AssetServer {
+             }
+         } else {
+             let loader = {
+-                self.data
+-                    .loaders
+-                    .read()
++                self.read_loaders()
+                     .find(None, asset_type_id, None, Some(asset_path))
+             };
+ 
+@@ -1539,7 +1550,7 @@ impl AssetServer {
+         cx: &mut core::task::Context<'_>,
+         id: UntypedAssetId,
+     ) -> Poll<Result<(), WaitForAssetError>> {
+-        let infos = self.data.infos.read();
++        let infos = self.read_infos();
+ 
+         let Some(info) = infos.get(id) else {
+             return Poll::Ready(Err(WaitForAssetError::NotLoaded));
+@@ -1566,7 +1577,7 @@ impl AssetServer {
+                 let mut infos = {
+                     // Must drop read-only guard to acquire write guard
+                     drop(infos);
+-                    self.data.infos.write()
++                    self.write_infos()
+                 };
+ 
+                 let Some(info) = infos.get_mut(id) else {
+@@ -1648,7 +1659,7 @@ impl AssetServer {
+ /// A system that manages internal [`AssetServer`] events, such as finalizing asset loads.
+ pub fn handle_internal_asset_events(world: &mut World) {
+     world.resource_scope(|world, server: Mut<AssetServer>| {
+-        let mut infos = server.data.infos.write();
++        let mut infos = server.write_infos();
+         let var_name = vec![];
+         let mut untyped_failures = var_name;
+         for event in server.data.asset_event_receiver.try_iter() {
+diff --git a/crates/bevy_derive/src/lib.rs b/crates/bevy_derive/src/lib.rs
+index 16a66eb90677d..59df5324202db 100644
+--- a/crates/bevy_derive/src/lib.rs
++++ b/crates/bevy_derive/src/lib.rs
+@@ -228,7 +228,7 @@ pub fn derive_enum_variant_meta(input: TokenStream) -> TokenStream {
+ #[proc_macro_derive(AppLabel)]
+ pub fn derive_app_label(input: TokenStream) -> TokenStream {
+     let input = syn::parse_macro_input!(input as syn::DeriveInput);
+-    let mut trait_path = BevyManifest::shared().get_path("bevy_app");
++    let mut trait_path = BevyManifest::shared(|manifest| manifest.get_path("bevy_app"));
+     trait_path.segments.push(format_ident!("AppLabel").into());
+     derive_label(input, "AppLabel", &trait_path)
+ }
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index a388a30cb696d..d65cf244a0fc6 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -566,7 +566,7 @@ pub fn derive_system_set(input: TokenStream) -> TokenStream {
+ }
+ 
+ pub(crate) fn bevy_ecs_path() -> syn::Path {
+-    BevyManifest::shared().get_path("bevy_ecs")
++    BevyManifest::shared(|manifest| manifest.get_path("bevy_ecs"))
+ }
+ 
+ /// Implement the `Event` trait.
+diff --git a/crates/bevy_encase_derive/src/lib.rs b/crates/bevy_encase_derive/src/lib.rs
+index d882cb5cae3aa..772e372a0e9c1 100644
+--- a/crates/bevy_encase_derive/src/lib.rs
++++ b/crates/bevy_encase_derive/src/lib.rs
+@@ -12,26 +12,27 @@ use encase_derive_impl::{implement, syn};
+ const ENCASE: &str = "encase";
+ 
+ fn bevy_encase_path() -> syn::Path {
+-    let bevy_manifest = BevyManifest::shared();
+-    bevy_manifest
+-        .maybe_get_path("bevy_render")
+-        .map(|bevy_render_path| {
+-            let mut segments = bevy_render_path.segments;
+-            segments.push(BevyManifest::parse_str("render_resource"));
+-            syn::Path {
+-                leading_colon: None,
+-                segments,
+-            }
+-        })
+-        .map(|path| {
+-            let mut segments = path.segments;
+-            segments.push(BevyManifest::parse_str(ENCASE));
+-            syn::Path {
+-                leading_colon: None,
+-                segments,
+-            }
+-        })
+-        .unwrap_or_else(|| bevy_manifest.get_path(ENCASE))
++    BevyManifest::shared(|bevy_manifest| {
++        bevy_manifest
++            .maybe_get_path("bevy_render")
++            .map(|bevy_render_path| {
++                let mut segments = bevy_render_path.segments;
++                segments.push(BevyManifest::parse_str("render_resource"));
++                syn::Path {
++                    leading_colon: None,
++                    segments,
++                }
++            })
++            .map(|path| {
++                let mut segments = path.segments;
++                segments.push(BevyManifest::parse_str(ENCASE));
++                syn::Path {
++                    leading_colon: None,
++                    segments,
++                }
++            })
++            .unwrap_or_else(|| bevy_manifest.get_path(ENCASE))
++    })
+ }
+ 
+ implement!(bevy_encase_path());
+diff --git a/crates/bevy_gizmos/macros/src/lib.rs b/crates/bevy_gizmos/macros/src/lib.rs
+index 441882d4b01ab..76dda54c1e4cf 100644
+--- a/crates/bevy_gizmos/macros/src/lib.rs
++++ b/crates/bevy_gizmos/macros/src/lib.rs
+@@ -11,18 +11,20 @@ use syn::{parse_macro_input, parse_quote, DeriveInput, Path};
+ #[proc_macro_derive(GizmoConfigGroup)]
+ pub fn derive_gizmo_config_group(input: TokenStream) -> TokenStream {
+     let mut ast = parse_macro_input!(input as DeriveInput);
+-    let bevy_gizmos_path: Path = BevyManifest::shared().get_path("bevy_gizmos");
+-    let bevy_reflect_path: Path = BevyManifest::shared().get_path("bevy_reflect");
++    BevyManifest::shared(|manifest| {
++        let bevy_gizmos_path: Path = manifest.get_path("bevy_gizmos");
++        let bevy_reflect_path: Path = manifest.get_path("bevy_reflect");
+ 
+-    ast.generics.make_where_clause().predicates.push(
+-        parse_quote! { Self: #bevy_reflect_path::Reflect + #bevy_reflect_path::TypePath + Default},
+-    );
++        ast.generics.make_where_clause().predicates.push(
++            parse_quote! { Self: #bevy_reflect_path::Reflect + #bevy_reflect_path::TypePath + Default},
++        );
+ 
+-    let struct_name = &ast.ident;
+-    let (impl_generics, type_generics, where_clause) = &ast.generics.split_for_impl();
++        let struct_name = &ast.ident;
++        let (impl_generics, type_generics, where_clause) = &ast.generics.split_for_impl();
+ 
+-    TokenStream::from(quote! {
+-        impl #impl_generics #bevy_gizmos_path::config::GizmoConfigGroup for #struct_name #type_generics #where_clause {
+-        }
++        TokenStream::from(quote! {
++            impl #impl_generics #bevy_gizmos_path::config::GizmoConfigGroup for #struct_name #type_generics #where_clause {
++            }
++        })
+     })
+ }
+diff --git a/crates/bevy_macro_utils/Cargo.toml b/crates/bevy_macro_utils/Cargo.toml
+index 1a91fc49fbb21..e3a104758b84f 100644
+--- a/crates/bevy_macro_utils/Cargo.toml
++++ b/crates/bevy_macro_utils/Cargo.toml
+@@ -15,7 +15,6 @@ proc-macro2 = "1.0"
+ toml_edit = { version = "0.23.2", default-features = false, features = [
+   "parse",
+ ] }
+-parking_lot = { version = "0.12" }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/bevy_macro_utils/src/bevy_manifest.rs b/crates/bevy_macro_utils/src/bevy_manifest.rs
+index 378e04a44869c..8e2066cdd8f29 100644
+--- a/crates/bevy_macro_utils/src/bevy_manifest.rs
++++ b/crates/bevy_macro_utils/src/bevy_manifest.rs
+@@ -1,8 +1,8 @@
+ extern crate proc_macro;
+ 
+ use alloc::collections::BTreeMap;
+-use parking_lot::{lock_api::RwLockReadGuard, MappedRwLockReadGuard, RwLock, RwLockWriteGuard};
+ use proc_macro::TokenStream;
++use std::sync::{PoisonError, RwLock};
+ use std::{
+     env,
+     path::{Path, PathBuf},
+@@ -21,31 +21,38 @@ const BEVY: &str = "bevy";
+ 
+ impl BevyManifest {
+     /// Returns a global shared instance of the [`BevyManifest`] struct.
+-    pub fn shared() -> MappedRwLockReadGuard<'static, BevyManifest> {
++    pub fn shared<R>(f: impl FnOnce(&BevyManifest) -> R) -> R {
+         static MANIFESTS: RwLock<BTreeMap<PathBuf, BevyManifest>> = RwLock::new(BTreeMap::new());
+         let manifest_path = Self::get_manifest_path();
+         let modified_time = Self::get_manifest_modified_time(&manifest_path)
+             .expect("The Cargo.toml should have a modified time");
+ 
+-        if let Ok(manifest) =
+-            RwLockReadGuard::try_map(MANIFESTS.read(), |manifests| manifests.get(&manifest_path))
++        let manifests = MANIFESTS.read().unwrap_or_else(PoisonError::into_inner);
++        if let Some(manifest) = manifests.get(&manifest_path)
+             && manifest.modified_time == modified_time
+         {
+-            return manifest;
++            return f(manifest);
+         }
+ 
++        drop(manifests);
++
+         let manifest = BevyManifest {
+             manifest: Self::read_manifest(&manifest_path),
+             modified_time,
+         };
+ 
+         let key = manifest_path.clone();
+-        let mut manifests = MANIFESTS.write();
+-        manifests.insert(key, manifest);
+-
+-        RwLockReadGuard::map(RwLockWriteGuard::downgrade(manifests), |manifests| {
+-            manifests.get(&manifest_path).unwrap()
+-        })
++        // TODO: Switch to using RwLockWriteGuard::downgrade when it stablizes.
++        MANIFESTS
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++            .insert(key, manifest);
++
++        f(MANIFESTS
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .get(&manifest_path)
++            .unwrap())
+     }
+ 
+     fn get_manifest_path() -> PathBuf {
+diff --git a/crates/bevy_reflect/derive/src/meta.rs b/crates/bevy_reflect/derive/src/meta.rs
+index 2423dfafb3706..759ec2bb8d765 100644
+--- a/crates/bevy_reflect/derive/src/meta.rs
++++ b/crates/bevy_reflect/derive/src/meta.rs
+@@ -3,5 +3,5 @@ use syn::Path;
+ 
+ /// Returns the correct path for `bevy_reflect`.
+ pub(crate) fn get_bevy_reflect_path() -> Path {
+-    BevyManifest::shared().get_path("bevy_reflect")
++    BevyManifest::shared(|manifest| manifest.get_path("bevy_reflect"))
+ }
+diff --git a/crates/bevy_render/macros/src/as_bind_group.rs b/crates/bevy_render/macros/src/as_bind_group.rs
+index 0fc325136c166..820a336d7a5ba 100644
+--- a/crates/bevy_render/macros/src/as_bind_group.rs
++++ b/crates/bevy_render/macros/src/as_bind_group.rs
+@@ -58,11 +58,14 @@ struct BindlessIndexTableRangeAttr {
+ }
+ 
+ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+-    let manifest = BevyManifest::shared();
+-    let render_path = manifest.get_path("bevy_render");
+-    let image_path = manifest.get_path("bevy_image");
+-    let asset_path = manifest.get_path("bevy_asset");
+-    let ecs_path = manifest.get_path("bevy_ecs");
++    let (render_path, image_path, asset_path, ecs_path) = BevyManifest::shared(|manifest| {
++        let render_path = manifest.get_path("bevy_render");
++        let image_path = manifest.get_path("bevy_image");
++        let asset_path = manifest.get_path("bevy_asset");
++        let ecs_path = manifest.get_path("bevy_ecs");
++
++        (render_path, image_path, asset_path, ecs_path)
++    });
+ 
+     let mut binding_states: Vec<BindingState> = Vec::new();
+     let mut binding_impls = Vec::new();
+diff --git a/crates/bevy_render/macros/src/extract_component.rs b/crates/bevy_render/macros/src/extract_component.rs
+index 8526f7b889c11..ce06fcebd2132 100644
+--- a/crates/bevy_render/macros/src/extract_component.rs
++++ b/crates/bevy_render/macros/src/extract_component.rs
+@@ -5,9 +5,11 @@ use syn::{parse_macro_input, parse_quote, DeriveInput, Path};
+ pub fn derive_extract_component(input: TokenStream) -> TokenStream {
+     let mut ast = parse_macro_input!(input as DeriveInput);
+     let bevy_render_path: Path = crate::bevy_render_path();
+-    let bevy_ecs_path: Path = bevy_macro_utils::BevyManifest::shared()
+-        .maybe_get_path("bevy_ecs")
+-        .expect("bevy_ecs should be found in manifest");
++    let bevy_ecs_path: Path = bevy_macro_utils::BevyManifest::shared(|manifest| {
++        manifest
++            .maybe_get_path("bevy_ecs")
++            .expect("bevy_ecs should be found in manifest")
++    });
+ 
+     ast.generics
+         .make_where_clause()
+diff --git a/crates/bevy_render/macros/src/lib.rs b/crates/bevy_render/macros/src/lib.rs
+index 1c9dcebf3df5b..a1f59a688159e 100644
+--- a/crates/bevy_render/macros/src/lib.rs
++++ b/crates/bevy_render/macros/src/lib.rs
+@@ -12,11 +12,11 @@ use quote::format_ident;
+ use syn::{parse_macro_input, DeriveInput};
+ 
+ pub(crate) fn bevy_render_path() -> syn::Path {
+-    BevyManifest::shared().get_path("bevy_render")
++    BevyManifest::shared(|manifest| manifest.get_path("bevy_render"))
+ }
+ 
+ pub(crate) fn bevy_ecs_path() -> syn::Path {
+-    BevyManifest::shared().get_path("bevy_ecs")
++    BevyManifest::shared(|manifest| manifest.get_path("bevy_ecs"))
+ }
+ 
+ #[proc_macro_derive(ExtractResource)]
+diff --git a/crates/bevy_state/macros/src/lib.rs b/crates/bevy_state/macros/src/lib.rs
+index 3c5a2d0674347..5b9a8048390ec 100644
+--- a/crates/bevy_state/macros/src/lib.rs
++++ b/crates/bevy_state/macros/src/lib.rs
+@@ -24,5 +24,5 @@ pub fn derive_substates(input: TokenStream) -> TokenStream {
+ }
+ 
+ pub(crate) fn bevy_state_path() -> syn::Path {
+-    BevyManifest::shared().get_path("bevy_state")
++    BevyManifest::shared(|manifest| manifest.get_path("bevy_state"))
+ }
+diff --git a/release-content/migration-guides/bevy_manifest_scope_api.md b/release-content/migration-guides/bevy_manifest_scope_api.md
+new file mode 100644
+index 0000000000000..815e86a07e3f0
+--- /dev/null
++++ b/release-content/migration-guides/bevy_manifest_scope_api.md
+@@ -0,0 +1,17 @@
++---
++title: "`BevyManifest::shared` is now a scope-like API."
++pull_requests: [20630]
++---
++
++In previous versions of Bevy, `BevyManifest` returned a mapped `RwLock` guard. Now, it's a scope-like API:
++
++```rust
++// 0.16
++let manifest = BevyManifest::shared();
++let path = manifest.get_path("my_bevy_crate");
++
++// 0.17
++let path = BevyManifest::shared(|manifest| {
++    manifest.get_path("my_bevy_crate")
++});
++```

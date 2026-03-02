@@ -1,0 +1,117 @@
+diff --git a/crates/bevy_core_pipeline/src/core_3d/mod.rs b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+index 162286f645546..a75f6a51126bf 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/mod.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/mod.rs
+@@ -128,7 +128,8 @@ impl Plugin for Core3dPlugin {
+                     sort_phase_system::<Transparent3d>.in_set(RenderSystems::PhaseSort),
+                     configure_occlusion_culling_view_targets
+                         .after(prepare_view_targets)
+-                        .in_set(RenderSystems::PrepareViews),
++                        .in_set(RenderSystems::PrepareViews)
++                        .ambiguous_with(RenderSystems::PrepareViews),
+                     prepare_core_3d_depth_textures.in_set(RenderSystems::PrepareResources),
+                     prepare_prepass_textures.in_set(RenderSystems::PrepareResources),
+                 ),
+diff --git a/crates/bevy_core_pipeline/src/oit/mod.rs b/crates/bevy_core_pipeline/src/oit/mod.rs
+index 6751294cb897c..36e6bd98a9f5c 100644
+--- a/crates/bevy_core_pipeline/src/oit/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/mod.rs
+@@ -99,7 +99,9 @@ impl Plugin for OrderIndependentTransparencyPlugin {
+             .add_systems(
+                 Render,
+                 (
+-                    configure_camera_depth_usages.in_set(RenderSystems::PrepareViews),
++                    configure_camera_depth_usages
++                        .in_set(RenderSystems::PrepareViews)
++                        .ambiguous_with(RenderSystems::PrepareViews),
+                     prepare_oit_buffers.in_set(RenderSystems::PrepareResources),
+                 ),
+             );
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index bfcea0216e4de..220bd8fb7c264 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -397,8 +397,11 @@ where
+                         // `sweep_entities_needing_specialization` for an
+                         // explanation of why the systems are ordered this way.
+                         extract_entities_needs_specialization::<M>
+-                            .in_set(MaterialExtractEntitiesNeedingSpecializationSystems),
++                            .in_set(MaterialExtractEntitiesNeedingSpecializationSystems)
++                            .ambiguous_with(MaterialExtractEntitiesNeedingSpecializationSystems),
+                         sweep_entities_needing_specialization::<M>
++                            .in_set(MaterialSweepEntitiesNeedingSpecializationSystems)
++                            .ambiguous_with(MaterialSweepEntitiesNeedingSpecializationSystems)
+                             .after(MaterialExtractEntitiesNeedingSpecializationSystems)
+                             .after(MaterialExtractionSystems)
+                             .after(extract_cameras)
+@@ -617,6 +620,11 @@ pub struct MaterialExtractionSystems;
+ #[derive(SystemSet, Clone, PartialEq, Eq, Debug, Hash)]
+ pub struct MaterialExtractEntitiesNeedingSpecializationSystems;
+ 
++/// A [`SystemSet`] that contains all `sweep_entities_needing_specialization`
++/// systems.
++#[derive(SystemSet, Clone, PartialEq, Eq, Debug, Hash)]
++pub struct MaterialSweepEntitiesNeedingSpecializationSystems;
++
+ pub const fn alpha_mode_pipeline_key(alpha_mode: AlphaMode, msaa: &Msaa) -> MeshPipelineKey {
+     match alpha_mode {
+         // Premultiplied and Add share the same pipeline key
+diff --git a/crates/bevy_pbr/src/render/gpu_preprocess.rs b/crates/bevy_pbr/src/render/gpu_preprocess.rs
+index 9573861dc8150..5b1fdb5df29e1 100644
+--- a/crates/bevy_pbr/src/render/gpu_preprocess.rs
++++ b/crates/bevy_pbr/src/render/gpu_preprocess.rs
+@@ -357,7 +357,8 @@ impl Plugin for GpuMeshPreprocessPlugin {
+                             MeshUniform,
+                             MeshInputUniform
+                         >>)
+-                        .in_set(RenderSystems::PrepareBindGroups),
++                        .in_set(RenderSystems::PrepareBindGroups)
++                        .after(prepare_preprocess_pipelines),
+                     write_mesh_culling_data_buffer.in_set(RenderSystems::PrepareResourcesFlush),
+                 ),
+             )
+diff --git a/crates/bevy_post_process/src/dof/mod.rs b/crates/bevy_post_process/src/dof/mod.rs
+index 1bac6ac5968f9..64a280964fa39 100644
+--- a/crates/bevy_post_process/src/dof/mod.rs
++++ b/crates/bevy_post_process/src/dof/mod.rs
+@@ -218,7 +218,8 @@ impl Plugin for DepthOfFieldPlugin {
+             .add_systems(
+                 Render,
+                 (
+-                    configure_depth_of_field_view_targets,
++                    configure_depth_of_field_view_targets
++                        .ambiguous_with(RenderSystems::PrepareViews),
+                     prepare_auxiliary_depth_of_field_textures,
+                 )
+                     .after(prepare_view_targets)
+diff --git a/tests/ecs/ambiguity_detection.rs b/tests/ecs/ambiguity_detection.rs
+index 072e9a05e54f4..c43f1c6965105 100644
+--- a/tests/ecs/ambiguity_detection.rs
++++ b/tests/ecs/ambiguity_detection.rs
+@@ -32,11 +32,8 @@ fn main() {
+     let main_app = app.main_mut();
+     configure_ambiguity_detection(main_app);
+ 
+-    // Ambiguities in the RenderApp are currently allowed.
+-    // Eventually, we should forbid these: see https://github.com/bevyengine/bevy/issues/7386
+-    // Uncomment the lines below to show the current ambiguities in the RenderApp.
+-    // let sub_app = app.sub_app_mut(bevy_render::RenderApp);
+-    // configure_ambiguity_detection(sub_app);
++    let sub_app = app.sub_app_mut(bevy_render::RenderApp);
++    configure_ambiguity_detection(sub_app);
+ 
+     app.finish();
+     app.cleanup();
+@@ -48,6 +45,12 @@ fn main() {
+         0,
+         "Main app has unexpected ambiguities among the following schedules: \n{main_app_ambiguities:#?}.",
+     );
++    let render_app_ambiguities = count_ambiguities(app.sub_app(bevy_render::RenderApp));
++    assert_eq!(
++        render_app_ambiguities.total(),
++        0,
++        "Render app has unexpected ambiguities among the following schedules: \n{render_app_ambiguities:#?}.",
++    );
+ }
+ 
+ /// Contains the number of conflicting systems per schedule.

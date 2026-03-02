@@ -1,0 +1,395 @@
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 581b8af288660..ea8a289346105 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -321,7 +321,7 @@ pub fn init_prepass_pipeline(
+         view_layout_no_motion_vectors,
+         mesh_layouts: mesh_pipeline.mesh_layouts.clone(),
+         default_prepass_shader: load_embedded_asset!(asset_server.as_ref(), "prepass.wgsl"),
+-        skins_use_uniform_buffers: skin::skins_use_uniform_buffers(&render_device),
++        skins_use_uniform_buffers: skin::skins_use_uniform_buffers(&render_device.limits()),
+         depth_clip_control_supported,
+         binding_arrays_are_usable: binding_arrays_are_usable(&render_device, &render_adapter),
+         empty_layout: render_device.create_bind_group_layout("prepass_empty_layout", &[]),
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 922294f0657f4..9ba412f644384 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -254,8 +254,9 @@ impl Plugin for MeshRenderPlugin {
+                     );
+             } else {
+                 let render_device = render_app.world().resource::<RenderDevice>();
+-                let cpu_batched_instance_buffer =
+-                    no_gpu_preprocessing::BatchedInstanceBuffer::<MeshUniform>::new(render_device);
++                let cpu_batched_instance_buffer = no_gpu_preprocessing::BatchedInstanceBuffer::<
++                    MeshUniform,
++                >::new(&render_device.limits());
+                 render_app
+                     .insert_resource(cpu_batched_instance_buffer)
+                     .add_systems(
+@@ -271,7 +272,7 @@ impl Plugin for MeshRenderPlugin {
+ 
+             let render_device = render_app.world().resource::<RenderDevice>();
+             if let Some(per_object_buffer_batch_size) =
+-                GpuArrayBuffer::<MeshUniform>::batch_size(render_device)
++                GpuArrayBuffer::<MeshUniform>::batch_size(&render_device.limits())
+             {
+                 mesh_bindings_shader_defs.push(ShaderDefVal::UInt(
+                     "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
+@@ -1853,13 +1854,15 @@ impl FromWorld for MeshPipeline {
+             dummy_white_gpu_image,
+             mesh_layouts: MeshLayouts::new(&render_device, &render_adapter),
+             shader,
+-            per_object_buffer_batch_size: GpuArrayBuffer::<MeshUniform>::batch_size(&render_device),
++            per_object_buffer_batch_size: GpuArrayBuffer::<MeshUniform>::batch_size(
++                &render_device.limits(),
++            ),
+             binding_arrays_are_usable: binding_arrays_are_usable(&render_device, &render_adapter),
+             clustered_decals_are_usable: decal::clustered::clustered_decals_are_usable(
+                 &render_device,
+                 &render_adapter,
+             ),
+-            skins_use_uniform_buffers: skins_use_uniform_buffers(&render_device),
++            skins_use_uniform_buffers: skins_use_uniform_buffers(&render_device.limits()),
+         }
+     }
+ }
+@@ -3043,7 +3046,7 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshBindGroup<I> {
+             offset_count += 1;
+         }
+         if let Some(current_skin_index) = current_skin_byte_offset
+-            && skins_use_uniform_buffers(&render_device)
++            && skins_use_uniform_buffers(&render_device.limits())
+         {
+             dynamic_offsets[offset_count] = current_skin_index.byte_offset;
+             offset_count += 1;
+@@ -3056,7 +3059,7 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMeshBindGroup<I> {
+         // Attach motion vectors if needed.
+         if has_motion_vector_prepass {
+             // Attach the previous skin index for motion vector computation.
+-            if skins_use_uniform_buffers(&render_device)
++            if skins_use_uniform_buffers(&render_device.limits())
+                 && let Some(current_skin_byte_offset) = current_skin_byte_offset
+             {
+                 dynamic_offsets[offset_count] = current_skin_byte_offset.byte_offset;
+diff --git a/crates/bevy_pbr/src/render/mesh_bindings.rs b/crates/bevy_pbr/src/render/mesh_bindings.rs
+index a80cdf547ac83..a71dfe50f394d 100644
+--- a/crates/bevy_pbr/src/render/mesh_bindings.rs
++++ b/crates/bevy_pbr/src/render/mesh_bindings.rs
+@@ -36,18 +36,18 @@ mod layout_entry {
+             BindGroupLayoutEntryBuilder, BufferSize, GpuArrayBuffer, SamplerBindingType,
+             ShaderStages, TextureSampleType,
+         },
+-        renderer::RenderDevice,
++        settings::WgpuLimits,
+     };
+ 
+-    pub(super) fn model(render_device: &RenderDevice) -> BindGroupLayoutEntryBuilder {
+-        GpuArrayBuffer::<MeshUniform>::binding_layout(render_device)
++    pub(super) fn model(limits: &WgpuLimits) -> BindGroupLayoutEntryBuilder {
++        GpuArrayBuffer::<MeshUniform>::binding_layout(limits)
+             .visibility(ShaderStages::VERTEX_FRAGMENT)
+     }
+-    pub(super) fn skinning(render_device: &RenderDevice) -> BindGroupLayoutEntryBuilder {
++    pub(super) fn skinning(limits: &WgpuLimits) -> BindGroupLayoutEntryBuilder {
+         // If we can use storage buffers, do so. Otherwise, fall back to uniform
+         // buffers.
+         let size = BufferSize::new(JOINT_BUFFER_SIZE as u64);
+-        if skin::skins_use_uniform_buffers(render_device) {
++        if skin::skins_use_uniform_buffers(limits) {
+             uniform_buffer_sized(true, size)
+         } else {
+             storage_buffer_read_only_sized(false, size)
+@@ -109,7 +109,7 @@ mod entry {
+         binding: u32,
+         buffer: &'a Buffer,
+     ) -> BindGroupEntry<'a> {
+-        let size = if skin::skins_use_uniform_buffers(render_device) {
++        let size = if skin::skins_use_uniform_buffers(&render_device.limits()) {
+             Some(JOINT_BUFFER_SIZE as u64)
+         } else {
+             None
+@@ -221,7 +221,7 @@ impl MeshLayouts {
+             "mesh_layout",
+             &BindGroupLayoutEntries::single(
+                 ShaderStages::empty(),
+-                layout_entry::model(render_device),
++                layout_entry::model(&render_device.limits()),
+             ),
+         )
+     }
+@@ -233,9 +233,9 @@ impl MeshLayouts {
+             &BindGroupLayoutEntries::with_indices(
+                 ShaderStages::VERTEX,
+                 (
+-                    (0, layout_entry::model(render_device)),
++                    (0, layout_entry::model(&render_device.limits())),
+                     // The current frame's joint matrix buffer.
+-                    (1, layout_entry::skinning(render_device)),
++                    (1, layout_entry::skinning(&render_device.limits())),
+                 ),
+             ),
+         )
+@@ -249,11 +249,11 @@ impl MeshLayouts {
+             &BindGroupLayoutEntries::with_indices(
+                 ShaderStages::VERTEX,
+                 (
+-                    (0, layout_entry::model(render_device)),
++                    (0, layout_entry::model(&render_device.limits())),
+                     // The current frame's joint matrix buffer.
+-                    (1, layout_entry::skinning(render_device)),
++                    (1, layout_entry::skinning(&render_device.limits())),
+                     // The previous frame's joint matrix buffer.
+-                    (6, layout_entry::skinning(render_device)),
++                    (6, layout_entry::skinning(&render_device.limits())),
+                 ),
+             ),
+         )
+@@ -266,7 +266,7 @@ impl MeshLayouts {
+             &BindGroupLayoutEntries::with_indices(
+                 ShaderStages::VERTEX,
+                 (
+-                    (0, layout_entry::model(render_device)),
++                    (0, layout_entry::model(&render_device.limits())),
+                     // The current frame's morph weight buffer.
+                     (2, layout_entry::weights()),
+                     (3, layout_entry::targets()),
+@@ -283,7 +283,7 @@ impl MeshLayouts {
+             &BindGroupLayoutEntries::with_indices(
+                 ShaderStages::VERTEX,
+                 (
+-                    (0, layout_entry::model(render_device)),
++                    (0, layout_entry::model(&render_device.limits())),
+                     // The current frame's morph weight buffer.
+                     (2, layout_entry::weights()),
+                     (3, layout_entry::targets()),
+@@ -302,9 +302,9 @@ impl MeshLayouts {
+             &BindGroupLayoutEntries::with_indices(
+                 ShaderStages::VERTEX,
+                 (
+-                    (0, layout_entry::model(render_device)),
++                    (0, layout_entry::model(&render_device.limits())),
+                     // The current frame's joint matrix buffer.
+-                    (1, layout_entry::skinning(render_device)),
++                    (1, layout_entry::skinning(&render_device.limits())),
+                     // The current frame's morph weight buffer.
+                     (2, layout_entry::weights()),
+                     (3, layout_entry::targets()),
+@@ -321,14 +321,14 @@ impl MeshLayouts {
+             &BindGroupLayoutEntries::with_indices(
+                 ShaderStages::VERTEX,
+                 (
+-                    (0, layout_entry::model(render_device)),
++                    (0, layout_entry::model(&render_device.limits())),
+                     // The current frame's joint matrix buffer.
+-                    (1, layout_entry::skinning(render_device)),
++                    (1, layout_entry::skinning(&render_device.limits())),
+                     // The current frame's morph weight buffer.
+                     (2, layout_entry::weights()),
+                     (3, layout_entry::targets()),
+                     // The previous frame's joint matrix buffer.
+-                    (6, layout_entry::skinning(render_device)),
++                    (6, layout_entry::skinning(&render_device.limits())),
+                     // The previous frame's morph weight buffer.
+                     (7, layout_entry::weights()),
+                 ),
+@@ -346,7 +346,7 @@ impl MeshLayouts {
+                 &BindGroupLayoutEntries::with_indices(
+                     ShaderStages::VERTEX,
+                     (
+-                        (0, layout_entry::model(render_device)),
++                        (0, layout_entry::model(&render_device.limits())),
+                         (4, layout_entry::lightmaps_texture_view_array()),
+                         (5, layout_entry::lightmaps_sampler_array()),
+                     ),
+@@ -358,7 +358,7 @@ impl MeshLayouts {
+                 &BindGroupLayoutEntries::with_indices(
+                     ShaderStages::VERTEX,
+                     (
+-                        (0, layout_entry::model(render_device)),
++                        (0, layout_entry::model(&render_device.limits())),
+                         (4, layout_entry::lightmaps_texture_view()),
+                         (5, layout_entry::lightmaps_sampler()),
+                     ),
+diff --git a/crates/bevy_pbr/src/render/skin.rs b/crates/bevy_pbr/src/render/skin.rs
+index 44e55094236d3..75c424311a056 100644
+--- a/crates/bevy_pbr/src/render/skin.rs
++++ b/crates/bevy_pbr/src/render/skin.rs
+@@ -8,6 +8,7 @@ use bevy_math::Mat4;
+ use bevy_mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+ use bevy_platform::collections::hash_map::Entry;
+ use bevy_render::render_resource::{Buffer, BufferDescriptor};
++use bevy_render::settings::WgpuLimits;
+ use bevy_render::sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet};
+ use bevy_render::{
+     batching::NoAutomaticBatching,
+@@ -118,7 +119,7 @@ pub struct SkinUniforms {
+ impl FromWorld for SkinUniforms {
+     fn from_world(world: &mut World) -> Self {
+         let device = world.resource::<RenderDevice>();
+-        let buffer_usages = (if skins_use_uniform_buffers(device) {
++        let buffer_usages = (if skins_use_uniform_buffers(&device.limits()) {
+             BufferUsages::UNIFORM
+         } else {
+             BufferUsages::STORAGE
+@@ -190,10 +191,9 @@ impl SkinUniformInfo {
+ 
+ /// Returns true if skinning must use uniforms (and dynamic offsets) because
+ /// storage buffers aren't supported on the current platform.
+-pub fn skins_use_uniform_buffers(render_device: &RenderDevice) -> bool {
++pub fn skins_use_uniform_buffers(limits: &WgpuLimits) -> bool {
+     static SKINS_USE_UNIFORM_BUFFERS: OnceLock<bool> = OnceLock::new();
+-    *SKINS_USE_UNIFORM_BUFFERS
+-        .get_or_init(|| render_device.limits().max_storage_buffers_per_shader_stage == 0)
++    *SKINS_USE_UNIFORM_BUFFERS.get_or_init(|| limits.max_storage_buffers_per_shader_stage == 0)
+ }
+ 
+ /// Uploads the buffers containing the joints to the GPU.
+@@ -224,7 +224,7 @@ pub fn prepare_skins(
+         }
+ 
+         // Create the new buffers.
+-        let buffer_usages = if skins_use_uniform_buffers(&render_device) {
++        let buffer_usages = if skins_use_uniform_buffers(&render_device.limits()) {
+             BufferUsages::UNIFORM
+         } else {
+             BufferUsages::STORAGE
+@@ -613,7 +613,7 @@ pub fn no_automatic_skin_batching(
+     query: Query<Entity, (With<SkinnedMesh>, Without<NoAutomaticBatching>)>,
+     render_device: Res<RenderDevice>,
+ ) {
+-    if !skins_use_uniform_buffers(&render_device) {
++    if !skins_use_uniform_buffers(&render_device.limits()) {
+         return;
+     }
+ 
+diff --git a/crates/bevy_render/src/batching/no_gpu_preprocessing.rs b/crates/bevy_render/src/batching/no_gpu_preprocessing.rs
+index a6127255911bd..66ba0783758d7 100644
+--- a/crates/bevy_render/src/batching/no_gpu_preprocessing.rs
++++ b/crates/bevy_render/src/batching/no_gpu_preprocessing.rs
+@@ -6,7 +6,7 @@ use bevy_ecs::resource::Resource;
+ use bevy_ecs::system::{Res, ResMut, StaticSystemParam};
+ use smallvec::{smallvec, SmallVec};
+ use tracing::error;
+-use wgpu::BindingResource;
++use wgpu::{BindingResource, Limits};
+ 
+ use crate::{
+     render_phase::{
+@@ -34,8 +34,8 @@ where
+     BD: GpuArrayBufferable + Sync + Send + 'static,
+ {
+     /// Creates a new buffer.
+-    pub fn new(render_device: &RenderDevice) -> Self {
+-        BatchedInstanceBuffer(GpuArrayBuffer::new(render_device))
++    pub fn new(limits: &Limits) -> Self {
++        BatchedInstanceBuffer(GpuArrayBuffer::new(limits))
+     }
+ 
+     /// Returns the binding of the buffer that contains the per-instance data.
+diff --git a/crates/bevy_render/src/gpu_component_array_buffer.rs b/crates/bevy_render/src/gpu_component_array_buffer.rs
+index b4eb56197f3f1..e5d86315a7178 100644
+--- a/crates/bevy_render/src/gpu_component_array_buffer.rs
++++ b/crates/bevy_render/src/gpu_component_array_buffer.rs
+@@ -28,7 +28,7 @@ impl<C: Component + GpuArrayBufferable> Plugin for GpuComponentArrayBufferPlugin
+     fn finish(&self, app: &mut App) {
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app.insert_resource(GpuArrayBuffer::<C>::new(
+-                render_app.world().resource::<RenderDevice>(),
++                &render_app.world().resource::<RenderDevice>().limits(),
+             ));
+         }
+     }
+diff --git a/crates/bevy_render/src/render_resource/gpu_array_buffer.rs b/crates/bevy_render/src/render_resource/gpu_array_buffer.rs
+index 2c81f56019d94..c99903394ed78 100644
+--- a/crates/bevy_render/src/render_resource/gpu_array_buffer.rs
++++ b/crates/bevy_render/src/render_resource/gpu_array_buffer.rs
+@@ -10,7 +10,7 @@ use bevy_ecs::{prelude::Component, resource::Resource};
+ use core::marker::PhantomData;
+ use encase::{private::WriteInto, ShaderSize, ShaderType};
+ use nonmax::NonMaxU32;
+-use wgpu::{BindingResource, BufferUsages};
++use wgpu::{BindingResource, BufferUsages, Limits};
+ 
+ /// Trait for types able to go in a [`GpuArrayBuffer`].
+ pub trait GpuArrayBufferable: ShaderType + ShaderSize + WriteInto + Clone {}
+@@ -39,10 +39,9 @@ pub enum GpuArrayBuffer<T: GpuArrayBufferable> {
+ }
+ 
+ impl<T: GpuArrayBufferable> GpuArrayBuffer<T> {
+-    pub fn new(device: &RenderDevice) -> Self {
+-        let limits = device.limits();
++    pub fn new(limits: &Limits) -> Self {
+         if limits.max_storage_buffers_per_shader_stage == 0 {
+-            GpuArrayBuffer::Uniform(BatchedUniformBuffer::new(&limits))
++            GpuArrayBuffer::Uniform(BatchedUniformBuffer::new(limits))
+         } else {
+             GpuArrayBuffer::Storage(BufferVec::new(BufferUsages::STORAGE))
+         }
+@@ -76,8 +75,8 @@ impl<T: GpuArrayBufferable> GpuArrayBuffer<T> {
+         }
+     }
+ 
+-    pub fn binding_layout(device: &RenderDevice) -> BindGroupLayoutEntryBuilder {
+-        if device.limits().max_storage_buffers_per_shader_stage == 0 {
++    pub fn binding_layout(limits: &Limits) -> BindGroupLayoutEntryBuilder {
++        if limits.max_storage_buffers_per_shader_stage == 0 {
+             uniform_buffer_sized(
+                 true,
+                 // BatchedUniformBuffer uses a MaxCapacityArray that is runtime-sized, so we use
+@@ -96,10 +95,9 @@ impl<T: GpuArrayBufferable> GpuArrayBuffer<T> {
+         }
+     }
+ 
+-    pub fn batch_size(device: &RenderDevice) -> Option<u32> {
+-        let limits = device.limits();
++    pub fn batch_size(limits: &Limits) -> Option<u32> {
+         if limits.max_storage_buffers_per_shader_stage == 0 {
+-            Some(BatchedUniformBuffer::<T>::batch_size(&limits) as u32)
++            Some(BatchedUniformBuffer::<T>::batch_size(limits) as u32)
+         } else {
+             None
+         }
+diff --git a/crates/bevy_sprite_render/src/mesh2d/mesh.rs b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+index 7b6032306cbde..7208ef47ba319 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+@@ -156,14 +156,16 @@ pub fn check_views_need_specialization(
+ }
+ 
+ pub fn init_batched_instance_buffer(mut commands: Commands, render_device: Res<RenderDevice>) {
+-    commands.insert_resource(BatchedInstanceBuffer::<Mesh2dUniform>::new(&render_device));
++    commands.insert_resource(BatchedInstanceBuffer::<Mesh2dUniform>::new(
++        &render_device.limits(),
++    ));
+ }
+ 
+ fn load_mesh2d_bindings(render_device: Res<RenderDevice>, asset_server: Res<AssetServer>) {
+     let mut mesh_bindings_shader_defs = Vec::with_capacity(1);
+ 
+     if let Some(per_object_buffer_batch_size) =
+-        GpuArrayBuffer::<Mesh2dUniform>::batch_size(&render_device)
++        GpuArrayBuffer::<Mesh2dUniform>::batch_size(&render_device.limits())
+     {
+         mesh_bindings_shader_defs.push(ShaderDefVal::UInt(
+             "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
+@@ -314,7 +316,7 @@ pub fn init_mesh_2d_pipeline(
+         "mesh2d_layout",
+         &BindGroupLayoutEntries::single(
+             ShaderStages::VERTEX_FRAGMENT,
+-            GpuArrayBuffer::<Mesh2dUniform>::binding_layout(&render_device),
++            GpuArrayBuffer::<Mesh2dUniform>::binding_layout(&render_device.limits()),
+         ),
+     );
+     // A 1x1x1 'all 1.0' texture to use as a dummy texture to use in place of optional StandardMaterial textures
+@@ -355,7 +357,9 @@ pub fn init_mesh_2d_pipeline(
+         view_layout,
+         mesh_layout,
+         dummy_white_gpu_image,
+-        per_object_buffer_batch_size: GpuArrayBuffer::<Mesh2dUniform>::batch_size(&render_device),
++        per_object_buffer_batch_size: GpuArrayBuffer::<Mesh2dUniform>::batch_size(
++            &render_device.limits(),
++        ),
+         shader: load_embedded_asset!(asset_server.as_ref(), "mesh2d.wgsl"),
+     });
+ }

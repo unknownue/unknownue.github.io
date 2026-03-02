@@ -1,0 +1,902 @@
+diff --git a/crates/bevy_pbr/src/atmosphere/aerial_view_lut.wgsl b/crates/bevy_pbr/src/atmosphere/aerial_view_lut.wgsl
+index f7ba0ecb60cdc..0201165edaf45 100644
+--- a/crates/bevy_pbr/src/atmosphere/aerial_view_lut.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/aerial_view_lut.wgsl
+@@ -6,8 +6,8 @@
+         functions::{
+             sample_transmittance_lut, sample_atmosphere, rayleigh, henyey_greenstein,
+             sample_multiscattering_lut, AtmosphereSample, sample_local_inscattering,
+-            get_local_r, get_local_up, view_radius, uv_to_ndc, max_atmosphere_distance,
+-            uv_to_ray_direction, MIDPOINT_RATIO
++            uv_to_ndc, max_atmosphere_distance, uv_to_ray_direction, 
++            MIDPOINT_RATIO, get_view_position
+         },
+     }
+ }
+@@ -22,8 +22,9 @@ fn main(@builtin(global_invocation_id) idx: vec3<u32>) {
+ 
+     let uv = (vec2<f32>(idx.xy) + 0.5) / vec2<f32>(settings.aerial_view_lut_size.xy);
+     let ray_dir = uv_to_ray_direction(uv);
+-    let r = view_radius();
+-    let mu = ray_dir.y;
++    let world_pos = get_view_position();
++    
++    let r = length(world_pos);
+     let t_max = settings.aerial_view_lut_max_distance;
+ 
+     var prev_t = 0.0;
+@@ -36,15 +37,16 @@ fn main(@builtin(global_invocation_id) idx: vec3<u32>) {
+             let dt = (t_i - prev_t);
+             prev_t = t_i;
+ 
+-            let local_r = get_local_r(r, mu, t_i);
+-            let local_up = get_local_up(r, t_i, ray_dir.xyz);
++            let sample_pos = world_pos + ray_dir * t_i;
++            let local_r = length(sample_pos);
++            let local_up = normalize(sample_pos);
+ 
+             let local_atmosphere = sample_atmosphere(local_r);
+             let sample_optical_depth = local_atmosphere.extinction * dt;
+             let sample_transmittance = exp(-sample_optical_depth);
+ 
+             // evaluate one segment of the integral
+-            var inscattering = sample_local_inscattering(local_atmosphere, ray_dir.xyz, local_r, local_up);
++            var inscattering = sample_local_inscattering(local_atmosphere, ray_dir, sample_pos);
+ 
+             // Analytical integration of the single scattering term in the radiance transfer equation
+             let s_int = (inscattering - inscattering * sample_transmittance) / local_atmosphere.extinction;
+diff --git a/crates/bevy_pbr/src/atmosphere/environment.rs b/crates/bevy_pbr/src/atmosphere/environment.rs
+index af41fb11494ea..ce8370f543d93 100644
+--- a/crates/bevy_pbr/src/atmosphere/environment.rs
++++ b/crates/bevy_pbr/src/atmosphere/environment.rs
+@@ -3,7 +3,7 @@ use crate::{
+         AtmosphereSamplers, AtmosphereTextures, AtmosphereTransform, AtmosphereTransforms,
+         AtmosphereTransformsOffset,
+     },
+-    AtmosphereSettings, GpuLights, LightMeta, ViewLightsUniformOffset,
++    GpuAtmosphereSettings, GpuLights, LightMeta, ViewLightsUniformOffset,
+ };
+ use bevy_asset::{load_embedded_asset, AssetServer, Assets, Handle, RenderAssetUsages};
+ use bevy_ecs::{
+@@ -69,7 +69,7 @@ pub fn init_atmosphere_probe_layout(mut commands: Commands, render_device: Res<R
+             ShaderStages::COMPUTE,
+             (
+                 uniform_buffer::<Atmosphere>(true),
+-                uniform_buffer::<AtmosphereSettings>(true),
++                uniform_buffer::<GpuAtmosphereSettings>(true),
+                 uniform_buffer::<AtmosphereTransform>(true),
+                 uniform_buffer::<ViewUniform>(true),
+                 uniform_buffer::<GpuLights>(true),
+@@ -102,7 +102,7 @@ pub(super) fn prepare_atmosphere_probe_bind_groups(
+     lights_uniforms: Res<LightMeta>,
+     atmosphere_transforms: Res<AtmosphereTransforms>,
+     atmosphere_uniforms: Res<ComponentUniforms<Atmosphere>>,
+-    settings_uniforms: Res<ComponentUniforms<AtmosphereSettings>>,
++    settings_uniforms: Res<ComponentUniforms<GpuAtmosphereSettings>>,
+     mut commands: Commands,
+ ) {
+     for (entity, textures) in &probes {
+@@ -246,7 +246,7 @@ pub fn prepare_atmosphere_probe_components(
+ pub(super) struct EnvironmentNode {
+     main_view_query: QueryState<(
+         Read<DynamicUniformIndex<Atmosphere>>,
+-        Read<DynamicUniformIndex<AtmosphereSettings>>,
++        Read<DynamicUniformIndex<GpuAtmosphereSettings>>,
+         Read<AtmosphereTransformsOffset>,
+         Read<ViewUniformOffset>,
+         Read<ViewLightsUniformOffset>,
+diff --git a/crates/bevy_pbr/src/atmosphere/environment.wgsl b/crates/bevy_pbr/src/atmosphere/environment.wgsl
+index 099aabb84771c..3e96b41120f6e 100644
+--- a/crates/bevy_pbr/src/atmosphere/environment.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/environment.wgsl
+@@ -1,6 +1,6 @@
+ #import bevy_pbr::{
+     atmosphere::{
+-        functions::{direction_world_to_atmosphere, sample_sky_view_lut, view_radius},
++        functions::{direction_world_to_atmosphere, sample_sky_view_lut, get_view_position},
+     },
+     utils::sample_cube_dir
+ }
+@@ -22,14 +22,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+         (f32(global_id.y) + 0.5) / f32(dimensions.y)
+     );
+ 
+-    let r = view_radius();
+-
+     var ray_dir_ws = sample_cube_dir(uv, slice_index);
+     
+     // invert the z direction to account for cubemaps being lefthanded
+     ray_dir_ws.z = -ray_dir_ws.z;
+ 
+-    let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws.xyz);
++    let world_pos = get_view_position();
++    let r = length(world_pos);
++    let up = normalize(world_pos);
++
++    let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws.xyz, up);
+     let inscattering = sample_sky_view_lut(r, ray_dir_as);
+     let color = vec4<f32>(inscattering, 1.0);
+ 
+diff --git a/crates/bevy_pbr/src/atmosphere/functions.wgsl b/crates/bevy_pbr/src/atmosphere/functions.wgsl
+index fde0dfe368f3e..e63f22d4d58cc 100644
+--- a/crates/bevy_pbr/src/atmosphere/functions.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/functions.wgsl
+@@ -1,6 +1,6 @@
+ #define_import_path bevy_pbr::atmosphere::functions
+ 
+-#import bevy_render::maths::{PI, HALF_PI, PI_2, fast_acos, fast_acos_4, fast_atan2}
++#import bevy_render::maths::{PI, HALF_PI, PI_2, fast_acos, fast_acos_4, fast_atan2, ray_sphere_intersect}
+ 
+ #import bevy_pbr::atmosphere::{
+     types::Atmosphere,
+@@ -243,7 +243,9 @@ fn sample_atmosphere(r: f32) -> AtmosphereSample {
+ }
+ 
+ /// evaluates L_scat, equation 3 in the paper, which gives the total single-order scattering towards the view at a single point
+-fn sample_local_inscattering(local_atmosphere: AtmosphereSample, ray_dir: vec3<f32>, local_r: f32, local_up: vec3<f32>) -> vec3<f32> {
++fn sample_local_inscattering(local_atmosphere: AtmosphereSample, ray_dir: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
++    let local_r = length(world_pos);
++    let local_up = normalize(world_pos);
+     var inscattering = vec3(0.0);
+     for (var light_i: u32 = 0u; light_i < lights.n_directional_lights; light_i++) {
+         let light = &lights.directional_lights[light_i];
+@@ -276,8 +278,10 @@ fn sample_local_inscattering(local_atmosphere: AtmosphereSample, ray_dir: vec3<f
+ }
+ 
+ fn sample_sun_radiance(ray_dir_ws: vec3<f32>) -> vec3<f32> {
+-    let r = view_radius();
+-    let mu_view = ray_dir_ws.y;
++    let view_pos = get_view_position();
++    let r = length(view_pos);
++    let up = normalize(view_pos);
++    let mu_view = dot(ray_dir_ws, up);
+     let shadow_factor = f32(!ray_intersects_ground(r, mu_view));
+     var sun_radiance = vec3(0.0);
+     for (var light_i: u32 = 0u; light_i < lights.n_directional_lights; light_i++) {
+@@ -305,9 +309,21 @@ fn max_atmosphere_distance(r: f32, mu: f32) -> f32 {
+     return mix(t_top, t_bottom, f32(hits));
+ }
+ 
+-/// Assuming y=0 is the planet ground, returns the view radius in meters
+-fn view_radius() -> f32 {
+-    return max(view.world_position.y * settings.scene_units_to_m, EPSILON) + atmosphere.bottom_radius;
++/// Returns the observer's position in the atmosphere
++fn get_view_position() -> vec3<f32> {
++    var world_pos = view.world_position * settings.scene_units_to_m + vec3(0.0, atmosphere.bottom_radius, 0.0);
++    
++    // If the camera is underground, clamp it to the ground surface along the local up.
++    let r = length(world_pos);
++    // Nudge r above ground to avoid sqrt cancellation, zero-length segments where 
++    // r is equal to bottom_radius, which show up as black pixels
++    let min_radius = atmosphere.bottom_radius + EPSILON;
++    if r < min_radius {
++        let up = normalize(world_pos);
++        world_pos = up * min_radius;
++    }
++
++    return world_pos;
+ }
+ 
+ // We assume the `up` vector at the view position is the y axis, since the world is locally flat/level.
+@@ -334,9 +350,16 @@ fn ndc_to_uv(ndc: vec2<f32>) -> vec2<f32> {
+ }
+ 
+ /// Converts a direction in world space to atmosphere space
+-fn direction_world_to_atmosphere(dir_ws: vec3<f32>) -> vec3<f32> {
+-    let dir_as = atmosphere_transforms.atmosphere_from_world * vec4(dir_ws, 0.0);
+-    return dir_as.xyz;
++fn direction_world_to_atmosphere(dir_ws: vec3<f32>, up: vec3<f32>) -> vec3<f32> {
++    // Camera forward in world space (-Z in view to world transform)
++    let forward_ws = (view.world_from_view * vec4(0.0, 0.0, -1.0, 0.0)).xyz;
++    let tangent_z = normalize(up * dot(forward_ws, up) - forward_ws);
++    let tangent_x = cross(up, tangent_z);
++    return vec3(
++        dot(dir_ws, tangent_x),
++        dot(dir_ws, up),
++        dot(dir_ws, tangent_z),
++    );
+ }
+ 
+ /// Converts a direction in atmosphere space to world space
+@@ -346,8 +369,8 @@ fn direction_atmosphere_to_world(dir_as: vec3<f32>) -> vec3<f32> {
+ }
+ 
+ // Modified from skybox.wgsl. For this pass we don't need to apply a separate sky transform or consider camera viewport.
+-// w component is the cosine of the view direction with the view forward vector, to correct step distance at the edges of the viewport
+-fn uv_to_ray_direction(uv: vec2<f32>) -> vec4<f32> {
++// Returns a normalized ray direction in world space.
++fn uv_to_ray_direction(uv: vec2<f32>) -> vec3<f32> {
+     // Using world positions of the fragment and camera to calculate a ray direction
+     // breaks down at large translations. This code only needs to know the ray direction.
+     // The ray direction is along the direction from the camera to the fragment position.
+@@ -369,7 +392,7 @@ fn uv_to_ray_direction(uv: vec2<f32>) -> vec4<f32> {
+     // the translations from the view matrix.
+     let ray_direction = (view.world_from_view * vec4(view_ray_direction, 0.0)).xyz;
+ 
+-    return vec4(normalize(ray_direction), -view_ray_direction.z);
++    return normalize(ray_direction);
+ }
+ 
+ fn zenith_azimuth_to_ray_dir(zenith: f32, azimuth: f32) -> vec3<f32> {
+@@ -379,3 +402,127 @@ fn zenith_azimuth_to_ray_dir(zenith: f32, azimuth: f32) -> vec3<f32> {
+     let cos_azimuth = cos(azimuth);
+     return vec3(sin_azimuth * sin_zenith, mu, -cos_azimuth * sin_zenith);
+ }
++
++struct RaymarchSegment {
++    start: f32,
++    end: f32,
++}
++
++fn get_raymarch_segment(r: f32, mu: f32) -> RaymarchSegment {
++    // Get both intersection points with atmosphere
++    let atmosphere_intersections = ray_sphere_intersect(r, mu, atmosphere.top_radius);
++    let ground_intersections = ray_sphere_intersect(r, mu, atmosphere.bottom_radius);
++    
++    var segment: RaymarchSegment;
++    
++    if r < atmosphere.bottom_radius {
++        // Inside planet - start from bottom of atmosphere
++        segment.start = ground_intersections.y; // Use second intersection point with ground
++        segment.end = atmosphere_intersections.y;
++    } else if r < atmosphere.top_radius {
++        // Inside atmosphere
++        segment.start = 0.0;
++        segment.end = select(atmosphere_intersections.y, ground_intersections.x, ray_intersects_ground(r, mu));
++    } else {
++        // Outside atmosphere
++        if atmosphere_intersections.x < 0.0 {
++            // No intersection with atmosphere
++            return segment;
++        }
++        // Start at atmosphere entry, end at exit or ground
++        segment.start = atmosphere_intersections.x;
++        segment.end = select(atmosphere_intersections.y, ground_intersections.x, ray_intersects_ground(r, mu));
++    }
++
++    return segment;
++}
++
++struct RaymarchResult {
++    inscattering: vec3<f32>,
++    transmittance: vec3<f32>,
++}
++
++fn raymarch_atmosphere(
++    pos: vec3<f32>,
++    ray_dir: vec3<f32>,
++    t_max: f32,
++    max_samples: u32,
++    uv: vec2<f32>,
++    ground: bool
++) -> RaymarchResult {
++    let r = length(pos);
++    let up = normalize(pos);
++    let mu = dot(ray_dir, up);
++    
++    // Optimization: Reduce sample count at close proximity to the scene
++    let sample_count = mix(1.0, f32(max_samples), saturate(t_max * 0.01));
++    
++    let segment = get_raymarch_segment(r, mu);
++    let t_start = segment.start;
++    var t_end = segment.end;
++    
++    t_end = min(t_end, t_max);
++    let t_total = t_end - t_start;
++    
++    var result: RaymarchResult;
++    result.inscattering = vec3(0.0);
++    result.transmittance = vec3(1.0);
++    
++    // Skip if invalid segment
++    if t_total <= 0.0 {
++        return result;
++    }
++    
++    var prev_t = t_start;
++    var optical_depth = vec3(0.0);
++    for (var s = 0.0; s < sample_count; s += 1.0) {
++        // Linear distribution from atmosphere entry to exit/ground
++        let t_i = t_start + t_total * (s + MIDPOINT_RATIO) / sample_count;
++        let dt_i = (t_i - prev_t);
++        prev_t = t_i;
++
++        let sample_pos = pos + ray_dir * t_i;
++        let local_r = length(sample_pos);
++        let local_up = normalize(sample_pos);
++        let local_atmosphere = sample_atmosphere(local_r);
++
++        let sample_optical_depth = local_atmosphere.extinction * dt_i;
++        optical_depth += sample_optical_depth;
++        let sample_transmittance = exp(-sample_optical_depth);
++
++        let inscattering = sample_local_inscattering(
++            local_atmosphere,
++            ray_dir,
++            sample_pos
++        );
++
++        let s_int = (inscattering - inscattering * sample_transmittance) / local_atmosphere.extinction;
++        result.inscattering += result.transmittance * s_int;
++
++        result.transmittance *= sample_transmittance;
++        if all(result.transmittance < vec3(0.001)) {
++            break;
++        }
++    }
++
++    // include reflected luminance from planet ground 
++    if ground && ray_intersects_ground(r, mu) {
++        for (var light_i: u32 = 0u; light_i < lights.n_directional_lights; light_i++) {
++            let light = &lights.directional_lights[light_i];
++            let light_dir = (*light).direction_to_light;
++            let light_color = (*light).color.rgb;
++            let transmittance_to_ground = exp(-optical_depth);
++            // position on the sphere and get the sphere normal (up)
++            let sphere_point = pos + ray_dir * t_end;
++            let sphere_normal = normalize(sphere_point);
++            let mu_light = dot(light_dir, sphere_normal);
++            let transmittance_to_light = sample_transmittance_lut(0.0, mu_light);
++            let light_luminance = transmittance_to_light * max(mu_light, 0.0) * light_color;
++            // Normalized Lambert BRDF
++            let ground_luminance = transmittance_to_ground * atmosphere.ground_albedo / PI;
++            result.inscattering += ground_luminance * light_luminance;
++        }
++    }
++
++    return result;
++}
+\ No newline at end of file
+diff --git a/crates/bevy_pbr/src/atmosphere/mod.rs b/crates/bevy_pbr/src/atmosphere/mod.rs
+index dfc26c5ecb564..608cf02314bf4 100644
+--- a/crates/bevy_pbr/src/atmosphere/mod.rs
++++ b/crates/bevy_pbr/src/atmosphere/mod.rs
+@@ -103,10 +103,10 @@ impl Plugin for AtmospherePlugin {
+ 
+         app.add_plugins((
+             ExtractComponentPlugin::<Atmosphere>::default(),
+-            ExtractComponentPlugin::<AtmosphereSettings>::default(),
++            ExtractComponentPlugin::<GpuAtmosphereSettings>::default(),
+             ExtractComponentPlugin::<AtmosphereEnvironmentMap>::default(),
+             UniformComponentPlugin::<Atmosphere>::default(),
+-            UniformComponentPlugin::<AtmosphereSettings>::default(),
++            UniformComponentPlugin::<GpuAtmosphereSettings>::default(),
+         ))
+         .add_systems(Update, prepare_atmosphere_probe_components);
+     }
+@@ -350,7 +350,7 @@ impl ExtractComponent for Atmosphere {
+ /// The aerial-view lut is a 3d LUT fit to the view frustum, which stores the luminance
+ /// scattered towards the camera at each point (RGB channels), alongside the average
+ /// transmittance to that point (A channel).
+-#[derive(Clone, Component, Reflect, ShaderType)]
++#[derive(Clone, Component, Reflect)]
+ #[reflect(Clone, Default)]
+ pub struct AtmosphereSettings {
+     /// The size of the transmittance LUT
+@@ -396,6 +396,13 @@ pub struct AtmosphereSettings {
+     /// A conversion factor between scene units and meters, used to
+     /// ensure correctness at different length scales.
+     pub scene_units_to_m: f32,
++
++    /// The number of points to sample for each fragment when the using
++    /// ray marching to render the sky
++    pub sky_max_samples: u32,
++
++    /// The rendering method to use for the atmosphere.
++    pub rendering_method: AtmosphereMode,
+ }
+ 
+ impl Default for AtmosphereSettings {
+@@ -412,19 +419,65 @@ impl Default for AtmosphereSettings {
+             aerial_view_lut_samples: 10,
+             aerial_view_lut_max_distance: 3.2e4,
+             scene_units_to_m: 1.0,
++            sky_max_samples: 16,
++            rendering_method: AtmosphereMode::LookupTexture,
+         }
+     }
+ }
+ 
+-impl ExtractComponent for AtmosphereSettings {
++#[derive(Clone, Component, Reflect, ShaderType)]
++#[reflect(Default)]
++pub struct GpuAtmosphereSettings {
++    pub transmittance_lut_size: UVec2,
++    pub multiscattering_lut_size: UVec2,
++    pub sky_view_lut_size: UVec2,
++    pub aerial_view_lut_size: UVec3,
++    pub transmittance_lut_samples: u32,
++    pub multiscattering_lut_dirs: u32,
++    pub multiscattering_lut_samples: u32,
++    pub sky_view_lut_samples: u32,
++    pub aerial_view_lut_samples: u32,
++    pub aerial_view_lut_max_distance: f32,
++    pub scene_units_to_m: f32,
++    pub sky_max_samples: u32,
++    pub rendering_method: u32,
++}
++
++impl Default for GpuAtmosphereSettings {
++    fn default() -> Self {
++        AtmosphereSettings::default().into()
++    }
++}
++
++impl From<AtmosphereSettings> for GpuAtmosphereSettings {
++    fn from(s: AtmosphereSettings) -> Self {
++        Self {
++            transmittance_lut_size: s.transmittance_lut_size,
++            multiscattering_lut_size: s.multiscattering_lut_size,
++            sky_view_lut_size: s.sky_view_lut_size,
++            aerial_view_lut_size: s.aerial_view_lut_size,
++            transmittance_lut_samples: s.transmittance_lut_samples,
++            multiscattering_lut_dirs: s.multiscattering_lut_dirs,
++            multiscattering_lut_samples: s.multiscattering_lut_samples,
++            sky_view_lut_samples: s.sky_view_lut_samples,
++            aerial_view_lut_samples: s.aerial_view_lut_samples,
++            aerial_view_lut_max_distance: s.aerial_view_lut_max_distance,
++            scene_units_to_m: s.scene_units_to_m,
++            sky_max_samples: s.sky_max_samples,
++            rendering_method: s.rendering_method as u32,
++        }
++    }
++}
++
++impl ExtractComponent for GpuAtmosphereSettings {
+     type QueryData = Read<AtmosphereSettings>;
+ 
+     type QueryFilter = (With<Camera3d>, With<Atmosphere>);
+ 
+-    type Out = AtmosphereSettings;
++    type Out = GpuAtmosphereSettings;
+ 
+     fn extract_component(item: QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
+-        Some(item.clone())
++        Some(item.clone().into())
+     }
+ }
+ 
+@@ -435,3 +488,23 @@ fn configure_camera_depth_usages(
+         camera.depth_texture_usages.0 |= TextureUsages::TEXTURE_BINDING.bits();
+     }
+ }
++
++/// Selects how the atmosphere is rendered. Choose based on scene scale and
++/// volumetric shadow quality, and based on performance needs.
++#[repr(u32)]
++#[derive(Clone, Default, Reflect, Copy)]
++pub enum AtmosphereMode {
++    /// High-performance solution tailored to scenes that are mostly inside of the atmosphere.
++    /// Uses a set of lookup textures to approximate scattering integration.
++    /// Slightly less accurate for very long-distance/space views (lighting precision
++    /// tapers as the camera moves far from the scene origin) and for sharp volumetric
++    /// (cloud/fog) shadows.
++    #[default]
++    LookupTexture = 0,
++    /// Slower, more accurate rendering method for any type of scene.
++    /// Integrates the scattering numerically with raymarching and produces sharp volumetric
++    /// (cloud/fog) shadows.
++    /// Best for cinematic shots, planets seen from orbit, and scenes requiring
++    /// accurate long-distance lighting.
++    Raymarched = 1,
++}
+diff --git a/crates/bevy_pbr/src/atmosphere/node.rs b/crates/bevy_pbr/src/atmosphere/node.rs
+index eb4ba81666f66..13734ab07a980 100644
+--- a/crates/bevy_pbr/src/atmosphere/node.rs
++++ b/crates/bevy_pbr/src/atmosphere/node.rs
+@@ -16,7 +16,7 @@ use super::{
+         AtmosphereBindGroups, AtmosphereLutPipelines, AtmosphereTransformsOffset,
+         RenderSkyPipelineId,
+     },
+-    Atmosphere, AtmosphereSettings,
++    Atmosphere, GpuAtmosphereSettings,
+ };
+ 
+ #[derive(PartialEq, Eq, Debug, Copy, Clone, Hash, RenderLabel)]
+@@ -31,10 +31,10 @@ pub(super) struct AtmosphereLutsNode {}
+ 
+ impl ViewNode for AtmosphereLutsNode {
+     type ViewQuery = (
+-        Read<AtmosphereSettings>,
++        Read<GpuAtmosphereSettings>,
+         Read<AtmosphereBindGroups>,
+         Read<DynamicUniformIndex<Atmosphere>>,
+-        Read<DynamicUniformIndex<AtmosphereSettings>>,
++        Read<DynamicUniformIndex<GpuAtmosphereSettings>>,
+         Read<AtmosphereTransformsOffset>,
+         Read<ViewUniformOffset>,
+         Read<ViewLightsUniformOffset>,
+@@ -168,7 +168,7 @@ impl ViewNode for RenderSkyNode {
+         Read<AtmosphereBindGroups>,
+         Read<ViewTarget>,
+         Read<DynamicUniformIndex<Atmosphere>>,
+-        Read<DynamicUniformIndex<AtmosphereSettings>>,
++        Read<DynamicUniformIndex<GpuAtmosphereSettings>>,
+         Read<AtmosphereTransformsOffset>,
+         Read<ViewUniformOffset>,
+         Read<ViewLightsUniformOffset>,
+diff --git a/crates/bevy_pbr/src/atmosphere/render_sky.wgsl b/crates/bevy_pbr/src/atmosphere/render_sky.wgsl
+index 182415fbee32d..0e0d5485c963b 100644
+--- a/crates/bevy_pbr/src/atmosphere/render_sky.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/render_sky.wgsl
+@@ -2,12 +2,13 @@ enable dual_source_blending;
+ 
+ #import bevy_pbr::atmosphere::{
+     types::{Atmosphere, AtmosphereSettings},
+-    bindings::{atmosphere, view, atmosphere_transforms},
++    bindings::{atmosphere, view, atmosphere_transforms, settings},
+     functions::{
+         sample_transmittance_lut, sample_transmittance_lut_segment,
+         sample_sky_view_lut, direction_world_to_atmosphere,
+         uv_to_ray_direction, uv_to_ndc, sample_aerial_view_lut,
+-        view_radius, sample_sun_radiance, ndc_to_camera_dist
++        sample_sun_radiance, ndc_to_camera_dist, raymarch_atmosphere, 
++        get_view_position, max_atmosphere_distance
+     },
+ };
+ #import bevy_render::view::View;
+@@ -34,23 +35,38 @@ fn main(in: FullscreenVertexOutput) -> RenderSkyOutput {
+     let depth = textureLoad(depth_texture, vec2<i32>(in.position.xy), 0);
+ 
+     let ray_dir_ws = uv_to_ray_direction(in.uv);
+-    let r = view_radius();
+-    let mu = ray_dir_ws.y;
++    let world_pos = get_view_position();
++    let r = length(world_pos);
++    let up = normalize(world_pos);
++    let mu = dot(ray_dir_ws, up);
++    let max_samples = settings.sky_max_samples;
++    let should_raymarch = settings.rendering_method == 1u;
+ 
+     var transmittance: vec3<f32>;
+     var inscattering: vec3<f32>;
+ 
+-    let sun_radiance = sample_sun_radiance(ray_dir_ws.xyz);
++    let sun_radiance = sample_sun_radiance(ray_dir_ws);
+ 
+     if depth == 0.0 {
+-        let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws.xyz);
++        let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws, up);
+         transmittance = sample_transmittance_lut(r, mu);
+-        inscattering += sample_sky_view_lut(r, ray_dir_as);
++        inscattering = sample_sky_view_lut(r, ray_dir_as);
++        if should_raymarch {
++            let t_max = max_atmosphere_distance(r, mu);
++            let result = raymarch_atmosphere(world_pos, ray_dir_ws, t_max, max_samples, in.uv, true);
++            inscattering = result.inscattering;
++            transmittance = result.transmittance;
++        }
+         inscattering += sun_radiance * transmittance;
+     } else {
+         let t = ndc_to_camera_dist(vec3(uv_to_ndc(in.uv), depth));
+         inscattering = sample_aerial_view_lut(in.uv, t);
+         transmittance = sample_transmittance_lut_segment(r, mu, t);
++        if should_raymarch {
++            let result = raymarch_atmosphere(world_pos, ray_dir_ws, t, max_samples, in.uv, false);
++            inscattering = result.inscattering;
++            transmittance = result.transmittance;
++        }
+     }
+ 
+     // exposure compensation
+diff --git a/crates/bevy_pbr/src/atmosphere/resources.rs b/crates/bevy_pbr/src/atmosphere/resources.rs
+index ecabc6fe7bc12..fe487975e8d6f 100644
+--- a/crates/bevy_pbr/src/atmosphere/resources.rs
++++ b/crates/bevy_pbr/src/atmosphere/resources.rs
+@@ -22,7 +22,7 @@ use bevy_render::{
+ use bevy_shader::Shader;
+ use bevy_utils::default;
+ 
+-use super::{Atmosphere, AtmosphereSettings};
++use super::{Atmosphere, GpuAtmosphereSettings};
+ 
+ #[derive(Resource)]
+ pub(crate) struct AtmosphereBindGroupLayouts {
+@@ -49,7 +49,7 @@ impl FromWorld for AtmosphereBindGroupLayouts {
+                 ShaderStages::COMPUTE,
+                 (
+                     (0, uniform_buffer::<Atmosphere>(true)),
+-                    (1, uniform_buffer::<AtmosphereSettings>(true)),
++                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                     (
+                         // transmittance lut storage texture
+                         13,
+@@ -68,7 +68,7 @@ impl FromWorld for AtmosphereBindGroupLayouts {
+                 ShaderStages::COMPUTE,
+                 (
+                     (0, uniform_buffer::<Atmosphere>(true)),
+-                    (1, uniform_buffer::<AtmosphereSettings>(true)),
++                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                     (5, texture_2d(TextureSampleType::Float { filterable: true })), //transmittance lut and sampler
+                     (6, sampler(SamplerBindingType::Filtering)),
+                     (
+@@ -89,7 +89,7 @@ impl FromWorld for AtmosphereBindGroupLayouts {
+                 ShaderStages::COMPUTE,
+                 (
+                     (0, uniform_buffer::<Atmosphere>(true)),
+-                    (1, uniform_buffer::<AtmosphereSettings>(true)),
++                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                     (2, uniform_buffer::<AtmosphereTransform>(true)),
+                     (3, uniform_buffer::<ViewUniform>(true)),
+                     (4, uniform_buffer::<GpuLights>(true)),
+@@ -114,7 +114,7 @@ impl FromWorld for AtmosphereBindGroupLayouts {
+                 ShaderStages::COMPUTE,
+                 (
+                     (0, uniform_buffer::<Atmosphere>(true)),
+-                    (1, uniform_buffer::<AtmosphereSettings>(true)),
++                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                     (3, uniform_buffer::<ViewUniform>(true)),
+                     (4, uniform_buffer::<GpuLights>(true)),
+                     (5, texture_2d(TextureSampleType::Float { filterable: true })), //transmittance lut and sampler
+@@ -151,12 +151,14 @@ impl FromWorld for RenderSkyBindGroupLayouts {
+                 ShaderStages::FRAGMENT,
+                 (
+                     (0, uniform_buffer::<Atmosphere>(true)),
+-                    (1, uniform_buffer::<AtmosphereSettings>(true)),
++                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                     (2, uniform_buffer::<AtmosphereTransform>(true)),
+                     (3, uniform_buffer::<ViewUniform>(true)),
+                     (4, uniform_buffer::<GpuLights>(true)),
+                     (5, texture_2d(TextureSampleType::Float { filterable: true })), //transmittance lut and sampler
+                     (6, sampler(SamplerBindingType::Filtering)),
++                    (7, texture_2d(TextureSampleType::Float { filterable: true })), //multiscattering lut and sampler
++                    (8, sampler(SamplerBindingType::Filtering)),
+                     (9, texture_2d(TextureSampleType::Float { filterable: true })), //sky view lut and sampler
+                     (10, sampler(SamplerBindingType::Filtering)),
+                     (
+@@ -180,12 +182,14 @@ impl FromWorld for RenderSkyBindGroupLayouts {
+                 ShaderStages::FRAGMENT,
+                 (
+                     (0, uniform_buffer::<Atmosphere>(true)),
+-                    (1, uniform_buffer::<AtmosphereSettings>(true)),
++                    (1, uniform_buffer::<GpuAtmosphereSettings>(true)),
+                     (2, uniform_buffer::<AtmosphereTransform>(true)),
+                     (3, uniform_buffer::<ViewUniform>(true)),
+                     (4, uniform_buffer::<GpuLights>(true)),
+                     (5, texture_2d(TextureSampleType::Float { filterable: true })), //transmittance lut and sampler
+                     (6, sampler(SamplerBindingType::Filtering)),
++                    (7, texture_2d(TextureSampleType::Float { filterable: true })), //multiscattering lut and sampler
++                    (8, sampler(SamplerBindingType::Filtering)),
+                     (9, texture_2d(TextureSampleType::Float { filterable: true })), //sky view lut and sampler
+                     (10, sampler(SamplerBindingType::Filtering)),
+                     (
+@@ -410,7 +414,7 @@ pub struct AtmosphereTextures {
+ }
+ 
+ pub(super) fn prepare_atmosphere_textures(
+-    views: Query<(Entity, &AtmosphereSettings), With<Atmosphere>>,
++    views: Query<(Entity, &GpuAtmosphereSettings), With<Atmosphere>>,
+     render_device: Res<RenderDevice>,
+     mut texture_cache: ResMut<TextureCache>,
+     mut commands: Commands,
+@@ -498,7 +502,6 @@ impl AtmosphereTransforms {
+ #[derive(ShaderType)]
+ pub struct AtmosphereTransform {
+     world_from_atmosphere: Mat4,
+-    atmosphere_from_world: Mat4,
+ }
+ 
+ #[derive(Component)]
+@@ -542,13 +545,11 @@ pub(super) fn prepare_atmosphere_transforms(
+         let world_from_atmosphere =
+             Affine3A::from_cols(atmo_x, atmo_y, atmo_z, world_from_view.translation);
+ 
+-        let atmosphere_from_world = Mat4::from(world_from_atmosphere.inverse());
+         let world_from_atmosphere = Mat4::from(world_from_atmosphere);
+ 
+         commands.entity(entity).insert(AtmosphereTransformsOffset {
+             index: writer.write(&AtmosphereTransform {
+                 world_from_atmosphere,
+-                atmosphere_from_world,
+             }),
+         });
+     }
+@@ -576,7 +577,7 @@ pub(super) fn prepare_atmosphere_bind_groups(
+     lights_uniforms: Res<LightMeta>,
+     atmosphere_transforms: Res<AtmosphereTransforms>,
+     atmosphere_uniforms: Res<ComponentUniforms<Atmosphere>>,
+-    settings_uniforms: Res<ComponentUniforms<AtmosphereSettings>>,
++    settings_uniforms: Res<ComponentUniforms<GpuAtmosphereSettings>>,
+ 
+     mut commands: Commands,
+ ) {
+@@ -678,6 +679,8 @@ pub(super) fn prepare_atmosphere_bind_groups(
+                 (4, lights_binding.clone()),
+                 (5, &textures.transmittance_lut.default_view),
+                 (6, &samplers.transmittance_lut),
++                (7, &textures.multiscattering_lut.default_view),
++                (8, &samplers.multiscattering_lut),
+                 (9, &textures.sky_view_lut.default_view),
+                 (10, &samplers.sky_view_lut),
+                 (11, &textures.aerial_view_lut.default_view),
+diff --git a/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl b/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl
+index cf3d95b173c42..5bb7b9417df98 100644
+--- a/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl
+@@ -4,11 +4,11 @@
+         types::{Atmosphere, AtmosphereSettings},
+         bindings::{atmosphere, view, settings},
+         functions::{
+-            sample_atmosphere, get_local_up, AtmosphereSample,
+-            sample_local_inscattering, get_local_r, view_radius,
++            sample_atmosphere, AtmosphereSample,
++            sample_local_inscattering, get_view_position,
+             max_atmosphere_distance, direction_atmosphere_to_world,
+             sky_view_lut_uv_to_zenith_azimuth, zenith_azimuth_to_ray_dir,
+-            MIDPOINT_RATIO
++            MIDPOINT_RATIO, raymarch_atmosphere, EPSILON
+         },
+     }
+ }
+@@ -26,47 +26,19 @@
+ fn main(@builtin(global_invocation_id) idx: vec3<u32>) {
+     let uv = vec2<f32>(idx.xy) / vec2<f32>(settings.sky_view_lut_size);
+ 
+-    let r = view_radius();
++    let cam_pos = get_view_position();
++    let r = length(cam_pos);
+     var zenith_azimuth = sky_view_lut_uv_to_zenith_azimuth(r, uv);
+ 
+     let ray_dir_as = zenith_azimuth_to_ray_dir(zenith_azimuth.x, zenith_azimuth.y);
+     let ray_dir_ws = direction_atmosphere_to_world(ray_dir_as);
+ 
+-    let mu = ray_dir_ws.y;
++    let world_pos = vec3(0.0, r, 0.0);
++    let up = normalize(world_pos);
++    let mu = dot(ray_dir_ws, up);
+     let t_max = max_atmosphere_distance(r, mu);
+ 
+-    let sample_count = mix(1.0, f32(settings.sky_view_lut_samples), clamp(t_max * 0.01, 0.0, 1.0));
+-    var total_inscattering = vec3(0.0);
+-    var throughput = vec3(1.0);
+-    var prev_t = 0.0;
+-    for (var s = 0.0; s < sample_count; s += 1.0) {
+-        let t_i = t_max * (s + MIDPOINT_RATIO) / sample_count;
+-        let dt_i = (t_i - prev_t);
+-        prev_t = t_i;
++    let result = raymarch_atmosphere(world_pos, ray_dir_ws, t_max, settings.sky_view_lut_samples, uv, true);
+ 
+-        let local_r = get_local_r(r, mu, t_i);
+-        let local_up = get_local_up(r, t_i, ray_dir_ws);
+-        let local_atmosphere = sample_atmosphere(local_r);
+-
+-        let sample_optical_depth = local_atmosphere.extinction * dt_i;
+-        let sample_transmittance = exp(-sample_optical_depth);
+-
+-        let inscattering = sample_local_inscattering(
+-            local_atmosphere,
+-            ray_dir_ws,
+-            local_r,
+-            local_up
+-        );
+-
+-        // Analytical integration of the single scattering term in the radiance transfer equation
+-        let s_int = (inscattering - inscattering * sample_transmittance) / local_atmosphere.extinction;
+-        total_inscattering += throughput * s_int;
+-
+-        throughput *= sample_transmittance;
+-        if all(throughput < vec3(0.001)) {
+-            break;
+-        }
+-    }
+-
+-    textureStore(sky_view_lut_out, idx.xy, vec4(total_inscattering, 1.0));
++    textureStore(sky_view_lut_out, idx.xy, vec4(result.inscattering, 1.0));
+ }
+diff --git a/crates/bevy_pbr/src/atmosphere/types.wgsl b/crates/bevy_pbr/src/atmosphere/types.wgsl
+index 78e9e9a717192..f9207dd7228c5 100644
+--- a/crates/bevy_pbr/src/atmosphere/types.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/types.wgsl
+@@ -34,6 +34,8 @@ struct AtmosphereSettings {
+     aerial_view_lut_samples: u32,
+     aerial_view_lut_max_distance: f32,
+     scene_units_to_m: f32,
++    sky_max_samples: u32,
++    rendering_method: u32,
+ }
+ 
+ 
+@@ -41,5 +43,4 @@ struct AtmosphereSettings {
+ // so the horizon stays a horizontal line in our luts
+ struct AtmosphereTransforms {
+     world_from_atmosphere: mat4x4<f32>,
+-    atmosphere_from_world: mat4x4<f32>,
+ }
+diff --git a/crates/bevy_render/src/maths.wgsl b/crates/bevy_render/src/maths.wgsl
+index a5c556f9f1104..40dfebf892d54 100644
+--- a/crates/bevy_render/src/maths.wgsl
++++ b/crates/bevy_render/src/maths.wgsl
+@@ -99,6 +99,32 @@ fn sphere_intersects_plane_half_space(
+     return dot(plane, sphere_center) + sphere_radius > 0.0;
+ }
+ 
++// Returns the distances along the ray to its intersections with a sphere
++// centered at the origin.
++//
++// r: distance from the sphere center to the ray origin
++// mu: cosine of the zenith angle
++// sphere_radius: radius of the sphere
++//
++// Returns vec2(t0, t1). If there is no intersection, returns vec2(-1.0).
++fn ray_sphere_intersect(r: f32, mu: f32, sphere_radius: f32) -> vec2<f32> {
++    let discriminant = r * r * (mu * mu - 1.0) + sphere_radius * sphere_radius;
++    
++    // No intersection
++    if discriminant < 0.0 {
++        return vec2(-1.0);
++    }
++    
++    let q = -r * mu;
++    let sqrt_discriminant = sqrt(discriminant);
++    
++    // Return both intersection distances
++    return vec2(
++        q - sqrt_discriminant,
++        q + sqrt_discriminant
++    );
++}
++
+ // pow() but safe for NaNs/negatives
+ fn powsafe(color: vec3<f32>, power: f32) -> vec3<f32> {
+     return pow(abs(color), vec3(power)) * sign(color);
+diff --git a/release-content/release-notes/raymarched-atmosphere-space-views.md b/release-content/release-notes/raymarched-atmosphere-space-views.md
+new file mode 100644
+index 0000000000000..d582211d0e41b
+--- /dev/null
++++ b/release-content/release-notes/raymarched-atmosphere-space-views.md
+@@ -0,0 +1,55 @@
++---
++title: Raymarched atmosphere and space views
++authors: ["@mate-h"]
++pull_requests: [20766]
++---
++
++(Insert screenshot of space shot including volumetric shadows)
++
++Bevy's atmosphere now supports a raymarched rendering path that unlocks accurate views from above the atmosphere. This is ideal for cinematic shots, planets seen from space, and scenes that need sharp shadows through the volume of the atmosphere.
++
++### What changed
++
++- Added `AtmosphereMode::Raymarched`, as an alternative to the existing lookup texture method.
++- Added support for views from above the atmosphere.
++
++### When to choose which
++
++- LookupTexture
++  - Fastest, approximate lighting, inaccurate for long distance views
++  - Ground level and broad outdoor scenes
++  - Most cameras and typical view distances
++  - Softer shadows through the atmosphere
++- Raymarched
++  - Slightly slower, more accurate lighting
++  - Views from above the atmosphere or far from the scene
++  - Cinematic shots that demand stable lighting over a large range of scales
++  - Flight or space simulators
++  - Sharp, per‑pixel shadows through the atmosphere
++
++### How to use it
++
++Switch the rendering method on the camera’s `AtmosphereSettings`:
++
++```rust
++use bevy::prelude::*;
++use bevy::pbr::atmosphere::{Atmosphere, AtmosphereSettings, AtmosphereMode};
++
++fn setup(mut commands: Commands) {
++    commands.spawn((
++        Camera3d::default(),
++        Atmosphere::default(),
++        AtmosphereSettings { 
++          sky_max_samples: 16,
++          rendering_method: AtmosphereMode::Raymarched, 
++          ..Default::default() 
++        }
++    ));
++}
++```
++
++You can also adjust the `sky_max_samples` for controlling what is the maximum number of steps to take when raymarching the atmosphere, which is `16` by default to set the right balance between performance and accuracy.
++
++Keep the default method for most scenes. Use raymarching for cinematics, cameras positioned far from the scene, and shots requiring sharp volumetric shadows.
++
++See the updated `examples/3d/atmosphere.rs` for a working reference.

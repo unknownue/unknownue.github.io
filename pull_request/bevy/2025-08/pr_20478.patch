@@ -1,0 +1,579 @@
+diff --git a/crates/bevy_sprite/Cargo.toml b/crates/bevy_sprite/Cargo.toml
+index a1fefc62c7434..e259ed4138c3f 100644
+--- a/crates/bevy_sprite/Cargo.toml
++++ b/crates/bevy_sprite/Cargo.toml
+@@ -21,6 +21,7 @@ bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
+ bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.17.0-dev" }
+ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
+ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
++bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_picking = { path = "../bevy_picking", version = "0.17.0-dev", optional = true }
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index 1b7f45d5716c6..7f3b8f2f64089 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -35,6 +35,10 @@ pub mod prelude {
+     };
+ }
+ 
++use bevy_camera::{
++    primitives::{Aabb, MeshAabb as _},
++    visibility::{NoFrustumCulling, VisibilitySystems},
++};
+ pub use mesh2d::*;
+ #[cfg(feature = "bevy_sprite_picking_backend")]
+ pub use picking_backend::*;
+@@ -50,13 +54,9 @@ use bevy_ecs::prelude::*;
+ use bevy_image::{prelude::*, TextureAtlasPlugin};
+ use bevy_mesh::{Mesh, Mesh2d};
+ use bevy_render::{
+-    batching::sort_binned_render_phase,
+-    load_shader_library,
+-    primitives::{Aabb, MeshAabb},
+-    render_phase::AddRenderCommand,
+-    render_resource::SpecializedRenderPipelines,
+-    view::{NoFrustumCulling, VisibilitySystems},
+-    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
++    batching::sort_binned_render_phase, load_shader_library, render_phase::AddRenderCommand,
++    render_resource::SpecializedRenderPipelines, ExtractSchedule, Render, RenderApp, RenderStartup,
++    RenderSystems,
+ };
+ 
+ /// Adds support for 2D sprite rendering.
+diff --git a/crates/bevy_sprite/src/mesh2d/material.rs b/crates/bevy_sprite/src/mesh2d/material.rs
+index 48dcff4cb75c4..e1f5e6e78caf1 100644
+--- a/crates/bevy_sprite/src/mesh2d/material.rs
++++ b/crates/bevy_sprite/src/mesh2d/material.rs
+@@ -6,6 +6,7 @@ use crate::{
+ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_asset::prelude::AssetChanged;
+ use bevy_asset::{AsAssetId, Asset, AssetApp, AssetEventSystems, AssetId, AssetServer, Handle};
++use bevy_camera::visibility::ViewVisibility;
+ use bevy_core_pipeline::{
+     core_2d::{
+         AlphaMask2d, AlphaMask2dBinKey, BatchSetKey2d, Opaque2d, Opaque2dBinKey, Transparent2d,
+@@ -23,30 +24,26 @@ use bevy_math::FloatOrd;
+ use bevy_mesh::MeshVertexBufferLayoutRef;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{prelude::ReflectDefault, Reflect};
+-use bevy_render::camera::extract_cameras;
+-use bevy_render::render_phase::{DrawFunctionId, InputUniformIndex};
+-use bevy_render::render_resource::{CachedRenderPipelineId, ShaderDefVal};
+-use bevy_render::view::RenderVisibleEntities;
+-use bevy_render::RenderStartup;
+ use bevy_render::{
++    camera::extract_cameras,
+     mesh::RenderMesh,
+     render_asset::{
+         prepare_assets, PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets,
+     },
+     render_phase::{
+-        AddRenderCommand, BinnedRenderPhaseType, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
+-        RenderCommand, RenderCommandResult, SetItemPipeline, TrackedRenderPass,
+-        ViewBinnedRenderPhases, ViewSortedRenderPhases,
++        AddRenderCommand, BinnedRenderPhaseType, DrawFunctionId, DrawFunctions, InputUniformIndex,
++        PhaseItem, PhaseItemExtraIndex, RenderCommand, RenderCommandResult, SetItemPipeline,
++        TrackedRenderPass, ViewBinnedRenderPhases, ViewSortedRenderPhases,
+     },
+     render_resource::{
+         AsBindGroup, AsBindGroupError, BindGroup, BindGroupId, BindGroupLayout, BindingResources,
+-        PipelineCache, RenderPipelineDescriptor, Shader, ShaderRef, SpecializedMeshPipeline,
+-        SpecializedMeshPipelineError, SpecializedMeshPipelines,
++        CachedRenderPipelineId, PipelineCache, RenderPipelineDescriptor, Shader, ShaderDefVal,
++        ShaderRef, SpecializedMeshPipeline, SpecializedMeshPipelineError, SpecializedMeshPipelines,
+     },
+     renderer::RenderDevice,
+     sync_world::{MainEntity, MainEntityHashMap},
+-    view::{ExtractedView, ViewVisibility},
+-    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
++    view::{ExtractedView, RenderVisibleEntities},
++    Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_utils::Parallel;
+ use core::{hash::Hash, marker::PhantomData};
+diff --git a/crates/bevy_sprite/src/mesh2d/mesh.rs b/crates/bevy_sprite/src/mesh2d/mesh.rs
+index d30dcd1782b9b..3cc009d37b4b6 100644
+--- a/crates/bevy_sprite/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite/src/mesh2d/mesh.rs
+@@ -1,13 +1,14 @@
+ use bevy_app::Plugin;
+ use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, AssetServer, Handle};
++use bevy_camera::{visibility::ViewVisibility, Camera2d};
+ use bevy_render::{load_shader_library, RenderStartup};
+ 
+ use crate::{tonemapping_pipeline_key, Material2dBindGroupId};
+-use bevy_core_pipeline::tonemapping::DebandDither;
+ use bevy_core_pipeline::{
+-    core_2d::{AlphaMask2d, Camera2d, Opaque2d, Transparent2d, CORE_2D_DEPTH_FORMAT},
++    core_2d::{AlphaMask2d, Opaque2d, Transparent2d, CORE_2D_DEPTH_FORMAT},
+     tonemapping::{
+-        get_lut_bind_group_layout_entries, get_lut_bindings, Tonemapping, TonemappingLuts,
++        get_lut_bind_group_layout_entries, get_lut_bindings, DebandDither, Tonemapping,
++        TonemappingLuts,
+     },
+ };
+ use bevy_derive::{Deref, DerefMut};
+@@ -43,9 +44,7 @@ use bevy_render::{
+     renderer::{RenderDevice, RenderQueue},
+     sync_world::{MainEntity, MainEntityHashMap},
+     texture::{DefaultImageSampler, FallbackImage, GpuImage},
+-    view::{
+-        ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms, ViewVisibility,
+-    },
++    view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+ };
+ use bevy_transform::components::GlobalTransform;
+diff --git a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+index cf3493c87c3bb..e08b3e41d4392 100644
+--- a/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
++++ b/crates/bevy_sprite/src/mesh2d/wireframe2d.rs
+@@ -7,11 +7,9 @@ use bevy_asset::{
+     embedded_asset, load_embedded_asset, prelude::AssetChanged, AsAssetId, Asset, AssetApp,
+     AssetEventSystems, AssetId, AssetServer, Assets, Handle, UntypedAssetId,
+ };
++use bevy_camera::{visibility::ViewVisibility, Camera, Camera2d};
+ use bevy_color::{Color, ColorToComponents};
+-use bevy_core_pipeline::core_2d::{
+-    graph::{Core2d, Node2d},
+-    Camera2d,
+-};
++use bevy_core_pipeline::core_2d::graph::{Core2d, Node2d};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     component::Tick,
+diff --git a/crates/bevy_sprite/src/picking_backend.rs b/crates/bevy_sprite/src/picking_backend.rs
+index a3a7c3a3db24f..9ade56bbc7102 100644
+--- a/crates/bevy_sprite/src/picking_backend.rs
++++ b/crates/bevy_sprite/src/picking_backend.rs
+@@ -13,13 +13,13 @@
+ use crate::{Anchor, Sprite};
+ use bevy_app::prelude::*;
+ use bevy_asset::prelude::*;
++use bevy_camera::{visibility::ViewVisibility, Camera, Projection};
+ use bevy_color::Alpha;
+ use bevy_ecs::prelude::*;
+ use bevy_image::prelude::*;
+ use bevy_math::{prelude::*, FloatExt};
+ use bevy_picking::backend::prelude::*;
+ use bevy_reflect::prelude::*;
+-use bevy_render::prelude::*;
+ use bevy_transform::prelude::*;
+ use bevy_window::PrimaryWindow;
+ 
+diff --git a/crates/bevy_sprite/src/render/mod.rs b/crates/bevy_sprite/src/render/mod.rs
+index 915e1ef83eaac..e17830ec86163 100644
+--- a/crates/bevy_sprite/src/render/mod.rs
++++ b/crates/bevy_sprite/src/render/mod.rs
+@@ -2,6 +2,7 @@ use core::ops::Range;
+ 
+ use crate::{Anchor, ComputedTextureSlices, ScalingMode, Sprite};
+ use bevy_asset::{load_embedded_asset, AssetEvent, AssetId, AssetServer, Assets, Handle};
++use bevy_camera::visibility::ViewVisibility;
+ use bevy_color::{ColorToComponents, LinearRgba};
+ use bevy_core_pipeline::{
+     core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT},
+@@ -34,10 +35,7 @@ use bevy_render::{
+     renderer::{RenderDevice, RenderQueue},
+     sync_world::RenderEntity,
+     texture::{DefaultImageSampler, FallbackImage, GpuImage},
+-    view::{
+-        ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms,
+-        ViewVisibility,
+-    },
++    view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+     Extract,
+ };
+ use bevy_transform::components::GlobalTransform;
+diff --git a/crates/bevy_sprite/src/sprite.rs b/crates/bevy_sprite/src/sprite.rs
+index 39e215df0406e..47bbb18390cb9 100644
+--- a/crates/bevy_sprite/src/sprite.rs
++++ b/crates/bevy_sprite/src/sprite.rs
+@@ -1,14 +1,12 @@
+ use bevy_asset::{Assets, Handle};
++use bevy_camera::visibility::{self, Visibility, VisibilityClass};
+ use bevy_color::Color;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{component::Component, reflect::ReflectComponent};
+ use bevy_image::{Image, TextureAtlas, TextureAtlasLayout};
+ use bevy_math::{Rect, UVec2, Vec2};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::{
+-    sync_world::SyncToRenderWorld,
+-    view::{self, Visibility, VisibilityClass},
+-};
++use bevy_render::sync_world::SyncToRenderWorld;
+ use bevy_transform::components::Transform;
+ 
+ use crate::TextureSlicer;
+@@ -17,7 +15,7 @@ use crate::TextureSlicer;
+ #[derive(Component, Debug, Default, Clone, Reflect)]
+ #[require(Transform, Visibility, SyncToRenderWorld, VisibilityClass, Anchor)]
+ #[reflect(Component, Default, Debug, Clone)]
+-#[component(on_add = view::add_visibility_class::<Sprite>)]
++#[component(on_add = visibility::add_visibility_class::<Sprite>)]
+ pub struct Sprite {
+     /// The image used to render the sprite
+     pub image: Handle<Image>,
+diff --git a/crates/bevy_text/Cargo.toml b/crates/bevy_text/Cargo.toml
+index b99c329ba1348..e8b237f5e691d 100644
+--- a/crates/bevy_text/Cargo.toml
++++ b/crates/bevy_text/Cargo.toml
+@@ -22,6 +22,7 @@ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
+ bevy_log = { path = "../bevy_log", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
++bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_sprite = { path = "../bevy_sprite", version = "0.17.0-dev" }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 46af2b04242c5..56ff703ccaceb 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -43,6 +43,7 @@ mod text;
+ mod text2d;
+ mod text_access;
+ 
++use bevy_camera::{visibility::VisibilitySystems, CameraUpdateSystems};
+ pub use bounds::*;
+ pub use error::*;
+ pub use font::*;
+@@ -69,9 +70,7 @@ pub mod prelude {
+ use bevy_app::{prelude::*, AnimationSystems};
+ use bevy_asset::{AssetApp, AssetEventSystems};
+ use bevy_ecs::prelude::*;
+-use bevy_render::{
+-    camera::CameraUpdateSystems, view::VisibilitySystems, ExtractSchedule, RenderApp,
+-};
++use bevy_render::{ExtractSchedule, RenderApp};
+ use bevy_sprite::SpriteSystems;
+ 
+ /// The raw data for the default font used by `bevy_text`
+diff --git a/crates/bevy_text/src/text2d.rs b/crates/bevy_text/src/text2d.rs
+index edda540a7fd4b..0ddce86eed720 100644
+--- a/crates/bevy_text/src/text2d.rs
++++ b/crates/bevy_text/src/text2d.rs
+@@ -5,6 +5,10 @@ use crate::{
+     TextSpanAccess, TextWriter,
+ };
+ use bevy_asset::Assets;
++use bevy_camera::primitives::Aabb;
++use bevy_camera::visibility::{
++    self, NoFrustumCulling, ViewVisibility, Visibility, VisibilityClass,
++};
+ use bevy_color::LinearRgba;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::entity::EntityHashSet;
+@@ -20,12 +24,7 @@ use bevy_image::prelude::*;
+ use bevy_math::{Vec2, Vec3};
+ use bevy_reflect::{prelude::ReflectDefault, Reflect};
+ use bevy_render::sync_world::TemporaryRenderEntity;
+-use bevy_render::view::{self, Visibility, VisibilityClass};
+-use bevy_render::{
+-    primitives::Aabb,
+-    view::{NoFrustumCulling, ViewVisibility},
+-    Extract,
+-};
++use bevy_render::Extract;
+ use bevy_sprite::{
+     Anchor, ExtractedSlice, ExtractedSlices, ExtractedSprite, ExtractedSprites, Sprite,
+ };
+@@ -94,7 +93,7 @@ use bevy_window::{PrimaryWindow, Window};
+     VisibilityClass,
+     Transform
+ )]
+-#[component(on_add = view::add_visibility_class::<Sprite>)]
++#[component(on_add = visibility::add_visibility_class::<Sprite>)]
+ pub struct Text2d(pub String);
+ 
+ impl Text2d {
+diff --git a/crates/bevy_ui/Cargo.toml b/crates/bevy_ui/Cargo.toml
+index 3a8f1c484b45d..71bc02bc7abe2 100644
+--- a/crates/bevy_ui/Cargo.toml
++++ b/crates/bevy_ui/Cargo.toml
+@@ -13,6 +13,7 @@ keywords = ["bevy"]
+ bevy_a11y = { path = "../bevy_a11y", version = "0.17.0-dev" }
+ bevy_app = { path = "../bevy_app", version = "0.17.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
++bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
+ bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.17.0-dev" }
+ bevy_derive = { path = "../bevy_derive", version = "0.17.0-dev" }
+diff --git a/crates/bevy_ui/src/accessibility.rs b/crates/bevy_ui/src/accessibility.rs
+index 78e80717a21ff..81c78a50a2da8 100644
+--- a/crates/bevy_ui/src/accessibility.rs
++++ b/crates/bevy_ui/src/accessibility.rs
+@@ -16,7 +16,7 @@ use bevy_ecs::{
+ };
+ 
+ use accesskit::{Node, Rect, Role};
+-use bevy_render::camera::CameraUpdateSystems;
++use bevy_camera::CameraUpdateSystems;
+ 
+ fn calc_label(
+     text_reader: &mut TextUiReader,
+diff --git a/crates/bevy_ui/src/experimental/ghost_hierarchy.rs b/crates/bevy_ui/src/experimental/ghost_hierarchy.rs
+index 9134f5eebac75..3ae45377ebeaa 100644
+--- a/crates/bevy_ui/src/experimental/ghost_hierarchy.rs
++++ b/crates/bevy_ui/src/experimental/ghost_hierarchy.rs
+@@ -3,12 +3,12 @@
+ #[cfg(feature = "ghost_nodes")]
+ use crate::ui_node::ComputedNodeTarget;
+ use crate::Node;
++#[cfg(feature = "ghost_nodes")]
++use bevy_camera::visibility::Visibility;
+ use bevy_ecs::{prelude::*, system::SystemParam};
+ #[cfg(feature = "ghost_nodes")]
+ use bevy_reflect::prelude::*;
+ #[cfg(feature = "ghost_nodes")]
+-use bevy_render::view::Visibility;
+-#[cfg(feature = "ghost_nodes")]
+ use bevy_transform::prelude::Transform;
+ #[cfg(feature = "ghost_nodes")]
+ use smallvec::SmallVec;
+diff --git a/crates/bevy_ui/src/focus.rs b/crates/bevy_ui/src/focus.rs
+index 7b02d4a0b8e85..03f022c7627af 100644
+--- a/crates/bevy_ui/src/focus.rs
++++ b/crates/bevy_ui/src/focus.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+     ui_transform::UiGlobalTransform, ComputedNode, ComputedNodeTarget, Node, OverrideClip, UiStack,
+ };
++use bevy_camera::{visibility::InheritedVisibility, Camera, NormalizedRenderTarget};
+ use bevy_ecs::{
+     change_detection::DetectChangesMut,
+     entity::{ContainsEntity, Entity},
+@@ -14,7 +15,6 @@ use bevy_input::{mouse::MouseButton, touch::Touches, ButtonInput};
+ use bevy_math::Vec2;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::{camera::NormalizedRenderTarget, prelude::Camera, view::InheritedVisibility};
+ use bevy_window::{PrimaryWindow, Window};
+ 
+ use smallvec::SmallVec;
+diff --git a/crates/bevy_ui/src/layout/mod.rs b/crates/bevy_ui/src/layout/mod.rs
+index 3d011358fe7c9..9a077acb17ea2 100644
+--- a/crates/bevy_ui/src/layout/mod.rs
++++ b/crates/bevy_ui/src/layout/mod.rs
+@@ -356,12 +356,12 @@ mod tests {
+     use taffy::TraversePartialTree;
+ 
+     use bevy_asset::{AssetEvent, Assets};
+-    use bevy_core_pipeline::core_2d::Camera2d;
++    use bevy_camera::{Camera, Camera2d};
+     use bevy_ecs::{prelude::*, system::RunSystemOnce};
+     use bevy_image::Image;
+     use bevy_math::{Rect, UVec2, Vec2};
+     use bevy_platform::collections::HashMap;
+-    use bevy_render::{prelude::Camera, texture::ManualTextureViews};
++    use bevy_render::texture::ManualTextureViews;
+     use bevy_transform::systems::mark_dirty_trees;
+     use bevy_transform::systems::{propagate_parent_transforms, sync_simple_transforms};
+     use bevy_utils::prelude::default;
+@@ -814,7 +814,7 @@ mod tests {
+                 let viewport_height = primary_window.resolution.physical_height();
+                 let physical_position = UVec2::new(viewport_width * camera_index as u32, 0);
+                 let physical_size = UVec2::new(viewport_width, viewport_height);
+-                camera.viewport = Some(bevy_render::camera::Viewport {
++                camera.viewport = Some(bevy_camera::Viewport {
+                     physical_position,
+                     physical_size,
+                     ..default()
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index ddee3a8d9e7f0..e75f1ed96cd8d 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -69,9 +69,9 @@ pub mod prelude {
+ }
+ 
+ use bevy_app::{prelude::*, AnimationSystems, HierarchyPropagatePlugin, PropagateSet};
++use bevy_camera::CameraUpdateSystems;
+ use bevy_ecs::prelude::*;
+ use bevy_input::InputSystems;
+-use bevy_render::camera::CameraUpdateSystems;
+ use bevy_transform::TransformSystems;
+ use layout::ui_surface::UiSurface;
+ use stack::ui_stack_system;
+diff --git a/crates/bevy_ui/src/picking_backend.rs b/crates/bevy_ui/src/picking_backend.rs
+index 6a393744ee0ab..1c229920fc457 100644
+--- a/crates/bevy_ui/src/picking_backend.rs
++++ b/crates/bevy_ui/src/picking_backend.rs
+@@ -26,11 +26,11 @@
+ 
+ use crate::{clip_check_recursive, prelude::*, ui_transform::UiGlobalTransform, UiStack};
+ use bevy_app::prelude::*;
++use bevy_camera::{visibility::InheritedVisibility, Camera};
+ use bevy_ecs::{prelude::*, query::QueryData};
+ use bevy_math::Vec2;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::prelude::*;
+ use bevy_window::PrimaryWindow;
+ 
+ use bevy_picking::backend::prelude::*;
+diff --git a/crates/bevy_ui/src/ui_node.rs b/crates/bevy_ui/src/ui_node.rs
+index d6549b6722f79..41dcd7030fd51 100644
+--- a/crates/bevy_ui/src/ui_node.rs
++++ b/crates/bevy_ui/src/ui_node.rs
+@@ -2,15 +2,12 @@ use crate::{
+     ui_transform::{UiGlobalTransform, UiTransform},
+     FocusPolicy, UiRect, Val,
+ };
++use bevy_camera::{visibility::Visibility, Camera, RenderTarget};
+ use bevy_color::{Alpha, Color};
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{prelude::*, system::SystemParam};
+ use bevy_math::{vec4, Rect, UVec2, Vec2, Vec4Swizzles};
+ use bevy_reflect::prelude::*;
+-use bevy_render::{
+-    camera::{Camera, RenderTarget},
+-    view::Visibility,
+-};
+ use bevy_sprite::BorderRect;
+ use bevy_utils::once;
+ use bevy_window::{PrimaryWindow, WindowRef};
+@@ -2720,7 +2717,7 @@ impl Default for LayoutConfig {
+ /// Indicates that this root [`Node`] entity should be rendered to a specific camera.
+ ///
+ /// UI then will be laid out respecting the camera's viewport and scale factor, and
+-/// rendered to this camera's [`bevy_render::camera::RenderTarget`].
++/// rendered to this camera's [`bevy_camera::RenderTarget`].
+ ///
+ /// Setting this component on a non-root node will have no effect. It will be overridden
+ /// by the root node's component.
+@@ -2750,7 +2747,7 @@ impl UiTargetCamera {
+ /// ```
+ /// # use bevy_ui::prelude::*;
+ /// # use bevy_ecs::prelude::Commands;
+-/// # use bevy_render::camera::{Camera, RenderTarget};
++/// # use bevy_camera::{Camera, RenderTarget};
+ /// # use bevy_core_pipeline::prelude::Camera2d;
+ /// # use bevy_window::{Window, WindowRef};
+ ///
+diff --git a/crates/bevy_ui/src/update.rs b/crates/bevy_ui/src/update.rs
+index b49e1f90c4db6..1978f6b3a4a18 100644
+--- a/crates/bevy_ui/src/update.rs
++++ b/crates/bevy_ui/src/update.rs
+@@ -9,13 +9,13 @@ use crate::{
+ 
+ use super::ComputedNode;
+ use bevy_app::Propagate;
++use bevy_camera::Camera;
+ use bevy_ecs::{
+     entity::Entity,
+     query::Has,
+     system::{Commands, Query, Res},
+ };
+ use bevy_math::{Rect, UVec2};
+-use bevy_render::camera::Camera;
+ use bevy_sprite::BorderRect;
+ 
+ /// Updates clipping for all nodes
+@@ -180,14 +180,14 @@ mod tests {
+     use bevy_app::PropagateSet;
+     use bevy_asset::AssetEvent;
+     use bevy_asset::Assets;
+-    use bevy_core_pipeline::core_2d::Camera2d;
++    use bevy_camera::Camera;
++    use bevy_camera::Camera2d;
++    use bevy_camera::RenderTarget;
+     use bevy_ecs::event::Events;
+     use bevy_ecs::hierarchy::ChildOf;
+     use bevy_ecs::schedule::IntoScheduleConfigs;
+     use bevy_image::Image;
+     use bevy_math::UVec2;
+-    use bevy_render::camera::Camera;
+-    use bevy_render::camera::RenderTarget;
+     use bevy_render::texture::ManualTextureViews;
+     use bevy_utils::default;
+     use bevy_window::PrimaryWindow;
+diff --git a/crates/bevy_ui/src/widget/viewport.rs b/crates/bevy_ui/src/widget/viewport.rs
+index 5002813cd4de9..0851d4d8303a8 100644
+--- a/crates/bevy_ui/src/widget/viewport.rs
++++ b/crates/bevy_ui/src/widget/viewport.rs
+@@ -1,4 +1,7 @@
+ use bevy_asset::Assets;
++use bevy_camera::Camera;
++#[cfg(feature = "bevy_ui_picking_backend")]
++use bevy_camera::NormalizedRenderTarget;
+ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+@@ -24,9 +27,6 @@ use bevy_picking::{
+ #[cfg(feature = "bevy_ui_picking_backend")]
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::Reflect;
+-use bevy_render::camera::Camera;
+-#[cfg(feature = "bevy_ui_picking_backend")]
+-use bevy_render::camera::NormalizedRenderTarget;
+ #[cfg(feature = "bevy_ui_picking_backend")]
+ use bevy_transform::components::GlobalTransform;
+ #[cfg(feature = "bevy_ui_picking_backend")]
+diff --git a/crates/bevy_ui_render/Cargo.toml b/crates/bevy_ui_render/Cargo.toml
+index 970836ae9e79f..27098585541ef 100644
+--- a/crates/bevy_ui_render/Cargo.toml
++++ b/crates/bevy_ui_render/Cargo.toml
+@@ -12,6 +12,7 @@ keywords = ["bevy"]
+ # bevy
+ bevy_app = { path = "../bevy_app", version = "0.17.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.17.0-dev" }
++bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_color = { path = "../bevy_color", version = "0.17.0-dev" }
+ bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.17.0-dev" }
+ bevy_derive = { path = "../bevy_derive", version = "0.17.0-dev" }
+diff --git a/crates/bevy_ui_render/src/box_shadow.rs b/crates/bevy_ui_render/src/box_shadow.rs
+index d31610d0713c9..6751b059638bb 100644
+--- a/crates/bevy_ui_render/src/box_shadow.rs
++++ b/crates/bevy_ui_render/src/box_shadow.rs
+@@ -4,6 +4,7 @@ use core::{hash::Hash, ops::Range};
+ 
+ use bevy_app::prelude::*;
+ use bevy_asset::*;
++use bevy_camera::visibility::InheritedVisibility;
+ use bevy_color::{Alpha, ColorToComponents, LinearRgba};
+ use bevy_ecs::prelude::*;
+ use bevy_ecs::{
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index f993d4860dae6..5683313b7fe02 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -18,6 +18,8 @@ pub mod ui_texture_slice_pipeline;
+ #[cfg(feature = "bevy_ui_debug")]
+ mod debug_overlay;
+ 
++use bevy_camera::visibility::InheritedVisibility;
++use bevy_camera::{Camera, Camera2d, Camera3d};
+ use bevy_reflect::prelude::ReflectDefault;
+ use bevy_reflect::Reflect;
+ use bevy_ui::widget::{ImageNode, TextShadow, ViewportNode};
+@@ -31,7 +33,6 @@ use bevy_asset::{AssetEvent, AssetId, Assets};
+ use bevy_color::{Alpha, ColorToComponents, LinearRgba};
+ use bevy_core_pipeline::core_2d::graph::{Core2d, Node2d};
+ use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
+-use bevy_core_pipeline::{core_2d::Camera2d, core_3d::Camera3d};
+ use bevy_ecs::prelude::*;
+ use bevy_ecs::system::SystemParam;
+ use bevy_image::prelude::*;
+@@ -41,9 +42,9 @@ use bevy_render::render_phase::ViewSortedRenderPhases;
+ use bevy_render::renderer::RenderContext;
+ use bevy_render::sync_world::MainEntity;
+ use bevy_render::texture::TRANSPARENT_IMAGE_HANDLE;
+-use bevy_render::view::{Hdr, InheritedVisibility, RetainedViewEntity};
++use bevy_render::view::{Hdr, RetainedViewEntity};
++use bevy_render::{load_shader_library, RenderStartup};
+ use bevy_render::{
+-    camera::Camera,
+     render_asset::RenderAssets,
+     render_graph::{Node as RenderGraphNode, RenderGraph},
+     render_phase::{sort_phase_system, AddRenderCommand, DrawFunctions},
+@@ -52,7 +53,6 @@ use bevy_render::{
+     view::{ExtractedView, ViewUniforms},
+     Extract, RenderApp, RenderSystems,
+ };
+-use bevy_render::{load_shader_library, RenderStartup};
+ use bevy_render::{
+     render_phase::{PhaseItem, PhaseItemExtraIndex},
+     sync_world::{RenderEntity, TemporaryRenderEntity},

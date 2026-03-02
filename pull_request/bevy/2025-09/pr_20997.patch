@@ -1,0 +1,337 @@
+diff --git a/crates/bevy_ecs/src/entity/mod.rs b/crates/bevy_ecs/src/entity/mod.rs
+index 07404459c6c36..f16319318f8d2 100644
+--- a/crates/bevy_ecs/src/entity/mod.rs
++++ b/crates/bevy_ecs/src/entity/mod.rs
+@@ -972,10 +972,10 @@ impl Entities {
+     /// # Safety
+     ///  - `index` must be a valid entity index.
+     #[inline]
+-    pub(crate) unsafe fn mark_spawn_despawn(&mut self, index: u32, by: MaybeLocation, at: Tick) {
++    pub(crate) unsafe fn mark_spawn_despawn(&mut self, index: u32, by: MaybeLocation, tick: Tick) {
+         // SAFETY: Caller guarantees that `index` a valid entity index
+         let meta = unsafe { self.meta.get_unchecked_mut(index as usize) };
+-        meta.spawned_or_despawned = SpawnedOrDespawned { by, at };
++        meta.spawned_or_despawned = SpawnedOrDespawned { by, tick };
+     }
+ 
+     /// Increments the `generation` of a freed [`Entity`]. The next entity ID allocated with this
+@@ -1037,7 +1037,7 @@ impl Entities {
+         &mut self,
+         mut init: impl FnMut(Entity, &mut EntityIdLocation),
+         by: MaybeLocation,
+-        at: Tick,
++        tick: Tick,
+     ) {
+         let free_cursor = self.free_cursor.get_mut();
+         let current_free_cursor = *free_cursor;
+@@ -1055,7 +1055,7 @@ impl Entities {
+                     Entity::from_raw_and_generation(row, meta.generation),
+                     &mut meta.location,
+                 );
+-                meta.spawned_or_despawned = SpawnedOrDespawned { by, at };
++                meta.spawned_or_despawned = SpawnedOrDespawned { by, tick };
+             }
+ 
+             *free_cursor = 0;
+@@ -1068,13 +1068,13 @@ impl Entities {
+                 Entity::from_raw_and_generation(row, meta.generation),
+                 &mut meta.location,
+             );
+-            meta.spawned_or_despawned = SpawnedOrDespawned { by, at };
++            meta.spawned_or_despawned = SpawnedOrDespawned { by, tick };
+         }
+     }
+ 
+     /// Flushes all reserved entities to an "invalid" state. Attempting to retrieve them will return `None`
+     /// unless they are later populated with a valid archetype.
+-    pub fn flush_as_invalid(&mut self, by: MaybeLocation, at: Tick) {
++    pub fn flush_as_invalid(&mut self, by: MaybeLocation, tick: Tick) {
+         // SAFETY: as per `flush` safety docs, the archetype id can be set to [`ArchetypeId::INVALID`] if
+         // the [`Entity`] has not been assigned to an [`Archetype`][crate::archetype::Archetype], which is the case here
+         unsafe {
+@@ -1083,7 +1083,7 @@ impl Entities {
+                     *location = None;
+                 },
+                 by,
+-                at,
++                tick,
+             );
+         }
+     }
+@@ -1151,9 +1151,9 @@ impl Entities {
+     ///
+     /// Returns `None` if its index has been reused by another entity or if this entity
+     /// has never been spawned.
+-    pub fn entity_get_spawned_or_despawned_at(&self, entity: Entity) -> Option<Tick> {
++    pub fn entity_get_spawn_or_despawn_tick(&self, entity: Entity) -> Option<Tick> {
+         self.entity_get_spawned_or_despawned(entity)
+-            .map(|spawned_or_despawned| spawned_or_despawned.at)
++            .map(|spawned_or_despawned| spawned_or_despawned.tick)
+     }
+ 
+     /// Try to get the [`SpawnedOrDespawned`] related to the entity's last spawn,
+@@ -1187,13 +1187,13 @@ impl Entities {
+     ) -> (MaybeLocation, Tick) {
+         // SAFETY: caller ensures entity is allocated
+         let meta = unsafe { self.meta.get_unchecked(entity.index() as usize) };
+-        (meta.spawned_or_despawned.by, meta.spawned_or_despawned.at)
++        (meta.spawned_or_despawned.by, meta.spawned_or_despawned.tick)
+     }
+ 
+     #[inline]
+     pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+         for meta in &mut self.meta {
+-            meta.spawned_or_despawned.at.check_tick(check);
++            meta.spawned_or_despawned.tick.check_tick(check);
+         }
+     }
+ 
+@@ -1263,7 +1263,7 @@ struct EntityMeta {
+ #[derive(Copy, Clone, Debug)]
+ struct SpawnedOrDespawned {
+     by: MaybeLocation,
+-    at: Tick,
++    tick: Tick,
+ }
+ 
+ impl EntityMeta {
+@@ -1273,7 +1273,7 @@ impl EntityMeta {
+         location: None,
+         spawned_or_despawned: SpawnedOrDespawned {
+             by: MaybeLocation::caller(),
+-            at: Tick::new(0),
++            tick: Tick::new(0),
+         },
+     };
+ }
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 0e868e0be3496..ec7d7d87015f1 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -555,7 +555,7 @@ impl ReleaseStateQueryData for EntityLocation {
+ ///         print!(
+ ///             "entity {:?} spawned at {:?}",
+ ///             entity,
+-///             spawn_details.spawned_at()
++///             spawn_details.spawn_tick()
+ ///         );
+ ///         match spawn_details.spawned_by().into_option() {
+ ///             Some(location) => println!(" by {:?}", location),
+@@ -569,7 +569,7 @@ impl ReleaseStateQueryData for EntityLocation {
+ #[derive(Clone, Copy, Debug)]
+ pub struct SpawnDetails {
+     spawned_by: MaybeLocation,
+-    spawned_at: Tick,
++    spawn_tick: Tick,
+     last_run: Tick,
+     this_run: Tick,
+ }
+@@ -578,12 +578,12 @@ impl SpawnDetails {
+     /// Returns `true` if the entity spawned since the last time this system ran.
+     /// Otherwise, returns `false`.
+     pub fn is_spawned(self) -> bool {
+-        self.spawned_at.is_newer_than(self.last_run, self.this_run)
++        self.spawn_tick.is_newer_than(self.last_run, self.this_run)
+     }
+ 
+     /// Returns the `Tick` this entity spawned at.
+-    pub fn spawned_at(self) -> Tick {
+-        self.spawned_at
++    pub fn spawn_tick(self) -> Tick {
++        self.spawn_tick
+     }
+ 
+     /// Returns the source code location from which this entity has been spawned.
+@@ -680,14 +680,14 @@ unsafe impl QueryData for SpawnDetails {
+         _table_row: TableRow,
+     ) -> Self::Item<'w, 's> {
+         // SAFETY: only living entities are queried
+-        let (spawned_by, spawned_at) = unsafe {
++        let (spawned_by, spawn_tick) = unsafe {
+             fetch
+                 .entities
+                 .entity_get_spawned_or_despawned_unchecked(entity)
+         };
+         Self {
+             spawned_by,
+-            spawned_at,
++            spawn_tick,
+             last_run: fetch.last_run,
+             this_run: fetch.this_run,
+         }
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index 13967a46ddf61..ea07cb5da5f9f 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -2807,7 +2807,7 @@ mod tests {
+         world.flush();
+         assert_eq!(
+             Some(expected),
+-            world.entities().entity_get_spawned_or_despawned_at(id)
++            world.entities().entity_get_spawn_or_despawn_tick(id)
+         );
+     }
+ }
+diff --git a/crates/bevy_ecs/src/system/mod.rs b/crates/bevy_ecs/src/system/mod.rs
+index b5738733d7f95..22b6db8e4e936 100644
+--- a/crates/bevy_ecs/src/system/mod.rs
++++ b/crates/bevy_ecs/src/system/mod.rs
+@@ -1336,7 +1336,7 @@ mod tests {
+             SystemState::new(&mut world);
+         {
+             let query = system_state.get(&world);
+-            assert_eq!(query.unwrap().spawned_at(), spawn_tick);
++            assert_eq!(query.unwrap().spawn_tick(), spawn_tick);
+         }
+ 
+         {
+diff --git a/crates/bevy_ecs/src/world/entity_ref.rs b/crates/bevy_ecs/src/world/entity_ref.rs
+index 59d8b97de7f3e..20b910bf5abe2 100644
+--- a/crates/bevy_ecs/src/world/entity_ref.rs
++++ b/crates/bevy_ecs/src/world/entity_ref.rs
+@@ -298,8 +298,8 @@ impl<'w> EntityRef<'w> {
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has been spawned.
+-    pub fn spawned_at(&self) -> Tick {
+-        self.cell.spawned_at()
++    pub fn spawn_tick(&self) -> Tick {
++        self.cell.spawn_tick()
+     }
+ }
+ 
+@@ -1065,8 +1065,8 @@ impl<'w> EntityMut<'w> {
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has been spawned.
+-    pub fn spawned_at(&self) -> Tick {
+-        self.cell.spawned_at()
++    pub fn spawn_tick(&self) -> Tick {
++        self.cell.spawn_tick()
+     }
+ }
+ 
+@@ -3132,7 +3132,7 @@ impl<'w> EntityWorldMut<'w> {
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has last been spawned.
+-    pub fn spawned_at(&self) -> Tick {
++    pub fn spawn_tick(&self) -> Tick {
+         self.assert_not_despawned();
+ 
+         // SAFETY: entity being alive was asserted
+@@ -3679,8 +3679,8 @@ impl<'w, 's> FilteredEntityRef<'w, 's> {
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has been spawned.
+-    pub fn spawned_at(&self) -> Tick {
+-        self.entity.spawned_at()
++    pub fn spawn_tick(&self) -> Tick {
++        self.entity.spawn_tick()
+     }
+ }
+ 
+@@ -4041,8 +4041,8 @@ impl<'w, 's> FilteredEntityMut<'w, 's> {
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has been spawned.
+-    pub fn spawned_at(&self) -> Tick {
+-        self.entity.spawned_at()
++    pub fn spawn_tick(&self) -> Tick {
++        self.entity.spawn_tick()
+     }
+ }
+ 
+@@ -4225,8 +4225,8 @@ where
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has been spawned.
+-    pub fn spawned_at(&self) -> Tick {
+-        self.entity.spawned_at()
++    pub fn spawn_tick(&self) -> Tick {
++        self.entity.spawn_tick()
+     }
+ 
+     /// Gets the component of the given [`ComponentId`] from the entity.
+@@ -4480,8 +4480,8 @@ where
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has been spawned.
+-    pub fn spawned_at(&self) -> Tick {
+-        self.entity.spawned_at()
++    pub fn spawn_tick(&self) -> Tick {
++        self.entity.spawn_tick()
+     }
+ 
+     /// Returns `true` if the current entity has a component of type `T`.
+@@ -6399,7 +6399,7 @@ mod tests {
+                     .map(|l| l.unwrap());
+                 let at = world
+                     .entities
+-                    .entity_get_spawned_or_despawned_at(entity)
++                    .entity_get_spawn_or_despawn_tick(entity)
+                     .unwrap();
+                 (by, at)
+             });
+@@ -6439,7 +6439,7 @@ mod tests {
+             despawn_tick,
+             world
+                 .entities()
+-                .entity_get_spawned_or_despawned_at(entity)
++                .entity_get_spawn_or_despawn_tick(entity)
+                 .unwrap()
+         );
+     }
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 4c6d3c5455d51..ccee6ff8d5be7 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -4381,7 +4381,7 @@ mod tests {
+             MaybeLocation::new(Some(Location::caller()))
+         );
+         assert_eq!(
+-            world.entities.entity_get_spawned_or_despawned_at(entity),
++            world.entities.entity_get_spawn_or_despawn_tick(entity),
+             Some(world.change_tick())
+         );
+         world.despawn(entity);
+@@ -4390,7 +4390,7 @@ mod tests {
+             MaybeLocation::new(Some(Location::caller()))
+         );
+         assert_eq!(
+-            world.entities.entity_get_spawned_or_despawned_at(entity),
++            world.entities.entity_get_spawn_or_despawn_tick(entity),
+             Some(world.change_tick())
+         );
+         let new = world.spawn_empty().id();
+@@ -4400,7 +4400,7 @@ mod tests {
+             MaybeLocation::new(None)
+         );
+         assert_eq!(
+-            world.entities.entity_get_spawned_or_despawned_at(entity),
++            world.entities.entity_get_spawn_or_despawn_tick(entity),
+             None
+         );
+         world.despawn(new);
+@@ -4409,7 +4409,7 @@ mod tests {
+             MaybeLocation::new(None)
+         );
+         assert_eq!(
+-            world.entities.entity_get_spawned_or_despawned_at(entity),
++            world.entities.entity_get_spawn_or_despawn_tick(entity),
+             None
+         );
+     }
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index 0330a2e47d985..16b7a863b4442 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -1166,7 +1166,7 @@ impl<'w> UnsafeEntityCell<'w> {
+     }
+ 
+     /// Returns the [`Tick`] at which this entity has been spawned.
+-    pub fn spawned_at(self) -> Tick {
++    pub fn spawn_tick(self) -> Tick {
+         // SAFETY: UnsafeEntityCell is only constructed for living entities and offers no despawn method
+         unsafe {
+             self.world()

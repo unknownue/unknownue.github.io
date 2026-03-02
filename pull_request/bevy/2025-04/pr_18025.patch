@@ -1,0 +1,1161 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index af2d9d356cb59..8bb16b741db86 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4317,3 +4317,14 @@ name = "`no_std` Compatible Library"
+ description = "Example library compatible with `std` and `no_std` targets"
+ category = "Embedded"
+ wasm = true
++
++[[example]]
++name = "extended_material_bindless"
++path = "examples/shader/extended_material_bindless.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.extended_material_bindless]
++name = "Extended Bindless Material"
++description = "Demonstrates bindless `ExtendedMaterial`"
++category = "Shaders"
++wasm = false
+diff --git a/assets/shaders/extended_material_bindless.wgsl b/assets/shaders/extended_material_bindless.wgsl
+new file mode 100644
+index 0000000000000..f8650b0da7f60
+--- /dev/null
++++ b/assets/shaders/extended_material_bindless.wgsl
+@@ -0,0 +1,107 @@
++// The shader that goes with `extended_material_bindless.rs`.
++//
++// This code demonstrates how to write shaders that are compatible with both
++// bindless and non-bindless mode. See the `#ifdef BINDLESS` blocks.
++
++#import bevy_pbr::{
++    forward_io::{FragmentOutput, VertexOutput},
++    mesh_bindings::mesh,
++    pbr_fragment::pbr_input_from_standard_material,
++    pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
++}
++#import bevy_render::bindless::{bindless_samplers_filtering, bindless_textures_2d}
++
++#ifdef BINDLESS
++#import bevy_pbr::pbr_bindings::{material_array, material_indices}
++#else   // BINDLESS
++#import bevy_pbr::pbr_bindings::material
++#endif  // BINDLESS
++
++// Stores the indices of the bindless resources in the bindless resource arrays,
++// for the `ExampleBindlessExtension` fields.
++struct ExampleBindlessExtendedMaterialIndices {
++    // The index of the `ExampleBindlessExtendedMaterial` data in
++    // `example_extended_material`.
++    material: u32,
++    // The index of the texture we're going to modulate the base color with in
++    // the `bindless_textures_2d` array.
++    modulate_texture: u32,
++    // The index of the sampler we're going to sample the modulated texture with
++    // in the `bindless_samplers_filtering` array.
++    modulate_texture_sampler: u32,
++}
++
++// Plain data associated with this example material.
++struct ExampleBindlessExtendedMaterial {
++    // The color that we multiply the base color, base color texture, and
++    // modulated texture with.
++    modulate_color: vec4<f32>,
++}
++
++#ifdef BINDLESS
++
++// The indices of the bindless resources in the bindless resource arrays, for
++// the `ExampleBindlessExtension` fields.
++@group(2) @binding(100) var<storage> example_extended_material_indices:
++    array<ExampleBindlessExtendedMaterialIndices>;
++// An array that holds the `ExampleBindlessExtendedMaterial` plain old data,
++// indexed by `ExampleBindlessExtendedMaterialIndices.material`.
++@group(2) @binding(101) var<storage> example_extended_material:
++    array<ExampleBindlessExtendedMaterial>;
++
++#else   // BINDLESS
++
++// In non-bindless mode, we simply use a uniform for the plain old data.
++@group(2) @binding(50) var<uniform> example_extended_material: ExampleBindlessExtendedMaterial;
++@group(2) @binding(51) var modulate_texture: texture_2d<f32>;
++@group(2) @binding(52) var modulate_sampler: sampler;
++
++#endif  // BINDLESS
++
++@fragment
++fn fragment(
++    in: VertexOutput,
++    @builtin(front_facing) is_front: bool,
++) -> FragmentOutput {
++#ifdef BINDLESS
++    // Fetch the material slot. We'll use this in turn to fetch the bindless
++    // indices from `example_extended_material_indices`.
++    let slot = mesh[in.instance_index].material_and_lightmap_bind_group_slot & 0xffffu;
++#endif  // BINDLESS
++
++    // Generate a `PbrInput` struct from the `StandardMaterial` bindings.
++    var pbr_input = pbr_input_from_standard_material(in, is_front);
++
++    // Calculate the UV for the texture we're about to sample.
++#ifdef BINDLESS
++    let uv_transform = material_array[material_indices[slot].material].uv_transform;
++#else   // BINDLESS
++    let uv_transform = material.uv_transform;
++#endif  // BINDLESS
++    let uv = (uv_transform * vec3(in.uv, 1.0)).xy;
++
++    // Multiply the base color by the `modulate_texture` and `modulate_color`.
++#ifdef BINDLESS
++    // Notice how we fetch the texture, sampler, and plain extended material
++    // data from the appropriate arrays.
++    pbr_input.material.base_color *= textureSample(
++        bindless_textures_2d[example_extended_material_indices[slot].modulate_texture],
++        bindless_samplers_filtering[
++            example_extended_material_indices[slot].modulate_texture_sampler
++        ],
++        uv
++    ) * example_extended_material[example_extended_material_indices[slot].material].modulate_color;
++#else   // BINDLESS
++    pbr_input.material.base_color *= textureSample(modulate_texture, modulate_sampler, uv) *
++        example_extended_material.modulate_color;
++#endif  // BINDLESS
++
++    var out: FragmentOutput;
++    // Apply lighting.
++    out.color = apply_pbr_lighting(pbr_input);
++    // Apply in-shader post processing (fog, alpha-premultiply, and also
++    // tonemapping, debanding if the camera is non-HDR). Note this does not
++    // include fullscreen postprocessing effects like bloom.
++    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
++    return out;
++}
+diff --git a/crates/bevy_pbr/src/extended_material.rs b/crates/bevy_pbr/src/extended_material.rs
+index b79f3c3d2ce27..2de80f04f1bfd 100644
+--- a/crates/bevy_pbr/src/extended_material.rs
++++ b/crates/bevy_pbr/src/extended_material.rs
+@@ -1,13 +1,16 @@
++use alloc::borrow::Cow;
++
+ use bevy_asset::{Asset, Handle};
+ use bevy_ecs::system::SystemParamItem;
++use bevy_platform_support::{collections::HashSet, hash::FixedHasher};
+ use bevy_reflect::{impl_type_path, Reflect};
+ use bevy_render::{
+     alpha::AlphaMode,
+     mesh::MeshVertexBufferLayoutRef,
+     render_resource::{
+-        AsBindGroup, AsBindGroupError, BindGroupLayout, BindlessDescriptor,
+-        BindlessSlabResourceLimit, RenderPipelineDescriptor, Shader, ShaderRef,
+-        SpecializedMeshPipelineError, UnpreparedBindGroup,
++        AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindlessDescriptor,
++        BindlessResourceType, BindlessSlabResourceLimit, RenderPipelineDescriptor, Shader,
++        ShaderRef, SpecializedMeshPipelineError, UnpreparedBindGroup,
+     },
+     renderer::RenderDevice,
+ };
+@@ -156,11 +159,24 @@ impl<B: Material, E: MaterialExtension> AsBindGroup for ExtendedMaterial<B, E> {
+     type Param = (<B as AsBindGroup>::Param, <E as AsBindGroup>::Param);
+ 
+     fn bindless_slot_count() -> Option<BindlessSlabResourceLimit> {
+-        // For now, disable bindless in `ExtendedMaterial`.
+-        if B::bindless_slot_count().is_some() && E::bindless_slot_count().is_some() {
+-            panic!("Bindless extended materials are currently unsupported")
++        // We only enable bindless if both the base material and its extension
++        // are bindless. If we do enable bindless, we choose the smaller of the
++        // two slab size limits.
++        match (B::bindless_slot_count()?, E::bindless_slot_count()?) {
++            (BindlessSlabResourceLimit::Auto, BindlessSlabResourceLimit::Auto) => {
++                Some(BindlessSlabResourceLimit::Auto)
++            }
++            (BindlessSlabResourceLimit::Auto, BindlessSlabResourceLimit::Custom(limit))
++            | (BindlessSlabResourceLimit::Custom(limit), BindlessSlabResourceLimit::Auto) => {
++                Some(BindlessSlabResourceLimit::Custom(limit))
++            }
++            (
++                BindlessSlabResourceLimit::Custom(base_limit),
++                BindlessSlabResourceLimit::Custom(extended_limit),
++            ) => Some(BindlessSlabResourceLimit::Custom(
++                base_limit.min(extended_limit),
++            )),
+         }
+-        None
+     }
+ 
+     fn unprepared_bind_group(
+@@ -168,15 +184,28 @@ impl<B: Material, E: MaterialExtension> AsBindGroup for ExtendedMaterial<B, E> {
+         layout: &BindGroupLayout,
+         render_device: &RenderDevice,
+         (base_param, extended_param): &mut SystemParamItem<'_, '_, Self::Param>,
+-        _: bool,
++        mut force_non_bindless: bool,
+     ) -> Result<UnpreparedBindGroup<Self::Data>, AsBindGroupError> {
++        force_non_bindless = force_non_bindless || Self::bindless_slot_count().is_none();
++
+         // add together the bindings of the base material and the user material
+         let UnpreparedBindGroup {
+             mut bindings,
+             data: base_data,
+-        } = B::unprepared_bind_group(&self.base, layout, render_device, base_param, true)?;
+-        let extended_bindgroup =
+-            E::unprepared_bind_group(&self.extension, layout, render_device, extended_param, true)?;
++        } = B::unprepared_bind_group(
++            &self.base,
++            layout,
++            render_device,
++            base_param,
++            force_non_bindless,
++        )?;
++        let extended_bindgroup = E::unprepared_bind_group(
++            &self.extension,
++            layout,
++            render_device,
++            extended_param,
++            force_non_bindless,
++        )?;
+ 
+         bindings.extend(extended_bindgroup.bindings.0);
+ 
+@@ -188,23 +217,72 @@ impl<B: Material, E: MaterialExtension> AsBindGroup for ExtendedMaterial<B, E> {
+ 
+     fn bind_group_layout_entries(
+         render_device: &RenderDevice,
+-        _: bool,
+-    ) -> Vec<bevy_render::render_resource::BindGroupLayoutEntry>
++        mut force_non_bindless: bool,
++    ) -> Vec<BindGroupLayoutEntry>
+     where
+         Self: Sized,
+     {
+-        // add together the bindings of the standard material and the user material
+-        let mut entries = B::bind_group_layout_entries(render_device, true);
+-        entries.extend(E::bind_group_layout_entries(render_device, true));
++        force_non_bindless = force_non_bindless || Self::bindless_slot_count().is_none();
++
++        // Add together the bindings of the standard material and the user
++        // material, skipping duplicate bindings. Duplicate bindings will occur
++        // when bindless mode is on, because of the common bindless resource
++        // arrays, and we need to eliminate the duplicates or `wgpu` will
++        // complain.
++        let mut entries = vec![];
++        let mut seen_bindings = HashSet::<_>::with_hasher(FixedHasher);
++        for entry in B::bind_group_layout_entries(render_device, force_non_bindless)
++            .into_iter()
++            .chain(E::bind_group_layout_entries(render_device, force_non_bindless).into_iter())
++        {
++            if seen_bindings.insert(entry.binding) {
++                entries.push(entry);
++            }
++        }
+         entries
+     }
+ 
+     fn bindless_descriptor() -> Option<BindlessDescriptor> {
+-        if B::bindless_descriptor().is_some() && E::bindless_descriptor().is_some() {
+-            panic!("Bindless extended materials are currently unsupported")
++        // We're going to combine the two bindless descriptors.
++        let base_bindless_descriptor = B::bindless_descriptor()?;
++        let extended_bindless_descriptor = E::bindless_descriptor()?;
++
++        // Combining the buffers and index tables is straightforward.
++
++        let mut buffers = base_bindless_descriptor.buffers.to_vec();
++        let mut index_tables = base_bindless_descriptor.index_tables.to_vec();
++
++        buffers.extend(extended_bindless_descriptor.buffers.iter().cloned());
++        index_tables.extend(extended_bindless_descriptor.index_tables.iter().cloned());
++
++        // Combining the resources is a little trickier because the resource
++        // array is indexed by bindless index, so we have to merge the two
++        // arrays, not just concatenate them.
++        let max_bindless_index = base_bindless_descriptor
++            .resources
++            .len()
++            .max(extended_bindless_descriptor.resources.len());
++        let mut resources = Vec::with_capacity(max_bindless_index);
++        for bindless_index in 0..max_bindless_index {
++            // In the event of a conflicting bindless index, we choose the
++            // base's binding.
++            match base_bindless_descriptor.resources.get(bindless_index) {
++                None | Some(&BindlessResourceType::None) => resources.push(
++                    extended_bindless_descriptor
++                        .resources
++                        .get(bindless_index)
++                        .copied()
++                        .unwrap_or(BindlessResourceType::None),
++                ),
++                Some(&resource_type) => resources.push(resource_type),
++            }
+         }
+ 
+-        None
++        Some(BindlessDescriptor {
++            resources: Cow::Owned(resources),
++            buffers: Cow::Owned(buffers),
++            index_tables: Cow::Owned(index_tables),
++        })
+     }
+ }
+ 
+diff --git a/crates/bevy_pbr/src/material_bind_groups.rs b/crates/bevy_pbr/src/material_bind_groups.rs
+index 442050d9b2521..1351d335c5262 100644
+--- a/crates/bevy_pbr/src/material_bind_groups.rs
++++ b/crates/bevy_pbr/src/material_bind_groups.rs
+@@ -4,7 +4,7 @@
+ //! allocator manages each bind group, assigning slots to materials as
+ //! appropriate.
+ 
+-use core::{iter, marker::PhantomData, mem};
++use core::{cmp::Ordering, iter, marker::PhantomData, mem, ops::Range};
+ 
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+@@ -16,11 +16,11 @@ use bevy_reflect::{prelude::ReflectDefault, Reflect};
+ use bevy_render::{
+     render_resource::{
+         BindGroup, BindGroupEntry, BindGroupLayout, BindingNumber, BindingResource,
+-        BindingResources, BindlessDescriptor, BindlessIndex, BindlessResourceType, Buffer,
+-        BufferBinding, BufferDescriptor, BufferId, BufferInitDescriptor, BufferUsages,
+-        CompareFunction, FilterMode, OwnedBindingResource, PreparedBindGroup, RawBufferVec,
+-        Sampler, SamplerDescriptor, SamplerId, TextureView, TextureViewDimension, TextureViewId,
+-        UnpreparedBindGroup, WgpuSampler, WgpuTextureView,
++        BindingResources, BindlessDescriptor, BindlessIndex, BindlessIndexTableDescriptor,
++        BindlessResourceType, Buffer, BufferBinding, BufferDescriptor, BufferId,
++        BufferInitDescriptor, BufferUsages, CompareFunction, FilterMode, OwnedBindingResource,
++        PreparedBindGroup, RawBufferVec, Sampler, SamplerDescriptor, SamplerId, TextureView,
++        TextureViewDimension, TextureViewId, UnpreparedBindGroup, WgpuSampler, WgpuTextureView,
+     },
+     renderer::{RenderDevice, RenderQueue},
+     settings::WgpuFeatures,
+@@ -89,11 +89,16 @@ where
+     /// regenerated.
+     bind_group: Option<BindGroup>,
+ 
+-    /// A GPU-accessible buffer that holds the mapping from binding index to
++    /// The GPU-accessible buffers that hold the mapping from binding index to
+     /// bindless slot.
+     ///
+-    /// This is conventionally assigned to bind group binding 0.
+-    bindless_index_table: MaterialBindlessIndexTable<M>,
++    /// This is conventionally assigned to bind group binding 0, but it can be
++    /// changed using the `#[bindless(index_table(binding(B)))]` attribute on
++    /// `AsBindGroup`.
++    ///
++    /// Because the slab binary searches this table, the entries within must be
++    /// sorted by bindless index.
++    bindless_index_tables: Vec<MaterialBindlessIndexTable<M>>,
+ 
+     /// The binding arrays containing samplers.
+     samplers: HashMap<BindlessResourceType, MaterialBindlessBindingArray<Sampler>>,
+@@ -122,13 +127,25 @@ where
+ /// A GPU-accessible buffer that holds the mapping from binding index to
+ /// bindless slot.
+ ///
+-/// This is conventionally assigned to bind group binding 0.
++/// This is conventionally assigned to bind group binding 0, but it can be
++/// changed by altering the [`Self::binding_number`], which corresponds to the
++/// `#[bindless(index_table(binding(B)))]` attribute in `AsBindGroup`.
+ struct MaterialBindlessIndexTable<M>
+ where
+     M: Material,
+ {
+     /// The buffer containing the mappings.
+     buffer: RetainedRawBufferVec<u32>,
++    /// The range of bindless indices that this bindless index table covers.
++    ///
++    /// If this range is M..N, then the field at index $i$ maps to bindless
++    /// index $i$ + M. The size of this table is N - M.
++    ///
++    /// This corresponds to the `#[bindless(index_table(range(M..N)))]`
++    /// attribute in `AsBindGroup`.
++    index_range: Range<BindlessIndex>,
++    /// The binding number that this index table is assigned to in the shader.
++    binding_number: BindingNumber,
+     phantom: PhantomData<M>,
+ }
+ 
+@@ -601,29 +618,54 @@ where
+     M: Material,
+ {
+     /// Creates a new [`MaterialBindlessIndexTable`] for a single slab.
+-    fn new(bindless_descriptor: &BindlessDescriptor) -> MaterialBindlessIndexTable<M> {
++    fn new(
++        bindless_index_table_descriptor: &BindlessIndexTableDescriptor,
++    ) -> MaterialBindlessIndexTable<M> {
+         // Preallocate space for one bindings table, so that there will always be a buffer.
+         let mut buffer = RetainedRawBufferVec::new(BufferUsages::STORAGE);
+-        for _ in 0..bindless_descriptor.resources.len() {
++        for _ in *bindless_index_table_descriptor.indices.start
++            ..*bindless_index_table_descriptor.indices.end
++        {
+             buffer.push(0);
+         }
+ 
+         MaterialBindlessIndexTable {
+             buffer,
++            index_range: bindless_index_table_descriptor.indices.clone(),
++            binding_number: bindless_index_table_descriptor.binding_number,
+             phantom: PhantomData,
+         }
+     }
+ 
+-    /// Returns the binding index table for a single material.
++    /// Returns the bindings in the binding index table.
+     ///
+-    /// Element *i* of the returned binding index table contains the slot of the
+-    /// bindless resource with bindless index *i*.
+-    fn get(&self, slot: MaterialBindGroupSlot, bindless_descriptor: &BindlessDescriptor) -> &[u32] {
+-        let struct_size = bindless_descriptor.resources.len();
++    /// If the current [`MaterialBindlessIndexTable::index_range`] is M..N, then
++    /// element *i* of the returned binding index table contains the slot of the
++    /// bindless resource with bindless index *i* + M.
++    fn get(&self, slot: MaterialBindGroupSlot) -> &[u32] {
++        let struct_size = *self.index_range.end as usize - *self.index_range.start as usize;
+         let start = struct_size * slot.0 as usize;
+         &self.buffer.values()[start..(start + struct_size)]
+     }
+ 
++    /// Returns a single binding from the binding index table.
++    fn get_binding(
++        &self,
++        slot: MaterialBindGroupSlot,
++        bindless_index: BindlessIndex,
++    ) -> Option<u32> {
++        if bindless_index < self.index_range.start || bindless_index >= self.index_range.end {
++            return None;
++        }
++        self.get(slot)
++            .get((*bindless_index - *self.index_range.start) as usize)
++            .copied()
++    }
++
++    fn table_length(&self) -> u32 {
++        self.index_range.end.0 - self.index_range.start.0
++    }
++
+     /// Updates the binding index table for a single material.
+     ///
+     /// The `allocated_resource_slots` map contains a mapping from the
+@@ -635,22 +677,37 @@ where
+         &mut self,
+         slot: MaterialBindGroupSlot,
+         allocated_resource_slots: &HashMap<BindlessIndex, u32>,
+-        bindless_descriptor: &BindlessDescriptor,
+     ) {
+-        let table_len = bindless_descriptor.resources.len();
++        let table_len = self.table_length() as usize;
+         let range = (slot.0 as usize * table_len)..((slot.0 as usize + 1) * table_len);
+         while self.buffer.len() < range.end {
+             self.buffer.push(0);
+         }
+ 
+         for (&bindless_index, &resource_slot) in allocated_resource_slots {
+-            self.buffer
+-                .set(*bindless_index + range.start as u32, resource_slot);
++            if self.index_range.contains(&bindless_index) {
++                self.buffer.set(
++                    *bindless_index + range.start as u32 - *self.index_range.start,
++                    resource_slot,
++                );
++            }
+         }
+ 
+         // Mark the buffer as needing to be recreated, in case we grew it.
+         self.buffer.dirty = BufferDirtyState::NeedsReserve;
+     }
++
++    /// Returns the [`BindGroupEntry`] for the index table itself.
++    fn bind_group_entry(&self) -> BindGroupEntry {
++        BindGroupEntry {
++            binding: *self.binding_number,
++            resource: self
++                .buffer
++                .buffer()
++                .expect("Bindings buffer must exist")
++                .as_entire_binding(),
++        }
++    }
+ }
+ 
+ impl<T> RetainedRawBufferVec<T>
+@@ -743,11 +800,7 @@ where
+     ) -> MaterialBindingId {
+         for (slab_index, slab) in self.slabs.iter_mut().enumerate() {
+             trace!("Trying to allocate in slab {}", slab_index);
+-            match slab.try_allocate(
+-                unprepared_bind_group,
+-                &self.bindless_descriptor,
+-                self.slab_capacity,
+-            ) {
++            match slab.try_allocate(unprepared_bind_group, self.slab_capacity) {
+                 Ok(slot) => {
+                     return MaterialBindingId {
+                         group: MaterialBindGroupIndex(slab_index as u32),
+@@ -767,11 +820,7 @@ where
+             .slabs
+             .last_mut()
+             .expect("We just pushed a slab")
+-            .try_allocate(
+-                unprepared_bind_group,
+-                &self.bindless_descriptor,
+-                self.slab_capacity,
+-            )
++            .try_allocate(unprepared_bind_group, self.slab_capacity)
+         else {
+             panic!("An allocation into an empty slab should always succeed")
+         };
+@@ -852,7 +901,6 @@ where
+     fn try_allocate(
+         &mut self,
+         unprepared_bind_group: UnpreparedBindGroup<M::Data>,
+-        bindless_descriptor: &BindlessDescriptor,
+         slot_capacity: u32,
+     ) -> Result<MaterialBindGroupSlot, UnpreparedBindGroup<M::Data>> {
+         // Locate pre-existing resources, and determine how many free slots we need.
+@@ -890,8 +938,9 @@ where
+             self.insert_resources(unprepared_bind_group.bindings, allocation_candidate);
+ 
+         // Serialize the allocated resource slots.
+-        self.bindless_index_table
+-            .set(slot, &allocated_resource_slots, bindless_descriptor);
++        for bindless_index_table in &mut self.bindless_index_tables {
++            bindless_index_table.set(slot, &allocated_resource_slots);
++        }
+ 
+         // Insert extra data.
+         if self.extra_data.len() < (*slot as usize + 1) {
+@@ -1103,13 +1152,17 @@ where
+     /// descriptor, from this slab.
+     fn free(&mut self, slot: MaterialBindGroupSlot, bindless_descriptor: &BindlessDescriptor) {
+         // Loop through each binding.
+-        for (bindless_index, (bindless_resource_type, &bindless_binding)) in bindless_descriptor
+-            .resources
+-            .iter()
+-            .zip(self.bindless_index_table.get(slot, bindless_descriptor))
+-            .enumerate()
++        for (bindless_index, bindless_resource_type) in
++            bindless_descriptor.resources.iter().enumerate()
+         {
+             let bindless_index = BindlessIndex::from(bindless_index as u32);
++            let Some(bindless_index_table) = self.get_bindless_index_table(bindless_index) else {
++                continue;
++            };
++            let Some(bindless_binding) = bindless_index_table.get_binding(slot, bindless_index)
++            else {
++                continue;
++            };
+ 
+             // Free the binding. If the resource in question was anything other
+             // than a data buffer, then it has a reference count and
+@@ -1176,8 +1229,10 @@ where
+         bindless_descriptor: &BindlessDescriptor,
+         slab_capacity: u32,
+     ) {
+-        // Create the bindless index table buffer if needed.
+-        self.bindless_index_table.buffer.prepare(render_device);
++        // Create the bindless index table buffers if needed.
++        for bindless_index_table in &mut self.bindless_index_tables {
++            bindless_index_table.buffer.prepare(render_device);
++        }
+ 
+         // Create any data buffers we were managing if necessary.
+         for data_buffer in self.data_buffers.values_mut() {
+@@ -1232,15 +1287,11 @@ where
+             required_binding_array_size,
+         );
+ 
+-        let mut bind_group_entries = vec![BindGroupEntry {
+-            binding: 0,
+-            resource: self
+-                .bindless_index_table
+-                .buffer
+-                .buffer()
+-                .expect("Bindings buffer must exist")
+-                .as_entire_binding(),
+-        }];
++        let mut bind_group_entries: Vec<_> = self
++            .bindless_index_tables
++            .iter()
++            .map(|bindless_index_table| bindless_index_table.bind_group_entry())
++            .collect();
+ 
+         for &(&binding, ref binding_resource_array) in binding_resource_arrays.iter() {
+             bind_group_entries.push(BindGroupEntry {
+@@ -1283,9 +1334,11 @@ where
+     /// Currently, this consists of the bindless index table plus any data
+     /// buffers we're managing.
+     fn write_buffer(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
+-        self.bindless_index_table
+-            .buffer
+-            .write(render_device, render_queue);
++        for bindless_index_table in &mut self.bindless_index_tables {
++            bindless_index_table
++                .buffer
++                .write(render_device, render_queue);
++        }
+ 
+         for data_buffer in self.data_buffers.values_mut() {
+             data_buffer.buffer.write(render_device, render_queue);
+@@ -1520,6 +1573,26 @@ where
+             .and_then(|data| data.as_ref())
+             .expect("Extra data not present")
+     }
++
++    /// Returns the bindless index table containing the given bindless index.
++    fn get_bindless_index_table(
++        &self,
++        bindless_index: BindlessIndex,
++    ) -> Option<&MaterialBindlessIndexTable<M>> {
++        let table_index = self
++            .bindless_index_tables
++            .binary_search_by(|bindless_index_table| {
++                if bindless_index < bindless_index_table.index_range.start {
++                    Ordering::Less
++                } else if bindless_index >= bindless_index_table.index_range.end {
++                    Ordering::Greater
++                } else {
++                    Ordering::Equal
++                }
++            })
++            .ok()?;
++        self.bindless_index_tables.get(table_index)
++    }
+ }
+ 
+ impl<R> MaterialBindlessBindingArray<R>
+@@ -1708,9 +1781,15 @@ where
+             }
+         }
+ 
++        let bindless_index_tables = bindless_descriptor
++            .index_tables
++            .iter()
++            .map(|bindless_index_table| MaterialBindlessIndexTable::new(bindless_index_table))
++            .collect();
++
+         MaterialBindlessSlab {
+             bind_group: None,
+-            bindless_index_table: MaterialBindlessIndexTable::new(bindless_descriptor),
++            bindless_index_tables,
+             samplers,
+             textures,
+             buffers,
+diff --git a/crates/bevy_render/macros/src/as_bind_group.rs b/crates/bevy_render/macros/src/as_bind_group.rs
+index d21bff4472176..4252929170f19 100644
+--- a/crates/bevy_render/macros/src/as_bind_group.rs
++++ b/crates/bevy_render/macros/src/as_bind_group.rs
+@@ -6,7 +6,7 @@ use syn::{
+     parenthesized,
+     parse::{Parse, ParseStream},
+     punctuated::Punctuated,
+-    token::Comma,
++    token::{Comma, DotDot},
+     Data, DataStruct, Error, Fields, LitInt, LitStr, Meta, MetaList, Result,
+ };
+ 
+@@ -20,6 +20,9 @@ const BINDLESS_ATTRIBUTE_NAME: Symbol = Symbol("bindless");
+ const DATA_ATTRIBUTE_NAME: Symbol = Symbol("data");
+ const BINDING_ARRAY_MODIFIER_NAME: Symbol = Symbol("binding_array");
+ const LIMIT_MODIFIER_NAME: Symbol = Symbol("limit");
++const INDEX_TABLE_MODIFIER_NAME: Symbol = Symbol("index_table");
++const RANGE_MODIFIER_NAME: Symbol = Symbol("range");
++const BINDING_MODIFIER_NAME: Symbol = Symbol("binding");
+ 
+ #[derive(Copy, Clone, Debug)]
+ enum BindingType {
+@@ -48,6 +51,12 @@ enum BindlessSlabResourceLimitAttr {
+     Limit(LitInt),
+ }
+ 
++// The `bindless(index_table(range(M..N)))` attribute.
++struct BindlessIndexTableRangeAttr {
++    start: LitInt,
++    end: LitInt,
++}
++
+ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+     let manifest = BevyManifest::shared();
+     let render_path = manifest.get_path("bevy_render");
+@@ -65,6 +74,8 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+     // After the first attribute pass, this will be `None` if the object isn't
+     // bindless and `Some` if it is.
+     let mut attr_bindless_count = None;
++    let mut attr_bindless_index_table_range = None;
++    let mut attr_bindless_index_table_binding = None;
+ 
+     // `actual_bindless_slot_count` holds the actual number of bindless slots
+     // per bind group, taking into account whether the current platform supports
+@@ -88,28 +99,54 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+                     attr_prepared_data_ident = Some(prepared_data_ident);
+                 }
+             } else if attr_ident == BINDLESS_ATTRIBUTE_NAME {
+-                match attr.meta {
+-                    Meta::Path(_) => {
+-                        attr_bindless_count = Some(BindlessSlabResourceLimitAttr::Auto);
+-                    }
+-                    Meta::List(_) => {
+-                        // Parse bindless features. For now, the only one we
+-                        // support is `limit(N)`.
+-                        attr.parse_nested_meta(|submeta| {
+-                            if submeta.path.is_ident(&LIMIT_MODIFIER_NAME) {
+-                                let content;
+-                                parenthesized!(content in submeta.input);
+-                                let lit: LitInt = content.parse()?;
+-
+-                                attr_bindless_count =
+-                                    Some(BindlessSlabResourceLimitAttr::Limit(lit));
+-                                return Ok(());
+-                            }
++                attr_bindless_count = Some(BindlessSlabResourceLimitAttr::Auto);
++                if let Meta::List(_) = attr.meta {
++                    // Parse bindless features.
++                    attr.parse_nested_meta(|submeta| {
++                        if submeta.path.is_ident(&LIMIT_MODIFIER_NAME) {
++                            let content;
++                            parenthesized!(content in submeta.input);
++                            let lit: LitInt = content.parse()?;
++
++                            attr_bindless_count = Some(BindlessSlabResourceLimitAttr::Limit(lit));
++                            return Ok(());
++                        }
+ 
+-                            Err(Error::new_spanned(attr, "Expected `limit(N)`"))
+-                        })?;
+-                    }
+-                    _ => {}
++                        if submeta.path.is_ident(&INDEX_TABLE_MODIFIER_NAME) {
++                            submeta.parse_nested_meta(|subsubmeta| {
++                                if subsubmeta.path.is_ident(&RANGE_MODIFIER_NAME) {
++                                    let content;
++                                    parenthesized!(content in subsubmeta.input);
++                                    let start: LitInt = content.parse()?;
++                                    content.parse::<DotDot>()?;
++                                    let end: LitInt = content.parse()?;
++                                    attr_bindless_index_table_range =
++                                        Some(BindlessIndexTableRangeAttr { start, end });
++                                    return Ok(());
++                                }
++
++                                if subsubmeta.path.is_ident(&BINDING_MODIFIER_NAME) {
++                                    let content;
++                                    parenthesized!(content in subsubmeta.input);
++                                    let lit: LitInt = content.parse()?;
++
++                                    attr_bindless_index_table_binding = Some(lit);
++                                    return Ok(());
++                                }
++
++                                Err(Error::new_spanned(
++                                    attr,
++                                    "Expected `range(M..N)` or `binding(N)`",
++                                ))
++                            })?;
++                            return Ok(());
++                        }
++
++                        Err(Error::new_spanned(
++                            attr,
++                            "Expected `limit` or `index_table`",
++                        ))
++                    })?;
+                 }
+             }
+         }
+@@ -881,6 +918,33 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+         None => quote! { 0 },
+     };
+ 
++    // Calculate the actual bindless index table range, taking the
++    // `#[bindless(index_table(range(M..N)))]` attribute into account.
++    let bindless_index_table_range = match attr_bindless_index_table_range {
++        None => {
++            let resource_count = bindless_resource_types.len() as u32;
++            quote! {
++                #render_path::render_resource::BindlessIndex(0)..
++                #render_path::render_resource::BindlessIndex(#resource_count)
++            }
++        }
++        Some(BindlessIndexTableRangeAttr { start, end }) => {
++            quote! {
++                #render_path::render_resource::BindlessIndex(#start)..
++                #render_path::render_resource::BindlessIndex(#end)
++            }
++        }
++    };
++
++    // Calculate the actual binding number of the bindless index table, taking
++    // the `#[bindless(index_table(binding(B)))]` into account.
++    let bindless_index_table_binding_number = match attr_bindless_index_table_binding {
++        None => quote! { #render_path::render_resource::BindingNumber(0) },
++        Some(binding_number) => {
++            quote! { #render_path::render_resource::BindingNumber(#binding_number) }
++        }
++    };
++
+     // Calculate the actual number of bindless slots, taking hardware
+     // limitations into account.
+     let (bindless_slot_count, actual_bindless_slot_count_declaration, bindless_descriptor_syntax) =
+@@ -942,9 +1006,18 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+                     ]> = ::std::sync::LazyLock::new(|| {
+                         [#(#bindless_buffer_descriptors),*]
+                     });
++                    static INDEX_TABLES: &[
++                        #render_path::render_resource::BindlessIndexTableDescriptor
++                    ] = &[
++                        #render_path::render_resource::BindlessIndexTableDescriptor {
++                            indices: #bindless_index_table_range,
++                            binding_number: #bindless_index_table_binding_number,
++                        }
++                    ];
+                     Some(#render_path::render_resource::BindlessDescriptor {
+                         resources: ::std::borrow::Cow::Borrowed(RESOURCES),
+                         buffers: ::std::borrow::Cow::Borrowed(&*BUFFERS),
++                        index_tables: ::std::borrow::Cow::Borrowed(&*INDEX_TABLES),
+                     })
+                 };
+ 
+@@ -964,8 +1037,6 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+             ),
+         };
+ 
+-    let bindless_resource_count = bindless_resource_types.len() as u32;
+-
+     Ok(TokenStream::from(quote! {
+         #(#field_struct_impls)*
+ 
+@@ -1011,10 +1082,13 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
+                 let mut #bind_group_layout_entries = Vec::new();
+                 match #actual_bindless_slot_count {
+                     Some(bindless_slot_count) => {
++                        let bindless_index_table_range = #bindless_index_table_range;
+                         #bind_group_layout_entries.extend(
+                             #render_path::render_resource::create_bindless_bind_group_layout_entries(
+-                                #bindless_resource_count,
++                                bindless_index_table_range.end.0 -
++                                    bindless_index_table_range.start.0,
+                                 bindless_slot_count.into(),
++                                #bindless_index_table_binding_number,
+                             ).into_iter()
+                         );
+                         #(#bindless_binding_layouts)*;
+diff --git a/crates/bevy_render/src/render_resource/bind_group.rs b/crates/bevy_render/src/render_resource/bind_group.rs
+index 02f4e09351fba..2c8e984bfdcaf 100644
+--- a/crates/bevy_render/src/render_resource/bind_group.rs
++++ b/crates/bevy_render/src/render_resource/bind_group.rs
+@@ -369,12 +369,12 @@ impl Deref for BindGroup {
+ ///   available. Because not all platforms support bindless resources, you
+ ///   should check for the presence of this definition via `#ifdef` and fall
+ ///   back to standard bindings if it isn't present.
+-/// * In bindless mode, binding 0 becomes the *bindless index table*, which is
+-///   an array of structures, each of which contains as many fields of type `u32`
+-///   as the highest binding number in the structure annotated with
+-///   `#[derive(AsBindGroup)]`. The *i*th field of the bindless index table
+-///   contains the index of the resource with binding *i* within the appropriate
+-///   binding array.
++/// * By default, in bindless mode, binding 0 becomes the *bindless index
++///   table*, which is an array of structures, each of which contains as many
++///   fields of type `u32` as the highest binding number in the structure
++///   annotated with `#[derive(AsBindGroup)]`. Again by default, the *i*th field
++///   of the bindless index table contains the index of the resource with binding
++///   *i* within the appropriate binding array.
+ /// * In the case of materials, the index of the applicable table within the
+ ///   bindless index table list corresponding to the mesh currently being drawn
+ ///   can be retrieved with
+@@ -384,12 +384,30 @@ impl Deref for BindGroup {
+ ///   each slab will have no more than 16 total resources in it. If you don't
+ ///   specify a limit, Bevy automatically picks a reasonable one for the current
+ ///   platform.
++/// * The `index_table(range(M..N), binding(B))` declaration allows you to
++///   customize the layout of the bindless index table. This is useful for
++///   materials that are composed of multiple bind groups, such as
++///   `ExtendedMaterial`. In such cases, there will be multiple bindless index
++///   tables, so they can't both be assigned to binding 0 or their bindings will
++///   conflict.
++///   - The `binding(B)` attribute of the `index_table` attribute allows you to
++///     customize the binding (`@binding(B)`, in the shader) at which the index
++///     table will be bound.
++///   - The `range(M, N)` attribute of the `index_table` attribute allows you to
++///     change the mapping from the field index in the bindless index table to the
++///     bindless index. Instead of the field at index $i$ being mapped to the
++///     bindless index $i$, with the `range(M, N)` attribute the field at index
++///     $i$ in the bindless index table is mapped to the bindless index $i$ + M.
++///     The size of the index table will be set to N - M. Note that this may
++///     result in the table being too small to contain all the bindless bindings.
+ /// * The purpose of bindless mode is to improve performance by reducing
+ ///   state changes. By grouping resources together into binding arrays, Bevy
+ ///   doesn't have to modify GPU state as often, decreasing API and driver
+ ///   overhead.
+-/// * See the `shaders/shader_material_bindless` example for an example of
+-///   how to use bindless mode.
++/// * See the `shaders/shader_material_bindless` example for an example of how
++///   to use bindless mode. See the `shaders/extended_material_bindless` example
++///   for a more exotic example of bindless mode that demonstrates the
++///   `index_table` attribute.
+ /// * The following diagram illustrates how bindless mode works using a subset
+ ///   of `StandardMaterial`:
+ ///
+diff --git a/crates/bevy_render/src/render_resource/bindless.rs b/crates/bevy_render/src/render_resource/bindless.rs
+index 6734abc572ef5..64a0fa2c1fe84 100644
+--- a/crates/bevy_render/src/render_resource/bindless.rs
++++ b/crates/bevy_render/src/render_resource/bindless.rs
+@@ -1,7 +1,10 @@
+ //! Types and functions relating to bindless resources.
+ 
+ use alloc::borrow::Cow;
+-use core::num::{NonZeroU32, NonZeroU64};
++use core::{
++    num::{NonZeroU32, NonZeroU64},
++    ops::Range,
++};
+ 
+ use bevy_derive::{Deref, DerefMut};
+ use wgpu::{
+@@ -102,6 +105,11 @@ pub struct BindlessDescriptor {
+     ///
+     /// The order of this array is irrelevant.
+     pub buffers: Cow<'static, [BindlessBufferDescriptor]>,
++    /// The [`BindlessIndexTableDescriptor`]s describing each bindless index
++    /// table.
++    ///
++    /// This list must be sorted by the first bindless index.
++    pub index_tables: Cow<'static, [BindlessIndexTableDescriptor]>,
+ }
+ 
+ /// The type of potentially-bindless resource.
+@@ -165,7 +173,7 @@ pub enum BindlessResourceType {
+ /// `#[uniform(BINDLESS_INDEX, StandardMaterialUniform,
+ /// bindless(BINDING_NUMBER)]`, the bindless index is `BINDLESS_INDEX`, and the
+ /// binding number is `BINDING_NUMBER`. Note the order.
+-#[derive(Clone, Copy)]
++#[derive(Clone, Copy, Debug)]
+ pub struct BindlessBufferDescriptor {
+     /// The actual binding number of the buffer.
+     ///
+@@ -185,6 +193,19 @@ pub struct BindlessBufferDescriptor {
+     pub size: Option<usize>,
+ }
+ 
++/// Describes the layout of the bindless index table, which maps bindless
++/// indices to indices within the binding arrays.
++#[derive(Clone)]
++pub struct BindlessIndexTableDescriptor {
++    /// The range of bindless indices that this descriptor covers.
++    pub indices: Range<BindlessIndex>,
++    /// The binding at which the index table itself will be bound.
++    ///
++    /// By default, this is binding 0, but it can be changed with the
++    /// `#[bindless(index_table(binding(B)))]` attribute.
++    pub binding_number: BindingNumber,
++}
++
+ /// The index of the actual binding in the bind group.
+ ///
+ /// This is the value specified in WGSL as `@binding`.
+@@ -194,7 +215,7 @@ pub struct BindingNumber(pub u32);
+ /// The index in the bindless index table.
+ ///
+ /// This table is conventionally bound to binding number 0.
+-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Deref, DerefMut)]
++#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash, Debug, Deref, DerefMut)]
+ pub struct BindlessIndex(pub u32);
+ 
+ /// Creates the bind group layout entries common to all shaders that use
+@@ -204,8 +225,9 @@ pub struct BindlessIndex(pub u32);
+ /// `bindless_slab_resource_limit` specifies the resolved
+ /// [`BindlessSlabResourceLimit`] value.
+ pub fn create_bindless_bind_group_layout_entries(
+-    bindless_resource_count: u32,
++    bindless_index_table_length: u32,
+     bindless_slab_resource_limit: u32,
++    bindless_index_table_binding_number: BindingNumber,
+ ) -> Vec<BindGroupLayoutEntry> {
+     let bindless_slab_resource_limit =
+         NonZeroU32::new(bindless_slab_resource_limit).expect("Bindless slot count must be nonzero");
+@@ -219,10 +241,10 @@ pub fn create_bindless_bind_group_layout_entries(
+         // Start with the bindless index table, bound to binding number 0.
+         storage_buffer_read_only_sized(
+             false,
+-            NonZeroU64::new(bindless_resource_count as u64 * size_of::<u32>() as u64),
++            NonZeroU64::new(bindless_index_table_length as u64 * size_of::<u32>() as u64),
+         )
+-        .build(0, ShaderStages::all()),
+-        // Continue with the common bindless buffers.
++        .build(*bindless_index_table_binding_number, ShaderStages::all()),
++        // Continue with the common bindless resource arrays.
+         sampler(SamplerBindingType::Filtering)
+             .count(bindless_slab_resource_limit)
+             .build(1, ShaderStages::all()),
+diff --git a/examples/README.md b/examples/README.md
+index 202c41a4f1d98..d0e33d957f2d4 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -453,6 +453,7 @@ Example | Description
+ [Custom Render Phase](../examples/shader/custom_render_phase.rs) | Shows how to make a complete render phase
+ [Custom Vertex Attribute](../examples/shader/custom_vertex_attribute.rs) | A shader that reads a mesh's custom vertex attribute
+ [Custom phase item](../examples/shader/custom_phase_item.rs) | Demonstrates how to enqueue custom draw commands in a render phase
++[Extended Bindless Material](../examples/shader/extended_material_bindless.rs) | Demonstrates bindless `ExtendedMaterial`
+ [Extended Material](../examples/shader/extended_material.rs) | A custom shader that builds on the standard material
+ [GPU readback](../examples/shader/gpu_readback.rs) | A very simple compute shader that writes to a buffer that is read by the cpu
+ [Instancing](../examples/shader/custom_shader_instancing.rs) | A shader that renders a mesh multiple times in one draw call using low level rendering api
+diff --git a/examples/shader/extended_material_bindless.rs b/examples/shader/extended_material_bindless.rs
+new file mode 100644
+index 0000000000000..562522fa437ff
+--- /dev/null
++++ b/examples/shader/extended_material_bindless.rs
+@@ -0,0 +1,156 @@
++//! Demonstrates bindless `ExtendedMaterial`.
++
++use std::f32::consts::FRAC_PI_2;
++
++use bevy::{
++    color::palettes::{css::RED, tailwind::GRAY_600},
++    pbr::{ExtendedMaterial, MaterialExtension, MeshMaterial3d},
++    prelude::*,
++    render::{
++        mesh::{SphereKind, SphereMeshBuilder},
++        render_resource::{AsBindGroup, ShaderRef, ShaderType},
++    },
++    utils::default,
++};
++
++/// The path to the example material shader.
++static SHADER_ASSET_PATH: &str = "shaders/extended_material_bindless.wgsl";
++
++/// The example bindless material extension.
++///
++/// As usual for material extensions, we need to avoid conflicting with both the
++/// binding numbers and bindless indices of the [`StandardMaterial`], so we
++/// start both values at 100 and 50 respectively.
++///
++/// The `#[data(50, ExampleBindlessExtensionUniform, binding_array(101))]`
++/// attribute specifies that the plain old data
++/// [`ExampleBindlessExtensionUniform`] will be placed into an array with
++/// binding 100 and will occupy index 50 in the
++/// `ExampleBindlessExtendedMaterialIndices` structure. (See the shader for the
++/// definition of that structure.) That corresponds to the following shader
++/// declaration:
++///
++/// ```wgsl
++/// @group(2) @binding(100) var<storage> example_extended_material_indices:
++///     array<ExampleBindlessExtendedMaterialIndices>;
++/// ```
++///
++/// The `#[bindless(index_table(range(50..53), binding(100)))]` attribute
++/// specifies that this material extension should be bindless. The `range`
++/// subattribute specifies that this material extension should have its own
++/// index table covering bindings 50, 51, and 52. The `binding` subattribute
++/// specifies that the extended material index table should be bound to binding
++/// 100. This corresponds to the following shader declarations:
++///
++/// ```wgsl
++/// struct ExampleBindlessExtendedMaterialIndices {
++///     material: u32,                      // 50
++///     modulate_texture: u32,              // 51
++///     modulate_texture_sampler: u32,      // 52
++/// }
++///
++/// @group(2) @binding(100) var<storage> example_extended_material_indices:
++///     array<ExampleBindlessExtendedMaterialIndices>;
++/// ```
++///
++/// We need to use the `index_table` subattribute because the
++/// [`StandardMaterial`] bindless index table is bound to binding 0 by default.
++/// Thus we need to specify a different binding so that our extended bindless
++/// index table doesn't conflict.
++#[derive(Asset, Clone, Reflect, AsBindGroup)]
++#[data(50, ExampleBindlessExtensionUniform, binding_array(101))]
++#[bindless(index_table(range(50..53), binding(100)))]
++struct ExampleBindlessExtension {
++    /// The color we're going to multiply the base color with.
++    modulate_color: Color,
++    /// The image we're going to multiply the base color with.
++    #[texture(51)]
++    #[sampler(52)]
++    modulate_texture: Option<Handle<Image>>,
++}
++
++/// The GPU-side data structure specifying plain old data for the material
++/// extension.
++#[derive(Clone, Default, ShaderType)]
++struct ExampleBindlessExtensionUniform {
++    /// The GPU representation of the color we're going to multiply the base
++    /// color with.
++    modulate_color: Vec4,
++}
++
++impl MaterialExtension for ExampleBindlessExtension {
++    fn fragment_shader() -> ShaderRef {
++        SHADER_ASSET_PATH.into()
++    }
++}
++
++impl<'a> From<&'a ExampleBindlessExtension> for ExampleBindlessExtensionUniform {
++    fn from(material_extension: &'a ExampleBindlessExtension) -> Self {
++        // Convert the CPU `ExampleBindlessExtension` structure to its GPU
++        // format.
++        ExampleBindlessExtensionUniform {
++            modulate_color: LinearRgba::from(material_extension.modulate_color).to_vec4(),
++        }
++    }
++}
++
++/// The entry point.
++fn main() {
++    App::new()
++        .add_plugins(DefaultPlugins)
++        .add_plugins(MaterialPlugin::<
++            ExtendedMaterial<StandardMaterial, ExampleBindlessExtension>,
++        >::default())
++        .add_systems(Startup, setup)
++        .add_systems(Update, rotate_sphere)
++        .run();
++}
++
++/// Creates the scene.
++fn setup(
++    mut commands: Commands,
++    asset_server: Res<AssetServer>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, ExampleBindlessExtension>>>,
++) {
++    // Create a gray sphere, modulated with a red-tinted Bevy logo.
++    commands.spawn((
++        Mesh3d(meshes.add(SphereMeshBuilder::new(
++            1.0,
++            SphereKind::Uv {
++                sectors: 20,
++                stacks: 20,
++            },
++        ))),
++        MeshMaterial3d(materials.add(ExtendedMaterial {
++            base: StandardMaterial {
++                base_color: GRAY_600.into(),
++                ..default()
++            },
++            extension: ExampleBindlessExtension {
++                modulate_color: RED.into(),
++                modulate_texture: Some(asset_server.load("textures/uv_checker_bw.png")),
++            },
++        })),
++        Transform::from_xyz(0.0, 0.5, 0.0),
++    ));
++
++    // Create a light.
++    commands.spawn((
++        DirectionalLight::default(),
++        Transform::from_xyz(1.0, 1.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
++    ));
++
++    // Create a camera.
++    commands.spawn((
++        Camera3d::default(),
++        Transform::from_xyz(-2.0, 2.5, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
++    ));
++}
++
++fn rotate_sphere(mut meshes: Query<&mut Transform, With<Mesh3d>>, time: Res<Time>) {
++    for mut transform in &mut meshes {
++        transform.rotation =
++            Quat::from_euler(EulerRot::YXZ, -time.elapsed_secs(), FRAC_PI_2 * 3.0, 0.0);
++    }
++}

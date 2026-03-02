@@ -1,0 +1,101 @@
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index 5f6653be39834..4aeb704ecf9f2 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -105,6 +105,11 @@ impl SystemMeta {
+     pub fn set_has_deferred(&mut self) {
+         self.flags |= SystemStateFlags::DEFERRED;
+     }
++
++    /// Mark the system to run exclusively. i.e. no other systems will run at the same time.
++    pub fn set_exclusive(&mut self) {
++        self.flags |= SystemStateFlags::EXCLUSIVE;
++    }
+ }
+ 
+ // TODO: Actually use this in FunctionSystem. We should probably only do this once Systems are constructed using a World reference
+diff --git a/crates/bevy_ecs/src/system/mod.rs b/crates/bevy_ecs/src/system/mod.rs
+index eeecf4b7ac5db..f729731ea327a 100644
+--- a/crates/bevy_ecs/src/system/mod.rs
++++ b/crates/bevy_ecs/src/system/mod.rs
+@@ -418,8 +418,8 @@ mod tests {
+             SystemCondition,
+         },
+         system::{
+-            Commands, In, InMut, IntoSystem, Local, NonSend, NonSendMut, ParamSet, Query, Res,
+-            ResMut, Single, StaticSystemParam, System, SystemState,
++            Commands, ExclusiveMarker, In, InMut, IntoSystem, Local, NonSend, NonSendMut, ParamSet,
++            Query, Res, ResMut, Single, StaticSystemParam, System, SystemState,
+         },
+         world::{DeferredWorld, EntityMut, FromWorld, World},
+     };
+@@ -1049,6 +1049,24 @@ mod tests {
+         assert_eq!(*world.resource::<SystemRan>(), SystemRan::Yes);
+     }
+ 
++    #[test]
++    fn function_system_as_exclusive() {
++        let mut world = World::default();
++
++        world.insert_resource(SystemRan::No);
++
++        fn sys(_marker: ExclusiveMarker, mut system_ran: ResMut<SystemRan>) {
++            *system_ran = SystemRan::Yes;
++        }
++
++        let mut sys = IntoSystem::into_system(sys);
++        sys.initialize(&mut world);
++        assert!(sys.is_exclusive());
++
++        run_system(&mut world, sys);
++        assert_eq!(*world.resource::<SystemRan>(), SystemRan::Yes);
++    }
++
+     #[test]
+     fn removal_tracking() {
+         let mut world = World::new();
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index 8e99259149b67..bc58aa7d85b94 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -1309,6 +1309,40 @@ unsafe impl<T: SystemBuffer> SystemParam for Deferred<'_, T> {
+     }
+ }
+ 
++/// A dummy type to tell the executor to run the system exclusively.
++pub struct ExclusiveMarker(PhantomData<()>);
++
++// SAFETY: No world access.
++unsafe impl SystemParam for ExclusiveMarker {
++    type State = ();
++    type Item<'w, 's> = Self;
++
++    #[inline]
++    fn init_state(_world: &mut World) -> Self::State {}
++
++    fn init_access(
++        _state: &Self::State,
++        system_meta: &mut SystemMeta,
++        _component_access_set: &mut FilteredAccessSet,
++        _world: &mut World,
++    ) {
++        system_meta.set_exclusive();
++    }
++
++    #[inline]
++    unsafe fn get_param<'world, 'state>(
++        _state: &'state mut Self::State,
++        _system_meta: &SystemMeta,
++        _world: UnsafeWorldCell<'world>,
++        _change_tick: Tick,
++    ) -> Self::Item<'world, 'state> {
++        Self(PhantomData)
++    }
++}
++
++// SAFETY: Does not read any world state
++unsafe impl ReadOnlySystemParam for ExclusiveMarker {}
++
+ /// A dummy type that is [`!Send`](Send), to force systems to run on the main thread.
+ pub struct NonSendMarker(PhantomData<*mut ()>);
+ 

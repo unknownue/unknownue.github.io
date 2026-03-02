@@ -1,0 +1,341 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a3d3a2ab63e51..86c1a1ebe2014 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,7 +10,7 @@ keywords = ["game", "engine", "gamedev", "graphics", "bevy"]
+ license = "MIT OR Apache-2.0"
+ repository = "https://github.com/bevyengine/bevy"
+ documentation = "https://docs.rs/bevy"
+-rust-version = "1.85.0"
++rust-version = "1.86.0"
+ 
+ [workspace]
+ resolver = "2"
+diff --git a/crates/bevy_derive/src/lib.rs b/crates/bevy_derive/src/lib.rs
+index 2636ffc57d13f..e446d0f50dd50 100644
+--- a/crates/bevy_derive/src/lib.rs
++++ b/crates/bevy_derive/src/lib.rs
+@@ -205,8 +205,6 @@ pub fn derive_enum_variant_meta(input: TokenStream) -> TokenStream {
+ pub fn derive_app_label(input: TokenStream) -> TokenStream {
+     let input = syn::parse_macro_input!(input as syn::DeriveInput);
+     let mut trait_path = BevyManifest::shared().get_path("bevy_app");
+-    let mut dyn_eq_path = trait_path.clone();
+     trait_path.segments.push(format_ident!("AppLabel").into());
+-    dyn_eq_path.segments.push(format_ident!("DynEq").into());
+-    derive_label(input, "AppLabel", &trait_path, &dyn_eq_path)
++    derive_label(input, "AppLabel", &trait_path)
+ }
+diff --git a/crates/bevy_ecs/Cargo.toml b/crates/bevy_ecs/Cargo.toml
+index 97cdcee0824b7..9198f9b79a3cf 100644
+--- a/crates/bevy_ecs/Cargo.toml
++++ b/crates/bevy_ecs/Cargo.toml
+@@ -8,7 +8,7 @@ repository = "https://github.com/bevyengine/bevy"
+ license = "MIT OR Apache-2.0"
+ keywords = ["ecs", "game", "bevy"]
+ categories = ["game-engines", "data-structures"]
+-rust-version = "1.85.0"
++rust-version = "1.86.0"
+ 
+ [features]
+ default = ["std", "bevy_reflect", "async_executor", "backtrace"]
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index a657765ac23f9..4fd3d6d1a5889 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -504,12 +504,10 @@ pub fn derive_schedule_label(input: TokenStream) -> TokenStream {
+     let input = parse_macro_input!(input as DeriveInput);
+     let mut trait_path = bevy_ecs_path();
+     trait_path.segments.push(format_ident!("schedule").into());
+-    let mut dyn_eq_path = trait_path.clone();
+     trait_path
+         .segments
+         .push(format_ident!("ScheduleLabel").into());
+-    dyn_eq_path.segments.push(format_ident!("DynEq").into());
+-    derive_label(input, "ScheduleLabel", &trait_path, &dyn_eq_path)
++    derive_label(input, "ScheduleLabel", &trait_path)
+ }
+ 
+ /// Derive macro generating an impl of the trait `SystemSet`.
+@@ -520,10 +518,8 @@ pub fn derive_system_set(input: TokenStream) -> TokenStream {
+     let input = parse_macro_input!(input as DeriveInput);
+     let mut trait_path = bevy_ecs_path();
+     trait_path.segments.push(format_ident!("schedule").into());
+-    let mut dyn_eq_path = trait_path.clone();
+     trait_path.segments.push(format_ident!("SystemSet").into());
+-    dyn_eq_path.segments.push(format_ident!("DynEq").into());
+-    derive_label(input, "SystemSet", &trait_path, &dyn_eq_path)
++    derive_label(input, "SystemSet", &trait_path)
+ }
+ 
+ pub(crate) fn bevy_ecs_path() -> syn::Path {
+diff --git a/crates/bevy_ecs/src/label.rs b/crates/bevy_ecs/src/label.rs
+index c404c563bdbec..9d3f6f838dc47 100644
+--- a/crates/bevy_ecs/src/label.rs
++++ b/crates/bevy_ecs/src/label.rs
+@@ -12,9 +12,6 @@ pub use alloc::boxed::Box;
+ /// An object safe version of [`Eq`]. This trait is automatically implemented
+ /// for any `'static` type that implements `Eq`.
+ pub trait DynEq: Any {
+-    /// Casts the type to `dyn Any`.
+-    fn as_any(&self) -> &dyn Any;
+-
+     /// This method tests for `self` and `other` values to be equal.
+     ///
+     /// Implementers should avoid returning `true` when the underlying types are
+@@ -29,12 +26,8 @@ impl<T> DynEq for T
+ where
+     T: Any + Eq,
+ {
+-    fn as_any(&self) -> &dyn Any {
+-        self
+-    }
+-
+     fn dyn_eq(&self, other: &dyn DynEq) -> bool {
+-        if let Some(other) = other.as_any().downcast_ref::<T>() {
++        if let Some(other) = (other as &dyn Any).downcast_ref::<T>() {
+             return self == other;
+         }
+         false
+@@ -44,9 +37,6 @@ where
+ /// An object safe version of [`Hash`]. This trait is automatically implemented
+ /// for any `'static` type that implements `Hash`.
+ pub trait DynHash: DynEq {
+-    /// Casts the type to `dyn Any`.
+-    fn as_dyn_eq(&self) -> &dyn DynEq;
+-
+     /// Feeds this value into the given [`Hasher`].
+     fn dyn_hash(&self, state: &mut dyn Hasher);
+ }
+@@ -58,10 +48,6 @@ impl<T> DynHash for T
+ where
+     T: DynEq + Hash,
+ {
+-    fn as_dyn_eq(&self) -> &dyn DynEq {
+-        self
+-    }
+-
+     fn dyn_hash(&self, mut state: &mut dyn Hasher) {
+         T::hash(self, &mut state);
+         self.type_id().hash(&mut state);
+@@ -120,7 +106,7 @@ macro_rules! define_label {
+     ) => {
+ 
+         $(#[$label_attr])*
+-        pub trait $label_trait_name: 'static + Send + Sync + ::core::fmt::Debug {
++        pub trait $label_trait_name: Send + Sync + ::core::fmt::Debug + $crate::label::DynEq + $crate::label::DynHash {
+ 
+             $($trait_extra_methods)*
+ 
+@@ -129,12 +115,6 @@ macro_rules! define_label {
+             ///`.
+             fn dyn_clone(&self) -> $crate::label::Box<dyn $label_trait_name>;
+ 
+-            /// Casts this value to a form where it can be compared with other type-erased values.
+-            fn as_dyn_eq(&self) -> &dyn $crate::label::DynEq;
+-
+-            /// Feeds this value into the given [`Hasher`].
+-            fn dyn_hash(&self, state: &mut dyn ::core::hash::Hasher);
+-
+             /// Returns an [`Interned`] value corresponding to `self`.
+             fn intern(&self) -> $crate::intern::Interned<dyn $label_trait_name>
+             where Self: Sized {
+@@ -151,15 +131,6 @@ macro_rules! define_label {
+                 (**self).dyn_clone()
+             }
+ 
+-            /// Casts this value to a form where it can be compared with other type-erased values.
+-            fn as_dyn_eq(&self) -> &dyn $crate::label::DynEq {
+-                (**self).as_dyn_eq()
+-            }
+-
+-            fn dyn_hash(&self, state: &mut dyn ::core::hash::Hasher) {
+-                (**self).dyn_hash(state);
+-            }
+-
+             fn intern(&self) -> Self {
+                 *self
+             }
+@@ -167,7 +138,7 @@ macro_rules! define_label {
+ 
+         impl PartialEq for dyn $label_trait_name {
+             fn eq(&self, other: &Self) -> bool {
+-                self.as_dyn_eq().dyn_eq(other.as_dyn_eq())
++                self.dyn_eq(other)
+             }
+         }
+ 
+@@ -188,7 +159,7 @@ macro_rules! define_label {
+                 use ::core::ptr;
+ 
+                 // Test that both the type id and pointer address are equivalent.
+-                self.as_dyn_eq().type_id() == other.as_dyn_eq().type_id()
++                self.type_id() == other.type_id()
+                     && ptr::addr_eq(ptr::from_ref::<Self>(self), ptr::from_ref::<Self>(other))
+             }
+ 
+@@ -196,7 +167,7 @@ macro_rules! define_label {
+                 use ::core::{hash::Hash, ptr};
+ 
+                 // Hash the type id...
+-                self.as_dyn_eq().type_id().hash(state);
++                self.type_id().hash(state);
+ 
+                 // ...and the pointer address.
+                 // Cast to a unit `()` first to discard any pointer metadata.
+diff --git a/crates/bevy_ecs/src/schedule/set.rs b/crates/bevy_ecs/src/schedule/set.rs
+index 896c7ed050ecc..2ad456e1ca033 100644
+--- a/crates/bevy_ecs/src/schedule/set.rs
++++ b/crates/bevy_ecs/src/schedule/set.rs
+@@ -115,15 +115,6 @@ impl<T> SystemSet for SystemTypeSet<T> {
+     fn dyn_clone(&self) -> Box<dyn SystemSet> {
+         Box::new(*self)
+     }
+-
+-    fn as_dyn_eq(&self) -> &dyn DynEq {
+-        self
+-    }
+-
+-    fn dyn_hash(&self, mut state: &mut dyn Hasher) {
+-        TypeId::of::<Self>().hash(&mut state);
+-        self.hash(&mut state);
+-    }
+ }
+ 
+ /// A [`SystemSet`] implicitly created when using
+@@ -146,15 +137,6 @@ impl SystemSet for AnonymousSet {
+     fn dyn_clone(&self) -> Box<dyn SystemSet> {
+         Box::new(*self)
+     }
+-
+-    fn as_dyn_eq(&self) -> &dyn DynEq {
+-        self
+-    }
+-
+-    fn dyn_hash(&self, mut state: &mut dyn Hasher) {
+-        TypeId::of::<Self>().hash(&mut state);
+-        self.hash(&mut state);
+-    }
+ }
+ 
+ /// Types that can be converted into a [`SystemSet`].
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index 7a16c485196b3..d3a9acc8009d6 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -2622,10 +2622,7 @@ impl DynSystemParamState {
+ }
+ 
+ /// Allows a [`SystemParam::State`] to be used as a trait object for implementing [`DynSystemParam`].
+-trait DynParamState: Sync + Send {
+-    /// Casts the underlying `ParamState<T>` to an `Any` so it can be downcast.
+-    fn as_any_mut(&mut self) -> &mut dyn Any;
+-
++trait DynParamState: Sync + Send + Any {
+     /// For the specified [`Archetype`], registers the components accessed by this [`SystemParam`] (if applicable).a
+     ///
+     /// # Safety
+@@ -2656,10 +2653,6 @@ trait DynParamState: Sync + Send {
+ struct ParamState<T: SystemParam>(T::State);
+ 
+ impl<T: SystemParam + 'static> DynParamState for ParamState<T> {
+-    fn as_any_mut(&mut self) -> &mut dyn Any {
+-        self
+-    }
+-
+     unsafe fn new_archetype(&mut self, archetype: &Archetype, system_meta: &mut SystemMeta) {
+         // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+         unsafe { T::new_archetype(&mut self.0, archetype, system_meta) };
+@@ -2709,18 +2702,11 @@ unsafe impl SystemParam for DynSystemParam<'_, '_> {
+         change_tick: Tick,
+     ) -> Self::Item<'world, 'state> {
+         // SAFETY:
+-        // - `state.0` is a boxed `ParamState<T>`, and its implementation of `as_any_mut` returns `self`.
++        // - `state.0` is a boxed `ParamState<T>`.
+         // - The state was obtained from `SystemParamBuilder::build()`, which registers all [`World`] accesses used
+         //   by [`SystemParam::get_param`] with the provided [`system_meta`](SystemMeta).
+         // - The caller ensures that the provided world is the same and has the required access.
+-        unsafe {
+-            DynSystemParam::new(
+-                state.0.as_any_mut(),
+-                world,
+-                system_meta.clone(),
+-                change_tick,
+-            )
+-        }
++        unsafe { DynSystemParam::new(state.0.as_mut(), world, system_meta.clone(), change_tick) }
+     }
+ 
+     unsafe fn new_archetype(
+diff --git a/crates/bevy_macro_utils/src/label.rs b/crates/bevy_macro_utils/src/label.rs
+index 1fc540c9c4ea3..7669f85f1a385 100644
+--- a/crates/bevy_macro_utils/src/label.rs
++++ b/crates/bevy_macro_utils/src/label.rs
+@@ -58,7 +58,6 @@ pub fn derive_label(
+     input: syn::DeriveInput,
+     trait_name: &str,
+     trait_path: &syn::Path,
+-    dyn_eq_path: &syn::Path,
+ ) -> TokenStream {
+     if let syn::Data::Union(_) = &input.data {
+         let message = format!("Cannot derive {trait_name} for unions.");
+@@ -89,16 +88,6 @@ pub fn derive_label(
+                 fn dyn_clone(&self) -> alloc::boxed::Box<dyn #trait_path> {
+                     alloc::boxed::Box::new(::core::clone::Clone::clone(self))
+                 }
+-
+-                fn as_dyn_eq(&self) -> &dyn #dyn_eq_path {
+-                    self
+-                }
+-
+-                fn dyn_hash(&self, mut state: &mut dyn ::core::hash::Hasher) {
+-                    let ty_id = ::core::any::TypeId::of::<Self>();
+-                    ::core::hash::Hash::hash(&ty_id, &mut state);
+-                    ::core::hash::Hash::hash(self, &mut state);
+-                }
+             }
+         };
+     }
+diff --git a/crates/bevy_render/macros/src/lib.rs b/crates/bevy_render/macros/src/lib.rs
+index 7a04932bcd0d6..75cbdfa959b3a 100644
+--- a/crates/bevy_render/macros/src/lib.rs
++++ b/crates/bevy_render/macros/src/lib.rs
+@@ -80,12 +80,10 @@ pub fn derive_render_label(input: TokenStream) -> TokenStream {
+     trait_path
+         .segments
+         .push(format_ident!("render_graph").into());
+-    let mut dyn_eq_path = trait_path.clone();
+     trait_path
+         .segments
+         .push(format_ident!("RenderLabel").into());
+-    dyn_eq_path.segments.push(format_ident!("DynEq").into());
+-    derive_label(input, "RenderLabel", &trait_path, &dyn_eq_path)
++    derive_label(input, "RenderLabel", &trait_path)
+ }
+ 
+ /// Derive macro generating an impl of the trait `RenderSubGraph`.
+@@ -98,10 +96,8 @@ pub fn derive_render_sub_graph(input: TokenStream) -> TokenStream {
+     trait_path
+         .segments
+         .push(format_ident!("render_graph").into());
+-    let mut dyn_eq_path = trait_path.clone();
+     trait_path
+         .segments
+         .push(format_ident!("RenderSubGraph").into());
+-    dyn_eq_path.segments.push(format_ident!("DynEq").into());
+-    derive_label(input, "RenderSubGraph", &trait_path, &dyn_eq_path)
++    derive_label(input, "RenderSubGraph", &trait_path)
+ }
+diff --git a/release-content/migration-guides/interned-labels-cleanup.md b/release-content/migration-guides/interned-labels-cleanup.md
+new file mode 100644
+index 0000000000000..281787d2fcb81
+--- /dev/null
++++ b/release-content/migration-guides/interned-labels-cleanup.md
+@@ -0,0 +1,8 @@
++---
++title: Interned labels cleanup
++pull_requests: [18984]
++---
++
++- `DynEq::as_any` has been removed. Use `&value as &dyn Any` instead.
++- `DynHash::as_dyn_eq` has been removed. Use `&value as &dyn DynEq` instead.
++- `as_dyn_eq` has been removed from 'label' types such as `ScheduleLabel` and `SystemSet`. Call `DynEq::dyn_eq` directly on the label instead.

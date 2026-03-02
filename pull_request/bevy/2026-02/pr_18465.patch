@@ -1,0 +1,400 @@
+diff --git a/crates/bevy_animation/src/lib.rs b/crates/bevy_animation/src/lib.rs
+index bdfc343eb5ec8..b2661bb222cd4 100644
+--- a/crates/bevy_animation/src/lib.rs
++++ b/crates/bevy_animation/src/lib.rs
+@@ -1244,11 +1244,6 @@ impl Plugin for AnimationPlugin {
+                     // it to its own system set after `Update` but before
+                     // `PostUpdate`. For now, we just disable ambiguity testing
+                     // for this system.
+-                    #[cfg(feature = "bevy_mesh")]
+-                    animate_targets
+-                        .before(bevy_mesh::InheritWeightSystems)
+-                        .ambiguous_with_all(),
+-                    #[cfg(not(feature = "bevy_mesh"))]
+                     animate_targets.ambiguous_with_all(),
+                     trigger_untargeted_animation_events,
+                     expire_completed_transitions,
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index e3e10562177bd..48395c746cba0 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -1587,7 +1587,7 @@ fn load_node(
+     // Map node index to entity
+     node_index_to_entity_map.insert(gltf_node.index(), node.id());
+ 
+-    let mut morph_weights = None;
++    let mut max_morph_target_count = 0;
+ 
+     node.with_children(|parent| {
+         // Only include meshes in the output if they're set to be retained in the MAIN_WORLD and/or RENDER_WORLD by the load_meshes flag
+@@ -1631,6 +1631,7 @@ fn load_node(
+                     primitive: primitive.index(),
+                 };
+                 let bounds = primitive.bounding_box();
++                let parent_entity = parent.target_entity();
+ 
+                 // Apply the inverse of the conversion transform that's been
+                 // applied to the mesh asset. This preserves the mesh's relation
+@@ -1658,22 +1659,8 @@ fn load_node(
+ 
+                 let target_count = primitive.morph_targets().len();
+                 if target_count != 0 {
+-                    let weights = match mesh.weights() {
+-                        Some(weights) => weights.to_vec(),
+-                        None => vec![0.0; target_count],
+-                    };
+-
+-                    if morph_weights.is_none() {
+-                        morph_weights = Some(weights.clone());
+-                    }
+-
+-                    // unwrap: the parent's call to `MeshMorphWeights::new`
+-                    // means this code doesn't run if it returns an `Err`.
+-                    // According to https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#morph-targets
+-                    // they should all have the same length.
+-                    // > All morph target accessors MUST have the same count as
+-                    // > the accessors of the original primitive.
+-                    mesh_entity.insert(MeshMorphWeights::new(weights).unwrap());
++                    max_morph_target_count = max_morph_target_count.max(target_count);
++                    mesh_entity.insert(MeshMorphWeights::Reference(parent_entity));
+                 }
+ 
+                 let mut bounds_min = Vec3::from_slice(&bounds.min);
+@@ -1844,15 +1831,31 @@ fn load_node(
+ 
+     // Only include meshes in the output if they're set to be retained in the MAIN_WORLD and/or RENDER_WORLD by the load_meshes flag
+     if !settings.load_meshes.is_empty()
+-        && let (Some(mesh), Some(weights)) = (gltf_node.mesh(), morph_weights)
++        && let Some(mesh) = gltf_node.mesh()
+     {
+-        let primitive_label = mesh.primitives().next().map(|p| GltfAssetLabel::Primitive {
+-            mesh: mesh.index(),
+-            primitive: p.index(),
+-        });
+-        let first_mesh =
+-            primitive_label.map(|label| load_context.get_label_handle(label.to_string()));
+-        node.insert(MorphWeights::new(weights, first_mesh)?);
++        // Create the `MorphWeights` component. The weights will be copied
++        // from `mesh.weights()` if present. If not then the weights are
++        // zero.
++        //
++        // The glTF spec says that all primitives within a mesh must have
++        // the same number of morph targets, and `mesh.weights()` should be
++        // equal to that number if present. We're more forgiving and take
++        // whichever is largest, leaving any unspecified weights at zero.
++        if (max_morph_target_count > 0) || mesh.weights().is_some() {
++            let mut weights = Vec::from(mesh.weights().unwrap_or(&[]));
++
++            if max_morph_target_count > weights.len() {
++                weights.resize(max_morph_target_count, 0.0);
++            }
++
++            let primitive_label = mesh.primitives().next().map(|p| GltfAssetLabel::Primitive {
++                mesh: mesh.index(),
++                primitive: p.index(),
++            });
++            let first_mesh =
++                primitive_label.map(|label| load_context.get_label_handle(label.to_string()));
++            node.insert(MorphWeights::new(weights, first_mesh)?);
++        }
+     }
+ 
+     // let extensions process node data
+diff --git a/crates/bevy_mesh/src/lib.rs b/crates/bevy_mesh/src/lib.rs
+index 5774761791098..68846c9a8d639 100644
+--- a/crates/bevy_mesh/src/lib.rs
++++ b/crates/bevy_mesh/src/lib.rs
+@@ -16,7 +16,7 @@ pub mod skinning;
+ mod vertex;
+ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_asset::{AssetApp, AssetEventSystems};
+-use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
++use bevy_ecs::schedule::IntoScheduleConfigs;
+ use bitflags::bitflags;
+ pub use components::*;
+ pub use index::*;
+@@ -89,7 +89,3 @@ impl BaseMeshPipelineKey {
+         }
+     }
+ }
+-
+-/// `bevy_render::mesh::inherit_weights` runs in this `SystemSet`
+-#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+-pub struct InheritWeightSystems;
+diff --git a/crates/bevy_mesh/src/morph.rs b/crates/bevy_mesh/src/morph.rs
+index 2cb39a31985cb..37c6accff750c 100644
+--- a/crates/bevy_mesh/src/morph.rs
++++ b/crates/bevy_mesh/src/morph.rs
+@@ -97,17 +97,36 @@ impl MorphTargetImage {
+     }
+ }
+ 
+-/// Controls the [morph targets] for all child [`Mesh3d`](crate::Mesh3d) entities. In most cases, [`MorphWeights`] should be considered
+-/// the "source of truth" when writing morph targets for meshes. However you can choose to write child [`MeshMorphWeights`]
+-/// if your situation requires more granularity. Just note that if you set [`MorphWeights`], it will overwrite child
+-/// [`MeshMorphWeights`] values.
++/// A component that controls the [morph targets] of one or more
++/// [`Mesh3d`](crate::Mesh3d) components.
+ ///
+-/// This exists because Bevy's [`Mesh`] corresponds to a _single_ surface / material, whereas morph targets
+-/// as defined in the GLTF spec exist on "multi-primitive meshes" (where each primitive is its own surface with its own material).
+-/// Therefore in Bevy [`MorphWeights`] an a parent entity are the "canonical weights" from a GLTF perspective, which then
+-/// synchronized to child [`Mesh3d`](crate::Mesh3d) / [`MeshMorphWeights`] (which correspond to "primitives" / "surfaces" from a GLTF perspective).
++/// `MorphWeights` works together with the [`MeshMorphWeights`] component. When
++/// a `MeshMorphWeights` is set to `MeshMorphWeights::Reference`, it references
++/// another entity that is expected to contain a `MorphWeights` component. This
++/// allows multiple meshes to share a single `MorphWeights` component.
+ ///
+-/// Add this to the parent of one or more [`Entities`](`Entity`) with a [`Mesh3d`](crate::Mesh3d) with a [`MeshMorphWeights`].
++/// ```
++/// # use bevy_asset::prelude::*;
++/// # use bevy_ecs::prelude::*;
++/// # use bevy_mesh::Mesh;
++/// # use bevy_mesh::morph::*;
++/// # #[derive(Component)]
++/// # struct Mesh3d(Handle<Mesh>);
++/// fn setup(mut commands: Commands, mesh_handle: Handle<Mesh>) {
++///     // Create the `MorphWeights` component.
++///     let weights_component = MorphWeights::new(vec![0.0, 0.5, 1.0], None).unwrap();
++///
++///     // Spawn an entity that contains the `MorphWeights` component.
++///     let weights_entity = commands.spawn(weights_component).id();
++///
++///     // Spawn another entity with a mesh and a `MeshMorphWeights` component
++///     // that references `weights_entity`.
++///     let mesh_entity = commands.spawn((
++///         Mesh3d(mesh_handle.clone()),
++///         MeshMorphWeights::Reference(weights_entity),
++///     ));
++/// }
++/// ```
+ ///
+ /// [morph targets]: https://en.wikipedia.org/wiki/Morph_target_animation
+ #[derive(Reflect, Default, Debug, Clone, Component)]
+@@ -145,43 +164,22 @@ impl MorphWeights {
+     }
+ }
+ 
+-/// Control a specific [`Mesh`] instance's [morph targets]. These control the weights of
+-/// specific "mesh primitives" in scene formats like GLTF. They can be set manually, but
+-/// in most cases they should "automatically" synced by setting the [`MorphWeights`] component
+-/// on a parent entity.
+-///
+-/// See [`MorphWeights`] for more details on Bevy's morph target implementation.
+-///
+-/// Add this to an [`Entity`] with a [`Mesh3d`](crate::Mesh3d) with a [`MorphAttributes`] set
+-/// to control individual weights of each morph target.
++/// A component that controls the [morph targets] of a mesh. Must be assigned
++/// to an entity with a [`Mesh3d`](crate::Mesh3d) component.
+ ///
+ /// [morph targets]: https://en.wikipedia.org/wiki/Morph_target_animation
+-#[derive(Reflect, Default, Debug, Clone, Component)]
+-#[reflect(Debug, Component, Default, Clone)]
+-pub struct MeshMorphWeights {
+-    weights: Vec<f32>,
+-}
+-
+-impl MeshMorphWeights {
+-    pub fn new(weights: Vec<f32>) -> Result<Self, MorphBuildError> {
+-        if weights.len() > MAX_MORPH_WEIGHTS {
+-            let target_count = weights.len();
+-            return Err(MorphBuildError::TooManyTargets { target_count });
+-        }
+-        Ok(MeshMorphWeights { weights })
+-    }
+-    pub fn weights(&self) -> &[f32] {
+-        &self.weights
+-    }
+-    pub fn weights_mut(&mut self) -> &mut [f32] {
+-        &mut self.weights
+-    }
+-    pub fn clear_weights(&mut self) {
+-        self.weights.clear();
+-    }
+-    pub fn extend_weights(&mut self, weights: &[f32]) {
+-        self.weights.extend(weights);
+-    }
++#[derive(Reflect, Debug, Clone, Component)]
++#[reflect(Debug, Component, Clone)]
++pub enum MeshMorphWeights {
++    Value {
++        weights: Vec<f32>,
++    },
++    /// A reference to an entity containing a [`MorphWeights`] component. This
++    /// allows a single `MorphWeights` component to control the morph targets
++    /// of multiple meshes.
++    ///
++    /// See [`MorphWeights`] for an example.
++    Reference(#[entities] Entity),
+ }
+ 
+ /// Attributes **differences** used for morph targets.
+diff --git a/crates/bevy_pbr/src/render/morph.rs b/crates/bevy_pbr/src/render/morph.rs
+index c742c77300cc0..c04d06dabd2b0 100644
+--- a/crates/bevy_pbr/src/render/morph.rs
++++ b/crates/bevy_pbr/src/render/morph.rs
+@@ -2,7 +2,7 @@ use core::{iter, mem};
+ 
+ use bevy_camera::visibility::ViewVisibility;
+ use bevy_ecs::prelude::*;
+-use bevy_mesh::morph::{MeshMorphWeights, MAX_MORPH_WEIGHTS};
++use bevy_mesh::morph::{MeshMorphWeights, MorphWeights, MAX_MORPH_WEIGHTS};
+ use bevy_render::sync_world::MainEntityHashMap;
+ use bevy_render::{
+     batching::NoAutomaticBatching,
+@@ -110,6 +110,7 @@ pub fn extract_morphs(
+     morph_indices: ResMut<MorphIndices>,
+     uniform: ResMut<MorphUniforms>,
+     query: Extract<Query<(Entity, &ViewVisibility, &MeshMorphWeights)>>,
++    weights_query: Extract<Query<&MorphWeights>>,
+ ) {
+     // Borrow check workaround.
+     let (morph_indices, uniform) = (morph_indices.into_inner(), uniform.into_inner());
+@@ -121,12 +122,19 @@ pub fn extract_morphs(
+     morph_indices.current.clear();
+     uniform.current_buffer.clear();
+ 
+-    for (entity, view_visibility, morph_weights) in &query {
++    for (entity, view_visibility, mesh_weights) in &query {
+         if !view_visibility.get() {
+             continue;
+         }
++        let Ok(weights) = (match mesh_weights {
++            MeshMorphWeights::Reference(entity) => {
++                weights_query.get(*entity).map(MorphWeights::weights)
++            }
++            MeshMorphWeights::Value { weights } => Ok(weights.as_slice()),
++        }) else {
++            continue;
++        };
+         let start = uniform.current_buffer.len();
+-        let weights = morph_weights.weights();
+         let legal_weights = weights
+             .iter()
+             .chain(iter::repeat(&0.0))
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index 89e71c62c2319..3a75044bcdd22 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -284,8 +284,6 @@ impl Plugin for RenderPlugin {
+             ViewPlugin,
+             MeshRenderAssetPlugin,
+             GlobalsPlugin,
+-            #[cfg(feature = "morph")]
+-            mesh::MorphPlugin,
+             TexturePlugin,
+             BatchingPlugin {
+                 debug_flags: self.debug_flags,
+diff --git a/crates/bevy_render/src/mesh/mod.rs b/crates/bevy_render/src/mesh/mod.rs
+index fb849cd51b3aa..a00381642a798 100644
+--- a/crates/bevy_render/src/mesh/mod.rs
++++ b/crates/bevy_render/src/mesh/mod.rs
+@@ -16,9 +16,7 @@ use bevy_ecs::{
+         SystemParamItem,
+     },
+ };
+-#[cfg(feature = "morph")]
+-use bevy_mesh::morph::{MeshMorphWeights, MorphWeights};
+-use bevy_mesh::*;
++pub use bevy_mesh::*;
+ use wgpu::IndexFormat;
+ 
+ /// Makes sure that [`Mesh`]es are extracted and prepared for the GPU.
+@@ -40,38 +38,6 @@ impl Plugin for MeshRenderAssetPlugin {
+     }
+ }
+ 
+-/// [Inherit weights](inherit_weights) from glTF mesh parent entity to direct
+-/// bevy mesh child entities (ie: glTF primitive).
+-#[cfg(feature = "morph")]
+-pub struct MorphPlugin;
+-#[cfg(feature = "morph")]
+-impl Plugin for MorphPlugin {
+-    fn build(&self, app: &mut App) {
+-        app.add_systems(
+-            bevy_app::PostUpdate,
+-            inherit_weights.in_set(InheritWeightSystems),
+-        );
+-    }
+-}
+-
+-/// Bevy meshes are gltf primitives, [`MorphWeights`] on the bevy node entity
+-/// should be inherited by children meshes.
+-///
+-/// Only direct children are updated, to fulfill the expectations of glTF spec.
+-#[cfg(feature = "morph")]
+-pub fn inherit_weights(
+-    morph_nodes: Query<(&Children, &MorphWeights), (Without<Mesh3d>, Changed<MorphWeights>)>,
+-    mut morph_primitives: Query<&mut MeshMorphWeights, With<Mesh3d>>,
+-) {
+-    for (children, parent_weights) in &morph_nodes {
+-        let mut iter = morph_primitives.iter_many_mut(children);
+-        while let Some(mut child_weight) = iter.fetch_next() {
+-            child_weight.clear_weights();
+-            child_weight.extend_weights(parent_weights.weights());
+-        }
+-    }
+-}
+-
+ /// The render world representation of a [`Mesh`].
+ #[derive(Debug, Clone)]
+ pub struct RenderMesh {
+diff --git a/release-content/migration-guides/mesh_morph_weights.md b/release-content/migration-guides/mesh_morph_weights.md
+new file mode 100644
+index 0000000000000..b1926a72f4a46
+--- /dev/null
++++ b/release-content/migration-guides/mesh_morph_weights.md
+@@ -0,0 +1,53 @@
++---
++title: "`MorphWeights` and `MeshMorphWeights` have been restructured"
++pull_requests: [18465]
++---
++
++Mesh morph target weights have been restructured to improve flexibility and
++performance. Users who manually create `MeshMorphWeights` or `MorphWeights`
++components may need to make changes.
++
++In Bevy 0.18, entities with a `Mesh3d` component could have a `MeshMorphWeights`
++component containing morph weight values. In addition, if a parent of the mesh
++entity had a `MorphWeights` component then its values would be automatically
++copied to the `MeshMorphWeights` component - this allowed multiple meshes to
++share a single set of weight values.
++
++In Bevy 0.19, `MeshMorphWeights` has been changed. It can now be either a set of
++weight values as before, or a reference to an entity containing a `MorphWeights`
++component. Referencing replaces the previous automatic copying.
++
++```rust
++// 0.18
++struct MeshMorphWeights { weights: Vec<f32> }
++
++// 0.19
++enum MeshMorphWeights {
++    Value { weights: Vec<f32> },
++    Reference(Entity),
++}
++```
++
++If you were using `MeshMorphWeights` on its own, then you just need to
++use `MeshMorphWeights::Value`.
++
++If you were using `MorphWeights` and `MeshMorphWeights` and relying on the
++automatic copying, then you need to use `MeshMorphWeights::Reference` and point
++it to the entity with `MorphWeights`.
++
++```rust
++// 0.18
++parent_entity.insert(MorphWeights::new(...));
++mesh_entity.insert((mesh, MeshMorphWeights::new(...)));
++
++// 0.19
++parent_entity.insert(MorphWeights::new(...));
++mesh_entity.insert((mesh, MeshMorphWeights::Reference(parent_entity)));
++```
++
++These changes improve performance due to less copying. They also add
++flexibility - a `MeshMorphWeights` component can reference a `MorphWeights`
++component on any entity, not just its parent.
++
++As a result of these changes, `MorphPlugin` was no longer needed and has been
++removed.

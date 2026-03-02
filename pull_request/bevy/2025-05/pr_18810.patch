@@ -1,0 +1,1017 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a3d3a2ab63e51..7cf1334e81356 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -291,9 +291,6 @@ bevy_log = ["bevy_internal/bevy_log"]
+ # Enable input focus subsystem
+ bevy_input_focus = ["bevy_internal/bevy_input_focus"]
+ 
+-# Use the configurable global error handler as the default error handler.
+-configurable_error_handler = ["bevy_internal/configurable_error_handler"]
+-
+ # Enable passthrough loading for SPIR-V shaders (Only supported on Vulkan, shader capabilities and extensions must agree with the platform implementation)
+ spirv_shader_passthrough = ["bevy_internal/spirv_shader_passthrough"]
+ 
+@@ -2215,7 +2212,6 @@ wasm = false
+ name = "fallible_params"
+ path = "examples/ecs/fallible_params.rs"
+ doc-scrape-examples = true
+-required-features = ["configurable_error_handler"]
+ 
+ [package.metadata.example.fallible_params]
+ name = "Fallible System Parameters"
+@@ -2227,7 +2223,7 @@ wasm = false
+ name = "error_handling"
+ path = "examples/ecs/error_handling.rs"
+ doc-scrape-examples = true
+-required-features = ["bevy_mesh_picking_backend", "configurable_error_handler"]
++required-features = ["bevy_mesh_picking_backend"]
+ 
+ [package.metadata.example.error_handling]
+ name = "Error handling"
+diff --git a/crates/bevy_app/src/app.rs b/crates/bevy_app/src/app.rs
+index 60431ca47948d..81d7baeb4b520 100644
+--- a/crates/bevy_app/src/app.rs
++++ b/crates/bevy_app/src/app.rs
+@@ -10,6 +10,7 @@ use alloc::{
+ pub use bevy_derive::AppLabel;
+ use bevy_ecs::{
+     component::RequiredComponentsError,
++    error::{DefaultErrorHandler, ErrorHandler},
+     event::{event_update_system, EventCursor},
+     intern::Interned,
+     prelude::*,
+@@ -85,6 +86,7 @@ pub struct App {
+     /// [`WinitPlugin`]: https://docs.rs/bevy/latest/bevy/winit/struct.WinitPlugin.html
+     /// [`ScheduleRunnerPlugin`]: https://docs.rs/bevy/latest/bevy/app/struct.ScheduleRunnerPlugin.html
+     pub(crate) runner: RunnerFn,
++    default_error_handler: Option<ErrorHandler>,
+ }
+ 
+ impl Debug for App {
+@@ -143,6 +145,7 @@ impl App {
+                 sub_apps: HashMap::default(),
+             },
+             runner: Box::new(run_once),
++            default_error_handler: None,
+         }
+     }
+ 
+@@ -1115,7 +1118,12 @@ impl App {
+     }
+ 
+     /// Inserts a [`SubApp`] with the given label.
+-    pub fn insert_sub_app(&mut self, label: impl AppLabel, sub_app: SubApp) {
++    pub fn insert_sub_app(&mut self, label: impl AppLabel, mut sub_app: SubApp) {
++        if let Some(handler) = self.default_error_handler {
++            sub_app
++                .world_mut()
++                .get_resource_or_insert_with(|| DefaultErrorHandler(handler));
++        }
+         self.sub_apps.sub_apps.insert(label.intern(), sub_app);
+     }
+ 
+@@ -1334,6 +1342,49 @@ impl App {
+         self.world_mut().add_observer(observer);
+         self
+     }
++
++    /// Gets the error handler to set for new supapps.
++    ///
++    /// Note that the error handler of existing subapps may differ.
++    pub fn get_error_handler(&self) -> Option<ErrorHandler> {
++        self.default_error_handler
++    }
++
++    /// Set the [default error handler] for the all subapps (including the main one and future ones)
++    /// that do not have one.
++    ///
++    /// May only be called once and should be set by the application, not by libraries.
++    ///
++    /// The handler will be called when an error is produced and not otherwise handled.
++    ///
++    /// # Panics
++    /// Panics if called multiple times.
++    ///
++    /// # Example
++    /// ```
++    /// # use bevy_app::*;
++    /// # use bevy_ecs::error::warn;
++    /// # fn MyPlugins(_: &mut App) {}
++    /// App::new()
++    ///     .set_error_handler(warn)
++    ///     .add_plugins(MyPlugins)
++    ///     .run();
++    /// ```
++    ///
++    /// [default error handler]: bevy_ecs::error::DefaultErrorHandler
++    pub fn set_error_handler(&mut self, handler: ErrorHandler) -> &mut Self {
++        assert!(
++            self.default_error_handler.is_none(),
++            "`set_error_handler` called multiple times on same `App`"
++        );
++        self.default_error_handler = Some(handler);
++        for sub_app in self.sub_apps.iter_mut() {
++            sub_app
++                .world_mut()
++                .get_resource_or_insert_with(|| DefaultErrorHandler(handler));
++        }
++        self
++    }
+ }
+ 
+ type RunnerFn = Box<dyn FnOnce(App) -> AppExit>;
+diff --git a/crates/bevy_ecs/Cargo.toml b/crates/bevy_ecs/Cargo.toml
+index 97cdcee0824b7..28987f1413449 100644
+--- a/crates/bevy_ecs/Cargo.toml
++++ b/crates/bevy_ecs/Cargo.toml
+@@ -33,13 +33,6 @@ bevy_reflect = ["dep:bevy_reflect"]
+ ## Extends reflection support to functions.
+ reflect_functions = ["bevy_reflect", "bevy_reflect/functions"]
+ 
+-## Use the configurable global error handler as the default error handler.
+-##
+-## This is typically used to turn panics from the ECS into loggable errors.
+-## This may be useful for production builds,
+-## but can result in a measurable performance impact, especially for commands.
+-configurable_error_handler = []
+-
+ ## Enables automatic backtrace capturing in BevyError
+ backtrace = ["std"]
+ 
+diff --git a/crates/bevy_ecs/src/error/command_handling.rs b/crates/bevy_ecs/src/error/command_handling.rs
+index d85ad4a87e551..bf2741d3766e5 100644
+--- a/crates/bevy_ecs/src/error/command_handling.rs
++++ b/crates/bevy_ecs/src/error/command_handling.rs
+@@ -7,22 +7,17 @@ use crate::{
+     world::{error::EntityMutableFetchError, World},
+ };
+ 
+-use super::{default_error_handler, BevyError, ErrorContext};
++use super::{BevyError, ErrorContext, ErrorHandler};
+ 
+-/// Takes a [`Command`] that returns a Result and uses a given error handler function to convert it into
++/// Takes a [`Command`] that potentially returns a Result and uses a given error handler function to convert it into
+ /// a [`Command`] that internally handles an error if it occurs and returns `()`.
+-pub trait HandleError<Out = ()> {
++pub trait HandleError<Out = ()>: Send + 'static {
+     /// Takes a [`Command`] that returns a Result and uses a given error handler function to convert it into
+     /// a [`Command`] that internally handles an error if it occurs and returns `()`.
+-    fn handle_error_with(self, error_handler: fn(BevyError, ErrorContext)) -> impl Command;
++    fn handle_error_with(self, error_handler: ErrorHandler) -> impl Command;
+     /// Takes a [`Command`] that returns a Result and uses the default error handler function to convert it into
+     /// a [`Command`] that internally handles an error if it occurs and returns `()`.
+-    fn handle_error(self) -> impl Command
+-    where
+-        Self: Sized,
+-    {
+-        self.handle_error_with(default_error_handler())
+-    }
++    fn handle_error(self) -> impl Command;
+ }
+ 
+ impl<C, T, E> HandleError<Result<T, E>> for C
+@@ -30,7 +25,7 @@ where
+     C: Command<Result<T, E>>,
+     E: Into<BevyError>,
+ {
+-    fn handle_error_with(self, error_handler: fn(BevyError, ErrorContext)) -> impl Command {
++    fn handle_error_with(self, error_handler: ErrorHandler) -> impl Command {
+         move |world: &mut World| match self.apply(world) {
+             Ok(_) => {}
+             Err(err) => (error_handler)(
+@@ -41,6 +36,18 @@ where
+             ),
+         }
+     }
++
++    fn handle_error(self) -> impl Command {
++        move |world: &mut World| match self.apply(world) {
++            Ok(_) => {}
++            Err(err) => world.default_error_handler()(
++                err.into(),
++                ErrorContext::Command {
++                    name: type_name::<C>().into(),
++                },
++            ),
++        }
++    }
+ }
+ 
+ impl<C> HandleError<Never> for C
+@@ -52,6 +59,13 @@ where
+             self.apply(world);
+         }
+     }
++
++    #[inline]
++    fn handle_error(self) -> impl Command {
++        move |world: &mut World| {
++            self.apply(world);
++        }
++    }
+ }
+ 
+ impl<C> HandleError for C
+@@ -63,10 +77,7 @@ where
+         self
+     }
+     #[inline]
+-    fn handle_error(self) -> impl Command
+-    where
+-        Self: Sized,
+-    {
++    fn handle_error(self) -> impl Command {
+         self
+     }
+ }
+diff --git a/crates/bevy_ecs/src/error/handler.rs b/crates/bevy_ecs/src/error/handler.rs
+index 688b599473ab9..d53e1b3e057c4 100644
+--- a/crates/bevy_ecs/src/error/handler.rs
++++ b/crates/bevy_ecs/src/error/handler.rs
+@@ -1,9 +1,8 @@
+-#[cfg(feature = "configurable_error_handler")]
+-use bevy_platform::sync::OnceLock;
+ use core::fmt::Display;
+ 
+-use crate::{component::Tick, error::BevyError};
++use crate::{component::Tick, error::BevyError, prelude::Resource};
+ use alloc::borrow::Cow;
++use derive_more::derive::{Deref, DerefMut};
+ 
+ /// Context for a [`BevyError`] to aid in debugging.
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -77,53 +76,6 @@ impl ErrorContext {
+     }
+ }
+ 
+-/// A global error handler. This can be set at startup, as long as it is set before
+-/// any uses. This should generally be configured _before_ initializing the app.
+-///
+-/// This should be set inside of your `main` function, before initializing the Bevy app.
+-/// The value of this error handler can be accessed using the [`default_error_handler`] function,
+-/// which calls [`OnceLock::get_or_init`] to get the value.
+-///
+-/// **Note:** this is only available when the `configurable_error_handler` feature of `bevy_ecs` (or `bevy`) is enabled!
+-///
+-/// # Example
+-///
+-/// ```
+-/// # use bevy_ecs::error::{GLOBAL_ERROR_HANDLER, warn};
+-/// GLOBAL_ERROR_HANDLER.set(warn).expect("The error handler can only be set once, globally.");
+-/// // initialize Bevy App here
+-/// ```
+-///
+-/// To use this error handler in your app for custom error handling logic:
+-///
+-/// ```rust
+-/// use bevy_ecs::error::{default_error_handler, GLOBAL_ERROR_HANDLER, BevyError, ErrorContext, panic};
+-///
+-/// fn handle_errors(error: BevyError, ctx: ErrorContext) {
+-///    let error_handler = default_error_handler();
+-///    error_handler(error, ctx);        
+-/// }
+-/// ```
+-///
+-/// # Warning
+-///
+-/// As this can *never* be overwritten, library code should never set this value.
+-#[cfg(feature = "configurable_error_handler")]
+-pub static GLOBAL_ERROR_HANDLER: OnceLock<fn(BevyError, ErrorContext)> = OnceLock::new();
+-
+-/// The default error handler. This defaults to [`panic()`],
+-/// but if set, the [`GLOBAL_ERROR_HANDLER`] will be used instead, enabling error handler customization.
+-/// The `configurable_error_handler` feature must be enabled to change this from the panicking default behavior,
+-/// as there may be runtime overhead.
+-#[inline]
+-pub fn default_error_handler() -> fn(BevyError, ErrorContext) {
+-    #[cfg(not(feature = "configurable_error_handler"))]
+-    return panic;
+-
+-    #[cfg(feature = "configurable_error_handler")]
+-    return *GLOBAL_ERROR_HANDLER.get_or_init(|| panic);
+-}
+-
+ macro_rules! inner {
+     ($call:path, $e:ident, $c:ident) => {
+         $call!(
+@@ -135,6 +87,25 @@ macro_rules! inner {
+     };
+ }
+ 
++/// Defines how Bevy reacts to errors.
++pub type ErrorHandler = fn(BevyError, ErrorContext);
++
++/// Error handler to call when an error is not handled otherwise.
++/// Defaults to [`panic()`].
++///
++/// When updated while a [`Schedule`] is running, it doesn't take effect for
++/// that schedule until it's completed.
++///
++/// [`Schedule`]: crate::schedule::Schedule
++#[derive(Resource, Deref, DerefMut, Copy, Clone)]
++pub struct DefaultErrorHandler(pub ErrorHandler);
++
++impl Default for DefaultErrorHandler {
++    fn default() -> Self {
++        Self(panic)
++    }
++}
++
+ /// Error handler that panics with the system error.
+ #[track_caller]
+ #[inline]
+diff --git a/crates/bevy_ecs/src/error/mod.rs b/crates/bevy_ecs/src/error/mod.rs
+index 950deee3ecf97..231bdda940117 100644
+--- a/crates/bevy_ecs/src/error/mod.rs
++++ b/crates/bevy_ecs/src/error/mod.rs
+@@ -7,8 +7,9 @@
+ //! All [`BevyError`]s returned by a system, observer or command are handled by an "error handler". By default, the
+ //! [`panic`] error handler function is used, resulting in a panic with the error message attached.
+ //!
+-//! You can change the default behavior by registering a custom error handler.
+-//! Modify the [`GLOBAL_ERROR_HANDLER`] value to set a custom error handler function for your entire app.
++//! You can change the default behavior by registering a custom error handler:
++//! Use [`DefaultErrorHandler`] to set a custom error handler function for a world,
++//! or `App::set_error_handler` for a whole app.
+ //! In practice, this is generally feature-flagged: panicking or loudly logging errors in development,
+ //! and quietly logging or ignoring them in production to avoid crashing the app.
+ //!
+@@ -33,10 +34,8 @@
+ //! The [`ErrorContext`] allows you to access additional details relevant to providing
+ //! context surrounding the error – such as the system's [`name`] – in your error messages.
+ //!
+-//! Remember to turn on the `configurable_error_handler` feature to set a global error handler!
+-//!
+ //! ```rust, ignore
+-//! use bevy_ecs::error::{GLOBAL_ERROR_HANDLER, BevyError, ErrorContext};
++//! use bevy_ecs::error::{BevyError, ErrorContext, DefaultErrorHandler};
+ //! use log::trace;
+ //!
+ //! fn my_error_handler(error: BevyError, ctx: ErrorContext) {
+@@ -48,10 +47,9 @@
+ //! }
+ //!
+ //! fn main() {
+-//!     // This requires the "configurable_error_handler" feature to be enabled to be in scope.
+-//!     GLOBAL_ERROR_HANDLER.set(my_error_handler).expect("The error handler can only be set once.");
+-//!     
+-//!     // Initialize your Bevy App here
++//!     let mut world = World::new();
++//!     world.insert_resource(DefaultErrorHandler(my_error_handler));
++//!     // Use your world here
+ //! }
+ //! ```
+ //!
+diff --git a/crates/bevy_ecs/src/observer/runner.rs b/crates/bevy_ecs/src/observer/runner.rs
+index ac1caa5ad0683..be7bc4ede2613 100644
+--- a/crates/bevy_ecs/src/observer/runner.rs
++++ b/crates/bevy_ecs/src/observer/runner.rs
+@@ -3,7 +3,7 @@ use core::any::Any;
+ 
+ use crate::{
+     component::{ComponentHook, ComponentId, HookContext, Mutable, StorageType},
+-    error::{default_error_handler, ErrorContext},
++    error::{ErrorContext, ErrorHandler},
+     observer::{ObserverDescriptor, ObserverTrigger},
+     prelude::*,
+     query::DebugCheckedUnwrap,
+@@ -190,7 +190,7 @@ pub type ObserverRunner = fn(DeferredWorld, ObserverTrigger, PtrMut, propagate:
+ /// [`SystemParam`]: crate::system::SystemParam
+ pub struct Observer {
+     hook_on_add: ComponentHook,
+-    error_handler: Option<fn(BevyError, ErrorContext)>,
++    error_handler: Option<ErrorHandler>,
+     system: Box<dyn Any + Send + Sync + 'static>,
+     pub(crate) descriptor: ObserverDescriptor,
+     pub(crate) last_trigger_id: u32,
+@@ -232,6 +232,7 @@ impl Observer {
+             system: Box::new(|| {}),
+             descriptor: Default::default(),
+             hook_on_add: |mut world, hook_context| {
++                let default_error_handler = world.default_error_handler();
+                 world.commands().queue(move |world: &mut World| {
+                     let entity = hook_context.entity;
+                     if let Some(mut observe) = world.get_mut::<Observer>(entity) {
+@@ -239,7 +240,7 @@ impl Observer {
+                             return;
+                         }
+                         if observe.error_handler.is_none() {
+-                            observe.error_handler = Some(default_error_handler());
++                            observe.error_handler = Some(default_error_handler);
+                         }
+                         world.register_observer(entity);
+                     }
+@@ -348,8 +349,6 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+         return;
+     }
+     state.last_trigger_id = last_trigger;
+-    // SAFETY: Observer was triggered so must have an `Observer` component.
+-    let error_handler = unsafe { state.error_handler.debug_checked_unwrap() };
+ 
+     let trigger: Trigger<E, B> = Trigger::new(
+         // SAFETY: Caller ensures `ptr` is castable to `&mut T`
+@@ -377,7 +376,10 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+         match (*system).validate_param_unsafe(world) {
+             Ok(()) => {
+                 if let Err(err) = (*system).run_unsafe(trigger, world) {
+-                    error_handler(
++                    let handler = state
++                        .error_handler
++                        .unwrap_or_else(|| world.default_error_handler());
++                    handler(
+                         err,
+                         ErrorContext::Observer {
+                             name: (*system).name(),
+@@ -389,7 +391,10 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+             }
+             Err(e) => {
+                 if !e.skipped {
+-                    error_handler(
++                    let handler = state
++                        .error_handler
++                        .unwrap_or_else(|| world.default_error_handler());
++                    handler(
+                         e.into(),
+                         ErrorContext::Observer {
+                             name: (*system).name(),
+@@ -424,9 +429,6 @@ fn hook_on_add<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+             observe.descriptor.events.push(event_id);
+             observe.descriptor.components.extend(components);
+ 
+-            if observe.error_handler.is_none() {
+-                observe.error_handler = Some(default_error_handler());
+-            }
+             let system: *mut dyn ObserverSystem<E, B> = observe.system.downcast_mut::<S>().unwrap();
+             // SAFETY: World reference is exclusive and initialize does not touch system, so references do not alias
+             unsafe {
+@@ -439,7 +441,11 @@ fn hook_on_add<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::{event::Event, observer::Trigger};
++    use crate::{
++        error::{ignore, DefaultErrorHandler},
++        event::Event,
++        observer::Trigger,
++    };
+ 
+     #[derive(Event)]
+     struct TriggerEvent;
+@@ -467,11 +473,20 @@ mod tests {
+             Err("I failed!".into())
+         }
+ 
++        // Using observer error handler
+         let mut world = World::default();
+         world.init_resource::<Ran>();
+-        let observer = Observer::new(system).with_error_handler(crate::error::ignore);
+-        world.spawn(observer);
+-        Schedule::default().run(&mut world);
++        world.spawn(Observer::new(system).with_error_handler(ignore));
++        world.trigger(TriggerEvent);
++        assert!(world.resource::<Ran>().0);
++
++        // Using world error handler
++        let mut world = World::default();
++        world.init_resource::<Ran>();
++        world.spawn(Observer::new(system));
++        // Test that the correct handler is used when the observer was added
++        // before the default handler
++        world.insert_resource(DefaultErrorHandler(ignore));
+         world.trigger(TriggerEvent);
+         assert!(world.resource::<Ran>().0);
+     }
+diff --git a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+index b0757cc031c16..763504eaec422 100644
+--- a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
+ use tracing::{info_span, Span};
+ 
+ use crate::{
+-    error::{default_error_handler, BevyError, ErrorContext, Result},
++    error::{ErrorContext, ErrorHandler, Result},
+     prelude::Resource,
+     schedule::{is_apply_deferred, BoxedCondition, ExecutorKind, SystemExecutor, SystemSchedule},
+     system::ScheduleSystem,
+@@ -134,7 +134,7 @@ pub struct ExecutorState {
+ struct Context<'scope, 'env, 'sys> {
+     environment: &'env Environment<'env, 'sys>,
+     scope: &'scope Scope<'scope, 'env, ()>,
+-    error_handler: fn(BevyError, ErrorContext),
++    error_handler: ErrorHandler,
+ }
+ 
+ impl Default for MultiThreadedExecutor {
+@@ -240,7 +240,7 @@ impl SystemExecutor for MultiThreadedExecutor {
+         schedule: &mut SystemSchedule,
+         world: &mut World,
+         _skip_systems: Option<&FixedBitSet>,
+-        error_handler: fn(BevyError, ErrorContext),
++        error_handler: ErrorHandler,
+     ) {
+         let state = self.state.get_mut().unwrap();
+         // reset counts
+@@ -484,6 +484,7 @@ impl ExecutorState {
+                         system,
+                         conditions,
+                         context.environment.world_cell,
++                        context.error_handler,
+                     )
+                 } {
+                     self.skip_system_and_signal_dependents(system_index);
+@@ -584,9 +585,9 @@ impl ExecutorState {
+         system: &mut ScheduleSystem,
+         conditions: &mut Conditions,
+         world: UnsafeWorldCell,
++        error_handler: ErrorHandler,
+     ) -> bool {
+         let mut should_run = !self.skipped_systems.contains(system_index);
+-        let error_handler = default_error_handler();
+ 
+         for set_idx in conditions.sets_with_conditions_of_systems[system_index].ones() {
+             if self.evaluated_sets.contains(set_idx) {
+@@ -599,7 +600,11 @@ impl ExecutorState {
+             //   required by the conditions.
+             // - `update_archetype_component_access` has been called for each run condition.
+             let set_conditions_met = unsafe {
+-                evaluate_and_fold_conditions(&mut conditions.set_conditions[set_idx], world)
++                evaluate_and_fold_conditions(
++                    &mut conditions.set_conditions[set_idx],
++                    world,
++                    error_handler,
++                )
+             };
+ 
+             if !set_conditions_met {
+@@ -617,7 +622,11 @@ impl ExecutorState {
+         //   required by the conditions.
+         // - `update_archetype_component_access` has been called for each run condition.
+         let system_conditions_met = unsafe {
+-            evaluate_and_fold_conditions(&mut conditions.system_conditions[system_index], world)
++            evaluate_and_fold_conditions(
++                &mut conditions.system_conditions[system_index],
++                world,
++                error_handler,
++            )
+         };
+ 
+         if !system_conditions_met {
+@@ -822,9 +831,8 @@ fn apply_deferred(
+ unsafe fn evaluate_and_fold_conditions(
+     conditions: &mut [BoxedCondition],
+     world: UnsafeWorldCell,
++    error_handler: ErrorHandler,
+ ) -> bool {
+-    let error_handler = default_error_handler();
+-
+     #[expect(
+         clippy::unnecessary_fold,
+         reason = "Short-circuiting here would prevent conditions from mutating their own state as needed."
+diff --git a/crates/bevy_ecs/src/schedule/executor/simple.rs b/crates/bevy_ecs/src/schedule/executor/simple.rs
+index 701a8d8f0639f..584c5a1073046 100644
+--- a/crates/bevy_ecs/src/schedule/executor/simple.rs
++++ b/crates/bevy_ecs/src/schedule/executor/simple.rs
+@@ -10,7 +10,7 @@ use tracing::info_span;
+ use std::eprintln;
+ 
+ use crate::{
+-    error::{default_error_handler, BevyError, ErrorContext},
++    error::{ErrorContext, ErrorHandler},
+     schedule::{
+         executor::is_apply_deferred, BoxedCondition, ExecutorKind, SystemExecutor, SystemSchedule,
+     },
+@@ -50,7 +50,7 @@ impl SystemExecutor for SimpleExecutor {
+         schedule: &mut SystemSchedule,
+         world: &mut World,
+         _skip_systems: Option<&FixedBitSet>,
+-        error_handler: fn(BevyError, ErrorContext),
++        error_handler: ErrorHandler,
+     ) {
+         // If stepping is enabled, make sure we skip those systems that should
+         // not be run.
+@@ -73,8 +73,11 @@ impl SystemExecutor for SimpleExecutor {
+                 }
+ 
+                 // evaluate system set's conditions
+-                let set_conditions_met =
+-                    evaluate_and_fold_conditions(&mut schedule.set_conditions[set_idx], world);
++                let set_conditions_met = evaluate_and_fold_conditions(
++                    &mut schedule.set_conditions[set_idx],
++                    world,
++                    error_handler,
++                );
+ 
+                 if !set_conditions_met {
+                     self.completed_systems
+@@ -86,8 +89,11 @@ impl SystemExecutor for SimpleExecutor {
+             }
+ 
+             // evaluate system's conditions
+-            let system_conditions_met =
+-                evaluate_and_fold_conditions(&mut schedule.system_conditions[system_index], world);
++            let system_conditions_met = evaluate_and_fold_conditions(
++                &mut schedule.system_conditions[system_index],
++                world,
++                error_handler,
++            );
+ 
+             should_run &= system_conditions_met;
+ 
+@@ -175,9 +181,11 @@ impl SimpleExecutor {
+     since = "0.17.0",
+     note = "Use SingleThreadedExecutor instead. See https://github.com/bevyengine/bevy/issues/18453 for motivation."
+ )]
+-fn evaluate_and_fold_conditions(conditions: &mut [BoxedCondition], world: &mut World) -> bool {
+-    let error_handler = default_error_handler();
+-
++fn evaluate_and_fold_conditions(
++    conditions: &mut [BoxedCondition],
++    world: &mut World,
++    error_handler: ErrorHandler,
++) -> bool {
+     #[expect(
+         clippy::unnecessary_fold,
+         reason = "Short-circuiting here would prevent conditions from mutating their own state as needed."
+diff --git a/crates/bevy_ecs/src/schedule/executor/single_threaded.rs b/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
+index 82e9e354a80c3..0076103637778 100644
+--- a/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
+@@ -8,7 +8,7 @@ use tracing::info_span;
+ use std::eprintln;
+ 
+ use crate::{
+-    error::{default_error_handler, BevyError, ErrorContext},
++    error::{ErrorContext, ErrorHandler},
+     schedule::{is_apply_deferred, BoxedCondition, ExecutorKind, SystemExecutor, SystemSchedule},
+     world::World,
+ };
+@@ -50,7 +50,7 @@ impl SystemExecutor for SingleThreadedExecutor {
+         schedule: &mut SystemSchedule,
+         world: &mut World,
+         _skip_systems: Option<&FixedBitSet>,
+-        error_handler: fn(BevyError, ErrorContext),
++        error_handler: ErrorHandler,
+     ) {
+         // If stepping is enabled, make sure we skip those systems that should
+         // not be run.
+@@ -73,8 +73,11 @@ impl SystemExecutor for SingleThreadedExecutor {
+                 }
+ 
+                 // evaluate system set's conditions
+-                let set_conditions_met =
+-                    evaluate_and_fold_conditions(&mut schedule.set_conditions[set_idx], world);
++                let set_conditions_met = evaluate_and_fold_conditions(
++                    &mut schedule.set_conditions[set_idx],
++                    world,
++                    error_handler,
++                );
+ 
+                 if !set_conditions_met {
+                     self.completed_systems
+@@ -86,8 +89,11 @@ impl SystemExecutor for SingleThreadedExecutor {
+             }
+ 
+             // evaluate system's conditions
+-            let system_conditions_met =
+-                evaluate_and_fold_conditions(&mut schedule.system_conditions[system_index], world);
++            let system_conditions_met = evaluate_and_fold_conditions(
++                &mut schedule.system_conditions[system_index],
++                world,
++                error_handler,
++            );
+ 
+             should_run &= system_conditions_met;
+ 
+@@ -193,9 +199,11 @@ impl SingleThreadedExecutor {
+     }
+ }
+ 
+-fn evaluate_and_fold_conditions(conditions: &mut [BoxedCondition], world: &mut World) -> bool {
+-    let error_handler: fn(BevyError, ErrorContext) = default_error_handler();
+-
++fn evaluate_and_fold_conditions(
++    conditions: &mut [BoxedCondition],
++    world: &mut World,
++    error_handler: ErrorHandler,
++) -> bool {
+     #[expect(
+         clippy::unnecessary_fold,
+         reason = "Short-circuiting here would prevent conditions from mutating their own state as needed."
+diff --git a/crates/bevy_ecs/src/schedule/schedule.rs b/crates/bevy_ecs/src/schedule/schedule.rs
+index a754f1e1d4bce..b15860406b4f2 100644
+--- a/crates/bevy_ecs/src/schedule/schedule.rs
++++ b/crates/bevy_ecs/src/schedule/schedule.rs
+@@ -27,7 +27,6 @@ use tracing::info_span;
+ 
+ use crate::{
+     component::{ComponentId, Components, Tick},
+-    error::default_error_handler,
+     prelude::Component,
+     resource::Resource,
+     schedule::*,
+@@ -442,7 +441,7 @@ impl Schedule {
+         self.initialize(world)
+             .unwrap_or_else(|e| panic!("Error when initializing schedule {:?}: {e}", self.label));
+ 
+-        let error_handler = default_error_handler();
++        let error_handler = world.default_error_handler();
+ 
+         #[cfg(not(feature = "bevy_debug_stepping"))]
+         self.executor
+@@ -2061,6 +2060,7 @@ mod tests {
+     use bevy_ecs_macros::ScheduleLabel;
+ 
+     use crate::{
++        error::{ignore, panic, DefaultErrorHandler, Result},
+         prelude::{ApplyDeferred, Res, Resource},
+         schedule::{
+             tests::ResMut, IntoScheduleConfigs, Schedule, ScheduleBuildSettings, SystemSet,
+@@ -2810,4 +2810,32 @@ mod tests {
+             .expect("CheckSystemRan Resource Should Exist");
+         assert_eq!(value.0, 2);
+     }
++
++    #[test]
++    fn test_default_error_handler() {
++        #[derive(Resource, Default)]
++        struct Ran(bool);
++
++        fn system(mut ran: ResMut<Ran>) -> Result {
++            ran.0 = true;
++            Err("I failed!".into())
++        }
++
++        // Test that the default error handler is used
++        let mut world = World::default();
++        world.init_resource::<Ran>();
++        world.insert_resource(DefaultErrorHandler(ignore));
++        let mut schedule = Schedule::default();
++        schedule.add_systems(system).run(&mut world);
++        assert!(world.resource::<Ran>().0);
++
++        // Test that the handler doesn't change within the schedule
++        schedule.add_systems(
++            (|world: &mut World| {
++                world.insert_resource(DefaultErrorHandler(panic));
++            })
++            .before(system),
++        );
++        schedule.run(&mut world);
++    }
+ }
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index 621a9de77ed89..8b10b64b28ce2 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -88,8 +88,8 @@ use crate::{
+ /// A [`Command`] can return a [`Result`](crate::error::Result),
+ /// which will be passed to an [error handler](crate::error) if the `Result` is an error.
+ ///
+-/// The [default error handler](crate::error::default_error_handler) panics.
+-/// It can be configured by setting the `GLOBAL_ERROR_HANDLER`.
++/// The default error handler panics. It can be configured via
++/// the [`DefaultErrorHandler`](crate::error::DefaultErrorHandler) resource.
+ ///
+ /// Alternatively, you can customize the error handler for a specific command
+ /// by calling [`Commands::queue_handled`].
+@@ -508,7 +508,7 @@ impl<'w, 's> Commands<'w, 's> {
+     /// Pushes a generic [`Command`] to the command queue.
+     ///
+     /// If the [`Command`] returns a [`Result`],
+-    /// it will be handled using the [default error handler](crate::error::default_error_handler).
++    /// it will be handled using the [default error handler](crate::error::DefaultErrorHandler).
+     ///
+     /// To use a custom error handler, see [`Commands::queue_handled`].
+     ///
+@@ -643,7 +643,7 @@ impl<'w, 's> Commands<'w, 's> {
+     /// This command will fail if any of the given entities do not exist.
+     ///
+     /// It will internally return a [`TryInsertBatchError`](crate::world::error::TryInsertBatchError),
+-    /// which will be handled by the [default error handler](crate::error::default_error_handler).
++    /// which will be handled by the [default error handler](crate::error::DefaultErrorHandler).
+     #[track_caller]
+     pub fn insert_batch<I, B>(&mut self, batch: I)
+     where
+@@ -674,7 +674,7 @@ impl<'w, 's> Commands<'w, 's> {
+     /// This command will fail if any of the given entities do not exist.
+     ///
+     /// It will internally return a [`TryInsertBatchError`](crate::world::error::TryInsertBatchError),
+-    /// which will be handled by the [default error handler](crate::error::default_error_handler).
++    /// which will be handled by the [default error handler](crate::error::DefaultErrorHandler).
+     #[track_caller]
+     pub fn insert_batch_if_new<I, B>(&mut self, batch: I)
+     where
+@@ -1175,8 +1175,8 @@ impl<'w, 's> Commands<'w, 's> {
+ /// An [`EntityCommand`] can return a [`Result`](crate::error::Result),
+ /// which will be passed to an [error handler](crate::error) if the `Result` is an error.
+ ///
+-/// The [default error handler](crate::error::default_error_handler) panics.
+-/// It can be configured by setting the `GLOBAL_ERROR_HANDLER`.
++/// The default error handler panics. It can be configured via
++/// the [`DefaultErrorHandler`](crate::error::DefaultErrorHandler) resource.
+ ///
+ /// Alternatively, you can customize the error handler for a specific command
+ /// by calling [`EntityCommands::queue_handled`].
+@@ -1768,7 +1768,7 @@ impl<'a> EntityCommands<'a> {
+     /// Pushes an [`EntityCommand`] to the queue,
+     /// which will get executed for the current [`Entity`].
+     ///
+-    /// The [default error handler](crate::error::default_error_handler)
++    /// The [default error handler](crate::error::DefaultErrorHandler)
+     /// will be used to handle error cases.
+     /// Every [`EntityCommand`] checks whether the entity exists at the time of execution
+     /// and returns an error if it does not.
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index 87340551af477..3a1195aea3441 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -14,6 +14,7 @@ pub mod unsafe_world_cell;
+ #[cfg(feature = "bevy_reflect")]
+ pub mod reflect;
+ 
++use crate::error::{DefaultErrorHandler, ErrorHandler};
+ pub use crate::{
+     change_detection::{Mut, Ref, CHECK_TICK_THRESHOLD},
+     world::command_queue::CommandQueue,
+@@ -3046,6 +3047,16 @@ impl World {
+         // SAFETY: We just initialized the bundle so its id should definitely be valid.
+         unsafe { self.bundles.get(id).debug_checked_unwrap() }
+     }
++
++    /// Convenience method for accessing the world's default error handler,
++    /// which can be overwritten with [`DefaultErrorHandler`].
++    #[inline]
++    pub fn default_error_handler(&self) -> ErrorHandler {
++        self.get_resource::<DefaultErrorHandler>()
++            .copied()
++            .unwrap_or_default()
++            .0
++    }
+ }
+ 
+ impl World {
+diff --git a/crates/bevy_ecs/src/world/unsafe_world_cell.rs b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+index ea5f21c22ecca..3f74f855a6094 100644
+--- a/crates/bevy_ecs/src/world/unsafe_world_cell.rs
++++ b/crates/bevy_ecs/src/world/unsafe_world_cell.rs
+@@ -7,6 +7,7 @@ use crate::{
+     change_detection::{MaybeLocation, MutUntyped, Ticks, TicksMut},
+     component::{ComponentId, ComponentTicks, Components, Mutable, StorageType, Tick, TickCells},
+     entity::{ContainsEntity, Entities, Entity, EntityDoesNotExistError, EntityLocation},
++    error::{DefaultErrorHandler, ErrorHandler},
+     observer::Observers,
+     prelude::Component,
+     query::{DebugCheckedUnwrap, ReadOnlyQueryData},
+@@ -705,6 +706,18 @@ impl<'w> UnsafeWorldCell<'w> {
+             (*self.ptr).last_trigger_id = (*self.ptr).last_trigger_id.wrapping_add(1);
+         }
+     }
++
++    /// Convenience method for accessing the world's default error handler,
++    ///
++    /// # Safety
++    /// Must have read access to [`DefaultErrorHandler`].
++    #[inline]
++    pub unsafe fn default_error_handler(&self) -> ErrorHandler {
++        self.get_resource::<DefaultErrorHandler>()
++            .copied()
++            .unwrap_or_default()
++            .0
++    }
+ }
+ 
+ impl Debug for UnsafeWorldCell<'_> {
+diff --git a/crates/bevy_internal/Cargo.toml b/crates/bevy_internal/Cargo.toml
+index 28d234f2b4e3e..38f89d4ef8efc 100644
+--- a/crates/bevy_internal/Cargo.toml
++++ b/crates/bevy_internal/Cargo.toml
+@@ -279,9 +279,6 @@ custom_cursor = ["bevy_winit/custom_cursor"]
+ # Experimental support for nodes that are ignored for UI layouting
+ ghost_nodes = ["bevy_ui/ghost_nodes"]
+ 
+-# Use the configurable global error handler as the default error handler.
+-configurable_error_handler = ["bevy_ecs/configurable_error_handler"]
+-
+ # Allows access to the `std` crate. Enabling this feature will prevent compilation
+ # on `no_std` targets, but provides access to certain additional features on
+ # supported platforms.
+diff --git a/docs/cargo_features.md b/docs/cargo_features.md
+index f15fa1c4c6683..1a1cb68fda2e1 100644
+--- a/docs/cargo_features.md
++++ b/docs/cargo_features.md
+@@ -70,7 +70,6 @@ The default feature set enables most of the expected features of a game engine,
+ |bevy_remote|Enable the Bevy Remote Protocol|
+ |bevy_ui_debug|Provides a debug overlay for bevy UI|
+ |bmp|BMP image format support|
+-|configurable_error_handler|Use the configurable global error handler as the default error handler.|
+ |critical-section|`critical-section` provides the building blocks for synchronization primitives on all platforms, including `no_std`.|
+ |dds|DDS compressed texture support|
+ |debug_glam_assert|Enable assertions in debug builds to check the validity of parameters passed to glam|
+diff --git a/examples/ecs/error_handling.rs b/examples/ecs/error_handling.rs
+index d326d7d4aae81..31f9838aaa869 100644
+--- a/examples/ecs/error_handling.rs
++++ b/examples/ecs/error_handling.rs
+@@ -1,13 +1,7 @@
+ //! Showcases how fallible systems and observers can make use of Rust's powerful result handling
+ //! syntax.
+-//!
+-//! Important note: to set the global error handler, the `configurable_error_handler` feature must be
+-//! enabled. This feature is disabled by default, as it may introduce runtime overhead, especially for commands.
+-
+-use bevy::ecs::{
+-    error::{warn, GLOBAL_ERROR_HANDLER},
+-    world::DeferredWorld,
+-};
++
++use bevy::ecs::{error::warn, world::DeferredWorld};
+ use bevy::math::sampling::UniformMeshSampler;
+ use bevy::prelude::*;
+ 
+@@ -16,17 +10,15 @@ use rand::SeedableRng;
+ use rand_chacha::ChaCha8Rng;
+ 
+ fn main() {
++    let mut app = App::new();
+     // By default, fallible systems that return an error will panic.
+     //
+-    // We can change this by setting a custom error handler, which applies globally.
+-    // Here we set the global error handler using one of the built-in
+-    // error handlers. Bevy provides built-in handlers for `panic`, `error`, `warn`, `info`,
++    // We can change this by setting a custom error handler, which applies to the entire app
++    // (you can also set it for specific `World`s).
++    // Here we it using one of the built-in error handlers.
++    // Bevy provides built-in handlers for `panic`, `error`, `warn`, `info`,
+     // `debug`, `trace` and `ignore`.
+-    GLOBAL_ERROR_HANDLER
+-        .set(warn)
+-        .expect("The error handler can only be set once, globally.");
+-
+-    let mut app = App::new();
++    app.set_error_handler(warn);
+ 
+     app.add_plugins(DefaultPlugins);
+ 
+diff --git a/examples/ecs/fallible_params.rs b/examples/ecs/fallible_params.rs
+index 1ba510cda96ac..94a8007aec090 100644
+--- a/examples/ecs/fallible_params.rs
++++ b/examples/ecs/fallible_params.rs
+@@ -2,7 +2,7 @@
+ //! from running if their acquiry conditions aren't met.
+ //!
+ //! Fallible system parameters include:
+-//! - [`Res<R>`], [`ResMut<R>`] - Resource has to exist, and the [`GLOBAL_ERROR_HANDLER`] will be called if it doesn't.
++//! - [`Res<R>`], [`ResMut<R>`] - Resource has to exist, and the [`World::get_default_error_handler`] will be called if it doesn't.
+ //! - [`Single<D, F>`] - There must be exactly one matching entity, but the system will be silently skipped otherwise.
+ //! - [`Option<Single<D, F>>`] - There must be zero or one matching entity. The system will be silently skipped if there are more.
+ //! - [`Populated<D, F>`] - There must be at least one matching entity, but the system will be silently skipped otherwise.
+@@ -18,19 +18,13 @@
+ //!
+ //! [`SystemParamValidationError`]: bevy::ecs::system::SystemParamValidationError
+ //! [`SystemParam::validate_param`]: bevy::ecs::system::SystemParam::validate_param
++//! [`default_error_handler`]: bevy::ecs::error::default_error_handler
+ 
+-use bevy::ecs::error::{warn, GLOBAL_ERROR_HANDLER};
++use bevy::ecs::error::warn;
+ use bevy::prelude::*;
+ use rand::Rng;
+ 
+ fn main() {
+-    // By default, if a parameter fail to be fetched,
+-    // the `GLOBAL_ERROR_HANDLER` will be used to handle the error,
+-    // which by default is set to panic.
+-    GLOBAL_ERROR_HANDLER
+-        .set(warn)
+-        .expect("The error handler can only be set once, globally.");
+-
+     println!();
+     println!("Press 'A' to add enemy ships and 'R' to remove them.");
+     println!("Player ship will wait for enemy ships and track one if it exists,");
+@@ -38,6 +32,10 @@ fn main() {
+     println!();
+ 
+     App::new()
++        // By default, if a parameter fail to be fetched,
++        // `World::get_default_error_handler` will be used to handle the error,
++        // which by default is set to panic.
++        .set_error_handler(warn)
+         .add_plugins(DefaultPlugins)
+         .add_systems(Startup, setup)
+         .add_systems(Update, (user_input, move_targets, track_targets).chain())
+diff --git a/release-content/migration-guides/per-world-error-handler.md b/release-content/migration-guides/per-world-error-handler.md
+new file mode 100644
+index 0000000000000..1a963d13c63ec
+--- /dev/null
++++ b/release-content/migration-guides/per-world-error-handler.md
+@@ -0,0 +1,10 @@
++---
++title: Global default error handler
++pull_requests: [18810]
++---
++
++Worlds can now have different default error handlers, so there no longer is a global handler.
++
++Replace uses of `GLOBAL_ERROR_HANDLER` with `App`'s `.set_error_handler(handler)`.
++For worlds that do not directly belong to an `App`/`SubApp`,
++insert the `DefaultErrorHandler(handler)` resource.

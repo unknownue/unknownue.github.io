@@ -1,0 +1,167 @@
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/mod.rs b/crates/bevy_core_pipeline/src/motion_blur/mod.rs
+index 313e001bc38c9..5898f1a8c5ce3 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/mod.rs
++++ b/crates/bevy_core_pipeline/src/motion_blur/mod.rs
+@@ -9,7 +9,10 @@ use crate::{
+ use bevy_app::{App, Plugin};
+ use bevy_asset::{load_internal_asset, weak_handle, Handle};
+ use bevy_ecs::{
+-    component::Component, query::With, reflect::ReflectComponent, schedule::IntoScheduleConfigs,
++    component::Component,
++    query::{QueryItem, With},
++    reflect::ReflectComponent,
++    schedule::IntoScheduleConfigs,
+ };
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+@@ -53,9 +56,8 @@ pub mod pipeline;
+ /// ));
+ /// # }
+ /// ````
+-#[derive(Reflect, Component, Clone, ExtractComponent, ShaderType)]
++#[derive(Reflect, Component, Clone)]
+ #[reflect(Component, Default, Clone)]
+-#[extract_component_filter(With<Camera>)]
+ #[require(DepthPrepass, MotionVectorPrepass)]
+ pub struct MotionBlur {
+     /// The strength of motion blur from `0.0` to `1.0`.
+@@ -88,9 +90,6 @@ pub struct MotionBlur {
+     /// Setting this to `3` will result in `3 * 2 + 1 = 7` samples. Setting this to `0` is
+     /// equivalent to disabling motion blur.
+     pub samples: u32,
+-    #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+-    // WebGL2 structs must be 16 byte aligned.
+-    pub _webgl2_padding: bevy_math::Vec2,
+ }
+ 
+ impl Default for MotionBlur {
+@@ -98,12 +97,35 @@ impl Default for MotionBlur {
+         Self {
+             shutter_angle: 0.5,
+             samples: 1,
++        }
++    }
++}
++
++impl ExtractComponent for MotionBlur {
++    type QueryData = &'static Self;
++    type QueryFilter = With<Camera>;
++    type Out = MotionBlurUniform;
++
++    fn extract_component(item: QueryItem<Self::QueryData>) -> Option<Self::Out> {
++        Some(MotionBlurUniform {
++            shutter_angle: item.shutter_angle,
++            samples: item.samples,
+             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+             _webgl2_padding: Default::default(),
+-        }
++        })
+     }
+ }
+ 
++#[doc(hidden)]
++#[derive(Component, ShaderType, Clone)]
++pub struct MotionBlurUniform {
++    shutter_angle: f32,
++    samples: u32,
++    #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
++    // WebGL2 structs must be 16 byte aligned.
++    _webgl2_padding: bevy_math::Vec2,
++}
++
+ pub const MOTION_BLUR_SHADER_HANDLE: Handle<Shader> =
+     weak_handle!("d9ca74af-fa0a-4f11-b0f2-19613b618b93");
+ 
+@@ -119,7 +141,7 @@ impl Plugin for MotionBlurPlugin {
+         );
+         app.add_plugins((
+             ExtractComponentPlugin::<MotionBlur>::default(),
+-            UniformComponentPlugin::<MotionBlur>::default(),
++            UniformComponentPlugin::<MotionBlurUniform>::default(),
+         ));
+ 
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/node.rs b/crates/bevy_core_pipeline/src/motion_blur/node.rs
+index 2497bd633deda..ade5f50d77466 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/node.rs
++++ b/crates/bevy_core_pipeline/src/motion_blur/node.rs
+@@ -15,7 +15,7 @@ use crate::prepass::ViewPrepassTextures;
+ 
+ use super::{
+     pipeline::{MotionBlurPipeline, MotionBlurPipelineId},
+-    MotionBlur,
++    MotionBlurUniform,
+ };
+ 
+ #[derive(Default)]
+@@ -26,7 +26,7 @@ impl ViewNode for MotionBlurNode {
+         &'static ViewTarget,
+         &'static MotionBlurPipelineId,
+         &'static ViewPrepassTextures,
+-        &'static MotionBlur,
++        &'static MotionBlurUniform,
+         &'static Msaa,
+     );
+     fn run(
+@@ -42,7 +42,7 @@ impl ViewNode for MotionBlurNode {
+ 
+         let motion_blur_pipeline = world.resource::<MotionBlurPipeline>();
+         let pipeline_cache = world.resource::<PipelineCache>();
+-        let settings_uniforms = world.resource::<ComponentUniforms<MotionBlur>>();
++        let settings_uniforms = world.resource::<ComponentUniforms<MotionBlurUniform>>();
+         let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
+             return Ok(());
+         };
+diff --git a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs b/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
+index 61bb7b60ce42e..4eab4ff7a617f 100644
+--- a/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
++++ b/crates/bevy_core_pipeline/src/motion_blur/pipeline.rs
+@@ -26,7 +26,7 @@ use bevy_render::{
+ 
+ use crate::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
+ 
+-use super::{MotionBlur, MOTION_BLUR_SHADER_HANDLE};
++use super::{MotionBlurUniform, MOTION_BLUR_SHADER_HANDLE};
+ 
+ #[derive(Resource)]
+ pub struct MotionBlurPipeline {
+@@ -49,7 +49,7 @@ impl MotionBlurPipeline {
+                 // Linear Sampler
+                 sampler(SamplerBindingType::Filtering),
+                 // Motion blur settings uniform input
+-                uniform_buffer_sized(false, Some(MotionBlur::min_size())),
++                uniform_buffer_sized(false, Some(MotionBlurUniform::min_size())),
+                 // Globals uniform input
+                 uniform_buffer_sized(false, Some(GlobalsUniform::min_size())),
+             ),
+@@ -67,7 +67,7 @@ impl MotionBlurPipeline {
+                 // Linear Sampler
+                 sampler(SamplerBindingType::Filtering),
+                 // Motion blur settings uniform input
+-                uniform_buffer_sized(false, Some(MotionBlur::min_size())),
++                uniform_buffer_sized(false, Some(MotionBlurUniform::min_size())),
+                 // Globals uniform input
+                 uniform_buffer_sized(false, Some(GlobalsUniform::min_size())),
+             ),
+@@ -155,7 +155,7 @@ pub(crate) fn prepare_motion_blur_pipelines(
+     pipeline_cache: Res<PipelineCache>,
+     mut pipelines: ResMut<SpecializedRenderPipelines<MotionBlurPipeline>>,
+     pipeline: Res<MotionBlurPipeline>,
+-    views: Query<(Entity, &ExtractedView, &Msaa), With<MotionBlur>>,
++    views: Query<(Entity, &ExtractedView, &Msaa), With<MotionBlurUniform>>,
+ ) {
+     for (entity, view, msaa) in &views {
+         let pipeline_id = pipelines.specialize(
+diff --git a/examples/3d/motion_blur.rs b/examples/3d/motion_blur.rs
+index 68bb556c6b3e0..529ae85499f11 100644
+--- a/examples/3d/motion_blur.rs
++++ b/examples/3d/motion_blur.rs
+@@ -26,8 +26,6 @@ fn setup_camera(mut commands: Commands) {
+         MotionBlur {
+             shutter_angle: 1.0,
+             samples: 2,
+-            #[cfg(all(feature = "webgl2", target_arch = "wasm32", not(feature = "webgpu")))]
+-            _webgl2_padding: Default::default(),
+         },
+         // MSAA and Motion Blur together are not compatible on WebGL
+         #[cfg(all(feature = "webgl2", target_arch = "wasm32", not(feature = "webgpu")))]

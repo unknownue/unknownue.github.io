@@ -1,0 +1,1019 @@
+diff --git a/crates/bevy_ecs/macros/src/lib.rs b/crates/bevy_ecs/macros/src/lib.rs
+index 3b86f1e3c3ca4..6843197af2168 100644
+--- a/crates/bevy_ecs/macros/src/lib.rs
++++ b/crates/bevy_ecs/macros/src/lib.rs
+@@ -429,7 +429,7 @@ pub fn derive_system_param(input: TokenStream) -> TokenStream {
+                     state: &'s Self::State,
+                     system_meta: &#path::system::SystemMeta,
+                     world: #path::world::unsafe_world_cell::UnsafeWorldCell<'w>,
+-                ) -> #path::system::ValidationOutcome {
++                ) -> Result<(), #path::system::SystemParamValidationError> {
+                     <(#(#tuple_types,)*) as #path::system::SystemParam>::validate_param(&state.state, system_meta, world)
+                 }
+ 
+diff --git a/crates/bevy_ecs/src/observer/runner.rs b/crates/bevy_ecs/src/observer/runner.rs
+index 907bddad4ad51..c1ea4b2e1998a 100644
+--- a/crates/bevy_ecs/src/observer/runner.rs
++++ b/crates/bevy_ecs/src/observer/runner.rs
+@@ -7,7 +7,7 @@ use crate::{
+     observer::{ObserverDescriptor, ObserverTrigger},
+     prelude::*,
+     query::DebugCheckedUnwrap,
+-    system::{IntoObserverSystem, ObserverSystem, SystemParamValidationError, ValidationOutcome},
++    system::{IntoObserverSystem, ObserverSystem},
+     world::DeferredWorld,
+ };
+ use bevy_ptr::PtrMut;
+@@ -406,7 +406,7 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+     unsafe {
+         (*system).update_archetype_component_access(world);
+         match (*system).validate_param_unsafe(world) {
+-            ValidationOutcome::Valid => {
++            Ok(()) => {
+                 if let Err(err) = (*system).run_unsafe(trigger, world) {
+                     error_handler(
+                         err,
+@@ -418,14 +418,17 @@ fn observer_system_runner<E: Event, B: Bundle, S: ObserverSystem<E, B>>(
+                 };
+                 (*system).queue_deferred(world.into_deferred());
+             }
+-            ValidationOutcome::Invalid => error_handler(
+-                SystemParamValidationError.into(),
+-                ErrorContext::Observer {
+-                    name: (*system).name(),
+-                    last_run: (*system).get_last_run(),
+-                },
+-            ),
+-            ValidationOutcome::Skipped => (),
++            Err(e) => {
++                if !e.skipped {
++                    error_handler(
++                        e.into(),
++                        ErrorContext::Observer {
++                            name: (*system).name(),
++                            last_run: (*system).get_last_run(),
++                        },
++                    );
++                }
++            }
+         }
+     }
+ }
+diff --git a/crates/bevy_ecs/src/schedule/executor/mod.rs b/crates/bevy_ecs/src/schedule/executor/mod.rs
+index df2a57c14e189..e384680cf4e7a 100644
+--- a/crates/bevy_ecs/src/schedule/executor/mod.rs
++++ b/crates/bevy_ecs/src/schedule/executor/mod.rs
+@@ -20,7 +20,7 @@ use crate::{
+     prelude::{IntoSystemSet, SystemSet},
+     query::Access,
+     schedule::{BoxedCondition, InternedSystemSet, NodeId, SystemTypeSet},
+-    system::{ScheduleSystem, System, SystemIn, ValidationOutcome},
++    system::{ScheduleSystem, System, SystemIn, SystemParamValidationError},
+     world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, World},
+ };
+ 
+@@ -221,10 +221,13 @@ impl System for ApplyDeferred {
+ 
+     fn queue_deferred(&mut self, _world: DeferredWorld) {}
+ 
+-    unsafe fn validate_param_unsafe(&mut self, _world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        _world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         // This system is always valid to run because it doesn't do anything,
+         // and only used as a marker for the executor.
+-        ValidationOutcome::Valid
++        Ok(())
+     }
+ 
+     fn initialize(&mut self, _world: &mut World) {}
+diff --git a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+index daf01c99262bd..779686e319d6d 100644
+--- a/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/multi_threaded.rs
+@@ -18,7 +18,7 @@ use crate::{
+     prelude::Resource,
+     query::Access,
+     schedule::{is_apply_deferred, BoxedCondition, ExecutorKind, SystemExecutor, SystemSchedule},
+-    system::{ScheduleSystem, SystemParamValidationError, ValidationOutcome},
++    system::ScheduleSystem,
+     world::{unsafe_world_cell::UnsafeWorldCell, World},
+ };
+ 
+@@ -582,18 +582,19 @@ impl ExecutorState {
+             //   required by the system.
+             // - `update_archetype_component_access` has been called for system.
+             let valid_params = match unsafe { system.validate_param_unsafe(world) } {
+-                ValidationOutcome::Valid => true,
+-                ValidationOutcome::Invalid => {
+-                    error_handler(
+-                        SystemParamValidationError.into(),
+-                        ErrorContext::System {
+-                            name: system.name(),
+-                            last_run: system.get_last_run(),
+-                        },
+-                    );
++                Ok(()) => true,
++                Err(e) => {
++                    if !e.skipped {
++                        error_handler(
++                            e.into(),
++                            ErrorContext::System {
++                                name: system.name(),
++                                last_run: system.get_last_run(),
++                            },
++                        );
++                    }
+                     false
+                 }
+-                ValidationOutcome::Skipped => false,
+             };
+             if !valid_params {
+                 self.skipped_systems.insert(system_index);
+@@ -796,18 +797,19 @@ unsafe fn evaluate_and_fold_conditions(
+             //   required by the condition.
+             // - `update_archetype_component_access` has been called for condition.
+             match unsafe { condition.validate_param_unsafe(world) } {
+-                ValidationOutcome::Valid => (),
+-                ValidationOutcome::Invalid => {
+-                    error_handler(
+-                        SystemParamValidationError.into(),
+-                        ErrorContext::System {
+-                            name: condition.name(),
+-                            last_run: condition.get_last_run(),
+-                        },
+-                    );
++                Ok(()) => (),
++                Err(e) => {
++                    if !e.skipped {
++                        error_handler(
++                            e.into(),
++                            ErrorContext::System {
++                                name: condition.name(),
++                                last_run: condition.get_last_run(),
++                            },
++                        );
++                    }
+                     return false;
+                 }
+-                ValidationOutcome::Skipped => return false,
+             }
+             // SAFETY:
+             // - The caller ensures that `world` has permission to read any data
+diff --git a/crates/bevy_ecs/src/schedule/executor/simple.rs b/crates/bevy_ecs/src/schedule/executor/simple.rs
+index 653203d409ef1..a237a356de688 100644
+--- a/crates/bevy_ecs/src/schedule/executor/simple.rs
++++ b/crates/bevy_ecs/src/schedule/executor/simple.rs
+@@ -12,7 +12,6 @@ use crate::{
+     schedule::{
+         executor::is_apply_deferred, BoxedCondition, ExecutorKind, SystemExecutor, SystemSchedule,
+     },
+-    system::{SystemParamValidationError, ValidationOutcome},
+     world::World,
+ };
+ 
+@@ -89,18 +88,19 @@ impl SystemExecutor for SimpleExecutor {
+             let system = &mut schedule.systems[system_index];
+             if should_run {
+                 let valid_params = match system.validate_param(world) {
+-                    ValidationOutcome::Valid => true,
+-                    ValidationOutcome::Invalid => {
+-                        error_handler(
+-                            SystemParamValidationError.into(),
+-                            ErrorContext::System {
+-                                name: system.name(),
+-                                last_run: system.get_last_run(),
+-                            },
+-                        );
++                    Ok(()) => true,
++                    Err(e) => {
++                        if !e.skipped {
++                            error_handler(
++                                e.into(),
++                                ErrorContext::System {
++                                    name: system.name(),
++                                    last_run: system.get_last_run(),
++                                },
++                            );
++                        }
+                         false
+                     }
+-                    ValidationOutcome::Skipped => false,
+                 };
+                 should_run &= valid_params;
+             }
+@@ -177,18 +177,19 @@ fn evaluate_and_fold_conditions(conditions: &mut [BoxedCondition], world: &mut W
+         .iter_mut()
+         .map(|condition| {
+             match condition.validate_param(world) {
+-                ValidationOutcome::Valid => (),
+-                ValidationOutcome::Invalid => {
+-                    error_handler(
+-                        SystemParamValidationError.into(),
+-                        ErrorContext::System {
+-                            name: condition.name(),
+-                            last_run: condition.get_last_run(),
+-                        },
+-                    );
++                Ok(()) => (),
++                Err(e) => {
++                    if !e.skipped {
++                        error_handler(
++                            e.into(),
++                            ErrorContext::System {
++                                name: condition.name(),
++                                last_run: condition.get_last_run(),
++                            },
++                        );
++                    }
+                     return false;
+                 }
+-                ValidationOutcome::Skipped => return false,
+             }
+             __rust_begin_short_backtrace::readonly_run(&mut **condition, world)
+         })
+diff --git a/crates/bevy_ecs/src/schedule/executor/single_threaded.rs b/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
+index 4e5cf03b92a67..b42f47726d50c 100644
+--- a/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
++++ b/crates/bevy_ecs/src/schedule/executor/single_threaded.rs
+@@ -10,7 +10,6 @@ use std::eprintln;
+ use crate::{
+     error::{default_error_handler, BevyError, ErrorContext},
+     schedule::{is_apply_deferred, BoxedCondition, ExecutorKind, SystemExecutor, SystemSchedule},
+-    system::{SystemParamValidationError, ValidationOutcome},
+     world::World,
+ };
+ 
+@@ -95,18 +94,19 @@ impl SystemExecutor for SingleThreadedExecutor {
+             let system = &mut schedule.systems[system_index];
+             if should_run {
+                 let valid_params = match system.validate_param(world) {
+-                    ValidationOutcome::Valid => true,
+-                    ValidationOutcome::Invalid => {
+-                        error_handler(
+-                            SystemParamValidationError.into(),
+-                            ErrorContext::System {
+-                                name: system.name(),
+-                                last_run: system.get_last_run(),
+-                            },
+-                        );
++                    Ok(()) => true,
++                    Err(e) => {
++                        if !e.skipped {
++                            error_handler(
++                                e.into(),
++                                ErrorContext::System {
++                                    name: system.name(),
++                                    last_run: system.get_last_run(),
++                                },
++                            );
++                        }
+                         false
+                     }
+-                    ValidationOutcome::Skipped => false,
+                 };
+ 
+                 should_run &= valid_params;
+@@ -221,18 +221,19 @@ fn evaluate_and_fold_conditions(conditions: &mut [BoxedCondition], world: &mut W
+         .iter_mut()
+         .map(|condition| {
+             match condition.validate_param(world) {
+-                ValidationOutcome::Valid => (),
+-                ValidationOutcome::Invalid => {
+-                    error_handler(
+-                        SystemParamValidationError.into(),
+-                        ErrorContext::System {
+-                            name: condition.name(),
+-                            last_run: condition.get_last_run(),
+-                        },
+-                    );
++                Ok(()) => (),
++                Err(e) => {
++                    if !e.skipped {
++                        error_handler(
++                            e.into(),
++                            ErrorContext::System {
++                                name: condition.name(),
++                                last_run: condition.get_last_run(),
++                            },
++                        );
++                    }
+                     return false;
+                 }
+-                ValidationOutcome::Skipped => return false,
+             }
+             __rust_begin_short_backtrace::readonly_run(&mut **condition, world)
+         })
+diff --git a/crates/bevy_ecs/src/system/adapter_system.rs b/crates/bevy_ecs/src/system/adapter_system.rs
+index d66cc2fd8a7c5..4c7261aafdbf3 100644
+--- a/crates/bevy_ecs/src/system/adapter_system.rs
++++ b/crates/bevy_ecs/src/system/adapter_system.rs
+@@ -1,6 +1,6 @@
+ use alloc::{borrow::Cow, vec::Vec};
+ 
+-use super::{IntoSystem, ReadOnlySystem, System, ValidationOutcome};
++use super::{IntoSystem, ReadOnlySystem, System, SystemParamValidationError};
+ use crate::{
+     schedule::InternedSystemSet,
+     system::{input::SystemInput, SystemIn},
+@@ -179,7 +179,10 @@ where
+     }
+ 
+     #[inline]
+-    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Delegate to other `System` implementations.
+         unsafe { self.system.validate_param_unsafe(world) }
+     }
+diff --git a/crates/bevy_ecs/src/system/combinator.rs b/crates/bevy_ecs/src/system/combinator.rs
+index c5f519a4f7ae0..9f91d21eac6ea 100644
+--- a/crates/bevy_ecs/src/system/combinator.rs
++++ b/crates/bevy_ecs/src/system/combinator.rs
+@@ -7,7 +7,7 @@ use crate::{
+     prelude::World,
+     query::Access,
+     schedule::InternedSystemSet,
+-    system::{input::SystemInput, SystemIn, ValidationOutcome},
++    system::{input::SystemInput, SystemIn, SystemParamValidationError},
+     world::unsafe_world_cell::UnsafeWorldCell,
+ };
+ 
+@@ -212,7 +212,10 @@ where
+     }
+ 
+     #[inline]
+-    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Delegate to other `System` implementations.
+         unsafe { self.a.validate_param_unsafe(world) }
+     }
+@@ -431,18 +434,18 @@ where
+         self.b.queue_deferred(world);
+     }
+ 
+-    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Delegate to other `System` implementations.
+         unsafe { self.a.validate_param_unsafe(world) }
+     }
+ 
+-    fn validate_param(&mut self, world: &World) -> ValidationOutcome {
+-        // This follows the logic of `ValidationOutcome::combine`, but short-circuits
+-        let validate_a = self.a.validate_param(world);
+-        match validate_a {
+-            ValidationOutcome::Valid => self.b.validate_param(world),
+-            ValidationOutcome::Invalid | ValidationOutcome::Skipped => validate_a,
+-        }
++    fn validate_param(&mut self, world: &World) -> Result<(), SystemParamValidationError> {
++        self.a.validate_param(world)?;
++        self.b.validate_param(world)?;
++        Ok(())
+     }
+ 
+     fn initialize(&mut self, world: &mut World) {
+diff --git a/crates/bevy_ecs/src/system/commands/mod.rs b/crates/bevy_ecs/src/system/commands/mod.rs
+index 7317ff0a1dbbc..2eb7d8b451201 100644
+--- a/crates/bevy_ecs/src/system/commands/mod.rs
++++ b/crates/bevy_ecs/src/system/commands/mod.rs
+@@ -27,7 +27,7 @@ use crate::{
+     schedule::ScheduleLabel,
+     system::{
+         Deferred, IntoObserverSystem, IntoSystem, RegisteredSystem, SystemId, SystemInput,
+-        ValidationOutcome,
++        SystemParamValidationError,
+     },
+     world::{
+         command_queue::RawCommandQueue, unsafe_world_cell::UnsafeWorldCell, CommandQueue,
+@@ -182,7 +182,7 @@ const _: () = {
+             state: &Self::State,
+             system_meta: &bevy_ecs::system::SystemMeta,
+             world: UnsafeWorldCell,
+-        ) -> ValidationOutcome {
++        ) -> Result<(), SystemParamValidationError> {
+             <(Deferred<CommandQueue>, &Entities) as bevy_ecs::system::SystemParam>::validate_param(
+                 &state.state,
+                 system_meta,
+diff --git a/crates/bevy_ecs/src/system/exclusive_function_system.rs b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+index 073c4d29aed18..3b07798108995 100644
+--- a/crates/bevy_ecs/src/system/exclusive_function_system.rs
++++ b/crates/bevy_ecs/src/system/exclusive_function_system.rs
+@@ -14,7 +14,7 @@ use alloc::{borrow::Cow, vec, vec::Vec};
+ use core::marker::PhantomData;
+ use variadics_please::all_tuples;
+ 
+-use super::ValidationOutcome;
++use super::SystemParamValidationError;
+ 
+ /// A function system that runs with exclusive [`World`] access.
+ ///
+@@ -156,9 +156,12 @@ where
+     }
+ 
+     #[inline]
+-    unsafe fn validate_param_unsafe(&mut self, _world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        _world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         // All exclusive system params are always available.
+-        ValidationOutcome::Valid
++        Ok(())
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/system/function_system.rs b/crates/bevy_ecs/src/system/function_system.rs
+index 30b91f2f6c00a..4e05ef4dae360 100644
+--- a/crates/bevy_ecs/src/system/function_system.rs
++++ b/crates/bevy_ecs/src/system/function_system.rs
+@@ -18,7 +18,7 @@ use variadics_please::all_tuples;
+ #[cfg(feature = "trace")]
+ use tracing::{info_span, Span};
+ 
+-use super::{IntoSystem, ReadOnlySystem, SystemParamBuilder, ValidationOutcome};
++use super::{IntoSystem, ReadOnlySystem, SystemParamBuilder, SystemParamValidationError};
+ 
+ /// The metadata of a [`System`].
+ #[derive(Clone)]
+@@ -417,7 +417,10 @@ impl<Param: SystemParam> SystemState<Param> {
+     /// - The passed [`UnsafeWorldCell`] must have read-only access to
+     ///   world data in `archetype_component_access`.
+     /// - `world` must be the same [`World`] that was used to initialize [`state`](SystemParam::init_state).
+-    pub unsafe fn validate_param(state: &Self, world: UnsafeWorldCell) -> ValidationOutcome {
++    pub unsafe fn validate_param(
++        state: &Self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Delegated to existing `SystemParam` implementations.
+         unsafe { Param::validate_param(&state.param_state, &state.meta, world) }
+     }
+@@ -747,7 +750,10 @@ where
+     }
+ 
+     #[inline]
+-    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         let param_state = &self.state.as_ref().expect(Self::ERROR_UNINITIALIZED).param;
+         // SAFETY:
+         // - The caller has invoked `update_archetype_component_access`, which will panic
+diff --git a/crates/bevy_ecs/src/system/observer_system.rs b/crates/bevy_ecs/src/system/observer_system.rs
+index 7bcc9e7bce41d..743b58872b4b2 100644
+--- a/crates/bevy_ecs/src/system/observer_system.rs
++++ b/crates/bevy_ecs/src/system/observer_system.rs
+@@ -12,7 +12,7 @@ use crate::{
+     world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, World},
+ };
+ 
+-use super::{IntoSystem, ValidationOutcome};
++use super::{IntoSystem, SystemParamValidationError};
+ 
+ /// Implemented for [`System`]s that have a [`Trigger`] as the first argument.
+ pub trait ObserverSystem<E: 'static, B: Bundle, Out = Result>:
+@@ -155,7 +155,10 @@ where
+     }
+ 
+     #[inline]
+-    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         self.observer.validate_param_unsafe(world)
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/query.rs b/crates/bevy_ecs/src/system/query.rs
+index b39c7a42cedbb..16cc8546d0ef1 100644
+--- a/crates/bevy_ecs/src/system/query.rs
++++ b/crates/bevy_ecs/src/system/query.rs
+@@ -2574,7 +2574,7 @@ impl<'w, 'q, Q: QueryData, F: QueryFilter> From<&'q mut Query<'w, '_, Q, F>>
+ /// [System parameter] that provides access to single entity's components, much like [`Query::single`]/[`Query::single_mut`].
+ ///
+ /// This [`SystemParam`](crate::system::SystemParam) fails validation if zero or more than one matching entity exists.
+-/// This will cause the system to be skipped, according to the rules laid out in [`ValidationOutcome`](crate::system::ValidationOutcome).
++/// This will cause the system to be skipped, according to the rules laid out in [`SystemParamValidationError`](crate::system::SystemParamValidationError).
+ ///
+ /// Use [`Option<Single<D, F>>`] instead if zero or one matching entities can exist.
+ ///
+@@ -2610,7 +2610,7 @@ impl<'w, D: QueryData, F: QueryFilter> Single<'w, D, F> {
+ /// [System parameter] that works very much like [`Query`] except it always contains at least one matching entity.
+ ///
+ /// This [`SystemParam`](crate::system::SystemParam) fails validation if no matching entities exist.
+-/// This will cause the system to be skipped, according to the rules laid out in [`ValidationOutcome`](crate::system::ValidationOutcome).
++/// This will cause the system to be skipped, according to the rules laid out in [`SystemParamValidationError`](crate::system::SystemParamValidationError).
+ ///
+ /// Much like [`Query::is_empty`] the worst case runtime will be `O(n)` where `n` is the number of *potential* matches.
+ /// This can be notably expensive for queries that rely on non-archetypal filters such as [`Added`](crate::query::Added) or [`Changed`](crate::query::Changed)
+diff --git a/crates/bevy_ecs/src/system/schedule_system.rs b/crates/bevy_ecs/src/system/schedule_system.rs
+index e2c217e199356..34d4afae9dfa9 100644
+--- a/crates/bevy_ecs/src/system/schedule_system.rs
++++ b/crates/bevy_ecs/src/system/schedule_system.rs
+@@ -9,7 +9,7 @@ use crate::{
+     world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, World},
+ };
+ 
+-use super::{IntoSystem, ValidationOutcome};
++use super::{IntoSystem, SystemParamValidationError};
+ 
+ /// A wrapper system to change a system that returns `()` to return `Ok(())` to make it into a [`ScheduleSystem`]
+ pub struct InfallibleSystemWrapper<S: System<In = (), Out = ()>>(S);
+@@ -82,7 +82,10 @@ impl<S: System<In = (), Out = ()>> System for InfallibleSystemWrapper<S> {
+     }
+ 
+     #[inline]
+-    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> ValidationOutcome {
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError> {
+         self.0.validate_param_unsafe(world)
+     }
+ 
+diff --git a/crates/bevy_ecs/src/system/system.rs b/crates/bevy_ecs/src/system/system.rs
+index 633bfbf27def2..a12d1988d74c3 100644
+--- a/crates/bevy_ecs/src/system/system.rs
++++ b/crates/bevy_ecs/src/system/system.rs
+@@ -18,7 +18,7 @@ use crate::{
+ use alloc::{borrow::Cow, boxed::Box, vec::Vec};
+ use core::any::TypeId;
+ 
+-use super::{IntoSystem, ValidationOutcome};
++use super::{IntoSystem, SystemParamValidationError};
+ 
+ /// An ECS system that can be added to a [`Schedule`](crate::schedule::Schedule)
+ ///
+@@ -132,11 +132,14 @@ pub trait System: Send + Sync + 'static {
+     /// - The method [`System::update_archetype_component_access`] must be called at some
+     ///   point before this one, with the same exact [`World`]. If [`System::update_archetype_component_access`]
+     ///   panics (or otherwise does not return for any reason), this method must not be called.
+-    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> ValidationOutcome;
++    unsafe fn validate_param_unsafe(
++        &mut self,
++        world: UnsafeWorldCell,
++    ) -> Result<(), SystemParamValidationError>;
+ 
+     /// Safe version of [`System::validate_param_unsafe`].
+     /// that runs on exclusive, single-threaded `world` pointer.
+-    fn validate_param(&mut self, world: &World) -> ValidationOutcome {
++    fn validate_param(&mut self, world: &World) -> Result<(), SystemParamValidationError> {
+         let world_cell = world.as_unsafe_world_cell_readonly();
+         self.update_archetype_component_access(world_cell);
+         // SAFETY:
+@@ -364,12 +367,10 @@ impl RunSystemOnce for &mut World {
+         let mut system: T::System = IntoSystem::into_system(system);
+         system.initialize(self);
+         match system.validate_param(self) {
+-            ValidationOutcome::Valid => Ok(system.run(input, self)),
++            Ok(()) => Ok(system.run(input, self)),
+             // TODO: should we expse the fact that the system was skipped to the user?
+             // Should we somehow unify this better with system error handling?
+-            ValidationOutcome::Invalid | ValidationOutcome::Skipped => {
+-                Err(RunSystemError::InvalidParams(system.name()))
+-            }
++            Err(_) => Err(RunSystemError::InvalidParams(system.name())),
+         }
+     }
+ }
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index b858a34f24b29..de602dbf73abb 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -275,8 +275,8 @@ pub unsafe trait SystemParam: Sized {
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
+-        ValidationOutcome::Valid
++    ) -> Result<(), SystemParamValidationError> {
++        Ok(())
+     }
+ 
+     /// Creates a parameter to be passed into a [`SystemParamFunction`](super::SystemParamFunction).
+@@ -310,43 +310,6 @@ unsafe impl<'w, 's, D: ReadOnlyQueryData + 'static, F: QueryFilter + 'static> Re
+ {
+ }
+ 
+-/// The outcome of system / system param validation,
+-/// used by system executors to determine what to do with a system.
+-///
+-/// The behavior of each system parameter can be controlled by returning a different outcome from [`SystemParam::validate_param`].
+-pub enum ValidationOutcome {
+-    /// All system parameters were validated successfully and the system can be run.
+-    Valid,
+-    /// At least one system parameter failed validation, and an error must be handled.
+-    /// By default, this will result in a panic. See [`crate::error`] for more information.
+-    ///
+-    /// This is the default behavior, and is suitable for system params that should *always* be valid,
+-    /// either because sensible fallback behavior exists (like [`Query`] or because
+-    /// failures in validation should be considered a bug in the user's logic that must be immediately addressed (like [`Res`]).
+-    Invalid,
+-    /// At least one system parameter failed validation, but the system should be skipped.
+-    /// This is suitable for system params that are intended to only operate in certain application states, such as [`Single`].
+-    Skipped,
+-}
+-
+-impl ValidationOutcome {
+-    /// Combines two [`ValidationOutcome`]s, returning the most severe one.
+-    ///
+-    /// If either outcome is [`ValidationOutcome::Invalid`], the result will be [`ValidationOutcome::Invalid`].
+-    /// Otherwise, if either outcome is [`ValidationOutcome::Skipped`], the result will be [`ValidationOutcome::Skipped`].
+-    /// Finally, if both outcomes are [`ValidationOutcome::Valid`], the result will be [`ValidationOutcome::Valid`].
+-    ///
+-    /// When called, you should typically return early if the result is [`ValidationOutcome::Invalid`] or [`ValidationOutcome::Skipped`],
+-    /// to avoid unnecessary work validating irrelevant system parameters.
+-    pub const fn combine(self, other: Self) -> Self {
+-        match (self, other) {
+-            (Self::Invalid, _) | (_, Self::Invalid) => Self::Invalid,
+-            (Self::Skipped, _) | (_, Self::Skipped) => Self::Skipped,
+-            (Self::Valid, Self::Valid) => Self::Valid,
+-        }
+-    }
+-}
+-
+ // SAFETY: Relevant query ComponentId and ArchetypeComponentId access is applied to SystemMeta. If
+ // this Query conflicts with any prior access, a panic will occur.
+ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Query<'_, '_, D, F> {
+@@ -465,7 +428,7 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam fo
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: State ensures that the components it accesses are not mutably accessible elsewhere
+         // and the query is read only.
+         // The caller ensures the world matches the one used in init_state.
+@@ -477,8 +440,8 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam fo
+             )
+         };
+         match query.single_inner() {
+-            Ok(_) => ValidationOutcome::Valid,
+-            Err(_) => ValidationOutcome::Skipped,
++            Ok(_) => Ok(()),
++            Err(_) => Err(SystemParamValidationError::skipped()),
+         }
+     }
+ }
+@@ -532,7 +495,7 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: State ensures that the components it accesses are not mutably accessible elsewhere
+         // and the query is read only.
+         // The caller ensures the world matches the one used in init_state.
+@@ -544,8 +507,10 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+             )
+         };
+         match query.single_inner() {
+-            Ok(_) | Err(QuerySingleError::NoEntities(_)) => ValidationOutcome::Valid,
+-            Err(QuerySingleError::MultipleEntities(_)) => ValidationOutcome::Skipped,
++            Ok(_) | Err(QuerySingleError::NoEntities(_)) => Ok(()),
++            Err(QuerySingleError::MultipleEntities(_)) => {
++                Err(SystemParamValidationError::skipped())
++            }
+         }
+     }
+ }
+@@ -600,7 +565,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY:
+         // - We have read-only access to the components accessed by query.
+         // - The caller ensures the world matches the one used in init_state.
+@@ -612,9 +577,9 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
+             )
+         };
+         if query.is_empty() {
+-            ValidationOutcome::Skipped
++            Err(SystemParamValidationError::skipped())
+         } else {
+-            ValidationOutcome::Valid
++            Ok(())
+         }
+     }
+ }
+@@ -810,7 +775,7 @@ macro_rules! impl_param_set {
+                 state: &'s Self::State,
+                 system_meta: &SystemMeta,
+                 world: UnsafeWorldCell<'w>,
+-            ) -> ValidationOutcome {
++            ) -> Result<(), SystemParamValidationError> {
+                 <($($param,)*) as SystemParam>::validate_param(state, system_meta, world)
+             }
+ 
+@@ -888,16 +853,16 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
+         &component_id: &Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Read-only access to resource metadata.
+         if unsafe { world.storages() }
+             .resources
+             .get(component_id)
+             .is_some_and(ResourceData::is_present)
+         {
+-            ValidationOutcome::Valid
++            Ok(())
+         } else {
+-            ValidationOutcome::Invalid
++            Err(SystemParamValidationError::invalid())
+         }
+     }
+ 
+@@ -1001,16 +966,16 @@ unsafe impl<'a, T: Resource> SystemParam for ResMut<'a, T> {
+         &component_id: &Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Read-only access to resource metadata.
+         if unsafe { world.storages() }
+             .resources
+             .get(component_id)
+             .is_some_and(ResourceData::is_present)
+         {
+-            ValidationOutcome::Valid
++            Ok(())
+         } else {
+-            ValidationOutcome::Invalid
++            Err(SystemParamValidationError::invalid())
+         }
+     }
+ 
+@@ -1599,16 +1564,16 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+         &component_id: &Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Read-only access to resource metadata.
+         if unsafe { world.storages() }
+             .non_send_resources
+             .get(component_id)
+             .is_some_and(ResourceData::is_present)
+         {
+-            ValidationOutcome::Valid
++            Ok(())
+         } else {
+-            ValidationOutcome::Invalid
++            Err(SystemParamValidationError::invalid())
+         }
+     }
+ 
+@@ -1709,16 +1674,16 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+         &component_id: &Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Read-only access to resource metadata.
+         if unsafe { world.storages() }
+             .non_send_resources
+             .get(component_id)
+             .is_some_and(ResourceData::is_present)
+         {
+-            ValidationOutcome::Valid
++            Ok(())
+         } else {
+-            ValidationOutcome::Invalid
++            Err(SystemParamValidationError::invalid())
+         }
+     }
+ 
+@@ -1927,23 +1892,11 @@ unsafe impl<T: SystemParam> SystemParam for Vec<T> {
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
+-        let mut validation_state = ValidationOutcome::Valid;
+-
++    ) -> Result<(), SystemParamValidationError> {
+         for state in state {
+-            validation_state =
+-                validation_state.combine(T::validate_param(state, system_meta, world));
+-
+-            // Short-circuit to avoid wasted validation work
+-            if matches!(
+-                validation_state,
+-                ValidationOutcome::Invalid | ValidationOutcome::Skipped
+-            ) {
+-                return validation_state;
+-            }
++            T::validate_param(state, system_meta, world)?;
+         }
+-
+-        validation_state
++        Ok(())
+     }
+ 
+     #[inline]
+@@ -2127,12 +2080,12 @@ macro_rules! impl_system_param_tuple {
+                 state: &Self::State,
+                 system_meta: &SystemMeta,
+                 world: UnsafeWorldCell,
+-            ) -> ValidationOutcome {
+-                // PERF: short-circuit to avoid wasted validation work
++            ) -> Result<(), SystemParamValidationError> {
+                 let ($($param,)*) = state;
+-                // Run validation on each parameter in the tuple,
+-                // combining the results into a single `ValidationOutcome`.
+-                ValidationOutcome::Valid$(.combine($param::validate_param($param, system_meta, world)))*
++                $(
++                    $param::validate_param($param, system_meta, world)?;
++                )*
++                Ok(())
+             }
+ 
+             #[inline]
+@@ -2299,7 +2252,7 @@ unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_,
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         P::validate_param(state, system_meta, world)
+     }
+ 
+@@ -2549,7 +2502,7 @@ trait DynParamState: Sync + Send {
+         &self,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome;
++    ) -> Result<(), SystemParamValidationError>;
+ }
+ 
+ /// A wrapper around a [`SystemParam::State`] that can be used as a trait object in a [`DynSystemParam`].
+@@ -2577,7 +2530,7 @@ impl<T: SystemParam + 'static> DynParamState for ParamState<T> {
+         &self,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         T::validate_param(&self.0, system_meta, world)
+     }
+ }
+@@ -2597,7 +2550,7 @@ unsafe impl SystemParam for DynSystemParam<'_, '_> {
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         state.0.validate_param(system_meta, world)
+     }
+ 
+@@ -2692,12 +2645,38 @@ unsafe impl SystemParam for FilteredResourcesMut<'_, '_> {
+     }
+ }
+ 
+-/// An error that occurs when a system parameter is not valid.
++/// An error that occurs when a system parameter is not valid,
++/// used by system executors to determine what to do with a system.
+ ///
+-/// Generated when [`SystemParam::validate_param`] returns `false`,
++/// Returned as an error from [`SystemParam::validate_param`],
+ /// and handled using the unified error handling mechanisms defined in [`bevy_ecs::error`].
+ #[derive(Debug, PartialEq, Eq, Clone, Display, Error)]
+-pub struct SystemParamValidationError;
++pub struct SystemParamValidationError {
++    /// Whether the system should be skipped.
++    ///
++    /// If `false`, the error should be handled.
++    /// By default, this will result in a panic. See [`crate::error`] for more information.
++    ///
++    /// This is the default behavior, and is suitable for system params that should *always* be valid,
++    /// either because sensible fallback behavior exists (like [`Query`] or because
++    /// failures in validation should be considered a bug in the user's logic that must be immediately addressed (like [`Res`]).
++    ///
++    /// If `true`, the system should be skipped.
++    /// This is suitable for system params that are intended to only operate in certain application states, such as [`Single`].
++    pub skipped: bool,
++}
++
++impl SystemParamValidationError {
++    /// Constructs a `SystemParamValidationError` that skips the system.
++    pub const fn skipped() -> Self {
++        Self { skipped: true }
++    }
++
++    /// Constructs a `SystemParamValidationError` for an invalid parameter that should be treated as an error.
++    pub const fn invalid() -> Self {
++        Self { skipped: false }
++    }
++}
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/crates/bevy_ecs/src/system/system_registry.rs b/crates/bevy_ecs/src/system/system_registry.rs
+index 52a52bdc04ba2..416bf251f83ea 100644
+--- a/crates/bevy_ecs/src/system/system_registry.rs
++++ b/crates/bevy_ecs/src/system/system_registry.rs
+@@ -13,8 +13,6 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use core::marker::PhantomData;
+ use thiserror::Error;
+ 
+-use super::ValidationOutcome;
+-
+ /// A small wrapper for [`BoxedSystem`] that also keeps track whether or not the system has been initialized.
+ #[derive(Component)]
+ #[require(SystemIdMarker)]
+@@ -353,7 +351,7 @@ impl World {
+             initialized = true;
+         }
+ 
+-        let result = if let ValidationOutcome::Valid = system.validate_param(self) {
++        let result = if system.validate_param(self).is_ok() {
+             // Wait to run the commands until the system is available again.
+             // This is needed so the systems can recursively run themselves.
+             let ret = system.run_without_applying_deferred(input, self);
+diff --git a/crates/bevy_gizmos/src/gizmos.rs b/crates/bevy_gizmos/src/gizmos.rs
+index 70641a2f73e25..b51dd672fe07d 100644
+--- a/crates/bevy_gizmos/src/gizmos.rs
++++ b/crates/bevy_gizmos/src/gizmos.rs
+@@ -13,7 +13,7 @@ use bevy_ecs::{
+     resource::Resource,
+     system::{
+         Deferred, ReadOnlySystemParam, Res, SystemBuffer, SystemMeta, SystemParam,
+-        ValidationOutcome,
++        SystemParamValidationError,
+     },
+     world::{unsafe_world_cell::UnsafeWorldCell, World},
+ };
+@@ -225,7 +225,7 @@ where
+         state: &Self::State,
+         system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Delegated to existing `SystemParam` implementations.
+         unsafe { GizmosState::<Config, Clear>::validate_param(&state.state, system_meta, world) }
+     }
+diff --git a/crates/bevy_render/src/extract_param.rs b/crates/bevy_render/src/extract_param.rs
+index 1c2c43ece163f..918b7862a001e 100644
+--- a/crates/bevy_render/src/extract_param.rs
++++ b/crates/bevy_render/src/extract_param.rs
+@@ -3,8 +3,8 @@ use bevy_ecs::{
+     component::Tick,
+     prelude::*,
+     system::{
+-        ReadOnlySystemParam, SystemMeta, SystemParam, SystemParamItem, SystemState,
+-        ValidationOutcome,
++        ReadOnlySystemParam, SystemMeta, SystemParam, SystemParamItem, SystemParamValidationError,
++        SystemState,
+     },
+     world::unsafe_world_cell::UnsafeWorldCell,
+ };
+@@ -84,11 +84,11 @@ where
+         state: &Self::State,
+         _system_meta: &SystemMeta,
+         world: UnsafeWorldCell,
+-    ) -> ValidationOutcome {
++    ) -> Result<(), SystemParamValidationError> {
+         // SAFETY: Read-only access to world data registered in `init_state`.
+         let result = unsafe { world.get_resource_by_id(state.main_world_state) };
+         let Some(main_world) = result else {
+-            return ValidationOutcome::Invalid;
++            return Err(SystemParamValidationError::invalid());
+         };
+         // SAFETY: Type is guaranteed by `SystemState`.
+         let main_world: &World = unsafe { main_world.deref() };
+diff --git a/examples/ecs/fallible_params.rs b/examples/ecs/fallible_params.rs
+index d6343fa7f39d8..99eaedf10d071 100644
+--- a/examples/ecs/fallible_params.rs
++++ b/examples/ecs/fallible_params.rs
+@@ -9,16 +9,14 @@
+ //!
+ //! Other system parameters, such as [`Query`], will never fail validation: returning a query with no matching entities is valid.
+ //!
+-//! The result of failed system parameter validation is determined by the [`ValidationOutcome`] returned
++//! The result of failed system parameter validation is determined by the [`SystemParamValidationError`] returned
+ //! by [`SystemParam::validate_param`] for each system parameter.
+-//! Each system will pass, fail, or skip based on the joint outcome of all its parameters,
+-//! according to the rules defined in [`ValidationOutcome::combine`].
++//! Each system will pass if all of its parameters are valid, or else return [`SystemParamValidationError`] for the first failing parameter.
+ //!
+-//! To learn more about setting the fallback behavior for [`ValidationOutcome`] failures,
++//! To learn more about setting the fallback behavior for [`SystemParamValidationError`] failures,
+ //! please see the `error_handling.rs` example.
+ //!
+-//! [`ValidationOutcome`]: bevy::ecs::system::ValidationOutcome
+-//! [`ValidationOutcome::combine`]: bevy::ecs::system::ValidationOutcome::combine
++//! [`SystemParamValidationError`]: bevy::ecs::system::SystemParamValidationError
+ //! [`SystemParam::validate_param`]: bevy::ecs::system::SystemParam::validate_param
+ 
+ use bevy::ecs::error::{warn, GLOBAL_ERROR_HANDLER};

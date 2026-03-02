@@ -1,0 +1,165 @@
+diff --git a/crates/bevy_ecs/src/query/builder.rs b/crates/bevy_ecs/src/query/builder.rs
+index 4df8a615db617..2c4b29e06ea66 100644
+--- a/crates/bevy_ecs/src/query/builder.rs
++++ b/crates/bevy_ecs/src/query/builder.rs
+@@ -81,15 +81,17 @@ impl<'w, D: QueryData, F: QueryFilter> QueryBuilder<'w, D, F> {
+                 .is_some_and(|info| info.storage_type() == StorageType::Table)
+         };
+ 
+-        let Ok(component_accesses) = self.access.access().try_iter_component_access() else {
+-            // Access is unbounded, pessimistically assume it's sparse.
+-            return false;
+-        };
+-
+-        component_accesses
+-            .map(|access| *access.index())
+-            .all(is_dense)
+-            && !self.access.access().has_read_all_components()
++        // Use dense iteration if possible, but fall back to sparse if we need to.
++        // Both `D` and `F` must allow dense iteration, just as for queries without dynamic filters.
++        // All `with` and `without` filters must be dense to ensure that we match all archetypes in a table.
++        // We also need to ensure that any sparse set components in `access.required` cause sparse iteration,
++        // but anything that adds a `required` component also adds a `with` filter.
++        //
++        // Note that `EntityRef` and `EntityMut` types, including `FilteredEntityRef` and `FilteredEntityMut`, have `D::IS_DENSE = true`.
++        // Calling `builder.data::<&Sparse>()` will add a filter and force sparse iteration,
++        // but calling `builder.data::<Option<&Sparse>>()` will still allow them to use dense iteration!
++        D::IS_DENSE
++            && F::IS_DENSE
+             && self.access.with_filters().all(is_dense)
+             && self.access.without_filters().all(is_dense)
+     }
+@@ -537,4 +539,32 @@ mod tests {
+         let matched = query.iter(&world).count();
+         assert_eq!(matched, 1);
+     }
++
++    #[test]
++    fn builder_dynamic_can_be_dense() {
++        #[derive(Component)]
++        #[component(storage = "SparseSet")]
++        struct Sparse;
++
++        let mut world = World::new();
++
++        // FilteredEntityRef and FilteredEntityMut are dense by default
++        let query = QueryBuilder::<FilteredEntityRef>::new(&mut world).build();
++        assert!(query.is_dense);
++
++        let query = QueryBuilder::<FilteredEntityMut>::new(&mut world).build();
++        assert!(query.is_dense);
++
++        // Adding a required sparse term makes the query sparse
++        let query = QueryBuilder::<FilteredEntityRef>::new(&mut world)
++            .data::<&Sparse>()
++            .build();
++        assert!(!query.is_dense);
++
++        // Adding an optional sparse term lets it remain dense
++        let query = QueryBuilder::<FilteredEntityRef>::new(&mut world)
++            .data::<Option<&Sparse>>()
++            .build();
++        assert!(query.is_dense);
++    }
+ }
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index 33c3f0097b8ae..06fc17727e6fe 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -963,7 +963,7 @@ unsafe impl WorldQuery for FilteredEntityRef<'_, '_> {
+         fetch
+     }
+ 
+-    const IS_DENSE: bool = false;
++    const IS_DENSE: bool = true;
+ 
+     unsafe fn init_fetch<'w, 's>(
+         world: UnsafeWorldCell<'w>,
+@@ -1084,7 +1084,7 @@ unsafe impl WorldQuery for FilteredEntityMut<'_, '_> {
+         fetch
+     }
+ 
+-    const IS_DENSE: bool = false;
++    const IS_DENSE: bool = true;
+ 
+     unsafe fn init_fetch<'w, 's>(
+         world: UnsafeWorldCell<'w>,
+diff --git a/crates/bevy_ecs/src/query/state.rs b/crates/bevy_ecs/src/query/state.rs
+index 7fb3ef2fcf581..0f37fd17cea7e 100644
+--- a/crates/bevy_ecs/src/query/state.rs
++++ b/crates/bevy_ecs/src/query/state.rs
+@@ -677,11 +677,30 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
+             DebugName::type_name::<(NewD, NewF)>(), DebugName::type_name::<(D, F)>()
+         );
+ 
++        // For transmuted queries, the dense-ness of the query is equal to the dense-ness of the original query.
++        //
++        // We ensure soundness using `FilteredAccess::required`.
++        //
++        // Any `WorldQuery` implementations that rely on a query being sparse for soundness,
++        // including `&`, `&mut`, `Ref`, and `Mut`, will add a sparse set component to the `required` set.
++        // (`Option<&Sparse>` and `Has<Sparse>` will incorrectly report a component as never being present
++        // when doing dense iteration, but are not unsound.  See https://github.com/bevyengine/bevy/issues/16397)
++        //
++        // And any query with a sparse set component in the `required` set must have `is_dense = false`.
++        // For static queries, the `WorldQuery` implementations ensure this.
++        // For dynamic queries, anything that adds a `required` component also adds a `with` filter.
++        //
++        // The `component_access.is_subset()` check ensures that if the new query has a sparse set component in the `required` set,
++        // then the original query must also have had that component in the `required` set.
++        // Therefore, if the `WorldQuery` implementations rely on a query being sparse for soundness,
++        // then there was a sparse set component in the `required` set, and the query has `is_dense = false`.
++        let is_dense = self.is_dense;
++
+         QueryState {
+             world_id: self.world_id,
+             archetype_generation: self.archetype_generation,
+             matched_storage_ids: self.matched_storage_ids.clone(),
+-            is_dense: self.is_dense,
++            is_dense,
+             fetch_state,
+             filter_state,
+             component_access: self_access,
+@@ -1779,7 +1798,7 @@ mod tests {
+         entity_disabling::DefaultQueryFilters,
+         prelude::*,
+         system::{QueryLens, RunSystemOnce},
+-        world::{FilteredEntityMut, FilteredEntityRef},
++        world::{EntityRef, FilteredEntityMut, FilteredEntityRef},
+     };
+ 
+     #[test]
+@@ -2115,6 +2134,33 @@ mod tests {
+         assert_eq!(count, 2);
+     }
+ 
++    #[test]
++    fn dense_query_over_option_is_buggy() {
++        #[derive(Component)]
++        #[component(storage = "SparseSet")]
++        struct Sparse;
++
++        let mut world = World::new();
++        world.spawn(Sparse);
++
++        let mut query =
++            QueryState::<EntityRef>::new(&mut world).transmute::<Option<&Sparse>>(&world);
++        // EntityRef always performs dense iteration
++        // But `Option<&Sparse>` will incorrectly report a component as never being present when doing dense iteration
++        // See https://github.com/bevyengine/bevy/issues/16397
++        assert!(query.is_dense);
++        let matched = query.iter(&world).filter(Option::is_some).count();
++        assert_eq!(matched, 0);
++
++        let mut query = QueryState::<EntityRef>::new(&mut world).transmute::<Has<Sparse>>(&world);
++        // EntityRef always performs dense iteration
++        // But `Has<Sparse>` will incorrectly report a component as never being present when doing dense iteration
++        // See https://github.com/bevyengine/bevy/issues/16397
++        assert!(query.is_dense);
++        let matched = query.iter(&world).filter(|&has| has).count();
++        assert_eq!(matched, 0);
++    }
++
+     #[test]
+     fn join() {
+         let mut world = World::new();

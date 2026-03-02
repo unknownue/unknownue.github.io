@@ -1,0 +1,265 @@
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index 84d1b3e4da5c1..a5d06399ee3d3 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -47,9 +47,7 @@ bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_shader = { path = "../bevy_shader", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+-bevy_render = { path = "../bevy_render", features = [
+-  "bevy_light",
+-], version = "0.17.0-dev" }
++bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_tasks = { path = "../bevy_tasks", version = "0.17.0-dev", optional = true }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+diff --git a/crates/bevy_pbr/src/decal/clustered.rs b/crates/bevy_pbr/src/decal/clustered.rs
+index 27e8c2d5ec8da..857969510bd05 100644
+--- a/crates/bevy_pbr/src/decal/clustered.rs
++++ b/crates/bevy_pbr/src/decal/clustered.rs
+@@ -25,20 +25,20 @@ use bevy_ecs::{
+     query::With,
+     resource::Resource,
+     schedule::IntoScheduleConfigs as _,
+-    system::{Query, Res, ResMut},
++    system::{Commands, Local, Query, Res, ResMut},
+ };
+ use bevy_image::Image;
+ use bevy_light::{ClusteredDecal, DirectionalLightTexture, PointLightTexture, SpotLightTexture};
+ use bevy_math::Mat4;
+ use bevy_platform::collections::HashMap;
+ use bevy_render::{
+-    extract_component::ExtractComponentPlugin,
+     render_asset::RenderAssets,
+     render_resource::{
+         binding_types, BindGroupLayoutEntryBuilder, Buffer, BufferUsages, RawBufferVec, Sampler,
+         SamplerBindingType, ShaderType, TextureSampleType, TextureView,
+     },
+     renderer::{RenderAdapter, RenderDevice, RenderQueue},
++    sync_component::SyncComponentPlugin,
+     sync_world::RenderEntity,
+     texture::{FallbackImage, GpuImage},
+     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+@@ -142,7 +142,7 @@ impl Plugin for ClusteredDecalPlugin {
+     fn build(&self, app: &mut App) {
+         load_shader_library!(app, "clustered.wgsl");
+ 
+-        app.add_plugins(ExtractComponentPlugin::<ClusteredDecal>::default());
++        app.add_plugins(SyncComponentPlugin::<ClusteredDecal>::default());
+ 
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+@@ -151,7 +151,7 @@ impl Plugin for ClusteredDecalPlugin {
+         render_app
+             .init_resource::<DecalsBuffer>()
+             .init_resource::<RenderClusteredDecals>()
+-            .add_systems(ExtractSchedule, extract_decals)
++            .add_systems(ExtractSchedule, (extract_decals, extract_clustered_decal))
+             .add_systems(
+                 Render,
+                 prepare_decals
+@@ -165,6 +165,21 @@ impl Plugin for ClusteredDecalPlugin {
+     }
+ }
+ 
++// This is needed because of the orphan rule not allowing implementing
++// foreign trait ExtractComponent on foreign type ClusteredDecal
++fn extract_clustered_decal(
++    mut commands: Commands,
++    mut previous_len: Local<usize>,
++    query: Extract<Query<(RenderEntity, &ClusteredDecal)>>,
++) {
++    let mut values = Vec::with_capacity(*previous_len);
++    for (entity, query_item) in &query {
++        values.push((entity, query_item.clone()));
++    }
++    *previous_len = values.len();
++    commands.try_insert_batch(values);
++}
++
+ /// The GPU data structure that stores information about each decal.
+ #[derive(Clone, Copy, Default, ShaderType, Pod, Zeroable)]
+ #[repr(C)]
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index 3cad4b859d546..4bba01c2f4954 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -134,7 +134,6 @@ use bevy_image::{Image, ImageSampler};
+ use bevy_render::{
+     alpha::AlphaMode,
+     camera::sort_cameras,
+-    extract_component::ExtractComponentPlugin,
+     extract_resource::ExtractResourcePlugin,
+     render_graph::RenderGraph,
+     render_resource::{
+@@ -229,10 +228,9 @@ impl Plugin for PbrPlugin {
+                     ..Default::default()
+                 },
+                 ScreenSpaceAmbientOcclusionPlugin,
+-                ExtractResourcePlugin::<AmbientLight>::default(),
+                 FogPlugin,
+                 ExtractResourcePlugin::<DefaultOpaqueRendererMethod>::default(),
+-                ExtractComponentPlugin::<ShadowFilteringMethod>::default(),
++                SyncComponentPlugin::<ShadowFilteringMethod>::default(),
+                 LightmapPlugin,
+                 LightProbePlugin,
+                 LightPlugin,
+@@ -248,7 +246,7 @@ impl Plugin for PbrPlugin {
+                 SyncComponentPlugin::<DirectionalLight>::default(),
+                 SyncComponentPlugin::<PointLight>::default(),
+                 SyncComponentPlugin::<SpotLight>::default(),
+-                ExtractComponentPlugin::<AmbientLight>::default(),
++                SyncComponentPlugin::<AmbientLight>::default(),
+             ))
+             .add_plugins(AtmospherePlugin)
+             .configure_sets(
+@@ -325,6 +323,9 @@ impl Plugin for PbrPlugin {
+                 (
+                     extract_clusters,
+                     extract_lights,
++                    extract_ambient_light_resource,
++                    extract_ambient_light,
++                    extract_shadow_filtering_method,
+                     late_sweep_material_instances,
+                 ),
+             )
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 41792b38a62a1..f77d9e6bdb5ac 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -25,7 +25,7 @@ use bevy_light::cluster::GlobalVisibleClusterableObjects;
+ use bevy_light::{
+     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
+     Cascades, DirectionalLight, DirectionalLightShadowMap, NotShadowCaster, PointLight,
+-    PointLightShadowMap, SpotLight, VolumetricLight,
++    PointLightShadowMap, ShadowFilteringMethod, SpotLight, VolumetricLight,
+ };
+ use bevy_math::{ops, Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles};
+ use bevy_platform::collections::{HashMap, HashSet};
+@@ -224,6 +224,54 @@ pub fn init_shadow_samplers(mut commands: Commands, render_device: Res<RenderDev
+     });
+ }
+ 
++// This is needed because of the orphan rule not allowing implementing
++// foreign trait ExtractComponent on foreign type ShadowFilteringMethod
++pub fn extract_shadow_filtering_method(
++    mut commands: Commands,
++    mut previous_len: Local<usize>,
++    query: Extract<Query<(RenderEntity, &ShadowFilteringMethod)>>,
++) {
++    let mut values = Vec::with_capacity(*previous_len);
++    for (entity, query_item) in &query {
++        values.push((entity, *query_item));
++    }
++    *previous_len = values.len();
++    commands.try_insert_batch(values);
++}
++
++// This is needed because of the orphan rule not allowing implementing
++// foreign trait ExtractResource on foreign type AmbientLight
++pub fn extract_ambient_light_resource(
++    mut commands: Commands,
++    main_resource: Extract<Option<Res<AmbientLight>>>,
++    target_resource: Option<ResMut<AmbientLight>>,
++) {
++    if let Some(main_resource) = main_resource.as_ref() {
++        if let Some(mut target_resource) = target_resource {
++            if main_resource.is_changed() {
++                *target_resource = (*main_resource).clone();
++            }
++        } else {
++            commands.insert_resource((*main_resource).clone());
++        }
++    }
++}
++
++// This is needed because of the orphan rule not allowing implementing
++// foreign trait ExtractComponent on foreign type AmbientLight
++pub fn extract_ambient_light(
++    mut commands: Commands,
++    mut previous_len: Local<usize>,
++    query: Extract<Query<(RenderEntity, &AmbientLight)>>,
++) {
++    let mut values = Vec::with_capacity(*previous_len);
++    for (entity, query_item) in &query {
++        values.push((entity, query_item.clone()));
++    }
++    *previous_len = values.len();
++    commands.try_insert_batch(values);
++}
++
+ pub fn extract_lights(
+     mut commands: Commands,
+     point_light_shadow_map: Extract<Res<PointLightShadowMap>>,
+diff --git a/crates/bevy_render/Cargo.toml b/crates/bevy_render/Cargo.toml
+index 737c21b7986a7..c93986f3eab16 100644
+--- a/crates/bevy_render/Cargo.toml
++++ b/crates/bevy_render/Cargo.toml
+@@ -68,7 +68,6 @@ bevy_image = { path = "../bevy_image", version = "0.17.0-dev" }
+ bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev" }
+ bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_shader = { path = "../bevy_shader", version = "0.17.0-dev" }
+-bevy_light = { path = "../bevy_light", optional = true, version = "0.17.0-dev" }
+ bevy_platform = { path = "../bevy_platform", version = "0.17.0-dev", default-features = false, features = [
+   "std",
+   "serialize",
+diff --git a/crates/bevy_render/src/extract_impls.rs b/crates/bevy_render/src/extract_impls.rs
+deleted file mode 100644
+index 87b854363abea..0000000000000
+--- a/crates/bevy_render/src/extract_impls.rs
++++ /dev/null
+@@ -1,41 +0,0 @@
+-//! This module exists because of the orphan rule
+-
+-use bevy_ecs::query::QueryItem;
+-use bevy_light::{cluster::ClusteredDecal, AmbientLight, ShadowFilteringMethod};
+-
+-use crate::{extract_component::ExtractComponent, extract_resource::ExtractResource};
+-
+-impl ExtractComponent for ClusteredDecal {
+-    type QueryData = &'static Self;
+-    type QueryFilter = ();
+-    type Out = Self;
+-
+-    fn extract_component(item: QueryItem<Self::QueryData>) -> Option<Self::Out> {
+-        Some(item.clone())
+-    }
+-}
+-impl ExtractResource for AmbientLight {
+-    type Source = Self;
+-
+-    fn extract_resource(source: &Self::Source) -> Self {
+-        source.clone()
+-    }
+-}
+-impl ExtractComponent for AmbientLight {
+-    type QueryData = &'static Self;
+-    type QueryFilter = ();
+-    type Out = Self;
+-
+-    fn extract_component(item: QueryItem<Self::QueryData>) -> Option<Self::Out> {
+-        Some(item.clone())
+-    }
+-}
+-impl ExtractComponent for ShadowFilteringMethod {
+-    type QueryData = &'static Self;
+-    type QueryFilter = ();
+-    type Out = Self;
+-
+-    fn extract_component(item: QueryItem<Self::QueryData>) -> Option<Self::Out> {
+-        Some(*item)
+-    }
+-}
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index 99666e2dff061..8c54629fbe0b0 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -42,8 +42,6 @@ pub mod diagnostic;
+ pub mod erased_render_asset;
+ pub mod experimental;
+ pub mod extract_component;
+-#[cfg(feature = "bevy_light")]
+-mod extract_impls;
+ pub mod extract_instances;
+ mod extract_param;
+ pub mod extract_resource;

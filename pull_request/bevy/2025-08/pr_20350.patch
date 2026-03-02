@@ -1,0 +1,240 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 4b4f00b090393..421fc220e7bf9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3594,6 +3594,18 @@ description = "Demonstrates how to control the relative depth (z-position) of UI
+ category = "UI (User Interface)"
+ wasm = true
+ 
++[[example]]
++name = "virtual_keyboard"
++path = "examples/ui/virtual_keyboard.rs"
++doc-scrape-examples = true
++required-features = ["experimental_bevy_feathers"]
++
++[package.metadata.example.virtual_keyboard]
++name = "Virtual Keyboard"
++description = "Example demonstrating a virtual keyboard widget"
++category = "UI (User Interface)"
++wasm = true
++
+ [[example]]
+ name = "ui_scaling"
+ path = "examples/ui/ui_scaling.rs"
+diff --git a/crates/bevy_feathers/src/controls/mod.rs b/crates/bevy_feathers/src/controls/mod.rs
+index 32bcf2bfc80c6..c398b25e10bb0 100644
+--- a/crates/bevy_feathers/src/controls/mod.rs
++++ b/crates/bevy_feathers/src/controls/mod.rs
+@@ -7,6 +7,7 @@ mod color_swatch;
+ mod radio;
+ mod slider;
+ mod toggle_switch;
++mod virtual_keyboard;
+ 
+ pub use button::{button, ButtonPlugin, ButtonProps, ButtonVariant};
+ pub use checkbox::{checkbox, CheckboxPlugin, CheckboxProps};
+@@ -14,6 +15,7 @@ pub use color_swatch::{color_swatch, ColorSwatch, ColorSwatchFg};
+ pub use radio::{radio, RadioPlugin};
+ pub use slider::{slider, SliderPlugin, SliderProps};
+ pub use toggle_switch::{toggle_switch, ToggleSwitchPlugin, ToggleSwitchProps};
++pub use virtual_keyboard::virtual_keyboard;
+ 
+ use crate::alpha_pattern::AlphaPatternPlugin;
+ 
+diff --git a/crates/bevy_feathers/src/controls/virtual_keyboard.rs b/crates/bevy_feathers/src/controls/virtual_keyboard.rs
+new file mode 100644
+index 0000000000000..6f0473ffe0611
+--- /dev/null
++++ b/crates/bevy_feathers/src/controls/virtual_keyboard.rs
+@@ -0,0 +1,56 @@
++use bevy_core_widgets::{Activate, Callback};
++use bevy_ecs::{
++    bundle::Bundle,
++    component::Component,
++    hierarchy::{ChildOf, Children},
++    relationship::RelatedSpawner,
++    spawn::{Spawn, SpawnRelated, SpawnWith},
++    system::{In, SystemId},
++};
++use bevy_input_focus::tab_navigation::TabGroup;
++use bevy_ui::Node;
++use bevy_ui::Val;
++use bevy_ui::{widget::Text, FlexDirection};
++
++use crate::controls::{button, ButtonProps};
++
++/// Function to spawn a virtual keyboard
++pub fn virtual_keyboard<T>(
++    keys: impl Iterator<Item = Vec<(String, T)>> + Send + Sync + 'static,
++    on_key_press: SystemId<In<Activate>>,
++) -> impl Bundle
++where
++    T: Component,
++{
++    (
++        Node {
++            flex_direction: FlexDirection::Column,
++            row_gap: Val::Px(4.),
++            ..Default::default()
++        },
++        TabGroup::new(0),
++        Children::spawn((SpawnWith(move |parent: &mut RelatedSpawner<ChildOf>| {
++            for row in keys {
++                parent.spawn((
++                    Node {
++                        flex_direction: FlexDirection::Row,
++                        column_gap: Val::Px(4.),
++                        ..Default::default()
++                    },
++                    Children::spawn(SpawnWith(move |parent: &mut RelatedSpawner<ChildOf>| {
++                        for (label, key_id) in row.into_iter() {
++                            parent.spawn(button(
++                                ButtonProps {
++                                    on_click: Callback::System(on_key_press),
++                                    ..Default::default()
++                                },
++                                (key_id,),
++                                Spawn(Text::new(label)),
++                            ));
++                        }
++                    })),
++                ));
++            }
++        }),)),
++    )
++}
+diff --git a/examples/README.md b/examples/README.md
+index 06d79d826288f..2c5d6ab6f40cb 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -584,6 +584,7 @@ Example | Description
+ [UI Z-Index](../examples/ui/z_index.rs) | Demonstrates how to control the relative depth (z-position) of UI elements
+ [Viewport Debug](../examples/ui/viewport_debug.rs) | An example for debugging viewport coordinates
+ [Viewport Node](../examples/ui/viewport_node.rs) | Demonstrates how to create a viewport node with picking support
++[Virtual Keyboard](../examples/ui/virtual_keyboard.rs) | Example demonstrating a virtual keyboard widget
+ [Window Fallthrough](../examples/ui/window_fallthrough.rs) | Illustrates how to access `winit::window::Window`'s `hittest` functionality.
+ 
+ ### Usage
+diff --git a/examples/ui/virtual_keyboard.rs b/examples/ui/virtual_keyboard.rs
+new file mode 100644
+index 0000000000000..dc74760d19a96
+--- /dev/null
++++ b/examples/ui/virtual_keyboard.rs
+@@ -0,0 +1,95 @@
++//! Virtual keyboard example
++
++use bevy::{
++    color::palettes::css::NAVY,
++    core_widgets::{Activate, CoreWidgetsPlugins},
++    ecs::relationship::RelatedSpawnerCommands,
++    feathers::{
++        controls::virtual_keyboard, dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugin,
++    },
++    input_focus::{tab_navigation::TabNavigationPlugin, InputDispatchPlugin},
++    prelude::*,
++    winit::WinitSettings,
++};
++
++fn main() {
++    App::new()
++        .add_plugins((
++            DefaultPlugins,
++            CoreWidgetsPlugins,
++            InputDispatchPlugin,
++            TabNavigationPlugin,
++            FeathersPlugin,
++        ))
++        .insert_resource(UiTheme(create_dark_theme()))
++        // Only run the app when there is user input. This will significantly reduce CPU/GPU use.
++        .insert_resource(WinitSettings::desktop_app())
++        .add_systems(Startup, setup)
++        .run();
++}
++
++#[derive(Component)]
++struct VirtualKey(String);
++
++fn on_virtual_key_pressed(
++    In(Activate(virtual_key_entity)): In<Activate>,
++    virtual_key_query: Query<&VirtualKey>,
++) {
++    if let Ok(VirtualKey(label)) = virtual_key_query.get(virtual_key_entity) {
++        println!("key pressed: {label}");
++    }
++}
++
++fn setup(mut commands: Commands) {
++    // ui camera
++    commands.spawn(Camera2d);
++    let callback = commands.register_system(on_virtual_key_pressed);
++
++    let layout = [
++        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", ".", ","],
++        vec!["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
++        vec!["A", "S", "D", "F", "G", "H", "J", "K", "L", "'"],
++        vec!["Z", "X", "C", "V", "B", "N", "M", "-", "/"],
++        vec!["space", "enter", "backspace"],
++        vec!["left", "right", "up", "down", "home", "end"],
++    ];
++
++    let keys_iter = layout.into_iter().map(|row| {
++        row.into_iter()
++            .map(|label| {
++                let label_string = label.to_string();
++                (label_string.clone(), VirtualKey(label_string))
++            })
++            .collect()
++    });
++
++    commands
++        .spawn(Node {
++            width: Val::Percent(100.0),
++            height: Val::Percent(100.0),
++            align_items: AlignItems::End,
++            justify_content: JustifyContent::Center,
++            ..default()
++        })
++        .with_children(|parent: &mut RelatedSpawnerCommands<ChildOf>| {
++            parent
++                .spawn((
++                    Node {
++                        flex_direction: FlexDirection::Column,
++                        border: Val::Px(5.).into(),
++                        row_gap: Val::Px(5.),
++                        padding: Val::Px(5.).into(),
++                        align_items: AlignItems::Center,
++                        margin: Val::Px(25.).into(),
++                        ..Default::default()
++                    },
++                    BackgroundColor(NAVY.into()),
++                    BorderColor::all(Color::WHITE),
++                    BorderRadius::all(Val::Px(10.)),
++                ))
++                .with_children(|parent: &mut RelatedSpawnerCommands<ChildOf>| {
++                    parent.spawn(Text::new("virtual keyboard"));
++                    parent.spawn(virtual_keyboard(keys_iter, callback));
++                });
++        });
++}
+diff --git a/release-content/release-notes/feathers.md b/release-content/release-notes/feathers.md
+index b8d4ca06f07cf..bf21ba16bc725 100644
+--- a/release-content/release-notes/feathers.md
++++ b/release-content/release-notes/feathers.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Bevy Feathers
+-authors: ["@viridia", "@Atlas16A"]
+-pull_requests: [19730, 19900, 19928, 20237, 20169]
++authors: ["@viridia", "@Atlas16A", "@ickshonpe"]
++pull_requests: [19730, 19900, 19928, 20237, 20169, 20350]
+ ---
+ 
+ To make it easier for Bevy engine developers and third-party tool creators to make comfortable, visually cohesive tooling,
+@@ -15,6 +15,7 @@ we're pleased to introduce "Feathers" - a comprehensive widget set that offers:
+ - Robust theming support ensuring consistent visual styling across applications
+ - Accessibility features with built-in screen reader and assistive technology support
+ - Interactive cursor behavior that changes appropriately when hovering over widgets
++- A virtual keyboard suitable for touchscreen text input
+ 
+ Feathers isn't meant as a toolkit for building exciting and cool game UIs: it has a somewhat plain
+ and utilitarian look and feel suitable for editors and graphical utilities. That being said, using
