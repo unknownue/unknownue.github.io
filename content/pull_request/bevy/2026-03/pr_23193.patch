@@ -1,0 +1,158 @@
+diff --git a/crates/bevy_transform/src/systems.rs b/crates/bevy_transform/src/systems.rs
+index 1e1ea8eb0217d..1546ec38dd5a3 100644
+--- a/crates/bevy_transform/src/systems.rs
++++ b/crates/bevy_transform/src/systems.rs
+@@ -46,57 +46,22 @@ pub fn sync_simple_transforms(
+ /// For scenes with many static entities, it is much faster to track trees of unchanged
+ /// [`Transform`]s and skip these during the expensive transform propagation step. If your scene is
+ /// very dynamic, the cost of tracking these trees can exceed the performance benefits. By default,
+-/// static scene optimization is disabled for worlds with more than 30% of its entities moving.
+-///
+-/// This resource allows you to configure that threshold at runtime.
+-#[derive(Resource, Debug)]
++/// static scene optimization is enabled.
++#[derive(Resource, Debug, Default, PartialEq, Eq)]
+ #[cfg_attr(feature = "bevy_reflect", derive(bevy_reflect::Reflect))]
+-pub struct StaticTransformOptimizations {
+-    /// If the percentage of moving objects exceeds this value, skip dirty tree marking.
+-    threshold: f32,
+-    /// Updated every frame by [`mark_dirty_trees`].
+-    enabled: bool,
++pub enum StaticTransformOptimizations {
++    /// Enable static scene optimizations.
++    #[default]
++    Enabled,
++    /// Disable static scene optimizations.
++    Disabled,
+ }
+ 
+ impl StaticTransformOptimizations {
+-    /// If the percentage of moving objects exceeds this threshold, disable static [`Transform`]
+-    /// optimizations. This is done because the scene is so dynamic that the cost of tracking static
+-    /// trees exceeds the performance benefit of skipping propagation for these trees.
+-    ///
+-    /// - Setting this to `0.0` will result in never running static scene tracking.
+-    /// - Setting this to `1.0` will result in always tracking static transform trees.
+-    pub fn from_threshold(threshold: f32) -> Self {
+-        Self {
+-            threshold,
+-            enabled: true,
+-        }
+-    }
+-
+-    /// Unconditionally disable static scene optimizations.
+-    pub fn disabled() -> Self {
+-        Self {
+-            threshold: 0.0,
+-            enabled: false,
+-        }
+-    }
+-
+-    /// Unconditionally enable static scene optimizations.
+-    pub fn enabled() -> Self {
+-        Self {
+-            threshold: 1.0,
+-            enabled: true,
+-        }
+-    }
+-}
+-
+-impl Default for StaticTransformOptimizations {
+-    fn default() -> Self {
+-        Self {
+-            // Scenes with more than 30% moving objects are considered dynamic enough to skip static
+-            // optimizations.
+-            threshold: 0.3,
+-            enabled: true,
+-        }
++    /// Returns `true` if static scene optimizations are enabled.
++    #[inline]
++    pub fn is_enabled(&self) -> bool {
++        *self == StaticTransformOptimizations::Enabled
+     }
+ }
+ 
+@@ -114,22 +79,9 @@ pub fn mark_dirty_trees(
+     mut orphaned: RemovedComponents<ChildOf>,
+     mut transforms: Query<&mut TransformTreeChanged>,
+     parents: Query<&ChildOf>,
+-    mut static_optimizations: ResMut<StaticTransformOptimizations>,
++    static_optimizations: Res<StaticTransformOptimizations>,
+ ) {
+-    let threshold = static_optimizations.threshold.clamp(0.0, 1.0);
+-    match threshold {
+-        0.0 => static_optimizations.enabled = false,
+-        1.0 => static_optimizations.enabled = true,
+-        _ => {
+-            static_optimizations.enabled = true;
+-            let n_dyn = changed_transforms.count() as f32;
+-            let total = transforms.count() as f32;
+-            if n_dyn / total > threshold {
+-                static_optimizations.enabled = false;
+-            }
+-        }
+-    }
+-    if !static_optimizations.enabled {
++    if !static_optimizations.is_enabled() {
+         return;
+     }
+ 
+@@ -368,7 +320,7 @@ mod parallel {
+         roots.par_iter_mut().for_each_init(
+             || queue.local_queue.borrow_local_mut(),
+             |outbox, (parent, transform, mut parent_transform, children, transform_tree)| {
+-                if static_optimizations.enabled && !transform_tree.is_changed() {
++                if static_optimizations.is_enabled() && !transform_tree.is_changed() {
+                     // Early exit if the subtree is static and the optimization is enabled.
+                     return;
+                 }
+@@ -552,7 +504,7 @@ mod parallel {
+             let mut last_child = None;
+             let new_children = children_iter.filter_map(
+                 |(child, (transform, mut global_transform, tree), (children, child_of))| {
+-                    if static_optimizations.enabled
++                    if static_optimizations.is_enabled()
+                         && !tree.is_changed()
+                         && !p_global_transform.is_changed()
+                     {
+diff --git a/examples/stress_tests/bevymark.rs b/examples/stress_tests/bevymark.rs
+index 68bca13b0829b..352fe26cbe415 100644
+--- a/examples/stress_tests/bevymark.rs
++++ b/examples/stress_tests/bevymark.rs
+@@ -145,7 +145,7 @@ fn main() {
+             FrameTimeDiagnosticsPlugin::default(),
+             LogDiagnosticsPlugin::default(),
+         ))
+-        .insert_resource(StaticTransformOptimizations::disabled())
++        .insert_resource(StaticTransformOptimizations::Disabled)
+         .insert_resource(WinitSettings::continuous())
+         .insert_resource(args)
+         .insert_resource(BevyCounter {
+diff --git a/examples/stress_tests/many_foxes.rs b/examples/stress_tests/many_foxes.rs
+index b5f22edc8ca7c..acebfe552cc3d 100644
+--- a/examples/stress_tests/many_foxes.rs
++++ b/examples/stress_tests/many_foxes.rs
+@@ -59,7 +59,7 @@ fn main() {
+             FrameTimeDiagnosticsPlugin::default(),
+             LogDiagnosticsPlugin::default(),
+         ))
+-        .insert_resource(StaticTransformOptimizations::disabled())
++        .insert_resource(StaticTransformOptimizations::Disabled)
+         .insert_resource(WinitSettings::continuous())
+         .insert_resource(Foxes {
+             count: args.count,
+diff --git a/release-content/migration-guides/remove_threshold_StaticTransformOptimizations.md b/release-content/migration-guides/remove_threshold_StaticTransformOptimizations.md
+new file mode 100644
+index 0000000000000..e6656309b4929
+--- /dev/null
++++ b/release-content/migration-guides/remove_threshold_StaticTransformOptimizations.md
+@@ -0,0 +1,9 @@
++---
++title: "`StaticTransformOptimizations` no longer stores a threshold for dynamic toggling"
++pull_requests: [23193]
++---
++
++The threshold has been removed completely from `StaticTransformOptimizations`: the optimization is always either enabled or disabled. As a result this is now a simple `enum`, and some method calls will need to be updated.
++
++If you want to toggle this dynamically, you can count the entities in a system and dynamically enable or disable this.
++Performing this check can be slow however, so you probably should not perform this check each frame.
