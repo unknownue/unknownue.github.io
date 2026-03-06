@@ -1,0 +1,1283 @@
+diff --git a/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs b/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs
+index 73970110891b1..19dffeefc6d89 100644
+--- a/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs
++++ b/crates/bevy_core_pipeline/src/core_3d/main_transparent_pass_3d_node.rs
+@@ -1,11 +1,14 @@
+-use crate::core_3d::Transparent3d;
++use crate::{
++    core_3d::Transparent3d,
++    oit::{resolve::OitResolvePipelineId, OrderIndependentTransparencySettings},
++};
+ use bevy_camera::{MainPassResolutionOverride, Viewport};
+ use bevy_ecs::prelude::*;
+ use bevy_render::{
+     camera::ExtractedCamera,
+     diagnostic::RecordDiagnostics,
+     render_phase::ViewSortedRenderPhases,
+-    render_resource::{RenderPassDescriptor, StoreOp},
++    render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
+     renderer::{RenderContext, ViewQuery},
+     view::{ExtractedView, ViewDepthTexture, ViewTarget},
+ };
+@@ -21,13 +24,23 @@ pub fn main_transparent_pass_3d(
+         &ViewTarget,
+         &ViewDepthTexture,
+         Option<&MainPassResolutionOverride>,
++        Has<OrderIndependentTransparencySettings>,
++        Option<&OitResolvePipelineId>,
+     )>,
+     transparent_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
+     mut ctx: RenderContext,
+ ) {
+     let view_entity = view.entity();
+ 
+-    let (camera, extracted_view, target, depth, resolution_override) = view.into_inner();
++    let (
++        camera,
++        extracted_view,
++        target,
++        depth,
++        resolution_override,
++        has_oit,
++        oit_resolve_pipeline_id,
++    ) = view.into_inner();
+ 
+     let Some(transparent_phase) = transparent_phases.get(&extracted_view.retained_view_entity)
+     else {
+@@ -41,6 +54,22 @@ pub fn main_transparent_pass_3d(
+         let diagnostics = ctx.diagnostic_recorder();
+         let diagnostics = diagnostics.as_deref();
+ 
++        if has_oit {
++            // We can't run transparent phase if OitResolvePipelineId is not ready
++            // Otherwise we will write to `oit_atomic_counter` and `oit_heads` buffer without resetting them
++            // which causes corrupted linked list(can have circular references) on the next pass
++            let Some(oit_resolve_pipeline_id) = oit_resolve_pipeline_id else {
++                return;
++            };
++            let pipeline_cache = world.resource::<PipelineCache>();
++            if pipeline_cache
++                .get_render_pipeline(oit_resolve_pipeline_id.0)
++                .is_none()
++            {
++                return;
++            }
++        }
++
+         let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+             label: Some("main_transparent_pass_3d"),
+             color_attachments: &[Some(target.get_color_attachment())],
+diff --git a/crates/bevy_core_pipeline/src/oit/mod.rs b/crates/bevy_core_pipeline/src/oit/mod.rs
+index a8f5c1e15031e..e373c8721a910 100644
+--- a/crates/bevy_core_pipeline/src/oit/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/mod.rs
+@@ -1,27 +1,29 @@
+ //! Order Independent Transparency (OIT) for 3d rendering. See [`OrderIndependentTransparencyPlugin`] for more details.
+ 
+ use bevy_app::prelude::*;
+-use bevy_camera::{Camera3d, RenderTarget};
+-use bevy_ecs::{component::*, lifecycle::ComponentHook, prelude::*};
++use bevy_camera::Camera3d;
++use bevy_ecs::{component::*, prelude::*};
+ use bevy_math::UVec2;
+-use bevy_platform::collections::HashSet;
+ use bevy_platform::time::Instant;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+     camera::ExtractedCamera,
+     extract_component::{ExtractComponent, ExtractComponentPlugin},
+-    render_resource::{BufferUsages, BufferVec, DynamicUniformBuffer, ShaderType, TextureUsages},
++    render_resource::{
++        BufferUsages, DynamicUniformBuffer, ShaderType, TextureUsages, UniformBuffer,
++        UninitBufferVec,
++    },
+     renderer::{RenderDevice, RenderQueue},
+     view::Msaa,
+     Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_shader::load_shader_library;
+-use bevy_window::PrimaryWindow;
+-use resolve::{node::oit_resolve, OitResolvePlugin};
+-use tracing::{trace, warn};
++use resolve::OitResolvePlugin;
++use tracing::trace;
+ 
+ use crate::{
+     core_3d::main_transparent_pass_3d,
++    oit::resolve::node::oit_resolve,
+     schedule::{Core3d, Core3dSystems},
+ };
+ 
+@@ -34,13 +36,16 @@ pub mod resolve;
+ // depth peeling, stochastic transparency, ray tracing etc.
+ // This should probably be done by adding an enum to this component.
+ // We use the same struct to pass on the settings to the drawing shader.
+-#[derive(Clone, Copy, ExtractComponent, Reflect, ShaderType)]
++#[derive(Clone, Copy, ExtractComponent, Reflect, ShaderType, Component)]
+ #[reflect(Clone, Default)]
+ pub struct OrderIndependentTransparencySettings {
+-    /// Controls how many layers will be used to compute the blending.
+-    /// The more layers you use the more memory it will use but it will also give better results.
+-    /// 8 is generally recommended, going above 32 is probably not worth it in the vast majority of cases
+-    pub layer_count: i32,
++    /// Controls how many fragments will be exactly sorted.
++    /// If the scene has more fragments than this, they will be merged approximately.
++    /// More sorted fragments is more accurate but will be slower.
++    pub sorted_fragment_max_count: u32,
++    /// The average fragments per pixel stored in the buffer. This should be bigger enough otherwise the fragments will be discarded.
++    /// Higher values increase memory usage.
++    pub fragments_per_pixel_average: f32,
+     /// Threshold for which fragments will be added to the blending layers.
+     /// This can be tweaked to optimize quality / layers count. Higher values will
+     /// allow lower number of layers and a better performance, compromising quality.
+@@ -50,32 +55,13 @@ pub struct OrderIndependentTransparencySettings {
+ impl Default for OrderIndependentTransparencySettings {
+     fn default() -> Self {
+         Self {
+-            layer_count: 8,
++            sorted_fragment_max_count: 8,
++            fragments_per_pixel_average: 4.0,
+             alpha_threshold: 0.0,
+         }
+     }
+ }
+ 
+-// OrderIndependentTransparencySettings is also a Component. We explicitly implement the trait so
+-// we can hook on_add to issue a warning in case `layer_count` is seemingly too high.
+-impl Component for OrderIndependentTransparencySettings {
+-    const STORAGE_TYPE: StorageType = StorageType::SparseSet;
+-    type Mutability = Mutable;
+-
+-    fn on_add() -> Option<ComponentHook> {
+-        Some(|world, context| {
+-            if let Some(value) = world.get::<OrderIndependentTransparencySettings>(context.entity)
+-                && value.layer_count > 32
+-            {
+-                warn!("{}OrderIndependentTransparencySettings layer_count set to {} might be too high.",
+-                        context.caller.map(|location|format!("{location}: ")).unwrap_or_default(),
+-                        value.layer_count
+-                    );
+-            }
+-        })
+-    }
+-}
+-
+ /// A plugin that adds support for Order Independent Transparency (OIT).
+ /// This can correctly render some scenes that would otherwise have artifacts due to alpha blending, but uses more memory.
+ ///
+@@ -87,8 +73,8 @@ impl Component for OrderIndependentTransparencySettings {
+ /// # Implementation details
+ /// This implementation uses 2 passes.
+ ///
+-/// The first pass writes the depth and color of all the fragments to a big buffer.
+-/// The buffer contains N layers for each pixel, where N can be set with [`OrderIndependentTransparencySettings::layer_count`].
++/// The first pass constructs a linked list which stores depth and color of all fragments in a big buffer.
++/// The linked list capacity can be set with [`OrderIndependentTransparencySettings::fragments_per_pixel_average`].
+ /// This pass is essentially a forward pass.
+ ///
+ /// The second pass is a single fullscreen triangle pass that sorts all the fragments then blends them together
+@@ -102,8 +88,7 @@ impl Plugin for OrderIndependentTransparencyPlugin {
+             ExtractComponentPlugin::<OrderIndependentTransparencySettings>::default(),
+             OitResolvePlugin,
+         ))
+-        .add_systems(Update, check_msaa)
+-        .add_systems(Last, configure_depth_texture_usages);
++        .add_systems(Update, check_msaa);
+ 
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+@@ -113,7 +98,10 @@ impl Plugin for OrderIndependentTransparencyPlugin {
+             .add_systems(RenderStartup, init_oit_buffers)
+             .add_systems(
+                 Render,
+-                prepare_oit_buffers.in_set(RenderSystems::PrepareResources),
++                (
++                    configure_camera_depth_usages.in_set(RenderSystems::ManageViews),
++                    prepare_oit_buffers.in_set(RenderSystems::PrepareResources),
++                ),
+             );
+ 
+         render_app.add_systems(
+@@ -125,34 +113,17 @@ impl Plugin for OrderIndependentTransparencyPlugin {
+     }
+ }
+ 
+-// WARN This should only happen for cameras with the [`OrderIndependentTransparencySettings`] component
+-// but when multiple cameras are present on the same window
+-// bevy reuses the same depth texture so we need to set this on all cameras with the same render target.
+-fn configure_depth_texture_usages(
+-    p: Query<Entity, With<PrimaryWindow>>,
+-    cameras: Query<(&RenderTarget, Has<OrderIndependentTransparencySettings>)>,
+-    mut new_cameras: Query<(&mut Camera3d, &RenderTarget), Added<Camera3d>>,
++fn configure_camera_depth_usages(
++    mut cameras: Query<
++        &mut Camera3d,
++        (
++            Changed<Camera3d>,
++            With<OrderIndependentTransparencySettings>,
++        ),
++    >,
+ ) {
+-    if new_cameras.is_empty() {
+-        return;
+-    }
+-
+-    // Find all the render target that potentially uses OIT
+-    let primary_window = p.single().ok();
+-    let mut render_target_has_oit = <HashSet<_>>::default();
+-    for (render_target, has_oit) in &cameras {
+-        if has_oit {
+-            render_target_has_oit.insert(render_target.normalize(primary_window));
+-        }
+-    }
+-
+-    // Update the depth texture usage for cameras with a render target that has OIT
+-    for (mut camera_3d, render_target) in &mut new_cameras {
+-        if render_target_has_oit.contains(&render_target.normalize(primary_window)) {
+-            let mut usages = TextureUsages::from(camera_3d.depth_texture_usages);
+-            usages |= TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
+-            camera_3d.depth_texture_usages = usages.into();
+-        }
++    for mut camera in &mut cameras {
++        camera.depth_texture_usages.0 |= TextureUsages::TEXTURE_BINDING.bits();
+     }
+ }
+ 
+@@ -164,18 +135,45 @@ fn check_msaa(cameras: Query<&Msaa, With<OrderIndependentTransparencySettings>>)
+     }
+ }
+ 
++#[derive(Clone, Copy, ShaderType)]
++pub struct OitFragmentNode {
++    pub color: u32,
++    pub depth_alpha: u32,
++    pub next: u32,
++}
++
+ /// Holds the buffers that contain the data of all OIT layers.
+ /// We use one big buffer for the entire app. Each camera will reuse it so it will
+ /// always be the size of the biggest OIT enabled camera.
+ #[derive(Resource)]
+ pub struct OitBuffers {
+-    /// The OIT layers containing depth and color for each fragments.
+-    /// This is essentially used as a 3d array where xy is the screen coordinate and z is
+-    /// the list of fragments rendered with OIT.
+-    pub layers: BufferVec<UVec2>,
+-    /// Buffer containing the index of the last layer that was written for each fragment.
+-    pub layer_ids: BufferVec<i32>,
+     pub settings: DynamicUniformBuffer<OrderIndependentTransparencySettings>,
++    pub nodes_capacity: UniformBuffer<u32>,
++    /// OIT nodes buffer contains color, depth and linked next node for each fragments.
++    pub nodes: UninitBufferVec<OitFragmentNode>,
++    /// OIT heads buffer contains the head that pointers nodes buffer, essentially used as a 2d array where xy is the screen coordinate.
++    /// We don't use storage texture as it requires native only [`bevy_render::settings::WgpuFeatures::TEXTURE_ATOMIC`].
++    pub heads: UninitBufferVec<u32>,
++    pub atomic_counter: UninitBufferVec<u32>,
++}
++
++impl OitBuffers {
++    fn create_nodes_buffer(
++        size: usize,
++        render_device: &RenderDevice,
++    ) -> UninitBufferVec<OitFragmentNode> {
++        let mut nodes = UninitBufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
++        nodes.set_label(Some("oit_nodes"));
++        nodes.reserve(size, render_device);
++        nodes
++    }
++
++    fn create_heads_buffer(size: usize, render_device: &RenderDevice) -> UninitBufferVec<u32> {
++        let mut nodes = UninitBufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
++        nodes.set_label(Some("oit_heads"));
++        nodes.reserve(size, render_device);
++        nodes
++    }
+ }
+ 
+ pub fn init_oit_buffers(
+@@ -185,22 +183,27 @@ pub fn init_oit_buffers(
+ ) {
+     // initialize buffers with something so there's a valid binding
+ 
+-    let mut layers = BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
+-    layers.set_label(Some("oit_layers"));
+-    layers.reserve(1, &render_device);
+-    layers.write_buffer(&render_device, &render_queue);
++    let mut nodes_capacity = UniformBuffer::default();
++    nodes_capacity.set_label(Some("oit_nodes_capacity"));
++    nodes_capacity.set(1);
++    nodes_capacity.write_buffer(&render_device, &render_queue);
++
++    let nodes = OitBuffers::create_nodes_buffer(1, &render_device);
++
++    let heads = OitBuffers::create_heads_buffer(1, &render_device);
+ 
+-    let mut layer_ids = BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
+-    layer_ids.set_label(Some("oit_layer_ids"));
+-    layer_ids.reserve(1, &render_device);
+-    layer_ids.write_buffer(&render_device, &render_queue);
++    let mut atomic_counter = UninitBufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE);
++    atomic_counter.set_label(Some("oit_atomic_counter"));
++    atomic_counter.reserve(1, &render_device);
+ 
+     let mut settings = DynamicUniformBuffer::default();
+     settings.set_label(Some("oit_settings"));
+ 
+     commands.insert_resource(OitBuffers {
+-        layers,
+-        layer_ids,
++        nodes_capacity,
++        nodes,
++        heads,
++        atomic_counter,
+         settings,
+     });
+ }
+@@ -224,64 +227,72 @@ pub fn prepare_oit_buffers(
+             Changed<OrderIndependentTransparencySettings>,
+         ),
+     >,
+-    camera_oit_uniforms: Query<(Entity, &OrderIndependentTransparencySettings)>,
++    camera_oit_uniforms: Query<
++        (Entity, &OrderIndependentTransparencySettings),
++        With<ExtractedCamera>,
++    >,
+     mut buffers: ResMut<OitBuffers>,
+ ) {
++    let camera_count = camera_oit_uniforms.count();
++    if camera_count == 0 {
++        if buffers.nodes_capacity.get() > &1 {
++            // Release oit buffers if no camera enables OIT.
++            buffers.nodes = OitBuffers::create_nodes_buffer(1, &render_device);
++            buffers.heads = OitBuffers::create_heads_buffer(1, &render_device);
++            buffers.nodes_capacity.set(1);
++            buffers
++                .nodes_capacity
++                .write_buffer(&render_device, &render_queue);
++        }
++        return;
++    }
++
+     // Get the max buffer size for any OIT enabled camera
+-    let mut max_layer_ids_size = usize::MIN;
+-    let mut max_layers_size = usize::MIN;
++    let mut max_size = UVec2::new(0, 0);
++    let mut fragments_per_pixel_average = 0f32;
+     for (camera, settings) in &cameras {
+         let Some(size) = camera.physical_target_size else {
+             continue;
+         };
+-
+-        let layer_count = settings.layer_count as usize;
+-        let size = (size.x * size.y) as usize;
+-        max_layer_ids_size = max_layer_ids_size.max(size);
+-        max_layers_size = max_layers_size.max(size * layer_count);
++        max_size = max_size.max(size);
++        fragments_per_pixel_average =
++            fragments_per_pixel_average.max(settings.fragments_per_pixel_average);
+     }
+ 
+-    // Create or update the layers buffer based on the max size
+-    if buffers.layers.capacity() < max_layers_size {
++    // Create or update the heads buffer based on the max size
++    let heads_size = (max_size.x * max_size.y) as usize;
++    if buffers.heads.capacity() != heads_size {
+         let start = Instant::now();
+-        buffers.layers.reserve(max_layers_size, &render_device);
+-        let remaining = max_layers_size - buffers.layers.capacity();
+-        for _ in 0..remaining {
+-            buffers.layers.push(UVec2::ZERO);
+-        }
+-        buffers.layers.write_buffer(&render_device, &render_queue);
++        buffers.heads = OitBuffers::create_heads_buffer(heads_size, &render_device);
+         trace!(
+-            "OIT layers buffer updated in {:.01}ms with total size {} MiB",
++            "OIT heads buffer updated in {:.01}ms with total size {} MiB",
+             start.elapsed().as_millis(),
+-            buffers.layers.capacity() * size_of::<UVec2>() / 1024 / 1024,
++            (buffers.heads.capacity() * size_of::<u32>()) as f32 / 1024.0 / 1024.0,
+         );
+     }
+ 
+-    // Create or update the layer_ids buffer based on the max size
+-    if buffers.layer_ids.capacity() < max_layer_ids_size {
++    // Create or update the nodes buffer based on the max size
++    let nodes_size = ((max_size.x * max_size.y) as f32 * fragments_per_pixel_average) as usize;
++    if buffers.nodes.capacity() != nodes_size {
+         let start = Instant::now();
+-        buffers
+-            .layer_ids
+-            .reserve(max_layer_ids_size, &render_device);
+-        let remaining = max_layer_ids_size - buffers.layer_ids.capacity();
+-        for _ in 0..remaining {
+-            buffers.layer_ids.push(0);
+-        }
+-        buffers
+-            .layer_ids
+-            .write_buffer(&render_device, &render_queue);
++        buffers.nodes = OitBuffers::create_nodes_buffer(nodes_size, &render_device);
+         trace!(
+-            "OIT layer ids buffer updated in {:.01}ms with total size {} MiB",
++            "OIT nodes buffer updated in {:.01}ms with total size {} MiB",
+             start.elapsed().as_millis(),
+-            buffers.layer_ids.capacity() * size_of::<UVec2>() / 1024 / 1024,
++            (buffers.nodes.capacity() * size_of::<OitFragmentNode>()) as f32 / 1024.0 / 1024.0,
+         );
+     }
+ 
+-    if let Some(mut writer) = buffers.settings.get_writer(
+-        camera_oit_uniforms.iter().len(),
+-        &render_device,
+-        &render_queue,
+-    ) {
++    buffers.nodes_capacity.set(nodes_size as u32);
++    buffers
++        .nodes_capacity
++        .write_buffer(&render_device, &render_queue);
++
++    if let Some(mut writer) =
++        buffers
++            .settings
++            .get_writer(camera_count, &render_device, &render_queue)
++    {
+         for (entity, settings) in &camera_oit_uniforms {
+             let offset = writer.write(settings);
+             commands
+diff --git a/crates/bevy_core_pipeline/src/oit/oit_draw.wgsl b/crates/bevy_core_pipeline/src/oit/oit_draw.wgsl
+index 8e4c88ba2d64c..7e59d1fa7f798 100644
+--- a/crates/bevy_core_pipeline/src/oit/oit_draw.wgsl
++++ b/crates/bevy_core_pipeline/src/oit/oit_draw.wgsl
+@@ -1,48 +1,53 @@
+ #define_import_path bevy_core_pipeline::oit
+ 
+-#import bevy_pbr::mesh_view_bindings::{view, oit_layers, oit_layer_ids, oit_settings}
++#import bevy_pbr::mesh_view_bindings::{view, oit_nodes_capacity, oit_nodes, oit_heads, oit_atomic_counter, oit_settings}
++#import bevy_pbr::mesh_view_types::OitFragmentNode
++#import bevy_pbr::prepass_utils
+ 
+ #ifdef OIT_ENABLED
+ // Add the fragment to the oit buffer
+ fn oit_draw(position: vec4f, color: vec4f) {
++#ifdef DEPTH_PREPASS
++    if position.z < prepass_utils::prepass_depth(position, 0u) {
++        return;
++    }
++#endif
+     // Don't add fully transparent fragments to the list
+     // because we don't want to have to sort them in the resolve pass
+     if color.a < oit_settings.alpha_threshold {
+         return;
+     }
+     // get the index of the current fragment relative to the screen size
+-    let screen_index = i32(floor(position.x) + floor(position.y) * view.viewport.z);
+-    // get the size of the buffer.
+-    // It's always the size of the screen
+-    let buffer_size = i32(view.viewport.z * view.viewport.w);
++    let screen_index = u32(floor(position.x) + floor(position.y) * view.viewport.z);
+ 
+-    // gets the layer index of the current fragment
+-    var layer_id = atomicAdd(&oit_layer_ids[screen_index], 1);
+-    // exit early if we've reached the maximum amount of fragments per layer
+-    if layer_id >= oit_settings.layers_count {
+-        // force to store the oit_layers_count to make sure we don't
+-        // accidentally increase the index above the maximum value
+-        atomicStore(&oit_layer_ids[screen_index], oit_settings.layers_count);
++    var new_node_index = atomicAdd(&oit_atomic_counter, 1u);
++    // exit early if we've reached the maximum amount of fragments nodes
++    if new_node_index >= oit_nodes_capacity {
+         // TODO for tail blending we should return the color here
+         return;
+     }
+ 
+-    // get the layer_index from the screen
+-    let layer_index = screen_index + layer_id * buffer_size;
+-    let rgb9e5_color = bevy_pbr::rgb9e5::vec3_to_rgb9e5_(color.rgb);
+-    let depth_alpha = pack_24bit_depth_8bit_alpha(position.z, color.a);
+-    oit_layers[layer_index] = vec2(rgb9e5_color, depth_alpha);
++    var node: OitFragmentNode;
++    // In `oit_heads` buffer, index starts from 1, end sentinel is 0 so that we can avoid writing `u32::MAX` from CPU. wgpu guarantees buffers are zero-initialized.
++    node.next = atomicExchange(&oit_heads[screen_index], new_node_index + 1u) - 1u;
++    node.color = bevy_pbr::rgb9e5::vec3_to_rgb9e5_(color.rgb);
++    node.depth_alpha = pack_24bit_depth_8bit_alpha(position.z, color.a);
++    oit_nodes[new_node_index] = node;
+ }
+ #endif // OIT_ENABLED
+ 
++// The packing scheme puts depth in the higher bits so that
++//    depth(a) < depth(b) <=> packed(a) < packed(b)
++// irregardless of alpha(a) and alpha(b)
++// The property is used to optimize the resolve step
+ fn pack_24bit_depth_8bit_alpha(depth: f32, alpha: f32) -> u32 {
+     let depth_bits = u32(saturate(depth) * f32(0xFFFFFFu) + 0.5);
+     let alpha_bits = u32(saturate(alpha) * f32(0xFFu) + 0.5);
+-    return (depth_bits & 0xFFFFFFu) | ((alpha_bits & 0xFFu) << 24u);
++    return (depth_bits << 8u) | alpha_bits;
+ }
+ 
+ fn unpack_24bit_depth_8bit_alpha(packed: u32) -> vec2<f32> {
+-    let depth_bits = packed & 0xFFFFFFu;
+-    let alpha_bits = (packed >> 24u) & 0xFFu;
++    let depth_bits = packed >> 8u;
++    let alpha_bits = packed & 0xFFu;
+     return vec2(f32(depth_bits) / f32(0xFFFFFFu), f32(alpha_bits) / f32(0xFFu));
+ }
+diff --git a/crates/bevy_core_pipeline/src/oit/resolve/mod.rs b/crates/bevy_core_pipeline/src/oit/resolve/mod.rs
+index 41dd16390d420..b00e140fdf0ee 100644
+--- a/crates/bevy_core_pipeline/src/oit/resolve/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/resolve/mod.rs
+@@ -1,5 +1,7 @@
++use core::num::NonZero;
++
+ use super::OitBuffers;
+-use crate::{oit::OrderIndependentTransparencySettings, FullscreenShader};
++use crate::{oit::OrderIndependentTransparencySettings, prepass::DepthPrepass, FullscreenShader};
+ use bevy_app::Plugin;
+ use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
+ use bevy_derive::Deref;
+@@ -10,7 +12,9 @@ use bevy_ecs::{
+ use bevy_image::BevyDefault as _;
+ use bevy_render::{
+     render_resource::{
+-        binding_types::{storage_buffer_sized, texture_depth_2d, uniform_buffer},
++        binding_types::{
++            storage_buffer_read_only_sized, storage_buffer_sized, texture_depth_2d, uniform_buffer,
++        },
+         BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+         BlendComponent, BlendState, CachedRenderPipelineId, ColorTargetState, ColorWrites,
+         DownlevelFlags, FragmentState, PipelineCache, RenderPipelineDescriptor, ShaderStages,
+@@ -28,7 +32,7 @@ use tracing::warn;
+ pub mod node;
+ 
+ /// Minimum required value of `wgpu::Limits::max_storage_buffers_per_shader_stage`.
+-pub const OIT_REQUIRED_STORAGE_BUFFERS: u32 = 2;
++pub const OIT_REQUIRED_STORAGE_BUFFERS: u32 = 3;
+ 
+ /// Plugin needed to resolve the Order Independent Transparency (OIT) buffer to the screen.
+ pub struct OitResolvePlugin;
+@@ -111,10 +115,12 @@ impl OitResolvePipeline {
+                 ShaderStages::FRAGMENT,
+                 (
+                     uniform_buffer::<ViewUniform>(true),
+-                    // layers
+-                    storage_buffer_sized(false, None),
+-                    // layer ids
++                    // nodes
++                    storage_buffer_read_only_sized(false, None),
++                    // heads
+                     storage_buffer_sized(false, None),
++                    // atomic_counter
++                    storage_buffer_sized(false, NonZero::<u64>::new(size_of::<u32>() as u64)),
+                 ),
+             ),
+         );
+@@ -137,7 +143,8 @@ pub struct OitResolvePipelineId(pub CachedRenderPipelineId);
+ #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+ pub struct OitResolvePipelineKey {
+     hdr: bool,
+-    layer_count: i32,
++    sorted_fragment_max_count: u32,
++    depth_prepass: bool,
+ }
+ 
+ pub fn queue_oit_resolve_pipeline(
+@@ -149,6 +156,7 @@ pub fn queue_oit_resolve_pipeline(
+             Entity,
+             &ExtractedView,
+             &OrderIndependentTransparencySettings,
++            Has<DepthPrepass>,
+         ),
+         With<OrderIndependentTransparencySettings>,
+     >,
+@@ -159,11 +167,12 @@ pub fn queue_oit_resolve_pipeline(
+     mut cached_pipeline_id: Local<EntityHashMap<(OitResolvePipelineKey, CachedRenderPipelineId)>>,
+ ) {
+     let mut current_view_entities = EntityHashSet::default();
+-    for (e, view, oit_settings) in &views {
++    for (e, view, oit_settings, depth_prepass) in &views {
+         current_view_entities.insert(e);
+         let key = OitResolvePipelineKey {
+             hdr: view.hdr,
+-            layer_count: oit_settings.layer_count,
++            sorted_fragment_max_count: oit_settings.sorted_fragment_max_count,
++            depth_prepass,
+         };
+ 
+         if let Some((cached_key, id)) = cached_pipeline_id.get(&e)
+@@ -204,19 +213,23 @@ fn specialize_oit_resolve_pipeline(
+     } else {
+         TextureFormat::bevy_default()
+     };
++    let mut layout = vec![resolve_pipeline.view_bind_group_layout.clone()];
++    let mut shader_defs = vec![ShaderDefVal::UInt(
++        "SORTED_FRAGMENT_MAX_COUNT".into(),
++        key.sorted_fragment_max_count,
++    )];
++    if key.depth_prepass {
++        shader_defs.push(ShaderDefVal::Bool("DEPTH_PREPASS".into(), true));
++    } else {
++        layout.push(resolve_pipeline.oit_depth_bind_group_layout.clone());
++    }
+ 
+     RenderPipelineDescriptor {
+         label: Some("oit_resolve_pipeline".into()),
+-        layout: vec![
+-            resolve_pipeline.view_bind_group_layout.clone(),
+-            resolve_pipeline.oit_depth_bind_group_layout.clone(),
+-        ],
++        layout,
+         fragment: Some(FragmentState {
+             shader: load_embedded_asset!(asset_server, "oit_resolve.wgsl"),
+-            shader_defs: vec![ShaderDefVal::UInt(
+-                "LAYER_COUNT".into(),
+-                key.layer_count as u32,
+-            )],
++            shader_defs,
+             targets: vec![Some(ColorTargetState {
+                 format,
+                 blend: Some(BlendState {
+@@ -240,15 +253,26 @@ pub fn prepare_oit_resolve_bind_group(
+     pipeline_cache: Res<PipelineCache>,
+     buffers: Res<OitBuffers>,
+ ) {
+-    if let (Some(binding), Some(layers_binding), Some(layer_ids_binding)) = (
++    if let (
++        Some(view_binding),
++        Some(nodes_binding),
++        Some(heads_binding),
++        Some(atomic_counter_binding),
++    ) = (
+         view_uniforms.uniforms.binding(),
+-        buffers.layers.binding(),
+-        buffers.layer_ids.binding(),
++        buffers.nodes.binding(),
++        buffers.heads.binding(),
++        buffers.atomic_counter.binding(),
+     ) {
+         let bind_group = render_device.create_bind_group(
+             "oit_resolve_bind_group",
+             &pipeline_cache.get_bind_group_layout(&resolve_pipeline.view_bind_group_layout),
+-            &BindGroupEntries::sequential((binding.clone(), layers_binding, layer_ids_binding)),
++            &BindGroupEntries::sequential((
++                view_binding,
++                nodes_binding,
++                heads_binding,
++                atomic_counter_binding,
++            )),
+         );
+         commands.insert_resource(OitResolveBindGroup(bind_group));
+     }
+diff --git a/crates/bevy_core_pipeline/src/oit/resolve/node.rs b/crates/bevy_core_pipeline/src/oit/resolve/node.rs
+index 979c3e578835f..853053f615e28 100644
+--- a/crates/bevy_core_pipeline/src/oit/resolve/node.rs
++++ b/crates/bevy_core_pipeline/src/oit/resolve/node.rs
+@@ -8,6 +8,8 @@ use bevy_render::{
+     view::{ViewDepthTexture, ViewTarget, ViewUniformOffset},
+ };
+ 
++use crate::prepass::DepthPrepass;
++
+ use super::{OitResolveBindGroup, OitResolvePipeline, OitResolvePipelineId};
+ 
+ pub fn oit_resolve(
+@@ -18,15 +20,25 @@ pub fn oit_resolve(
+         &OitResolvePipelineId,
+         &ViewDepthTexture,
+         Option<&MainPassResolutionOverride>,
++        Has<DepthPrepass>,
+     )>,
+     resolve_pipeline: Option<Res<OitResolvePipeline>>,
+     bind_group: Option<Res<OitResolveBindGroup>>,
+     pipeline_cache: Res<PipelineCache>,
+     mut ctx: RenderContext,
+ ) {
+-    let (camera, view_target, view_uniform, oit_resolve_pipeline_id, depth, resolution_override) =
+-        view.into_inner();
++    let (
++        camera,
++        view_target,
++        view_uniform,
++        oit_resolve_pipeline_id,
++        depth,
++        resolution_override,
++        depth_prepass,
++    ) = view.into_inner();
+ 
++    // This *must* run after main_transparent_pass_3d to reset the `oit_atomic_counter` and `oit_heads` buffer
++    // Otherwise transparent pass will construct a corrupted linked list(can have circular references which causes infinite loop and device lost) on the next pass.
+     let Some(resolve_pipeline) = resolve_pipeline else {
+         return;
+     };
+@@ -37,11 +49,15 @@ pub fn oit_resolve(
+         return;
+     };
+ 
+-    let depth_bind_group = ctx.render_device().create_bind_group(
+-        "oit_resolve_depth_bind_group",
+-        &pipeline_cache.get_bind_group_layout(&resolve_pipeline.oit_depth_bind_group_layout),
+-        &BindGroupEntries::single(depth.view()),
+-    );
++    let depth_bind_group = if !depth_prepass {
++        Some(ctx.render_device().create_bind_group(
++            "oit_resolve_depth_bind_group",
++            &pipeline_cache.get_bind_group_layout(&resolve_pipeline.oit_depth_bind_group_layout),
++            &BindGroupEntries::single(depth.view()),
++        ))
++    } else {
++        None
++    };
+ 
+     let diagnostics = ctx.diagnostic_recorder();
+     let diagnostics = diagnostics.as_deref();
+@@ -64,8 +80,9 @@ pub fn oit_resolve(
+ 
+     render_pass.set_render_pipeline(pipeline);
+     render_pass.set_bind_group(0, &bind_group, &[view_uniform.offset]);
+-    render_pass.set_bind_group(1, &depth_bind_group, &[]);
+-
++    if let Some(depth_bind_group) = &depth_bind_group {
++        render_pass.set_bind_group(1, depth_bind_group, &[]);
++    }
+     render_pass.draw(0..3, 0..1);
+ 
+     pass_span.end(&mut render_pass);
+diff --git a/crates/bevy_core_pipeline/src/oit/resolve/oit_resolve.wgsl b/crates/bevy_core_pipeline/src/oit/resolve/oit_resolve.wgsl
+index 41ebb457ad534..ae5e5264e7025 100644
+--- a/crates/bevy_core_pipeline/src/oit/resolve/oit_resolve.wgsl
++++ b/crates/bevy_core_pipeline/src/oit/resolve/oit_resolve.wgsl
+@@ -1,111 +1,139 @@
++// Reference:
++// Order-independent transparency with per-pixel ordered linked lists - https://github.com/KhronosGroup/Vulkan-Samples/blob/main/shaders/oit_linked_lists/combine.frag
++
+ #import bevy_render::view::View
++#import bevy_pbr::mesh_view_types::OitFragmentNode
+ 
+ @group(0) @binding(0) var<uniform> view: View;
+-@group(0) @binding(1) var<storage, read_write> layers: array<vec2<u32>>;
+-@group(0) @binding(2) var<storage, read_write> layer_ids: array<atomic<i32>>;
++@group(0) @binding(1) var<storage, read> nodes: array<OitFragmentNode>;
++@group(0) @binding(2) var<storage, read_write> heads: array<u32>; // No need to be atomic
++@group(0) @binding(3) var<storage, read_write> atomic_counter: u32; // No need to be atomic
+ 
++#ifndef DEPTH_PREPASS
+ @group(1) @binding(0) var depth: texture_depth_2d;
++#endif
+ 
+ struct OitFragment {
+-    color: vec3<f32>,
+-    alpha: f32,
+-    depth: f32,
++    color: u32,
++    depth_alpha: u32,
+ }
+-// Contains all the colors and depth for this specific fragment
+-var<private> fragment_list: array<OitFragment, #{LAYER_COUNT}>;
+ 
+ struct FullscreenVertexOutput {
+     @builtin(position) position: vec4<f32>,
+     @location(0) uv: vec2<f32>,
+ };
+ 
++const LINKED_LIST_END_SENTINEL: u32 = 0xFFFFFFFFu;
++const SORTED_FRAGMENT_MAX_COUNT: u32 = #{SORTED_FRAGMENT_MAX_COUNT};
++
+ @fragment
+ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+-    let buffer_size = i32(view.viewport.z * view.viewport.w);
+-    let screen_index = i32(floor(in.position.x) + floor(in.position.y) * view.viewport.z);
+-
+-    let counter = atomicLoad(&layer_ids[screen_index]);
+-    if counter == 0 {
+-        reset_indices(screen_index);
++    atomic_counter = 0u;
++    let screen_index = u32(floor(in.position.x) + floor(in.position.y) * view.viewport.z);
+ 
++    let head = heads[screen_index] - 1u;
++    if head == LINKED_LIST_END_SENTINEL {
+         // https://github.com/gfx-rs/wgpu/issues/4416
+         if true {
+             discard;
+         }
+         return vec4(0.0);
+     } else {
+-        // Load depth for manual depth testing.
++#ifndef DEPTH_PREPASS
++        // If depth prepass is disabled, load depth for manual depth testing.
+         // This is necessary because early z doesn't seem to trigger in the transparent pass.
+         // This should be done during the draw pass so those fragments simply don't exist in the list,
+         // but this requires a bigger refactor
+         let d = textureLoad(depth, vec2<i32>(in.position.xy), 0);
+-        let result = sort(screen_index, buffer_size, d);
+-        reset_indices(screen_index);
+-
+-        return result.color;
++#else
++        let d = 0.0;
++#endif
++        let color = resolve(head, d);
++        heads[screen_index] = 0u; // LINKED_LIST_END_SENTINEL + 1u;
++        return color;
+     }
+ }
+ 
+-// Resets all indices to 0.
+-// This means we don't have to clear the entire layers buffer
+-fn reset_indices(screen_index: i32) {
+-    atomicStore(&layer_ids[screen_index], 0);
+-    layers[screen_index] = vec2(0u);
+-}
+-
+-struct SortResult {
+-    color: vec4f,
+-    depth: f32,
+-}
++fn resolve(head: u32, opaque_depth: f32) -> vec4<f32> {
++    // Contains all the colors and depth for this specific fragment
++    // Fragments are sorted from front to back (depth values are in descending order)
++    // This should make insertion sort slightly faster
++    // because transparent pass sorts objects so the linked list iteration is usually in descending order.
++    var fragment_list: array<OitFragment, SORTED_FRAGMENT_MAX_COUNT>;
++    var final_color = vec4<f32>(0.0);
+ 
+-fn sort(screen_index: i32, buffer_size: i32, opaque_depth: f32) -> SortResult {
+-    var counter = atomicLoad(&layer_ids[screen_index]);
++    var packed_opaque_depth = bevy_core_pipeline::oit::pack_24bit_depth_8bit_alpha(opaque_depth, 1.0);
+ 
+     // fill list
+-    for (var i = 0; i < counter; i += 1) {
+-        let fragment = layers[screen_index + buffer_size * i];
+-        // unpack color/alpha/depth
+-        let color = bevy_pbr::rgb9e5::rgb9e5_to_vec3_(fragment.x);
+-        let depth_alpha = bevy_core_pipeline::oit::unpack_24bit_depth_8bit_alpha(fragment.y);
+-        fragment_list[i].color = color;
+-        fragment_list[i].alpha = depth_alpha.y;
+-        fragment_list[i].depth = depth_alpha.x;
+-    }
++    var current_node = head;
++    var sorted_frag_count = 0u;
++    while current_node != LINKED_LIST_END_SENTINEL {
++        let fragment_node = nodes[current_node];
++        current_node = fragment_node.next;
+ 
+-    // bubble sort the list based on the depth
+-    for (var i = counter; i >= 0; i -= 1) {
+-        for (var j = 0; j < i; j += 1) {
+-            if fragment_list[j].depth < fragment_list[j + 1].depth {
+-                // swap
+-                let temp = fragment_list[j + 1];
+-                fragment_list[j + 1] = fragment_list[j];
+-                fragment_list[j] = temp;
++#ifndef DEPTH_PREPASS
++        // depth testing
++        if fragment_node.depth_alpha < packed_opaque_depth {
++            continue;
++        }
++#endif
++
++        if sorted_frag_count < SORTED_FRAGMENT_MAX_COUNT {
++            // There is still room in the sorted list.
++            // Insert the fragment so that the list stay sorted.
++            var i = sorted_frag_count;
++            for(; i > 0; i -= 1) {
++                // short-circuit can't be used in for(;;;), https://github.com/gfx-rs/wgpu/issues/4394
++                if fragment_node.depth_alpha > fragment_list[i - 1].depth_alpha {
++                    fragment_list[i] = fragment_list[i - 1];
++                } else {
++                    break;
++                }
+             }
++            fragment_list[i].color = fragment_node.color;
++            fragment_list[i].depth_alpha = fragment_node.depth_alpha;
++            sorted_frag_count += 1;
++        } else if fragment_list[0].depth_alpha > fragment_node.depth_alpha {
++            // The fragment is farther than the nearest sorted one.
++            // First, make room by blending the nearest fragment from the sorted list.
++            // Then, insert the fragment in the sorted list.
++            // This is an approximation.
++            let nearest_color = bevy_pbr::rgb9e5::rgb9e5_to_vec3_(fragment_list[0].color);
++            let nearest_alpha = packed_depth_alpha_get_alpha(fragment_list[0].depth_alpha);
++            final_color = blend(final_color, vec4f(nearest_color * nearest_alpha, nearest_alpha));
++            var i = 0u;
++            for(; i < SORTED_FRAGMENT_MAX_COUNT - 1; i += 1) {
++                // short-circuit can't be used in for(;;;), https://github.com/gfx-rs/wgpu/issues/4394
++                if fragment_node.depth_alpha < fragment_list[i + 1].depth_alpha {
++                    fragment_list[i] = fragment_list[i + 1];
++                } else {
++                    break;
++                }
++            }
++            fragment_list[i].color = fragment_node.color;
++            fragment_list[i].depth_alpha = fragment_node.depth_alpha;
++        } else {
++            // The next fragment is nearer than any of the sorted ones.
++            // Blend it early.
++            // This is an approximation.
++            let color = bevy_pbr::rgb9e5::rgb9e5_to_vec3_(fragment_node.color);
++            let alpha = packed_depth_alpha_get_alpha(fragment_node.depth_alpha);
++            final_color = blend(final_color, vec4f(color * alpha, alpha));
+         }
+     }
+ 
+-    // resolve blend
+-    var final_color = vec4(0.0);
+-    for (var i = 0; i <= counter; i += 1) {
+-        // depth testing
+-        // This needs to happen here because we can only stop iterating if the fragment is
+-        // occluded by something opaque and the fragments need to be sorted first
+-        if fragment_list[i].depth < opaque_depth {
+-            break;
+-        }
+-        let color = fragment_list[i].color;
+-        let alpha = fragment_list[i].alpha;
++    // blend sorted fragments
++    for (var i = 0u; i < sorted_frag_count; i += 1) {
++        let color = bevy_pbr::rgb9e5::rgb9e5_to_vec3_(fragment_list[i].color);
++        let alpha = packed_depth_alpha_get_alpha(fragment_list[i].depth_alpha);
+         var base_color = vec4(color.rgb * alpha, alpha);
+         final_color = blend(final_color, base_color);
+         if final_color.a == 1.0 {
+             break;
+         }
+     }
+-    var result: SortResult;
+-    result.color = final_color;
+-    result.depth = fragment_list[0].depth;
+ 
+-    return result;
++    return final_color;
+ }
+ 
+ // OVER operator using premultiplied alpha
+@@ -115,3 +143,7 @@ fn blend(color_a: vec4<f32>, color_b: vec4<f32>) -> vec4<f32> {
+     let alpha = color_a.a + (1.0 - color_a.a) * color_b.a;
+     return vec4(final_color.rgb, alpha);
+ }
++
++fn packed_depth_alpha_get_alpha(packed: u32) -> f32 {
++    return bevy_core_pipeline::oit::unpack_24bit_depth_8bit_alpha(packed).y;
++}
+diff --git a/crates/bevy_pbr/src/render/mesh_view_bindings.rs b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+index 5f67ce1d7b71f..bca1c0e575691 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_bindings.rs
++++ b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+@@ -398,15 +398,21 @@ fn layout_entries(
+         // platform, so we don't need to do it here.
+         if is_oit_supported(render_adapter, render_device, false) {
+             entries = entries.extend_with_indices((
+-                // oit_layers
+-                (27, storage_buffer_sized(false, None)),
+-                // oit_layer_ids,
+-                (28, storage_buffer_sized(false, None)),
+-                // oit_layer_count
+                 (
+-                    29,
++                    27,
+                     uniform_buffer::<OrderIndependentTransparencySettings>(true),
+                 ),
++                // oit_nodes_capacity
++                (28, uniform_buffer::<u32>(false)),
++                // oit_nodes
++                (29, storage_buffer_sized(false, None)),
++                // oit_heads,
++                (30, storage_buffer_sized(false, None)),
++                // oit_atomic_counter
++                (
++                    31,
++                    storage_buffer_sized(false, NonZero::<u64>::new(size_of::<u32>() as u64)),
++                ),
+             ));
+         }
+     }
+@@ -416,19 +422,19 @@ fn layout_entries(
+         entries = entries.extend_with_indices((
+             // transmittance LUT
+             (
+-                30,
++                32,
+                 texture_2d(TextureSampleType::Float { filterable: true }),
+             ),
+-            (31, sampler(SamplerBindingType::Filtering)),
++            (33, sampler(SamplerBindingType::Filtering)),
+             // atmosphere data buffer
+-            (32, storage_buffer_read_only::<AtmosphereData>(false)),
++            (34, storage_buffer_read_only::<AtmosphereData>(false)),
+         ));
+     }
+ 
+     // Blue noise
+     if layout_key.contains(MeshPipelineViewLayoutKey::STBN) {
+         entries = entries.extend_with_indices(((
+-            33,
++            35,
+             texture_2d_array(TextureSampleType::Float { filterable: false }),
+         ),));
+     }
+@@ -763,19 +769,25 @@ pub fn prepare_mesh_view_bind_groups(
+ 
+             if has_oit
+                 && let (
+-                    Some(oit_layers_binding),
+-                    Some(oit_layer_ids_binding),
+                     Some(oit_settings_binding),
++                    Some(oit_nodes_capacity),
++                    Some(oit_nodes),
++                    Some(oit_heads),
++                    Some(oit_atomic_counter),
+                 ) = (
+-                    oit_buffers.layers.binding(),
+-                    oit_buffers.layer_ids.binding(),
+                     oit_buffers.settings.binding(),
++                    oit_buffers.nodes_capacity.binding(),
++                    oit_buffers.nodes.binding(),
++                    oit_buffers.heads.binding(),
++                    oit_buffers.atomic_counter.binding(),
+                 )
+             {
+                 entries = entries.extend_with_indices((
+-                    (27, oit_layers_binding.clone()),
+-                    (28, oit_layer_ids_binding.clone()),
+-                    (29, oit_settings_binding.clone()),
++                    (27, oit_settings_binding),
++                    (28, oit_nodes_capacity),
++                    (29, oit_nodes),
++                    (30, oit_heads),
++                    (31, oit_atomic_counter),
+                 ));
+             }
+ 
+@@ -786,9 +798,9 @@ pub fn prepare_mesh_view_bind_groups(
+                 && let Some(atmosphere_buffer_binding) = atmosphere_buffer.buffer.binding()
+             {
+                 entries = entries.extend_with_indices((
+-                    (30, &atmosphere_textures.transmittance_lut.default_view),
+-                    (31, &***atmosphere_sampler),
+-                    (32, atmosphere_buffer_binding),
++                    (32, &atmosphere_textures.transmittance_lut.default_view),
++                    (33, &***atmosphere_sampler),
++                    (34, atmosphere_buffer_binding),
+                 ));
+             }
+ 
+@@ -797,7 +809,7 @@ pub fn prepare_mesh_view_bind_groups(
+                     .get(&blue_noise.texture)
+                     .expect("STBN texture is added unconditionally with at least a placeholder")
+                     .texture_view;
+-                entries = entries.extend_with_indices(((33, stbn_view),));
++                entries = entries.extend_with_indices(((35, stbn_view),));
+             }
+ 
+             let mut entries_binding_array = DynamicBindGroupEntries::new();
+diff --git a/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl b/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl
+index 070a992d1e86c..cc6a5e8677bbc 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl
+@@ -91,18 +91,20 @@ const VISIBILITY_RANGE_UNIFORM_BUFFER_SIZE: u32 = 64u;
+ @group(0) @binding(26) var view_transmission_sampler: sampler;
+ 
+ #ifdef OIT_ENABLED
+-@group(0) @binding(27) var<storage, read_write> oit_layers: array<vec2<u32>>;
+-@group(0) @binding(28) var<storage, read_write> oit_layer_ids: array<atomic<i32>>;
+-@group(0) @binding(29) var<uniform> oit_settings: types::OrderIndependentTransparencySettings;
++@group(0) @binding(27) var<uniform> oit_settings: types::OrderIndependentTransparencySettings;
++@group(0) @binding(28) var<uniform> oit_nodes_capacity: u32;
++@group(0) @binding(29) var<storage, read_write> oit_nodes: array<types::OitFragmentNode>;
++@group(0) @binding(30) var<storage, read_write> oit_heads: array<atomic<u32>>;
++@group(0) @binding(31) var<storage, read_write> oit_atomic_counter: atomic<u32>;
+ #endif // OIT_ENABLED
+ 
+ #ifdef ATMOSPHERE
+-@group(0) @binding(30) var atmosphere_transmittance_texture: texture_2d<f32>;
+-@group(0) @binding(31) var atmosphere_transmittance_sampler: sampler;
+-@group(0) @binding(32) var<storage> atmosphere_data: atmosphere::AtmosphereData;
++@group(0) @binding(32) var atmosphere_transmittance_texture: texture_2d<f32>;
++@group(0) @binding(33) var atmosphere_transmittance_sampler: sampler;
++@group(0) @binding(34) var<storage> atmosphere_data: atmosphere::AtmosphereData;
+ #endif // ATMOSPHERE
+ #ifdef BLUE_NOISE_TEXTURE
+-@group(0) @binding(33) var blue_noise_texture: texture_2d_array<f32>;
++@group(0) @binding(35) var blue_noise_texture: texture_2d_array<f32>;
+ #endif // BLUE_NOISE_TEXTURE
+ 
+ #ifdef MULTIPLE_LIGHT_PROBES_IN_ARRAY
+diff --git a/crates/bevy_pbr/src/render/mesh_view_types.wgsl b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+index a02e2188560ed..f4ca5d6e45cd5 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_types.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+@@ -198,10 +198,17 @@ struct EnvironmentMapUniform {
+ 
+ // Shader version of the order independent transparency settings component.
+ struct OrderIndependentTransparencySettings {
+-  layers_count: i32,
++  sorted_fragment_max_count: u32,
++  fragments_per_pixel_average: f32,
+   alpha_threshold: f32,
+ };
+ 
++struct OitFragmentNode {
++    color: u32,
++    depth_alpha: u32,
++    next: u32,
++};
++
+ struct ClusteredDecal {
+     local_from_world: mat4x4<f32>,
+     base_color_texture_index: i32,
+diff --git a/examples/3d/order_independent_transparency.rs b/examples/3d/order_independent_transparency.rs
+index 8bc161204eac8..9ada775f42f15 100644
+--- a/examples/3d/order_independent_transparency.rs
++++ b/examples/3d/order_independent_transparency.rs
+@@ -5,8 +5,8 @@
+ //! [`OrderIndependentTransparencyPlugin`]: bevy::core_pipeline::oit::OrderIndependentTransparencyPlugin
+ use bevy::{
+     camera::visibility::RenderLayers,
+-    color::palettes::css::{BLUE, GREEN, RED},
+-    core_pipeline::oit::OrderIndependentTransparencySettings,
++    color::palettes::css::{BLUE, GREEN, RED, YELLOW},
++    core_pipeline::{oit::OrderIndependentTransparencySettings, prepass::DepthPrepass},
+     prelude::*,
+ };
+ 
+@@ -33,6 +33,8 @@ fn setup(
+         RenderLayers::layer(1),
+         // Msaa currently doesn't work with OIT
+         Msaa::Off,
++        // Optional: depth prepass can help OIT filter out fragments occluded by opaque objects
++        DepthPrepass,
+     ));
+ 
+     // light
+@@ -99,6 +101,7 @@ fn cycle_scenes(
+     mut materials: ResMut<Assets<StandardMaterial>>,
+     q: Query<Entity, With<Mesh3d>>,
+     mut scene_id: Local<usize>,
++    asset_server: Res<AssetServer>,
+ ) {
+     if keyboard_input.just_pressed(KeyCode::KeyC) {
+         // despawn current scene
+@@ -106,11 +109,20 @@ fn cycle_scenes(
+             commands.entity(e).despawn();
+         }
+         // increment scene_id
+-        *scene_id = (*scene_id + 1) % 2;
++        *scene_id = (*scene_id + 1) % 4;
+         // spawn next scene
+         match *scene_id {
+             0 => spawn_spheres(&mut commands, &mut meshes, &mut materials),
+-            1 => spawn_occlusion_test(&mut commands, &mut meshes, &mut materials),
++            1 => spawn_quads(&mut commands, &mut meshes, &mut materials),
++            2 => spawn_occlusion_test(&mut commands, &mut meshes, &mut materials),
++            3 => {
++                spawn_auto_instancing_test(
++                    &mut commands,
++                    &mut meshes,
++                    &mut materials,
++                    asset_server,
++                );
++            }
+             _ => unreachable!(),
+         }
+     }
+@@ -168,6 +180,69 @@ fn spawn_spheres(
+     ));
+ }
+ 
++fn spawn_quads(
++    commands: &mut Commands,
++    meshes: &mut Assets<Mesh>,
++    materials: &mut Assets<StandardMaterial>,
++) {
++    let quad_handle = meshes.add(Rectangle::new(3.0, 3.0).mesh());
++    let render_layers = RenderLayers::layer(1);
++    let xform = |x, y, z| {
++        Transform::from_rotation(Quat::from_rotation_y(0.5))
++            .mul_transform(Transform::from_xyz(x, y, z))
++    };
++    commands.spawn((
++        Mesh3d(quad_handle.clone()),
++        MeshMaterial3d(materials.add(StandardMaterial {
++            base_color: RED.with_alpha(0.5).into(),
++            alpha_mode: AlphaMode::Blend,
++            ..default()
++        })),
++        xform(1.0, -0.1, 0.),
++        render_layers.clone(),
++    ));
++    commands.spawn((
++        Mesh3d(quad_handle.clone()),
++        MeshMaterial3d(materials.add(StandardMaterial {
++            base_color: BLUE.with_alpha(0.8).into(),
++            alpha_mode: AlphaMode::Blend,
++            ..default()
++        })),
++        xform(0.5, 0.2, -0.5),
++        render_layers.clone(),
++    ));
++    commands.spawn((
++        Mesh3d(quad_handle.clone()),
++        MeshMaterial3d(materials.add(StandardMaterial {
++            base_color: GREEN.with_green(1.0).with_alpha(0.5).into(),
++            alpha_mode: AlphaMode::Blend,
++            ..default()
++        })),
++        xform(0.0, 0.4, -1.),
++        render_layers.clone(),
++    ));
++    commands.spawn((
++        Mesh3d(quad_handle.clone()),
++        MeshMaterial3d(materials.add(StandardMaterial {
++            base_color: YELLOW.with_alpha(0.3).into(),
++            alpha_mode: AlphaMode::Blend,
++            ..default()
++        })),
++        xform(-0.5, 0.6, -1.1),
++        render_layers.clone(),
++    ));
++    commands.spawn((
++        Mesh3d(quad_handle.clone()),
++        MeshMaterial3d(materials.add(StandardMaterial {
++            base_color: BLUE.with_alpha(0.2).into(),
++            alpha_mode: AlphaMode::Blend,
++            ..default()
++        })),
++        xform(-0.8, 0.8, -1.2),
++        render_layers.clone(),
++    ));
++}
++
+ /// Spawn a combination of opaque cubes and transparent spheres.
+ /// This is useful to make sure transparent meshes drawn with OIT
+ /// are properly occluded by opaque meshes.
+@@ -238,3 +313,34 @@ fn spawn_occlusion_test(
+         render_layers.clone(),
+     ));
+ }
++
++fn spawn_auto_instancing_test(
++    commands: &mut Commands,
++    meshes: &mut Assets<Mesh>,
++    materials: &mut Assets<StandardMaterial>,
++    asset_server: Res<AssetServer>,
++) {
++    let render_layers = RenderLayers::layer(1);
++
++    let cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
++    let material_handle = materials.add(StandardMaterial {
++        alpha_mode: AlphaMode::Blend,
++        base_color_texture: Some(asset_server.load("textures/slice_square.png")),
++        ..Default::default()
++    });
++    let mut bundles = Vec::with_capacity(3 * 3 * 3);
++
++    for z in -1..=1 {
++        for y in -1..=1 {
++            for x in -1..=1 {
++                bundles.push((
++                    Mesh3d(cube.clone()),
++                    MeshMaterial3d(material_handle.clone()),
++                    Transform::from_xyz(x as f32 * 2.0, y as f32 * 2.0, z as f32 * 2.0),
++                    render_layers.clone(),
++                ));
++            }
++        }
++    }
++    commands.spawn_batch(bundles);
++}

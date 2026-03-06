@@ -1,0 +1,2083 @@
+diff --git a/crates/bevy_light/src/cluster/assign.rs b/crates/bevy_light/src/cluster/assign.rs
+index 69f068db15a98..bc3112eddd5d0 100644
+--- a/crates/bevy_light/src/cluster/assign.rs
++++ b/crates/bevy_light/src/cluster/assign.rs
+@@ -15,14 +15,16 @@ use bevy_math::{
+     Mat4, UVec3, Vec2, Vec3, Vec3A, Vec3Swizzles as _, Vec4, Vec4Swizzles as _,
+ };
+ use bevy_transform::components::GlobalTransform;
+-use bevy_utils::prelude::default;
+ use tracing::warn;
+ 
+ use super::{
+     ClusterConfig, ClusterFarZMode, ClusteredDecal, Clusters, GlobalClusterSettings,
+     GlobalVisibleClusterableObjects, VisibleClusterableObjects,
+ };
+-use crate::{EnvironmentMapLight, LightProbe, PointLight, SpotLight, VolumetricLight};
++use crate::{
++    cluster::ObjectsInCluster, EnvironmentMapLight, LightProbe, PointLight, SpotLight,
++    VolumetricLight,
++};
+ 
+ const NDC_MIN: Vec2 = Vec2::NEG_ONE;
+ const NDC_MAX: Vec2 = Vec2::ONE;
+@@ -120,7 +122,9 @@ impl ClusterableObjectType {
+     }
+ }
+ 
+-// NOTE: Run this before update_point_light_frusta!
++/// This system runs in the main world.
++///
++/// NOTE: Run this before `update_point_light_frusta`!
+ pub(crate) fn assign_objects_to_clusters(
+     mut commands: Commands,
+     mut global_clusterable_objects: ResMut<GlobalVisibleClusterableObjects>,
+@@ -463,14 +467,13 @@ pub(crate) fn assign_objects_to_clusters(
+         let view_from_clip = camera.clip_from_view().inverse();
+ 
+         for clusterable_objects in &mut clusters.clusterable_objects {
+-            clusterable_objects.entities.clear();
+-            clusterable_objects.counts = default();
++            clusterable_objects.clear();
+         }
+         let cluster_count =
+             (clusters.dimensions.x * clusters.dimensions.y * clusters.dimensions.z) as usize;
+         clusters
+             .clusterable_objects
+-            .resize_with(cluster_count, VisibleClusterableObjects::default);
++            .resize_with(cluster_count, ObjectsInCluster::default);
+ 
+         // initialize empty cluster bounding spheres
+         cluster_aabb_spheres.clear();
+@@ -533,329 +536,309 @@ pub(crate) fn assign_objects_to_clusters(
+             z_planes.push(HalfSpace::new(normal.extend(d)));
+         }
+ 
+-        let mut update_from_object_intersections = |visible_clusterable_objects: &mut Vec<
+-            Entity,
+-        >| {
+-            for clusterable_object in &clusterable_objects {
+-                // check if the clusterable light layers overlap the view layers
+-                if !view_layers.intersects(&clusterable_object.render_layers) {
+-                    continue;
+-                }
++        let mut update_from_object_intersections =
++            |visible_clusterable_objects: &mut VisibleClusterableObjects| {
++                for clusterable_object in &clusterable_objects {
++                    // check if the clusterable light layers overlap the view layers
++                    if !view_layers.intersects(&clusterable_object.render_layers) {
++                        continue;
++                    }
+ 
+-                let clusterable_object_sphere = clusterable_object.sphere();
++                    let clusterable_object_sphere = clusterable_object.sphere();
+ 
+-                // Check if the clusterable object is within the view frustum
+-                if !frustum.intersects_sphere(&clusterable_object_sphere, true) {
+-                    continue;
+-                }
++                    // Check if the clusterable object is within the view frustum
++                    if !frustum.intersects_sphere(&clusterable_object_sphere, true) {
++                        continue;
++                    }
+ 
+-                // NOTE: The clusterable object intersects the frustum so it
+-                // must be visible and part of the global set
+-                global_clusterable_objects
+-                    .entities
+-                    .insert(clusterable_object.entity);
+-                visible_clusterable_objects.push(clusterable_object.entity);
+-
+-                // note: caching seems to be slower than calling twice for this aabb calculation
+-                let (
+-                    clusterable_object_aabb_xy_ndc_z_view_min,
+-                    clusterable_object_aabb_xy_ndc_z_view_max,
+-                ) = cluster_space_clusterable_object_aabb(
+-                    view_from_world,
+-                    view_from_world_scale,
+-                    camera.clip_from_view(),
+-                    &clusterable_object_sphere,
+-                );
++                    // NOTE: The clusterable object intersects the frustum so it
++                    // must be visible and part of the global set
++                    global_clusterable_objects
++                        .entities
++                        .insert(clusterable_object.entity);
++                    visible_clusterable_objects
++                        .add(clusterable_object.entity, &clusterable_object.object_type);
++
++                    // note: caching seems to be slower than calling twice for this aabb calculation
++                    let (
++                        clusterable_object_aabb_xy_ndc_z_view_min,
++                        clusterable_object_aabb_xy_ndc_z_view_max,
++                    ) = cluster_space_clusterable_object_aabb(
++                        view_from_world,
++                        view_from_world_scale,
++                        camera.clip_from_view(),
++                        &clusterable_object_sphere,
++                    );
+ 
+-                let min_cluster = ndc_position_to_cluster(
+-                    clusters.dimensions,
+-                    cluster_factors,
+-                    is_orthographic,
+-                    clusterable_object_aabb_xy_ndc_z_view_min,
+-                    clusterable_object_aabb_xy_ndc_z_view_min.z,
+-                );
+-                let max_cluster = ndc_position_to_cluster(
+-                    clusters.dimensions,
+-                    cluster_factors,
+-                    is_orthographic,
+-                    clusterable_object_aabb_xy_ndc_z_view_max,
+-                    clusterable_object_aabb_xy_ndc_z_view_max.z,
+-                );
+-                let (min_cluster, max_cluster) =
+-                    (min_cluster.min(max_cluster), min_cluster.max(max_cluster));
+-
+-                // What follows is the Iterative Sphere Refinement algorithm from Just Cause 3
+-                // Persson et al, Practical Clustered Shading
+-                // http://newq.net/dl/pub/s2015_practical.pdf
+-                // NOTE: A sphere under perspective projection is no longer a sphere. It gets
+-                // stretched and warped, which prevents simpler algorithms from being correct
+-                // as they often assume that the widest part of the sphere under projection is the
+-                // center point on the axis of interest plus the radius, and that is not true!
+-                let view_clusterable_object_sphere = Sphere {
+-                    center: Vec3A::from_vec4(
+-                        view_from_world * clusterable_object_sphere.center.extend(1.0),
+-                    ),
+-                    radius: clusterable_object_sphere.radius * view_from_world_scale_max,
+-                };
+-                let spot_light_dir_sin_cos = match clusterable_object.object_type {
+-                    ClusterableObjectType::SpotLight { outer_angle, .. } => {
+-                        let (angle_sin, angle_cos) = sin_cos(outer_angle);
+-                        Some((
+-                            (view_from_world * clusterable_object.transform.back().extend(0.0))
+-                                .truncate()
+-                                .normalize(),
+-                            angle_sin,
+-                            angle_cos,
+-                        ))
+-                    }
+-                    ClusterableObjectType::Decal => {
+-                        // TODO: cull via a frustum
+-                        None
+-                    }
+-                    ClusterableObjectType::PointLight { .. }
+-                    | ClusterableObjectType::ReflectionProbe
+-                    | ClusterableObjectType::IrradianceVolume => None,
+-                };
+-                let clusterable_object_center_clip =
+-                    camera.clip_from_view() * view_clusterable_object_sphere.center.extend(1.0);
+-                let object_center_ndc =
+-                    clusterable_object_center_clip.xyz() / clusterable_object_center_clip.w;
+-                let cluster_coordinates = ndc_position_to_cluster(
+-                    clusters.dimensions,
+-                    cluster_factors,
+-                    is_orthographic,
+-                    object_center_ndc,
+-                    view_clusterable_object_sphere.center.z,
+-                );
+-                let z_center = if object_center_ndc.z <= 1.0 {
+-                    Some(cluster_coordinates.z)
+-                } else {
+-                    None
+-                };
+-                let y_center = if object_center_ndc.y > 1.0 {
+-                    None
+-                } else if object_center_ndc.y < -1.0 {
+-                    Some(clusters.dimensions.y + 1)
+-                } else {
+-                    Some(cluster_coordinates.y)
+-                };
+-                for z in min_cluster.z..=max_cluster.z {
+-                    let mut z_object = view_clusterable_object_sphere.clone();
+-                    if z_center.is_none() || z != z_center.unwrap() {
+-                        // The z plane closer to the clusterable object has the
+-                        // larger radius circle where the light sphere
+-                        // intersects the z plane.
+-                        let z_plane = if z_center.is_some() && z < z_center.unwrap() {
+-                            z_planes[(z + 1) as usize]
+-                        } else {
+-                            z_planes[z as usize]
+-                        };
+-                        // Project the sphere to this z plane and use its radius as the radius of a
+-                        // new, refined sphere.
+-                        if let Some(projected) = project_to_plane_z(z_object, z_plane) {
+-                            z_object = projected;
+-                        } else {
+-                            continue;
++                    let min_cluster = ndc_position_to_cluster(
++                        clusters.dimensions,
++                        cluster_factors,
++                        is_orthographic,
++                        clusterable_object_aabb_xy_ndc_z_view_min,
++                        clusterable_object_aabb_xy_ndc_z_view_min.z,
++                    );
++                    let max_cluster = ndc_position_to_cluster(
++                        clusters.dimensions,
++                        cluster_factors,
++                        is_orthographic,
++                        clusterable_object_aabb_xy_ndc_z_view_max,
++                        clusterable_object_aabb_xy_ndc_z_view_max.z,
++                    );
++                    let (min_cluster, max_cluster) =
++                        (min_cluster.min(max_cluster), min_cluster.max(max_cluster));
++
++                    // What follows is the Iterative Sphere Refinement algorithm from Just Cause 3
++                    // Persson et al, Practical Clustered Shading
++                    // http://newq.net/dl/pub/s2015_practical.pdf
++                    // NOTE: A sphere under perspective projection is no longer a sphere. It gets
++                    // stretched and warped, which prevents simpler algorithms from being correct
++                    // as they often assume that the widest part of the sphere under projection is the
++                    // center point on the axis of interest plus the radius, and that is not true!
++                    let view_clusterable_object_sphere = Sphere {
++                        center: Vec3A::from_vec4(
++                            view_from_world * clusterable_object_sphere.center.extend(1.0),
++                        ),
++                        radius: clusterable_object_sphere.radius * view_from_world_scale_max,
++                    };
++                    let spot_light_dir_sin_cos = match clusterable_object.object_type {
++                        ClusterableObjectType::SpotLight { outer_angle, .. } => {
++                            let (angle_sin, angle_cos) = sin_cos(outer_angle);
++                            Some((
++                                (view_from_world * clusterable_object.transform.back().extend(0.0))
++                                    .truncate()
++                                    .normalize(),
++                                angle_sin,
++                                angle_cos,
++                            ))
+                         }
+-                    }
+-                    for y in min_cluster.y..=max_cluster.y {
+-                        let mut y_object = z_object.clone();
+-                        if y_center.is_none() || y != y_center.unwrap() {
+-                            // The y plane closer to the clusterable object has
+-                            // the larger radius circle where the light sphere
+-                            // intersects the y plane.
+-                            let y_plane = if y_center.is_some() && y < y_center.unwrap() {
+-                                y_planes[(y + 1) as usize]
++                        ClusterableObjectType::Decal => {
++                            // TODO: cull via a frustum
++                            None
++                        }
++                        ClusterableObjectType::PointLight { .. }
++                        | ClusterableObjectType::ReflectionProbe
++                        | ClusterableObjectType::IrradianceVolume => None,
++                    };
++                    let clusterable_object_center_clip =
++                        camera.clip_from_view() * view_clusterable_object_sphere.center.extend(1.0);
++                    let object_center_ndc =
++                        clusterable_object_center_clip.xyz() / clusterable_object_center_clip.w;
++                    let cluster_coordinates = ndc_position_to_cluster(
++                        clusters.dimensions,
++                        cluster_factors,
++                        is_orthographic,
++                        object_center_ndc,
++                        view_clusterable_object_sphere.center.z,
++                    );
++                    let z_center = if object_center_ndc.z <= 1.0 {
++                        Some(cluster_coordinates.z)
++                    } else {
++                        None
++                    };
++                    let y_center = if object_center_ndc.y > 1.0 {
++                        None
++                    } else if object_center_ndc.y < -1.0 {
++                        Some(clusters.dimensions.y + 1)
++                    } else {
++                        Some(cluster_coordinates.y)
++                    };
++                    for z in min_cluster.z..=max_cluster.z {
++                        let mut z_object = view_clusterable_object_sphere.clone();
++                        if z_center.is_none() || z != z_center.unwrap() {
++                            // The z plane closer to the clusterable object has the
++                            // larger radius circle where the light sphere
++                            // intersects the z plane.
++                            let z_plane = if z_center.is_some() && z < z_center.unwrap() {
++                                z_planes[(z + 1) as usize]
+                             } else {
+-                                y_planes[y as usize]
++                                z_planes[z as usize]
+                             };
+-                            // Project the refined sphere to this y plane and use its radius as the
+-                            // radius of a new, even more refined sphere.
+-                            if let Some(projected) =
+-                                project_to_plane_y(y_object, y_plane, is_orthographic)
+-                            {
+-                                y_object = projected;
++                            // Project the sphere to this z plane and use its radius as the radius of a
++                            // new, refined sphere.
++                            if let Some(projected) = project_to_plane_z(z_object, z_plane) {
++                                z_object = projected;
+                             } else {
+                                 continue;
+                             }
+                         }
+-                        // Loop from the left to find the first affected cluster
+-                        let mut min_x = min_cluster.x;
+-                        loop {
+-                            if min_x >= max_cluster.x
+-                                || -get_distance_x(
+-                                    x_planes[(min_x + 1) as usize],
+-                                    y_object.center,
+-                                    is_orthographic,
+-                                ) + y_object.radius
+-                                    > 0.0
+-                            {
+-                                break;
++                        for y in min_cluster.y..=max_cluster.y {
++                            let mut y_object = z_object.clone();
++                            if y_center.is_none() || y != y_center.unwrap() {
++                                // The y plane closer to the clusterable object has
++                                // the larger radius circle where the light sphere
++                                // intersects the y plane.
++                                let y_plane = if y_center.is_some() && y < y_center.unwrap() {
++                                    y_planes[(y + 1) as usize]
++                                } else {
++                                    y_planes[y as usize]
++                                };
++                                // Project the refined sphere to this y plane and use its radius as the
++                                // radius of a new, even more refined sphere.
++                                if let Some(projected) =
++                                    project_to_plane_y(y_object, y_plane, is_orthographic)
++                                {
++                                    y_object = projected;
++                                } else {
++                                    continue;
++                                }
+                             }
+-                            min_x += 1;
+-                        }
+-                        // Loop from the right to find the last affected cluster
+-                        let mut max_x = max_cluster.x;
+-                        loop {
+-                            if max_x <= min_x
+-                                || get_distance_x(
+-                                    x_planes[max_x as usize],
+-                                    y_object.center,
+-                                    is_orthographic,
+-                                ) + y_object.radius
+-                                    > 0.0
+-                            {
+-                                break;
++                            // Loop from the left to find the first affected cluster
++                            let mut min_x = min_cluster.x;
++                            loop {
++                                if min_x >= max_cluster.x
++                                    || -get_distance_x(
++                                        x_planes[(min_x + 1) as usize],
++                                        y_object.center,
++                                        is_orthographic,
++                                    ) + y_object.radius
++                                        > 0.0
++                                {
++                                    break;
++                                }
++                                min_x += 1;
+                             }
+-                            max_x -= 1;
+-                        }
+-                        let mut cluster_index = ((y * clusters.dimensions.x + min_x)
+-                            * clusters.dimensions.z
+-                            + z) as usize;
+-
+-                        match clusterable_object.object_type {
+-                            ClusterableObjectType::SpotLight { .. } => {
+-                                let (view_light_direction, angle_sin, angle_cos) =
+-                                    spot_light_dir_sin_cos.unwrap();
+-                                for x in min_x..=max_x {
+-                                    // further culling for spot lights
+-                                    // get or initialize cluster bounding sphere
+-                                    let cluster_aabb_sphere =
+-                                        &mut cluster_aabb_spheres[cluster_index];
+-                                    let cluster_aabb_sphere =
+-                                        if let Some(sphere) = cluster_aabb_sphere {
+-                                            &*sphere
+-                                        } else {
+-                                            let aabb = compute_aabb_for_cluster(
+-                                                first_slice_depth,
+-                                                far_z,
+-                                                clusters.tile_size.as_vec2(),
+-                                                screen_size.as_vec2(),
+-                                                view_from_clip,
+-                                                is_orthographic,
+-                                                clusters.dimensions,
+-                                                UVec3::new(x, y, z),
+-                                            );
+-                                            let sphere = Sphere {
+-                                                center: aabb.center,
+-                                                radius: aabb.half_extents.length(),
++                            // Loop from the right to find the last affected cluster
++                            let mut max_x = max_cluster.x;
++                            loop {
++                                if max_x <= min_x
++                                    || get_distance_x(
++                                        x_planes[max_x as usize],
++                                        y_object.center,
++                                        is_orthographic,
++                                    ) + y_object.radius
++                                        > 0.0
++                                {
++                                    break;
++                                }
++                                max_x -= 1;
++                            }
++                            let mut cluster_index = ((y * clusters.dimensions.x + min_x)
++                                * clusters.dimensions.z
++                                + z) as usize;
++
++                            match clusterable_object.object_type {
++                                ClusterableObjectType::SpotLight { .. } => {
++                                    let (view_light_direction, angle_sin, angle_cos) =
++                                        spot_light_dir_sin_cos.unwrap();
++                                    for x in min_x..=max_x {
++                                        // further culling for spot lights
++                                        // get or initialize cluster bounding sphere
++                                        let cluster_aabb_sphere =
++                                            &mut cluster_aabb_spheres[cluster_index];
++                                        let cluster_aabb_sphere =
++                                            if let Some(sphere) = cluster_aabb_sphere {
++                                                &*sphere
++                                            } else {
++                                                let aabb = compute_aabb_for_cluster(
++                                                    first_slice_depth,
++                                                    far_z,
++                                                    clusters.tile_size.as_vec2(),
++                                                    screen_size.as_vec2(),
++                                                    view_from_clip,
++                                                    is_orthographic,
++                                                    clusters.dimensions,
++                                                    UVec3::new(x, y, z),
++                                                );
++                                                let sphere = Sphere {
++                                                    center: aabb.center,
++                                                    radius: aabb.half_extents.length(),
++                                                };
++                                                *cluster_aabb_sphere = Some(sphere);
++                                                cluster_aabb_sphere.as_ref().unwrap()
+                                             };
+-                                            *cluster_aabb_sphere = Some(sphere);
+-                                            cluster_aabb_sphere.as_ref().unwrap()
+-                                        };
+-
+-                                    // test -- based on https://bartwronski.com/2017/04/13/cull-that-cone/
+-                                    let spot_light_offset = Vec3::from(
+-                                        view_clusterable_object_sphere.center
+-                                            - cluster_aabb_sphere.center,
+-                                    );
+-                                    let spot_light_dist_sq = spot_light_offset.length_squared();
+-                                    let v1_len = spot_light_offset.dot(view_light_direction);
+-
+-                                    let distance_closest_point = (angle_cos
+-                                        * (spot_light_dist_sq - v1_len * v1_len).sqrt())
+-                                        - v1_len * angle_sin;
+-                                    let angle_cull =
+-                                        distance_closest_point > cluster_aabb_sphere.radius;
+-
+-                                    let front_cull = v1_len
+-                                        > cluster_aabb_sphere.radius
+-                                            + clusterable_object.range * view_from_world_scale_max;
+-                                    let back_cull = v1_len < -cluster_aabb_sphere.radius;
+-
+-                                    if !angle_cull && !front_cull && !back_cull {
+-                                        // this cluster is affected by the spot light
+-                                        clusters.clusterable_objects[cluster_index]
+-                                            .entities
+-                                            .push(clusterable_object.entity);
+-                                        clusters.clusterable_objects[cluster_index]
+-                                            .counts
+-                                            .spot_lights += 1;
++
++                                        // test -- based on https://bartwronski.com/2017/04/13/cull-that-cone/
++                                        let spot_light_offset = Vec3::from(
++                                            view_clusterable_object_sphere.center
++                                                - cluster_aabb_sphere.center,
++                                        );
++                                        let spot_light_dist_sq = spot_light_offset.length_squared();
++                                        let v1_len = spot_light_offset.dot(view_light_direction);
++
++                                        let distance_closest_point = (angle_cos
++                                            * (spot_light_dist_sq - v1_len * v1_len).sqrt())
++                                            - v1_len * angle_sin;
++                                        let angle_cull =
++                                            distance_closest_point > cluster_aabb_sphere.radius;
++
++                                        let front_cull = v1_len
++                                            > cluster_aabb_sphere.radius
++                                                + clusterable_object.range
++                                                    * view_from_world_scale_max;
++                                        let back_cull = v1_len < -cluster_aabb_sphere.radius;
++
++                                        if !angle_cull && !front_cull && !back_cull {
++                                            // this cluster is affected by the spot light
++                                            clusters.clusterable_objects[cluster_index]
++                                                .add_spot_light(clusterable_object.entity);
++                                        }
++                                        cluster_index += clusters.dimensions.z as usize;
+                                     }
+-                                    cluster_index += clusters.dimensions.z as usize;
+                                 }
+-                            }
+ 
+-                            ClusterableObjectType::PointLight { .. } => {
+-                                for _ in min_x..=max_x {
+-                                    // all clusters within range are affected by point lights
+-                                    clusters.clusterable_objects[cluster_index]
+-                                        .entities
+-                                        .push(clusterable_object.entity);
+-                                    clusters.clusterable_objects[cluster_index]
+-                                        .counts
+-                                        .point_lights += 1;
+-                                    cluster_index += clusters.dimensions.z as usize;
++                                ClusterableObjectType::PointLight { .. } => {
++                                    for _ in min_x..=max_x {
++                                        // all clusters within range are affected by point lights
++                                        clusters.clusterable_objects[cluster_index]
++                                            .add_point_light(clusterable_object.entity);
++                                        cluster_index += clusters.dimensions.z as usize;
++                                    }
+                                 }
+-                            }
+ 
+-                            ClusterableObjectType::ReflectionProbe => {
+-                                // Reflection probes currently affect all
+-                                // clusters in their bounding sphere.
+-                                //
+-                                // TODO: Cull more aggressively based on the
+-                                // probe's OBB.
+-                                for _ in min_x..=max_x {
+-                                    clusters.clusterable_objects[cluster_index]
+-                                        .entities
+-                                        .push(clusterable_object.entity);
+-                                    clusters.clusterable_objects[cluster_index]
+-                                        .counts
+-                                        .reflection_probes += 1;
+-                                    cluster_index += clusters.dimensions.z as usize;
++                                ClusterableObjectType::ReflectionProbe => {
++                                    // Reflection probes currently affect all
++                                    // clusters in their bounding sphere.
++                                    //
++                                    // TODO: Cull more aggressively based on the
++                                    // probe's OBB.
++                                    for _ in min_x..=max_x {
++                                        clusters.clusterable_objects[cluster_index]
++                                            .add_reflection_probe(clusterable_object.entity);
++                                        cluster_index += clusters.dimensions.z as usize;
++                                    }
+                                 }
+-                            }
+ 
+-                            ClusterableObjectType::IrradianceVolume => {
+-                                // Irradiance volumes currently affect all
+-                                // clusters in their bounding sphere.
+-                                //
+-                                // TODO: Cull more aggressively based on the
+-                                // probe's OBB.
+-                                for _ in min_x..=max_x {
+-                                    clusters.clusterable_objects[cluster_index]
+-                                        .entities
+-                                        .push(clusterable_object.entity);
+-                                    clusters.clusterable_objects[cluster_index]
+-                                        .counts
+-                                        .irradiance_volumes += 1;
+-                                    cluster_index += clusters.dimensions.z as usize;
++                                ClusterableObjectType::IrradianceVolume => {
++                                    // Irradiance volumes currently affect all
++                                    // clusters in their bounding sphere.
++                                    //
++                                    // TODO: Cull more aggressively based on the
++                                    // probe's OBB.
++                                    for _ in min_x..=max_x {
++                                        clusters.clusterable_objects[cluster_index]
++                                            .add_irradiance_volume(clusterable_object.entity);
++                                        cluster_index += clusters.dimensions.z as usize;
++                                    }
+                                 }
+-                            }
+ 
+-                            ClusterableObjectType::Decal => {
+-                                // Decals currently affect all clusters in their
+-                                // bounding sphere.
+-                                //
+-                                // TODO: Cull more aggressively based on the
+-                                // decal's OBB.
+-                                for _ in min_x..=max_x {
+-                                    clusters.clusterable_objects[cluster_index]
+-                                        .entities
+-                                        .push(clusterable_object.entity);
+-                                    clusters.clusterable_objects[cluster_index].counts.decals += 1;
+-                                    cluster_index += clusters.dimensions.z as usize;
++                                ClusterableObjectType::Decal => {
++                                    // Decals currently affect all clusters in their
++                                    // bounding sphere.
++                                    //
++                                    // TODO: Cull more aggressively based on the
++                                    // decal's OBB.
++                                    for _ in min_x..=max_x {
++                                        clusters.clusterable_objects[cluster_index]
++                                            .add_decal(clusterable_object.entity);
++                                        cluster_index += clusters.dimensions.z as usize;
++                                    }
+                                 }
+                             }
+                         }
+                     }
+                 }
+-            }
+-        };
++            };
+ 
+         // reuse existing visible clusterable objects Vec, if it exists
+         if let Some(visible_clusterable_objects) = visible_clusterable_objects.as_mut() {
+-            visible_clusterable_objects.entities.clear();
+-            update_from_object_intersections(&mut visible_clusterable_objects.entities);
++            visible_clusterable_objects.clear();
++            update_from_object_intersections(visible_clusterable_objects);
+         } else {
+-            let mut entities = Vec::new();
+-            update_from_object_intersections(&mut entities);
++            let mut visible_clusterable_objects = VisibleClusterableObjects::new();
++            update_from_object_intersections(&mut visible_clusterable_objects);
+             commands
+                 .entity(view_entity)
+-                .insert(VisibleClusterableObjects {
+-                    entities,
+-                    ..Default::default()
+-                });
++                .insert(visible_clusterable_objects);
+         }
+     }
+ }
+diff --git a/crates/bevy_light/src/cluster/mod.rs b/crates/bevy_light/src/cluster/mod.rs
+index 17e3f1e418195..582005909956c 100644
+--- a/crates/bevy_light/src/cluster/mod.rs
++++ b/crates/bevy_light/src/cluster/mod.rs
+@@ -1,5 +1,7 @@
+ //! Spatial clustering of objects, currently just point and spot lights.
+ 
++use core::any::TypeId;
++
+ use bevy_asset::Handle;
+ use bevy_camera::{
+     visibility::{self, Visibility, VisibilityClass},
+@@ -18,8 +20,11 @@ use bevy_math::{AspectRatio, UVec2, UVec3, Vec3Swizzles as _};
+ use bevy_platform::collections::HashSet;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_transform::components::Transform;
++use bevy_utils::TypeIdMap;
+ use tracing::warn;
+ 
++use crate::{cluster::assign::ClusterableObjectType, EnvironmentMapLight, IrradianceVolume};
++
+ pub mod assign;
+ 
+ #[cfg(test)]
+@@ -108,20 +113,39 @@ pub struct Clusters {
+     /// and explicitly-configured to avoid having unnecessarily many slices close to the camera.
+     pub near: f32,
+     pub far: f32,
+-    pub clusterable_objects: Vec<VisibleClusterableObjects>,
++    /// All objects within the cluster.
++    pub clusterable_objects: Vec<ObjectsInCluster>,
+ }
+ 
+-/// The [`VisibilityClass`] used for clusterables (decals, point lights, directional lights, and spot lights).
++/// The [`VisibilityClass`] used for clusterables (decals, point lights, spot
++/// lights, and light probes).
+ ///
+ /// [`VisibilityClass`]: bevy_camera::visibility::VisibilityClass
+ pub struct ClusterVisibilityClass;
+ 
++/// A component, present on each render-world view, that stores the light of all
++/// clusterable objects potentially visible in that view, separated by type.
+ #[derive(Clone, Component, Debug, Default)]
+ pub struct VisibleClusterableObjects {
+-    pub entities: Vec<Entity>,
++    /// A list of all point and spot lights that are potentially visible from
++    /// this view.
++    pub point_and_spot_lights: Vec<Entity>,
++    /// A list of all light probes that are potentially visible from this view.
++    pub light_probes: TypeIdMap<Vec<Entity>>,
++}
++
++/// All objects that potentially intersect a single cluster.
++#[derive(Default, Debug)]
++pub struct ObjectsInCluster {
++    /// A list of all clusterable objects that are potentially visible from this
++    /// view.
++    clusterables: Vec<Entity>,
++
++    /// The number of each clusterable object type.
+     pub counts: ClusterableObjectCounts,
+ }
+ 
++/// A resource that stores all clusterable objects visible in any view.
+ #[derive(Resource, Default)]
+ pub struct GlobalVisibleClusterableObjects {
+     pub(crate) entities: HashSet<Entity>,
+@@ -358,20 +382,82 @@ pub fn add_clusters(
+     }
+ }
+ 
+-impl VisibleClusterableObjects {
+-    #[inline]
++impl ObjectsInCluster {
++    /// Clears out all objects in this cluster in preparation for a new frame.
++    pub fn clear(&mut self) {
++        self.clusterables.clear();
++        self.counts = ClusterableObjectCounts::default();
++    }
++
++    /// Adds a spot light to the list.
++    pub fn add_spot_light(&mut self, entity: Entity) {
++        self.clusterables.push(entity);
++        self.counts.spot_lights += 1;
++    }
++
++    /// Adds a point light to the list.
++    pub fn add_point_light(&mut self, entity: Entity) {
++        self.clusterables.push(entity);
++        self.counts.point_lights += 1;
++    }
++
++    /// Adds a reflection probe to the list.
++    pub fn add_reflection_probe(&mut self, entity: Entity) {
++        self.clusterables.push(entity);
++        self.counts.reflection_probes += 1;
++    }
++
++    /// Adds an irradiance volume to the list.
++    pub fn add_irradiance_volume(&mut self, entity: Entity) {
++        self.clusterables.push(entity);
++        self.counts.irradiance_volumes += 1;
++    }
++
++    /// Adds a decal to the list.
++    pub fn add_decal(&mut self, entity: Entity) {
++        self.clusterables.push(entity);
++        self.counts.decals += 1;
++    }
++
++    /// Iterates through all objects in this cluster.
+     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Entity> {
+-        self.entities.iter()
++        self.clusterables.iter()
+     }
++}
+ 
+-    #[inline]
+-    pub fn len(&self) -> usize {
+-        self.entities.len()
++impl VisibleClusterableObjects {
++    /// Creates a new [`VisibleClusterableObjects`] container.
++    pub fn new() -> Self {
++        Self::default()
+     }
+ 
+-    #[inline]
+-    pub fn is_empty(&self) -> bool {
+-        self.entities.is_empty()
++    /// Clears out all lists of visible clusterable objects in preparation for a
++    /// new frame.
++    pub fn clear(&mut self) {
++        self.point_and_spot_lights.clear();
++        self.light_probes.clear();
++    }
++
++    /// Adds a new object of the given type to the list.
++    pub fn add(&mut self, entity: Entity, object_type: &ClusterableObjectType) {
++        match *object_type {
++            ClusterableObjectType::PointLight { .. } | ClusterableObjectType::SpotLight { .. } => {
++                self.point_and_spot_lights.push(entity);
++            }
++            ClusterableObjectType::ReflectionProbe => {
++                self.light_probes
++                    .entry(TypeId::of::<EnvironmentMapLight>())
++                    .or_default()
++                    .push(entity);
++            }
++            ClusterableObjectType::IrradianceVolume => {
++                self.light_probes
++                    .entry(TypeId::of::<IrradianceVolume>())
++                    .or_default()
++                    .push(entity);
++            }
++            ClusterableObjectType::Decal => {}
++        }
+     }
+ }
+ 
+diff --git a/crates/bevy_light/src/lib.rs b/crates/bevy_light/src/lib.rs
+index b8c6a8d7fab15..44396b48a3a64 100644
+--- a/crates/bevy_light/src/lib.rs
++++ b/crates/bevy_light/src/lib.rs
+@@ -514,7 +514,7 @@ pub fn check_point_light_mesh_visibility(
+ 
+     let visible_entity_ranges = visible_entity_ranges.as_deref();
+     for visible_lights in &visible_point_lights {
+-        for light_entity in visible_lights.entities.iter().copied() {
++        for light_entity in visible_lights.point_and_spot_lights.iter().copied() {
+             if !checked_lights.insert(light_entity) {
+                 continue;
+             }
+diff --git a/crates/bevy_pbr/src/cluster.rs b/crates/bevy_pbr/src/cluster.rs
+index ca7db2358735f..e4f6f76fc0141 100644
+--- a/crates/bevy_pbr/src/cluster.rs
++++ b/crates/bevy_pbr/src/cluster.rs
+@@ -2,19 +2,22 @@ use core::num::NonZero;
+ 
+ use bevy_camera::Camera;
+ use bevy_ecs::{entity::EntityHashMap, prelude::*};
+-use bevy_light::cluster::{ClusterableObjectCounts, Clusters, GlobalClusterSettings};
++use bevy_light::{
++    cluster::{ClusterableObjectCounts, Clusters, GlobalClusterSettings},
++    ClusteredDecal, EnvironmentMapLight, IrradianceVolume, LightProbe, PointLight, SpotLight,
++};
+ use bevy_math::{uvec4, UVec3, UVec4, Vec4};
+ use bevy_render::{
+     render_resource::{
+         BindingResource, BufferBindingType, ShaderSize, ShaderType, StorageBuffer, UniformBuffer,
+     },
+     renderer::{RenderAdapter, RenderDevice, RenderQueue},
+-    sync_world::RenderEntity,
++    sync_world::{MainEntity, RenderEntity},
+     Extract,
+ };
+-use tracing::warn;
++use tracing::{error, trace, warn};
+ 
+-use crate::MeshPipeline;
++use crate::{MeshPipeline, RenderViewLightProbes};
+ 
+ // NOTE: this must be kept in sync with the same constants in
+ // `mesh_view_types.wgsl`.
+@@ -22,7 +25,7 @@ pub const MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS: usize = 204;
+ // Make sure that the clusterable object buffer doesn't overflow the maximum
+ // size of a UBO on WebGL 2.
+ const _: () =
+-    assert!(size_of::<GpuClusterableObject>() * MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS <= 16384);
++    assert!(size_of::<GpuClusteredLight>() * MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS <= 16384);
+ 
+ // NOTE: Clustered-forward rendering requires 3 storage buffer bindings so check that
+ // at least that many are supported using this constant and SupportedBindingType::from_device()
+@@ -52,8 +55,12 @@ pub(crate) fn make_global_cluster_settings(world: &World) -> GlobalClusterSettin
+     }
+ }
+ 
++/// The GPU-side structure that stores information about a clustered light
++/// (point or spot).
++///
++/// This is *not* used for other clustered objects, such as light probes.
+ #[derive(Copy, Clone, ShaderType, Default, Debug)]
+-pub struct GpuClusterableObject {
++pub struct GpuClusteredLight {
+     // For point lights: the lower-right 2x2 values of the projection matrix [2][2] [2][3] [3][2] [3][3]
+     // For spot lights: 2 components of the direction (x,z), spot_scale and spot_offset
+     pub(crate) light_custom_data: Vec4,
+@@ -65,30 +72,53 @@ pub struct GpuClusterableObject {
+     pub(crate) spot_light_tan_angle: f32,
+     pub(crate) soft_shadow_size: f32,
+     pub(crate) shadow_map_near_z: f32,
++    /// The decal applied to this light.
++    ///
++    /// Note that this is separate from clustered decals. Clustered decals have
++    /// their own structures and don't use [`GpuClusteredLight`].
+     pub(crate) decal_index: u32,
+     pub(crate) pad: f32,
+ }
+ 
++/// Contains information about clusterable objects in the scene that's global:
++/// i.e. not specific to any view.
+ #[derive(Resource)]
+ pub struct GlobalClusterableObjectMeta {
+-    pub gpu_clusterable_objects: GpuClusterableObjects,
++    /// GPU buffers that hold data about the clustered lights.
++    ///
++    /// This is only for lights. Data about other clusterable objects are stored
++    /// in other buffers.
++    pub gpu_clustered_lights: GpuClusteredLights,
++
++    /// Maps a *render-world* entity to the index in the appropriate list.
++    ///
++    /// Only clusterable objects that have render-world entities are in this
++    /// list! In particular, light probes (reflection probes and irradiance
++    /// volumes) are not.
+     pub entity_to_index: EntityHashMap<usize>,
+ }
+ 
+-pub enum GpuClusterableObjects {
+-    Uniform(UniformBuffer<GpuClusterableObjectsUniform>),
+-    Storage(StorageBuffer<GpuClusterableObjectsStorage>),
++/// GPU buffers that hold data about the clustered lights.
++///
++/// This is only for lights. Data about other clusterable objects are stored in
++/// other buffers.
++///
++/// This has two variants in order to handle platforms in which storage buffers
++/// aren't available.
++pub enum GpuClusteredLights {
++    Uniform(UniformBuffer<GpuClusteredLightsUniform>),
++    Storage(StorageBuffer<GpuClusteredLightsStorage>),
+ }
+ 
+ #[derive(ShaderType)]
+-pub struct GpuClusterableObjectsUniform {
+-    data: Box<[GpuClusterableObject; MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS]>,
++pub struct GpuClusteredLightsUniform {
++    data: Box<[GpuClusteredLight; MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS]>,
+ }
+ 
+ #[derive(ShaderType, Default)]
+-pub struct GpuClusterableObjectsStorage {
++pub struct GpuClusteredLightsStorage {
+     #[shader(size(runtime))]
+-    data: Vec<GpuClusterableObject>,
++    data: Vec<GpuClusteredLight>,
+ }
+ 
+ #[derive(Component)]
+@@ -100,9 +130,28 @@ pub struct ExtractedClusterConfig {
+     pub(crate) dimensions: UVec3,
+ }
+ 
++/// A single command in the stream that [`extract_clusters`] produces.
+ enum ExtractedClusterableObjectElement {
++    /// Marks the beginning of a new cluster.
+     ClusterHeader(ClusterableObjectCounts),
+-    ClusterableObjectEntity(Entity),
++    /// Represents a light.
++    ///
++    /// The given entity is the render-world entity.
++    Light(Entity),
++    /// Represents a reflection probe.
++    ///
++    /// The given entity is the main-world entity of the light probe, as light
++    /// probes don't have render world entities.
++    ReflectionProbe(MainEntity),
++    /// Represents an irradiance volume.
++    ///
++    /// The given entity is the main-world entity of the light probe, as light
++    /// probes don't have render world entities.
++    IrradianceVolume(MainEntity),
++    /// Represents a clustered decal.
++    ///
++    /// The given entity is the render-world entity.
++    Decal(Entity),
+ }
+ 
+ #[derive(Component)]
+@@ -162,13 +211,13 @@ pub fn init_global_clusterable_object_meta(
+ impl GlobalClusterableObjectMeta {
+     pub fn new(buffer_binding_type: BufferBindingType) -> Self {
+         Self {
+-            gpu_clusterable_objects: GpuClusterableObjects::new(buffer_binding_type),
++            gpu_clustered_lights: GpuClusteredLights::new(buffer_binding_type),
+             entity_to_index: EntityHashMap::default(),
+         }
+     }
+ }
+ 
+-impl GpuClusterableObjects {
++impl GpuClusteredLights {
+     fn new(buffer_binding_type: BufferBindingType) -> Self {
+         match buffer_binding_type {
+             BufferBindingType::Storage { .. } => Self::storage(),
+@@ -184,9 +233,9 @@ impl GpuClusterableObjects {
+         Self::Storage(StorageBuffer::default())
+     }
+ 
+-    pub(crate) fn set(&mut self, mut clusterable_objects: Vec<GpuClusterableObject>) {
++    pub(crate) fn set(&mut self, mut clusterable_objects: Vec<GpuClusteredLight>) {
+         match self {
+-            GpuClusterableObjects::Uniform(buffer) => {
++            GpuClusteredLights::Uniform(buffer) => {
+                 let len = clusterable_objects
+                     .len()
+                     .min(MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS);
+@@ -194,7 +243,7 @@ impl GpuClusterableObjects {
+                 let dst = &mut buffer.get_mut().data[..len];
+                 dst.copy_from_slice(src);
+             }
+-            GpuClusterableObjects::Storage(buffer) => {
++            GpuClusteredLights::Storage(buffer) => {
+                 buffer.get_mut().data.clear();
+                 buffer.get_mut().data.append(&mut clusterable_objects);
+             }
+@@ -207,10 +256,10 @@ impl GpuClusterableObjects {
+         render_queue: &RenderQueue,
+     ) {
+         match self {
+-            GpuClusterableObjects::Uniform(buffer) => {
++            GpuClusteredLights::Uniform(buffer) => {
+                 buffer.write_buffer(render_device, render_queue);
+             }
+-            GpuClusterableObjects::Storage(buffer) => {
++            GpuClusteredLights::Storage(buffer) => {
+                 buffer.write_buffer(render_device, render_queue);
+             }
+         }
+@@ -218,25 +267,23 @@ impl GpuClusterableObjects {
+ 
+     pub fn binding(&self) -> Option<BindingResource<'_>> {
+         match self {
+-            GpuClusterableObjects::Uniform(buffer) => buffer.binding(),
+-            GpuClusterableObjects::Storage(buffer) => buffer.binding(),
++            GpuClusteredLights::Uniform(buffer) => buffer.binding(),
++            GpuClusteredLights::Storage(buffer) => buffer.binding(),
+         }
+     }
+ 
+     pub fn min_size(buffer_binding_type: BufferBindingType) -> NonZero<u64> {
+         match buffer_binding_type {
+-            BufferBindingType::Storage { .. } => GpuClusterableObjectsStorage::min_size(),
+-            BufferBindingType::Uniform => GpuClusterableObjectsUniform::min_size(),
++            BufferBindingType::Storage { .. } => GpuClusteredLightsStorage::min_size(),
++            BufferBindingType::Uniform => GpuClusteredLightsUniform::min_size(),
+         }
+     }
+ }
+ 
+-impl Default for GpuClusterableObjectsUniform {
++impl Default for GpuClusteredLightsUniform {
+     fn default() -> Self {
+         Self {
+-            data: Box::new(
+-                [GpuClusterableObject::default(); MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS],
+-            ),
++            data: Box::new([GpuClusteredLight::default(); MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS]),
+         }
+     }
+ }
+@@ -245,7 +292,22 @@ impl Default for GpuClusterableObjectsUniform {
+ pub fn extract_clusters(
+     mut commands: Commands,
+     views: Extract<Query<(RenderEntity, &Clusters, &Camera)>>,
+-    mapper: Extract<Query<RenderEntity>>,
++    mapper: Extract<
++        Query<
++            (
++                Option<&RenderEntity>,
++                Has<EnvironmentMapLight>,
++                Has<IrradianceVolume>,
++                Has<ClusteredDecal>,
++            ),
++            Or<(
++                With<PointLight>,
++                With<SpotLight>,
++                With<LightProbe>,
++                With<ClusteredDecal>,
++            )>,
++        >,
++    >,
+ ) {
+     for (entity, clusters, camera) in &views {
+         let mut entity_commands = commands
+@@ -256,20 +318,41 @@ pub fn extract_clusters(
+             continue;
+         }
+ 
+-        let entity_count: usize = clusters
+-            .clusterable_objects
+-            .iter()
+-            .map(|l| l.entities.len())
+-            .sum();
+-        let mut data = Vec::with_capacity(clusters.clusterable_objects.len() + entity_count);
++        let mut data = vec![];
+         for cluster_objects in &clusters.clusterable_objects {
+             data.push(ExtractedClusterableObjectElement::ClusterHeader(
+                 cluster_objects.counts,
+             ));
+-            for clusterable_entity in &cluster_objects.entities {
+-                if let Ok(entity) = mapper.get(*clusterable_entity) {
+-                    data.push(ExtractedClusterableObjectElement::ClusterableObjectEntity(
+-                        entity,
++            for clusterable_entity in cluster_objects.iter() {
++                let Ok((
++                    maybe_render_entity,
++                    is_reflection_probe,
++                    is_irradiance_volume,
++                    is_clustered_decal,
++                )) = mapper.get(*clusterable_entity)
++                else {
++                    error!(
++                        "Couldn't find clustered object {:?} in the main world",
++                        clusterable_entity
++                    );
++                    continue;
++                };
++
++                if let Some(render_entity) = maybe_render_entity {
++                    if is_clustered_decal {
++                        data.push(ExtractedClusterableObjectElement::Decal(**render_entity));
++                    } else {
++                        data.push(ExtractedClusterableObjectElement::Light(**render_entity));
++                    }
++                }
++                if is_reflection_probe {
++                    data.push(ExtractedClusterableObjectElement::ReflectionProbe(
++                        MainEntity::from(*clusterable_entity),
++                    ));
++                }
++                if is_irradiance_volume {
++                    data.push(ExtractedClusterableObjectElement::IrradianceVolume(
++                        MainEntity::from(*clusterable_entity),
+                     ));
+                 }
+             }
+@@ -292,14 +375,19 @@ pub fn prepare_clusters(
+     render_queue: Res<RenderQueue>,
+     mesh_pipeline: Res<MeshPipeline>,
+     global_clusterable_object_meta: Res<GlobalClusterableObjectMeta>,
+-    views: Query<(Entity, &ExtractedClusterableObjects)>,
++    views: Query<(
++        Entity,
++        &ExtractedClusterableObjects,
++        Option<&RenderViewLightProbes<EnvironmentMapLight>>,
++        Option<&RenderViewLightProbes<IrradianceVolume>>,
++    )>,
+ ) {
+     let render_device = render_device.into_inner();
+     let supports_storage_buffers = matches!(
+         mesh_pipeline.clustered_forward_buffer_binding_type,
+         BufferBindingType::Storage { .. }
+     );
+-    for (entity, extracted_clusters) in &views {
++    for (entity, extracted_clusters, maybe_environment_maps, maybe_irradiance_volumes) in &views {
+         let mut view_clusters_bindings =
+             ViewClusterBindings::new(mesh_pipeline.clustered_forward_buffer_binding_type);
+         view_clusters_bindings.clear();
+@@ -310,7 +398,9 @@ pub fn prepare_clusters(
+                     let offset = view_clusters_bindings.n_indices();
+                     view_clusters_bindings.push_offset_and_counts(offset, counts);
+                 }
+-                ExtractedClusterableObjectElement::ClusterableObjectEntity(entity) => {
++
++                ExtractedClusterableObjectElement::Light(entity)
++                | ExtractedClusterableObjectElement::Decal(entity) => {
+                     if let Some(clusterable_object_index) =
+                         global_clusterable_object_meta.entity_to_index.get(entity)
+                     {
+@@ -324,6 +414,54 @@ pub fn prepare_clusters(
+                             break;
+                         }
+                         view_clusters_bindings.push_index(*clusterable_object_index);
++                    } else {
++                        // This should never happen. The appropriate systems
++                        // should have populated
++                        // `global_clusterable_object_meta` by now.
++                        error!(
++                            "Clustered light or decal {:?} had no assigned index!",
++                            entity
++                        );
++                        view_clusters_bindings.push_dummy_index();
++                    }
++                }
++
++                ExtractedClusterableObjectElement::ReflectionProbe(main_entity) => {
++                    match maybe_environment_maps.and_then(|environment_maps| {
++                        environment_maps
++                            .main_entity_to_render_light_probe_index
++                            .get(main_entity)
++                    }) {
++                        Some(render_light_probe_index) => {
++                            view_clusters_bindings.push_index(*render_light_probe_index as usize);
++                        }
++                        None => {
++                            // This can happen while the reflection probe is loading.
++                            trace!(
++                                "Clustered reflection probe {:?} had no assigned index",
++                                main_entity,
++                            );
++                            view_clusters_bindings.push_dummy_index();
++                        }
++                    }
++                }
++
++                ExtractedClusterableObjectElement::IrradianceVolume(main_entity) => {
++                    match maybe_irradiance_volumes.and_then(|irradiance_volumes| {
++                        irradiance_volumes
++                            .main_entity_to_render_light_probe_index
++                            .get(main_entity)
++                    }) {
++                        Some(render_light_probe_index) => {
++                            view_clusters_bindings.push_index(*render_light_probe_index as usize);
++                        }
++                        None => {
++                            trace!(
++                                "Clustered irradiance volume {:?} had no assigned index",
++                                main_entity
++                            );
++                            view_clusters_bindings.push_dummy_index();
++                        }
+                     }
+                 }
+             }
+@@ -409,7 +547,9 @@ impl ViewClusterBindings {
+         self.n_indices
+     }
+ 
+-    pub fn push_index(&mut self, index: usize) {
++    // An internal helper method that pushes a raw clustered object index to the
++    // GPU buffer.
++    fn push_raw_index(&mut self, index: u32) {
+         match &mut self.buffers {
+             ViewClusterBuffers::Uniform {
+                 clusterable_object_index_lists,
+@@ -418,7 +558,6 @@ impl ViewClusterBindings {
+                 let array_index = self.n_indices >> 4; // >> 4 is equivalent to / 16
+                 let component = (self.n_indices >> 2) & ((1 << 2) - 1);
+                 let sub_index = self.n_indices & ((1 << 2) - 1);
+-                let index = index as u32;
+ 
+                 clusterable_object_index_lists.get_mut().data[array_index][component] |=
+                     index << (8 * sub_index);
+@@ -427,16 +566,26 @@ impl ViewClusterBindings {
+                 clusterable_object_index_lists,
+                 ..
+             } => {
+-                clusterable_object_index_lists
+-                    .get_mut()
+-                    .data
+-                    .push(index as u32);
++                clusterable_object_index_lists.get_mut().data.push(index);
+             }
+         }
+ 
+         self.n_indices += 1;
+     }
+ 
++    /// Pushes the index of a clustered object to the GPU buffer.
++    pub fn push_index(&mut self, index: usize) {
++        self.push_raw_index(index as u32);
++    }
++
++    /// Pushes a placeholder -1 index to the GPU buffer.
++    ///
++    /// This is used when processing reflection probes and irradiance volumes
++    /// that haven't loaded yet.
++    pub fn push_dummy_index(&mut self) {
++        self.push_raw_index(!0);
++    }
++
+     pub fn write_buffers(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
+         match &mut self.buffers {
+             ViewClusterBuffers::Uniform {
+diff --git a/crates/bevy_pbr/src/light_probe/environment_map.rs b/crates/bevy_pbr/src/light_probe/environment_map.rs
+index ba6e0cb93d394..9a60b1c1a70c8 100644
+--- a/crates/bevy_pbr/src/light_probe/environment_map.rs
++++ b/crates/bevy_pbr/src/light_probe/environment_map.rs
+@@ -182,6 +182,7 @@ impl<'a> RenderViewEnvironmentMapBindGroupEntries<'a> {
+         render_adapter: &RenderAdapter,
+     ) -> RenderViewEnvironmentMapBindGroupEntries<'a> {
+         if binding_arrays_are_usable(render_device, render_adapter) {
++            // Initialize the diffuse and specular texture views with the fallback texture.
+             let mut diffuse_texture_views = vec![];
+             let mut specular_texture_views = vec![];
+             let mut sampler = None;
+@@ -298,15 +299,19 @@ impl LightProbeComponent for EnvironmentMapLight {
+                 image_assets.get(specular_map_handle),
+             )
+         {
+-            render_view_light_probes.view_light_probe_info = EnvironmentMapViewLightProbeInfo {
+-                cubemap_index: render_view_light_probes.get_or_insert_cubemap(&EnvironmentMapIds {
+-                    diffuse: diffuse_map_handle.id(),
+-                    specular: specular_map_handle.id(),
+-                }) as i32,
+-                smallest_specular_mip_level: specular_map.texture_descriptor.mip_level_count - 1,
+-                intensity: *intensity,
+-                affects_lightmapped_mesh_diffuse: *affects_lightmapped_mesh_diffuse,
+-            };
++            render_view_light_probes.view_light_probe_info =
++                Some(EnvironmentMapViewLightProbeInfo {
++                    cubemap_index: render_view_light_probes.get_or_insert_cubemap(
++                        &EnvironmentMapIds {
++                            diffuse: diffuse_map_handle.id(),
++                            specular: specular_map_handle.id(),
++                        },
++                    ) as i32,
++                    smallest_specular_mip_level: specular_map.texture_descriptor.mip_level_count
++                        - 1,
++                    intensity: *intensity,
++                    affects_lightmapped_mesh_diffuse: *affects_lightmapped_mesh_diffuse,
++                });
+         };
+ 
+         render_view_light_probes
+diff --git a/crates/bevy_pbr/src/light_probe/environment_map.wgsl b/crates/bevy_pbr/src/light_probe/environment_map.wgsl
+index 53904e6cf03c5..8d12f917ef427 100644
+--- a/crates/bevy_pbr/src/light_probe/environment_map.wgsl
++++ b/crates/bevy_pbr/src/light_probe/environment_map.wgsl
+@@ -104,6 +104,12 @@ fn compute_radiances(
+     if (query_result.texture_index < 0) {
+         query_result.texture_index = light_probes.view_cubemap_index;
+         query_result.intensity = light_probes.intensity_for_view;
++        query_result.light_from_world = mat4x4(
++            vec4(1.0, 0.0, 0.0, 0.0),
++            vec4(0.0, 1.0, 0.0, 0.0),
++            vec4(0.0, 0.0, 1.0, 0.0),
++            vec4(0.0, 0.0, 0.0, 1.0)
++        );
+         if light_probes.view_environment_map_affects_lightmapped_mesh_diffuse != 0u {
+             query_result.flags = LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE;
+         } else {
+diff --git a/crates/bevy_pbr/src/light_probe/light_probe.wgsl b/crates/bevy_pbr/src/light_probe/light_probe.wgsl
+index d283987eb6a37..ac89cfc2fdbd9 100644
+--- a/crates/bevy_pbr/src/light_probe/light_probe.wgsl
++++ b/crates/bevy_pbr/src/light_probe/light_probe.wgsl
+@@ -68,6 +68,13 @@ fn query_light_probe(
+         let light_probe_index = i32(clustered_forward::get_clusterable_object_id(
+             light_probe_index_offset));
+ 
++        // FIXME: This happens when one or more images for the light probe
++        // aren't loaded yet. Really, though, we shouldn't be clustering such
++        // objects at all.
++        if (light_probe_index < 0) {
++            continue;
++        }
++
+         var light_probe: LightProbe;
+         if is_irradiance_volume {
+             light_probe = light_probes.irradiance_volumes[light_probe_index];
+diff --git a/crates/bevy_pbr/src/light_probe/mod.rs b/crates/bevy_pbr/src/light_probe/mod.rs
+index f214bb599bd23..27fbc1346ba0c 100644
+--- a/crates/bevy_pbr/src/light_probe/mod.rs
++++ b/crates/bevy_pbr/src/light_probe/mod.rs
+@@ -2,10 +2,7 @@
+ 
+ use bevy_app::{App, Plugin};
+ use bevy_asset::AssetId;
+-use bevy_camera::{
+-    primitives::{Aabb, Frustum},
+-    Camera3d,
+-};
++use bevy_camera::Camera3d;
+ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::{
+     component::Component,
+@@ -16,8 +13,10 @@ use bevy_ecs::{
+     system::{Commands, Local, Query, Res, ResMut},
+ };
+ use bevy_image::Image;
+-use bevy_light::{EnvironmentMapLight, IrradianceVolume, LightProbe};
+-use bevy_math::{Affine3A, FloatOrd, Mat4, Vec3A, Vec4};
++use bevy_light::{
++    cluster::VisibleClusterableObjects, EnvironmentMapLight, IrradianceVolume, LightProbe,
++};
++use bevy_math::{Affine3A, FloatOrd, Mat4, Vec4};
+ use bevy_platform::collections::HashMap;
+ use bevy_render::{
+     extract_instances::ExtractInstancesPlugin,
+@@ -25,7 +24,7 @@ use bevy_render::{
+     render_resource::{DynamicUniformBuffer, Sampler, ShaderType, TextureView},
+     renderer::{RenderAdapter, RenderAdapterInfo, RenderDevice, RenderQueue, WgpuWrapper},
+     settings::WgpuFeatures,
+-    sync_world::RenderEntity,
++    sync_world::{MainEntity, MainEntityHashMap, RenderEntity},
+     texture::{FallbackImage, GpuImage},
+     view::ExtractedView,
+     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+@@ -35,10 +34,11 @@ use bevy_transform::{components::Transform, prelude::GlobalTransform};
+ use bitflags::bitflags;
+ use tracing::error;
+ 
+-use core::{hash::Hash, ops::Deref};
++use core::{any::TypeId, hash::Hash, ops::Deref};
+ 
+ use crate::{
+-    generate::EnvironmentMapGenerationPlugin, light_probe::environment_map::EnvironmentMapIds,
++    extract_clusters, generate::EnvironmentMapGenerationPlugin,
++    light_probe::environment_map::EnvironmentMapIds,
+ };
+ 
+ pub mod environment_map;
+@@ -143,6 +143,9 @@ struct LightProbeInfo<C>
+ where
+     C: LightProbeComponent,
+ {
++    // The entity of the light probe in the main world.
++    main_entity: MainEntity,
++
+     // The transform from world space to light probe space.
+     // Stored as the transpose of the inverse transform to compress the structure
+     // on the GPU (from 4 `Vec4`s to 3 `Vec4`s). The shader will transpose it
+@@ -217,6 +220,10 @@ where
+     /// array.
+     render_light_probes: Vec<RenderLightProbe>,
+ 
++    /// A mapping from the main world entity to the index in
++    /// `render_light_probes`.
++    pub main_entity_to_render_light_probe_index: MainEntityHashMap<u32>,
++
+     /// Information needed to render the light probe attached directly to the
+     /// view, if applicable.
+     ///
+@@ -224,7 +231,7 @@ where
+     /// probe that affects all objects not in the bounding region of any light
+     /// probe. Currently, the only light probe type that supports this is the
+     /// [`EnvironmentMapLight`].
+-    view_light_probe_info: C::ViewLightProbeInfo,
++    view_light_probe_info: Option<C::ViewLightProbeInfo>,
+ }
+ 
+ /// A trait implemented by all components that represent light probes.
+@@ -329,8 +336,14 @@ impl Plugin for LightProbePlugin {
+             .init_resource::<LightProbesBuffer>()
+             .init_resource::<EnvironmentMapUniformBuffer>()
+             .add_systems(ExtractSchedule, gather_environment_map_uniform)
+-            .add_systems(ExtractSchedule, gather_light_probes::<EnvironmentMapLight>)
+-            .add_systems(ExtractSchedule, gather_light_probes::<IrradianceVolume>)
++            .add_systems(
++                ExtractSchedule,
++                gather_light_probes::<EnvironmentMapLight>.before(extract_clusters),
++            )
++            .add_systems(
++                ExtractSchedule,
++                gather_light_probes::<IrradianceVolume>.before(extract_clusters),
++            )
+             .add_systems(
+                 Render,
+                 (upload_light_probes, prepare_environment_uniform_buffer)
+@@ -368,36 +381,59 @@ fn gather_environment_map_uniform(
+ /// to views, performing frustum culling and distance sorting in the process.
+ fn gather_light_probes<C>(
+     image_assets: Res<RenderAssets<GpuImage>>,
+-    light_probe_query: Extract<Query<(&GlobalTransform, &C, C::QueryData), With<LightProbe>>>,
++    light_probe_query: Extract<
++        Query<(Entity, &GlobalTransform, &C, C::QueryData), With<LightProbe>>,
++    >,
+     view_query: Extract<
+-        Query<(RenderEntity, &GlobalTransform, &Frustum, Option<&C>), With<Camera3d>>,
++        Query<
++            (
++                RenderEntity,
++                &GlobalTransform,
++                &VisibleClusterableObjects,
++                Option<&C>,
++            ),
++            With<Camera3d>,
++        >,
+     >,
+-    mut reflection_probes: Local<Vec<LightProbeInfo<C>>>,
+-    mut view_reflection_probes: Local<Vec<LightProbeInfo<C>>>,
++    mut view_light_probe_info: Local<Vec<LightProbeInfo<C>>>,
+     mut commands: Commands,
+ ) where
+     C: LightProbeComponent,
+ {
+-    // Create [`LightProbeInfo`] for every light probe in the scene.
+-    reflection_probes.clear();
+-    reflection_probes.extend(
+-        light_probe_query
+-            .iter()
+-            .filter_map(|query_row| LightProbeInfo::new(query_row, &image_assets)),
+-    );
+     // Build up the light probes uniform and the key table.
+-    for (view_entity, view_transform, view_frustum, view_component) in view_query.iter() {
+-        // Cull light probes outside the view frustum.
+-        view_reflection_probes.clear();
+-        view_reflection_probes.extend(
+-            reflection_probes
+-                .iter()
+-                .filter(|light_probe_info| light_probe_info.frustum_cull(view_frustum))
+-                .cloned(),
+-        );
++    for (view_entity, view_transform, visible_clusterable_objects, view_component) in
++        view_query.iter()
++    {
++        view_light_probe_info.clear();
++        view_light_probe_info.reserve(visible_clusterable_objects.light_probes.len());
++        if let Some(visible_light_probes) = visible_clusterable_objects
++            .light_probes
++            .get(&TypeId::of::<C>())
++        {
++            for &main_entity in visible_light_probes {
++                let Ok(query_row) = light_probe_query.get(main_entity) else {
++                    // This should never happen. `assign_objects_to_clusters`
++                    // should use a light probe query that matches exactly the
++                    // same set of entities as our `light_probe_query`.
++                    error!(
++                        "Clustering shouldn't have clustered light probe {:?}",
++                        main_entity
++                    );
++                    continue;
++                };
++                // If we don't successfully create `LightProbeInfo`, that means
++                // the light probe hasn't loaded yet. We don't add such light
++                // probes to `view_light_probe_info` so that they don't waste
++                // space in the GPU light probe buffer, which has a limited
++                // size.
++                if let Some(light_probe_info) = LightProbeInfo::new(query_row, &image_assets) {
++                    view_light_probe_info.push(light_probe_info);
++                }
++            }
++        }
+ 
+         // Sort by distance to camera.
+-        view_reflection_probes.sort_by_cached_key(|light_probe_info| {
++        view_light_probe_info.sort_by_cached_key(|light_probe_info| {
+             light_probe_info.camera_distance_sort_key(view_transform)
+         });
+ 
+@@ -406,7 +442,7 @@ fn gather_light_probes<C>(
+             C::create_render_view_light_probes(view_component, &image_assets);
+ 
+         // Gather up the light probes in the list.
+-        render_view_light_probes.maybe_gather_light_probes(&view_reflection_probes);
++        render_view_light_probes.maybe_gather_light_probes(&view_light_probe_info);
+ 
+         // Record the per-view light probes.
+         if render_view_light_probes.is_empty() {
+@@ -487,6 +523,8 @@ fn upload_light_probes(
+ 
+         // Initialize the uniform with only the view environment map, if there
+         // is one.
++        let maybe_view_light_probe_info =
++            render_view_environment_maps.and_then(|maps| maps.view_light_probe_info.as_ref());
+         let mut light_probes_uniform = LightProbesUniform {
+             reflection_probes: [RenderLightProbe::default(); MAX_VIEW_LIGHT_PROBES],
+             irradiance_volumes: [RenderLightProbe::default(); MAX_VIEW_LIGHT_PROBES],
+@@ -498,18 +536,25 @@ fn upload_light_probes(
+                 .map(RenderViewLightProbes::len)
+                 .unwrap_or_default()
+                 .min(MAX_VIEW_LIGHT_PROBES) as i32,
+-            view_cubemap_index: render_view_environment_maps
+-                .map(|maps| maps.view_light_probe_info.cubemap_index)
+-                .unwrap_or(-1),
+-            smallest_specular_mip_level_for_view: render_view_environment_maps
+-                .map(|maps| maps.view_light_probe_info.smallest_specular_mip_level)
+-                .unwrap_or(0),
+-            intensity_for_view: render_view_environment_maps
+-                .map(|maps| maps.view_light_probe_info.intensity)
+-                .unwrap_or(1.0),
+-            view_environment_map_affects_lightmapped_mesh_diffuse: render_view_environment_maps
+-                .map(|maps| maps.view_light_probe_info.affects_lightmapped_mesh_diffuse as u32)
+-                .unwrap_or(1),
++            view_cubemap_index: match maybe_view_light_probe_info {
++                Some(view_light_probe_info) => view_light_probe_info.cubemap_index,
++                None => -1,
++            },
++            smallest_specular_mip_level_for_view: match maybe_view_light_probe_info {
++                Some(view_light_probe_info) => view_light_probe_info.smallest_specular_mip_level,
++                None => 0,
++            },
++            intensity_for_view: match maybe_view_light_probe_info {
++                Some(view_light_probe_info) => view_light_probe_info.intensity,
++                None => 1.0,
++            },
++            view_environment_map_affects_lightmapped_mesh_diffuse: match maybe_view_light_probe_info
++            {
++                Some(view_light_probe_info) => {
++                    view_light_probe_info.affects_lightmapped_mesh_diffuse as u32
++                }
++                None => 1,
++            },
+         };
+ 
+         // Add any environment maps that [`gather_light_probes`] found to the
+@@ -562,7 +607,8 @@ where
+     /// [`LightProbeInfo`]. This is done for every light probe in the scene
+     /// every frame.
+     fn new(
+-        (light_probe_transform, environment_map, query_components): (
++        (main_entity, light_probe_transform, environment_map, query_components): (
++            Entity,
+             &GlobalTransform,
+             &C,
+             <C::QueryData as QueryData>::Item<'_, '_>,
+@@ -572,6 +618,7 @@ where
+         let light_from_world_transposed =
+             Mat4::from(light_probe_transform.affine().inverse()).transpose();
+         environment_map.id(image_assets).map(|id| LightProbeInfo {
++            main_entity: main_entity.into(),
+             world_from_light: light_probe_transform.affine(),
+             light_from_world: [
+                 light_from_world_transposed.x_axis,
+@@ -584,20 +631,6 @@ where
+         })
+     }
+ 
+-    /// Returns true if this light probe is in the viewing frustum of the camera
+-    /// or false if it isn't.
+-    fn frustum_cull(&self, view_frustum: &Frustum) -> bool {
+-        view_frustum.intersects_obb(
+-            &Aabb {
+-                center: Vec3A::default(),
+-                half_extents: Vec3A::splat(0.5),
+-            },
+-            &self.world_from_light,
+-            true,
+-            false,
+-        )
+-    }
+-
+     /// Returns the squared distance from this light probe to the camera,
+     /// suitable for distance sorting.
+     fn camera_distance_sort_key(&self, view_transform: &GlobalTransform) -> FloatOrd {
+@@ -617,19 +650,20 @@ where
+         RenderViewLightProbes {
+             binding_index_to_textures: vec![],
+             cubemap_to_binding_index: HashMap::default(),
++            main_entity_to_render_light_probe_index: HashMap::default(),
+             render_light_probes: vec![],
+-            view_light_probe_info: C::ViewLightProbeInfo::default(),
++            view_light_probe_info: None,
+         }
+     }
+ 
+     /// Returns true if there are no light probes in the list.
+     pub(crate) fn is_empty(&self) -> bool {
+-        self.binding_index_to_textures.is_empty()
++        self.render_light_probes.is_empty() && self.view_light_probe_info.is_none()
+     }
+ 
+     /// Returns the number of light probes in the list.
+     pub(crate) fn len(&self) -> usize {
+-        self.binding_index_to_textures.len()
++        self.render_light_probes.len()
+     }
+ 
+     /// Adds a cubemap to the list of bindings, if it wasn't there already, and
+@@ -664,6 +698,12 @@ where
+             // Determine the index of the cubemap in the binding array.
+             let cubemap_index = self.get_or_insert_cubemap(&light_probe.asset_id);
+ 
++            // Assign an ID, and write in the index.
++            let render_light_probe_index = self.render_light_probes.len() as u32;
++            debug_assert!((render_light_probe_index as usize) < MAX_VIEW_LIGHT_PROBES);
++            self.main_entity_to_render_light_probe_index
++                .insert(light_probe.main_entity, render_light_probe_index);
++
+             // Write in the light probe data.
+             self.render_light_probes.push(RenderLightProbe {
+                 light_from_world_transposed: light_probe.light_from_world,
+@@ -681,6 +721,7 @@ where
+ {
+     fn clone(&self) -> Self {
+         Self {
++            main_entity: self.main_entity,
+             light_from_world: self.light_from_world,
+             world_from_light: self.world_from_light,
+             intensity: self.intensity,
+diff --git a/crates/bevy_pbr/src/render/clustered_forward.wgsl b/crates/bevy_pbr/src/render/clustered_forward.wgsl
+index aa3fb4f199b1f..30af387c2d059 100644
+--- a/crates/bevy_pbr/src/render/clustered_forward.wgsl
++++ b/crates/bevy_pbr/src/render/clustered_forward.wgsl
+@@ -121,7 +121,7 @@ fn unpack_clusterable_object_index_ranges(cluster_index: u32) -> ClusterableObje
+ // Returns the index of the clusterable object at the given offset.
+ //
+ // Note that, in the case of a light probe, the index refers to an element in
+-// one of the two `light_probes` sublists, not the `clusterable_objects` list.
++// one of the two `light_probes` sublists, not the `clustered_lights` list.
+ fn get_clusterable_object_id(index: u32) -> u32 {
+ #if AVAILABLE_STORAGE_BUFFER_BINDINGS >= 3
+     return bindings::clusterable_object_index_lists.data[index];
+diff --git a/crates/bevy_pbr/src/render/light.rs b/crates/bevy_pbr/src/render/light.rs
+index 25a9e2e4c188c..37c49fdd058b1 100644
+--- a/crates/bevy_pbr/src/render/light.rs
++++ b/crates/bevy_pbr/src/render/light.rs
+@@ -720,7 +720,7 @@ pub fn prepare_lights(
+     mut commands: Commands,
+     mut texture_cache: ResMut<TextureCache>,
+     (render_device, render_queue): (Res<RenderDevice>, Res<RenderQueue>),
+-    mut global_light_meta: ResMut<GlobalClusterableObjectMeta>,
++    mut global_clusterable_object_meta: ResMut<GlobalClusterableObjectMeta>,
+     mut light_meta: ResMut<LightMeta>,
+     views: Query<
+         (
+@@ -773,7 +773,7 @@ pub fn prepare_lights(
+         .map(|CubeMapFace { target, up }| Transform::IDENTITY.looking_at(*target, *up))
+         .collect::<Vec<_>>();
+ 
+-    global_light_meta.entity_to_index.clear();
++    global_clusterable_object_meta.entity_to_index.clear();
+ 
+     let mut point_lights: Vec<_> = point_lights.iter().collect::<Vec<_>>();
+     let mut directional_lights: Vec<_> = directional_lights.iter().collect::<Vec<_>>();
+@@ -892,13 +892,13 @@ pub fn prepare_lights(
+         (light.volumetric, light.shadow_maps_enabled, *entity)
+     });
+ 
+-    if global_light_meta.entity_to_index.capacity() < point_lights.len() {
+-        global_light_meta
++    if global_clusterable_object_meta.entity_to_index.capacity() < point_lights.len() {
++        global_clusterable_object_meta
+             .entity_to_index
+             .reserve(point_lights.len());
+     }
+ 
+-    let mut gpu_point_lights = Vec::new();
++    let mut gpu_clustered_lights = Vec::new();
+     for (index, &(entity, _, light, _)) in point_lights.iter().enumerate() {
+         let mut flags = PointLightFlags::NONE;
+ 
+@@ -965,7 +965,7 @@ pub fn prepare_lights(
+             }
+         };
+ 
+-        gpu_point_lights.push(GpuClusterableObject {
++        gpu_clustered_lights.push(GpuClusteredLight {
+             light_custom_data,
+             // premultiply color by intensity
+             // we don't use the alpha at all, so no reason to multiply only [0..3]
+@@ -991,7 +991,13 @@ pub fn prepare_lights(
+                 0.0
+             },
+         });
+-        global_light_meta.entity_to_index.insert(entity, index);
++        global_clusterable_object_meta
++            .entity_to_index
++            .insert(entity, index);
++        debug_assert_eq!(
++            global_clusterable_object_meta.entity_to_index.len(),
++            gpu_clustered_lights.len()
++        );
+     }
+ 
+     // iterate the views once to find the maximum number of cascade shadowmaps we will need
+@@ -1027,11 +1033,11 @@ pub fn prepare_lights(
+             .min(max_texture_array_layers);
+     }
+ 
+-    global_light_meta
+-        .gpu_clusterable_objects
+-        .set(gpu_point_lights);
+-    global_light_meta
+-        .gpu_clusterable_objects
++    global_clusterable_object_meta
++        .gpu_clustered_lights
++        .set(gpu_clustered_lights);
++    global_clusterable_object_meta
++        .gpu_clustered_lights
+         .write_buffer(&render_device, &render_queue);
+ 
+     live_shadow_mapping_lights.clear();
+@@ -1285,7 +1291,7 @@ pub fn prepare_lights(
+                 continue;
+             }
+ 
+-            let light_index = *global_light_meta
++            let light_index = *global_clusterable_object_meta
+                 .entity_to_index
+                 .get(&light_entity)
+                 .unwrap();
+diff --git a/crates/bevy_pbr/src/render/mesh_view_bindings.rs b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+index 579e6517e57f8..77fdc3d45525d 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_bindings.rs
++++ b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+@@ -49,7 +49,7 @@ use crate::{
+     prepass,
+     resources::{AtmosphereBuffer, AtmosphereData, AtmosphereSampler, AtmosphereTextures},
+     Bluenoise, EnvironmentMapUniformBuffer, ExtractedAtmosphere, FogMeta,
+-    GlobalClusterableObjectMeta, GpuClusterableObjects, GpuFog, GpuLights, LightMeta,
++    GlobalClusterableObjectMeta, GpuClusteredLights, GpuFog, GpuLights, LightMeta,
+     LightProbesBuffer, LightProbesUniform, MeshPipeline, MeshPipelineKey, RenderViewLightProbes,
+     ScreenSpaceAmbientOcclusionResources, ScreenSpaceReflectionsBuffer,
+     ScreenSpaceReflectionsUniform, ShadowSamplers, ViewClusterBindings, ViewShadowBindings,
+@@ -300,7 +300,7 @@ fn layout_entries(
+                 buffer_layout(
+                     clustered_forward_buffer_binding_type,
+                     false,
+-                    Some(GpuClusterableObjects::min_size(
++                    Some(GpuClusteredLights::min_size(
+                         clustered_forward_buffer_binding_type,
+                     )),
+                 ),
+@@ -593,7 +593,10 @@ pub fn prepare_mesh_view_bind_groups(
+     ),
+     mesh_pipeline: Res<MeshPipeline>,
+     shadow_samplers: Res<ShadowSamplers>,
+-    (light_meta, global_light_meta): (Res<LightMeta>, Res<GlobalClusterableObjectMeta>),
++    (light_meta, global_clusterable_object_meta): (
++        Res<LightMeta>,
++        Res<GlobalClusterableObjectMeta>,
++    ),
+     fog_meta: Res<FogMeta>,
+     (view_uniforms, environment_map_uniform): (Res<ViewUniforms>, Res<EnvironmentMapUniformBuffer>),
+     views: Query<(
+@@ -649,7 +652,9 @@ pub fn prepare_mesh_view_bind_groups(
+     ) = (
+         view_uniforms.uniforms.binding(),
+         light_meta.view_gpu_lights.binding(),
+-        global_light_meta.gpu_clusterable_objects.binding(),
++        global_clusterable_object_meta
++            .gpu_clustered_lights
++            .binding(),
+         globals_buffer.buffer.binding(),
+         fog_meta.gpu_fogs.binding(),
+         light_probes_buffer.binding(),
+diff --git a/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl b/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl
+index 8309b49db4bb7..070a992d1e86c 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_view_bindings.wgsl
+@@ -29,12 +29,12 @@
+ #endif  // PCSS_SAMPLERS_AVAILABLE
+ 
+ #if AVAILABLE_STORAGE_BUFFER_BINDINGS >= 3
+-@group(0) @binding(8) var<storage> clusterable_objects: types::ClusterableObjects;
+-@group(0) @binding(9) var<storage> clusterable_object_index_lists: types::ClusterLightIndexLists;
++@group(0) @binding(8) var<storage> clustered_lights: types::ClusteredLights;
++@group(0) @binding(9) var<storage> clusterable_object_index_lists: types::ClusterableObjectIndexLists;
+ @group(0) @binding(10) var<storage> cluster_offsets_and_counts: types::ClusterOffsetsAndCounts;
+ #else
+-@group(0) @binding(8) var<uniform> clusterable_objects: types::ClusterableObjects;
+-@group(0) @binding(9) var<uniform> clusterable_object_index_lists: types::ClusterLightIndexLists;
++@group(0) @binding(8) var<uniform> clustered_lights: types::ClusteredLights;
++@group(0) @binding(9) var<uniform> clusterable_object_index_lists: types::ClusterableObjectIndexLists;
+ @group(0) @binding(10) var<uniform> cluster_offsets_and_counts: types::ClusterOffsetsAndCounts;
+ #endif
+ 
+diff --git a/crates/bevy_pbr/src/render/mesh_view_types.wgsl b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+index 395f886488f4c..c09948c2100dd 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_types.wgsl
++++ b/crates/bevy_pbr/src/render/mesh_view_types.wgsl
+@@ -1,6 +1,6 @@
+ #define_import_path bevy_pbr::mesh_view_types
+ 
+-struct ClusterableObject {
++struct ClusteredLight {
+     // For point lights: the lower-right 2x2 values of the projection matrix [2][2] [2][3] [3][2] [3][3]
+     // For spot lights: the direction (x,z), spot_scale and spot_offset
+     light_custom_data: vec4<f32>,
+@@ -99,25 +99,25 @@ const FOG_MODE_EXPONENTIAL_SQUARED: u32   = 3u;
+ const FOG_MODE_ATMOSPHERIC: u32           = 4u;
+ 
+ #if AVAILABLE_STORAGE_BUFFER_BINDINGS >= 3
+-struct ClusterableObjects {
+-    data: array<ClusterableObject>,
++struct ClusteredLights {
++    data: array<ClusteredLight>,
+ };
+-struct ClusterLightIndexLists {
++struct ClusterableObjectIndexLists {
+     data: array<u32>,
+ };
+ struct ClusterOffsetsAndCounts {
+     data: array<array<vec4<u32>, 2>>,
+ };
+ #else
+-struct ClusterableObjects {
+-    data: array<ClusterableObject, 204u>,
++struct ClusteredLights {
++    data: array<ClusteredLight, 204u>,
+ };
+-struct ClusterLightIndexLists {
++struct ClusterableObjectIndexLists {
+     // each u32 contains 4 u8 indices into the ClusterableObjects array
+     data: array<vec4<u32>, 1024u>,
+ };
+ struct ClusterOffsetsAndCounts {
+-    // each u32 contains a 24-bit index into ClusterLightIndexLists in the high 24 bits
++    // each u32 contains a 24-bit index into ClusterableObjectIndexLists in the high 24 bits
+     // and an 8-bit count of the number of lights in the low 8 bits
+     data: array<vec4<u32>, 1024u>,
+ };
+diff --git a/crates/bevy_pbr/src/render/pbr_functions.wgsl b/crates/bevy_pbr/src/render/pbr_functions.wgsl
+index 20ffcd8b225e4..f125e044b0d92 100644
+--- a/crates/bevy_pbr/src/render/pbr_functions.wgsl
++++ b/crates/bevy_pbr/src/render/pbr_functions.wgsl
+@@ -455,7 +455,7 @@ fn apply_pbr_lighting(
+         // requested, to avoid double-counting light.
+ #ifdef LIGHTMAP
+         let enable_diffuse =
+-            (view_bindings::clusterable_objects.data[light_id].flags &
++            (view_bindings::clustered_lights.data[light_id].flags &
+                 mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
+ #else   // LIGHTMAP
+         let enable_diffuse = true;
+@@ -463,15 +463,15 @@ fn apply_pbr_lighting(
+ 
+         var shadow: f32 = 1.0;
+         if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+-                && (view_bindings::clusterable_objects.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
++                && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+             shadow = shadows::fetch_point_shadow(light_id, in.world_position, in.world_normal, in.frag_coord.xy);
+         }
+ 
+ #ifdef DEPTH_PREPASS
+         if contact_shadow_enabled && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
+-                (view_bindings::clusterable_objects.data[light_id].flags &
++                (view_bindings::clustered_lights.data[light_id].flags &
+                     mesh_view_types::POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT) != 0u {
+-            let L = normalize(view_bindings::clusterable_objects.data[light_id].position_radius.xyz - in.world_position.xyz);
++            let L = normalize(view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz);
+             shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps);
+         }
+ #endif
+@@ -491,7 +491,7 @@ fn apply_pbr_lighting(
+         // F0 = vec3<f32>(0.0)
+         var transmitted_shadow: f32 = 1.0;
+         if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
+-                && (view_bindings::clusterable_objects.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
++                && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+             transmitted_shadow = shadows::fetch_point_shadow(light_id, diffuse_transmissive_lobe_world_position, -in.world_normal, in.frag_coord.xy);
+         }
+ 
+@@ -511,7 +511,7 @@ fn apply_pbr_lighting(
+         // requested, to avoid double-counting light.
+ #ifdef LIGHTMAP
+         let enable_diffuse =
+-            (view_bindings::clusterable_objects.data[light_id].flags &
++            (view_bindings::clustered_lights.data[light_id].flags &
+                 mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
+ #else   // LIGHTMAP
+         let enable_diffuse = true;
+@@ -519,22 +519,22 @@ fn apply_pbr_lighting(
+ 
+         var shadow: f32 = 1.0;
+         if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+-                && (view_bindings::clusterable_objects.data[light_id].flags &
++                && (view_bindings::clustered_lights.data[light_id].flags &
+                     mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+             shadow = shadows::fetch_spot_shadow(
+                 light_id,
+                 in.world_position,
+                 in.world_normal,
+-                view_bindings::clusterable_objects.data[light_id].shadow_map_near_z,
++                view_bindings::clustered_lights.data[light_id].shadow_map_near_z,
+                 in.frag_coord.xy,
+             );
+         }
+ 
+ #ifdef DEPTH_PREPASS
+         if contact_shadow_enabled && (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u && shadow > 0.0 &&
+-                (view_bindings::clusterable_objects.data[light_id].flags &
++                (view_bindings::clustered_lights.data[light_id].flags &
+                     mesh_view_types::POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT) != 0u {
+-            let L = normalize(view_bindings::clusterable_objects.data[light_id].position_radius.xyz - in.world_position.xyz);
++            let L = normalize(view_bindings::clustered_lights.data[light_id].position_radius.xyz - in.world_position.xyz);
+             shadow *= calculate_contact_shadow(in.world_position.xyz, in.frag_coord.xy, L, contact_shadow_steps);
+         }
+ #endif
+@@ -554,12 +554,12 @@ fn apply_pbr_lighting(
+         // F0 = vec3<f32>(0.0)
+         var transmitted_shadow: f32 = 1.0;
+         if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
+-                && (view_bindings::clusterable_objects.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
++                && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+             transmitted_shadow = shadows::fetch_spot_shadow(
+                 light_id,
+                 diffuse_transmissive_lobe_world_position,
+                 -in.world_normal,
+-                view_bindings::clusterable_objects.data[light_id].shadow_map_near_z,
++                view_bindings::clustered_lights.data[light_id].shadow_map_near_z,
+                 in.frag_coord.xy,
+             );
+         }
+diff --git a/crates/bevy_pbr/src/render/pbr_lighting.wgsl b/crates/bevy_pbr/src/render/pbr_lighting.wgsl
+index c1d97489f267a..b69fdccb42a73 100644
+--- a/crates/bevy_pbr/src/render/pbr_lighting.wgsl
++++ b/crates/bevy_pbr/src/render/pbr_lighting.wgsl
+@@ -631,7 +631,7 @@ fn point_light(
+     let N = (*input).layers[LAYER_BASE].N;
+     let V = (*input).V;
+ 
+-    let light = &view_bindings::clusterable_objects.data[light_id];
++    let light = &view_bindings::clustered_lights.data[light_id];
+     let light_to_frag = (*light).position_radius.xyz - P;
+     let L = normalize(light_to_frag);
+     let distance_square = dot(light_to_frag, light_to_frag);
+@@ -780,7 +780,7 @@ fn spot_light(
+     // reuse the point light calculations
+     let point_light = point_light(light_id, input, enable_diffuse, false);
+ 
+-    let light = &view_bindings::clusterable_objects.data[light_id];
++    let light = &view_bindings::clustered_lights.data[light_id];
+ 
+     // reconstruct spot dir from x/z and y-direction flag
+     var spot_dir = vec3<f32>((*light).light_custom_data.x, 0.0, (*light).light_custom_data.y);
+diff --git a/crates/bevy_pbr/src/render/shadows.wgsl b/crates/bevy_pbr/src/render/shadows.wgsl
+index c7b8287f3f9b8..d10a960c221b1 100644
+--- a/crates/bevy_pbr/src/render/shadows.wgsl
++++ b/crates/bevy_pbr/src/render/shadows.wgsl
+@@ -22,7 +22,7 @@ fn fetch_point_shadow(
+     surface_normal: vec3<f32>,
+     frag_coord_xy: vec2<f32>,
+ ) -> f32 {
+-    let light = &view_bindings::clusterable_objects.data[light_id];
++    let light = &view_bindings::clustered_lights.data[light_id];
+ 
+     // because the shadow maps align with the axes and the frustum planes are at 45 degrees
+     // we can get the worldspace depth by taking the largest absolute axis
+@@ -75,7 +75,7 @@ fn fetch_spot_shadow(
+     near_z: f32,
+     frag_coord_xy: vec2<f32>,
+ ) -> f32 {
+-    let light = &view_bindings::clusterable_objects.data[light_id];
++    let light = &view_bindings::clustered_lights.data[light_id];
+ 
+     let surface_to_light = (*light).position_radius.xyz - frag_position.xyz;
+ 
+diff --git a/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl b/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl
+index aa96a832c6b24..6b6e28110d11a 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl
++++ b/crates/bevy_pbr/src/volumetric_fog/volumetric_fog.wgsl
+@@ -20,7 +20,7 @@
+ }
+ #import bevy_pbr::mesh_functions::{get_world_from_local, mesh_position_local_to_clip}
+ #import bevy_pbr::mesh_view_bindings::{
+-    globals, lights, view, clusterable_objects,
++    globals, lights, view, clustered_lights,
+     atmosphere_data, atmosphere_transmittance_texture, atmosphere_transmittance_sampler
+ }
+ #import bevy_pbr::mesh_view_types::{
+@@ -28,7 +28,6 @@
+     POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+     POINT_LIGHT_FLAGS_VOLUMETRIC_BIT,
+     POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
+-    ClusterableObject
+ }
+ #import bevy_pbr::shadow_sampling::{
+     sample_shadow_map_hardware,
+@@ -339,7 +338,7 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+             i < clusterable_object_index_ranges.first_reflection_probe_index_offset;
+             i = i + 1u) {
+         let light_id = clustering::get_clusterable_object_id(i);
+-        let light = &clusterable_objects.data[light_id];
++        let light = &clustered_lights.data[light_id];
+         if (((*light).flags & POINT_LIGHT_FLAGS_VOLUMETRIC_BIT) == 0) {
+             continue;
+         }
+@@ -423,7 +422,7 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+ }
+ 
+ fn fetch_point_shadow_without_normal(light_id: u32, frag_position: vec4<f32>, frag_coord_xy: vec2<f32>) -> f32 {
+-    let light = &clusterable_objects.data[light_id];
++    let light = &clustered_lights.data[light_id];
+ 
+     // because the shadow maps align with the axes and the frustum planes are at 45 degrees
+     // we can get the worldspace depth by taking the largest absolute axis
+@@ -456,7 +455,7 @@ fn fetch_point_shadow_without_normal(light_id: u32, frag_position: vec4<f32>, fr
+ }
+ 
+ fn fetch_spot_shadow_without_normal(light_id: u32, frag_position: vec4<f32>, frag_coord_xy: vec2<f32>) -> f32 {
+-    let light = &clusterable_objects.data[light_id];
++    let light = &clustered_lights.data[light_id];
+ 
+     let surface_to_light = (*light).position_radius.xyz - frag_position.xyz;
+ 
+diff --git a/examples/stress_tests/many_lights.rs b/examples/stress_tests/many_lights.rs
+index 73a6dcd56469d..32b81d366d95e 100644
+--- a/examples/stress_tests/many_lights.rs
++++ b/examples/stress_tests/many_lights.rs
+@@ -167,15 +167,19 @@ fn print_visible_light_count(
+     time: Res<Time>,
+     mut timer: Local<PrintingTimer>,
+     visible: Query<&ExtractedPointLight>,
+-    global_light_meta: Res<GlobalClusterableObjectMeta>,
++    global_clusterable_object_meta: Res<GlobalClusterableObjectMeta>,
+ ) {
+     timer.0.tick(time.delta());
+ 
+     if timer.0.just_finished() {
++        // Note that it's not generally a safe assumption that the number of
++        // lights equals the number of clusterable objects, since some objects
++        // other than lights are clusterable. However, in this specific example,
++        // the only clusterable objects are lights.
+         info!(
+             "Visible Lights: {}, Rendered Lights: {}",
+             visible.iter().len(),
+-            global_light_meta.entity_to_index.len()
++            global_clusterable_object_meta.entity_to_index.len()
+         );
+     }
+ }

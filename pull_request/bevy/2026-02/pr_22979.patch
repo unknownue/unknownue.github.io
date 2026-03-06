@@ -1,0 +1,175 @@
+diff --git a/crates/bevy_sprite/src/text2d.rs b/crates/bevy_sprite/src/text2d.rs
+index 18d1657dbcebb..1920adf81acb6 100644
+--- a/crates/bevy_sprite/src/text2d.rs
++++ b/crates/bevy_sprite/src/text2d.rs
+@@ -241,11 +241,10 @@ pub fn update_text2d_layout(
+ 
+         let text_changed = scale_factor != text_layout_info.scale_factor
+             || block.is_changed()
+-            || hinting.is_changed()
+             || computed.needs_rerender(viewport_size_changed, rem_size.is_changed())
+             || (!reprocess_queue.is_empty() && reprocess_queue.remove(&entity));
+ 
+-        if !(text_changed || bounds.is_changed()) {
++        if !(text_changed || bounds.is_changed() || hinting.is_changed()) {
+             continue;
+         }
+ 
+@@ -269,7 +268,6 @@ pub fn update_text2d_layout(
+                 &mut computed,
+                 &mut font_system,
+                 &mut layout_cx,
+-                *hinting,
+                 logical_viewport_size,
+                 rem_size.0,
+             ) {
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index fd5d1e2da5ef3..a6e28fc038e1e 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -55,7 +55,6 @@ impl TextPipeline {
+         computed: &mut ComputedTextBlock,
+         font_system: &mut FontCx,
+         layout_cx: &mut LayoutCx,
+-        hinting: FontHinting,
+         logical_viewport_size: Vec2,
+         base_rem_size: f32,
+     ) -> Result<(), TextError> {
+@@ -63,7 +62,6 @@ impl TextPipeline {
+         computed.needs_rerender = false;
+         computed.uses_rem_sizes = false;
+         computed.uses_viewport_sizes = false;
+-        computed.font_hinting = hinting;
+ 
+         if scale_factor <= 0.0 {
+             warn_once!("Text scale factor is <= 0.0. No text will be displayed.");
+@@ -227,7 +225,6 @@ impl TextPipeline {
+         computed: &mut ComputedTextBlock,
+         font_system: &mut FontCx,
+         layout_cx: &mut LayoutCx,
+-        hinting: FontHinting,
+         logical_viewport_size: Vec2,
+         base_rem_size: f32,
+     ) -> Result<TextMeasureInfo, TextError> {
+@@ -245,7 +242,6 @@ impl TextPipeline {
+             computed,
+             font_system,
+             layout_cx,
+-            hinting,
+             logical_viewport_size,
+             base_rem_size,
+         )?;
+@@ -282,8 +278,6 @@ impl TextPipeline {
+         let layout = &mut computed.layout;
+         layout_with_bounds(layout, bounds, justify);
+ 
+-        let hint = computed.font_hinting.should_hint();
+-
+         for (line_index, line) in layout.lines().enumerate() {
+             for item in line.items() {
+                 if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+@@ -310,6 +304,8 @@ impl TextPipeline {
+                         return Err(TextError::NoSuchFont);
+                     };
+ 
++                    let hint =
++                        hinting.should_hint() && font_smoothing == FontSmoothing::AntiAliased;
+                     let mut scaler = scale_cx
+                         .0
+                         .builder(font_ref)
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index cdc399a580489..17e9a2f86c47e 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -64,8 +64,6 @@ pub struct ComputedTextBlock {
+     // Used by dependents to determine if they should update a text block on changes to
+     // the rem size.
+     pub(crate) uses_rem_sizes: bool,
+-    /// Hinting mode to use when rasterizing glyphs for this block.
+-    pub(crate) font_hinting: FontHinting,
+ }
+ 
+ impl Debug for ComputedTextBlock {
+@@ -76,7 +74,6 @@ impl Debug for ComputedTextBlock {
+             .field("needs_rerender", &self.needs_rerender)
+             .field("uses_viewport_sizes", &self.uses_viewport_sizes)
+             .field("uses_rem_sizes", &self.uses_rem_sizes)
+-            .field("font_hinting", &self.font_hinting)
+             .finish()
+     }
+ }
+@@ -118,7 +115,6 @@ impl Default for ComputedTextBlock {
+             needs_rerender: true,
+             uses_rem_sizes: false,
+             uses_viewport_sizes: false,
+-            font_hinting: FontHinting::Disabled,
+         }
+     }
+ }
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index 99726004b542f..f8735e62b683a 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -104,9 +104,8 @@ impl Default for TextNodeFlags {
+     LineHeight,
+     TextNodeFlags,
+     ContentSize,
+-    // Disable hinting.
+-    // UI text is normally pixel-aligned, but with hinting enabled sometimes the text bounds are miscalculated slightly.
+-    FontHinting::Disabled
++    // Hinting is enabled by default as UI text is normally pixel.
++    FontHinting::Enabled
+ )]
+ pub struct Text(pub String);
+ 
+@@ -248,7 +247,6 @@ pub fn measure_text_system(
+             &mut ComputedTextBlock,
+             Ref<ComputedUiRenderTargetInfo>,
+             &ComputedNode,
+-            Ref<FontHinting>,
+         ),
+         With<Node>,
+     >,
+@@ -266,7 +264,6 @@ pub fn measure_text_system(
+         mut computed,
+         computed_target,
+         computed_node,
+-        hinting,
+     ) in &mut text_query
+     {
+         // Note: the ComputedTextBlock::needs_rerender bool is cleared in create_text_measure().
+@@ -275,8 +272,7 @@ pub fn measure_text_system(
+             < (computed_target.scale_factor() - computed_node.inverse_scale_factor.recip()).abs()
+             || computed.needs_rerender(computed_target.is_changed(), rem_size.is_changed())
+             || text_flags.needs_measure_fn
+-            || content_size.is_added()
+-            || hinting.is_changed())
++            || content_size.is_added())
+         {
+             continue;
+         }
+@@ -290,7 +286,6 @@ pub fn measure_text_system(
+             computed.as_mut(),
+             &mut font_system,
+             &mut layout_cx,
+-            *hinting,
+             computed_target.logical_size(),
+             rem_size.0,
+         ) {
+@@ -345,14 +340,14 @@ pub fn text_system(
+         &mut TextLayoutInfo,
+         &mut TextNodeFlags,
+         &mut ComputedTextBlock,
+-        &FontHinting,
++        Ref<FontHinting>,
+     )>,
+     mut scale_cx: ResMut<ScaleCx>,
+ ) {
+     for (node, block, mut text_layout_info, mut text_flags, mut computed, hinting) in
+         &mut text_query
+     {
+-        if node.is_changed() || text_flags.needs_recompute {
++        if node.is_changed() || text_flags.needs_recompute || hinting.is_changed() {
+             // Skip the text node if it is waiting for a new measure func
+             if text_flags.needs_measure_fn {
+                 continue;

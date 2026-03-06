@@ -1,0 +1,520 @@
+diff --git a/crates/bevy_camera/src/camera.rs b/crates/bevy_camera/src/camera.rs
+index 0fad8f94fe626..dff20913e65eb 100644
+--- a/crates/bevy_camera/src/camera.rs
++++ b/crates/bevy_camera/src/camera.rs
+@@ -6,12 +6,12 @@ use super::{
+ };
+ use bevy_asset::Handle;
+ use bevy_derive::Deref;
+-use bevy_ecs::{component::Component, reflect::ReflectComponent};
++use bevy_ecs::{component::Component, entity::Entity, reflect::ReflectComponent};
+ use bevy_image::Image;
+ use bevy_math::{ops, Dir3, FloatOrd, Mat4, Ray3d, Rect, URect, UVec2, Vec2, Vec3};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::{GlobalTransform, Transform};
+-use bevy_window::WindowRef;
++use bevy_window::{NormalizedWindowRef, WindowRef};
+ use core::ops::Range;
+ use derive_more::derive::From;
+ use thiserror::Error;
+@@ -809,6 +809,34 @@ impl RenderTarget {
+     }
+ }
+ 
++impl RenderTarget {
++    /// Normalize the render target down to a more concrete value, mostly used for equality comparisons.
++    pub fn normalize(&self, primary_window: Option<Entity>) -> Option<NormalizedRenderTarget> {
++        match self {
++            RenderTarget::Window(window_ref) => window_ref
++                .normalize(primary_window)
++                .map(NormalizedRenderTarget::Window),
++            RenderTarget::Image(handle) => Some(NormalizedRenderTarget::Image(handle.clone())),
++            RenderTarget::TextureView(id) => Some(NormalizedRenderTarget::TextureView(*id)),
++        }
++    }
++}
++
++/// Normalized version of the render target.
++///
++/// Once we have this we shouldn't need to resolve it down anymore.
++#[derive(Debug, Clone, Reflect, PartialEq, Eq, Hash, PartialOrd, Ord, From)]
++#[reflect(Clone, PartialEq, Hash)]
++pub enum NormalizedRenderTarget {
++    /// Window to which the camera's view is rendered.
++    Window(NormalizedWindowRef),
++    /// Image to which the camera's view is rendered.
++    Image(ImageRenderTarget),
++    /// Texture View to which the camera's view is rendered.
++    /// Useful when the texture view needs to be created outside of Bevy, for example OpenXR.
++    TextureView(ManualTextureViewHandle),
++}
++
+ /// A unique id that corresponds to a specific `ManualTextureView` in the `ManualTextureViews` collection.
+ #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Component, Reflect)]
+ #[reflect(Component, Default, Debug, PartialEq, Hash, Clone)]
+diff --git a/crates/bevy_core_pipeline/src/oit/mod.rs b/crates/bevy_core_pipeline/src/oit/mod.rs
+index f08fa2ffd701e..1a0c2f9987116 100644
+--- a/crates/bevy_core_pipeline/src/oit/mod.rs
++++ b/crates/bevy_core_pipeline/src/oit/mod.rs
+@@ -7,7 +7,7 @@ use bevy_platform::collections::HashSet;
+ use bevy_platform::time::Instant;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ use bevy_render::{
+-    camera::{Camera, ExtractedCamera, ToNormalizedRenderTarget as _},
++    camera::{Camera, ExtractedCamera},
+     extract_component::{ExtractComponent, ExtractComponentPlugin},
+     load_shader_library,
+     render_graph::{RenderGraphExt, ViewNodeRunner},
+diff --git a/crates/bevy_picking/Cargo.toml b/crates/bevy_picking/Cargo.toml
+index 9053f48188f2c..0271949e913d1 100644
+--- a/crates/bevy_picking/Cargo.toml
++++ b/crates/bevy_picking/Cargo.toml
+@@ -20,8 +20,8 @@ bevy_ecs = { path = "../bevy_ecs", version = "0.17.0-dev" }
+ bevy_input = { path = "../bevy_input", version = "0.17.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.17.0-dev" }
+ bevy_mesh = { path = "../bevy_mesh", version = "0.17.0-dev", optional = true }
++bevy_camera = { path = "../bevy_camera", version = "0.17.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.17.0-dev" }
+-bevy_render = { path = "../bevy_render", version = "0.17.0-dev" }
+ bevy_time = { path = "../bevy_time", version = "0.17.0-dev" }
+ bevy_transform = { path = "../bevy_transform", version = "0.17.0-dev" }
+ bevy_window = { path = "../bevy_window", version = "0.17.0-dev" }
+diff --git a/crates/bevy_picking/src/backend.rs b/crates/bevy_picking/src/backend.rs
+index e715d5fab2514..30e403a1129d8 100644
+--- a/crates/bevy_picking/src/backend.rs
++++ b/crates/bevy_picking/src/backend.rs
+@@ -63,7 +63,7 @@ pub struct PointerHits {
+     /// An unordered collection of entities and their distance (depth) from the cursor.
+     pub picks: Vec<(Entity, HitData)>,
+     /// Set the order of this group of picks. Normally, this is the
+-    /// [`bevy_render::camera::Camera::order`].
++    /// [`bevy_camera::Camera::order`].
+     ///
+     /// Used to allow multiple `PointerHits` submitted for the same pointer to be ordered.
+     /// `PointerHits` with a higher `order` will be checked before those with a lower `order`,
+@@ -102,7 +102,7 @@ pub struct HitData {
+     /// casted for this hit when using a raycasting backend.
+     pub camera: Entity,
+     /// `depth` only needs to be self-consistent with other [`PointerHits`]s using the same
+-    /// [`RenderTarget`](bevy_render::camera::RenderTarget). However, it is recommended to use the
++    /// [`RenderTarget`](bevy_camera::RenderTarget). However, it is recommended to use the
+     /// distance from the pointer to the hit, measured from the near plane of the camera, to the
+     /// point, in world space.
+     pub depth: f32,
+@@ -129,11 +129,11 @@ pub mod ray {
+     //! Types and systems for constructing rays from cameras and pointers.
+ 
+     use crate::backend::prelude::{PointerId, PointerLocation};
++    use bevy_camera::Camera;
+     use bevy_ecs::prelude::*;
+     use bevy_math::Ray3d;
+     use bevy_platform::collections::{hash_map::Iter, HashMap};
+     use bevy_reflect::Reflect;
+-    use bevy_render::camera::Camera;
+     use bevy_transform::prelude::GlobalTransform;
+     use bevy_window::PrimaryWindow;
+ 
+diff --git a/crates/bevy_picking/src/events.rs b/crates/bevy_picking/src/events.rs
+index e100662389448..b2f603562d2fe 100644
+--- a/crates/bevy_picking/src/events.rs
++++ b/crates/bevy_picking/src/events.rs
+@@ -39,13 +39,13 @@
+ 
+ use core::{fmt::Debug, time::Duration};
+ 
++use bevy_camera::NormalizedRenderTarget;
+ use bevy_ecs::{prelude::*, query::QueryData, system::SystemParam, traversal::Traversal};
+ use bevy_input::mouse::MouseScrollUnit;
+ use bevy_math::Vec2;
+ use bevy_platform::collections::HashMap;
+ use bevy_platform::time::Instant;
+ use bevy_reflect::prelude::*;
+-use bevy_render::camera::NormalizedRenderTarget;
+ use bevy_window::Window;
+ use tracing::debug;
+ 
+@@ -200,7 +200,7 @@ pub struct Move {
+     ///
+     /// This is stored in screen pixels, not world coordinates. Screen pixels go from top-left to
+     /// bottom-right, whereas (in 2D) world coordinates go from bottom-left to top-right. Consider
+-    /// using methods on [`Camera`](bevy_render::camera::Camera) to convert from screen-space to
++    /// using methods on [`Camera`](bevy_camera::Camera) to convert from screen-space to
+     /// world-space.
+     pub delta: Vec2,
+ }
+@@ -225,14 +225,14 @@ pub struct Drag {
+     ///
+     /// This is stored in screen pixels, not world coordinates. Screen pixels go from top-left to
+     /// bottom-right, whereas (in 2D) world coordinates go from bottom-left to top-right. Consider
+-    /// using methods on [`Camera`](bevy_render::camera::Camera) to convert from screen-space to
++    /// using methods on [`Camera`](bevy_camera::Camera) to convert from screen-space to
+     /// world-space.
+     pub distance: Vec2,
+     /// The change in position since the last drag event.
+     ///
+     /// This is stored in screen pixels, not world coordinates. Screen pixels go from top-left to
+     /// bottom-right, whereas (in 2D) world coordinates go from bottom-left to top-right. Consider
+-    /// using methods on [`Camera`](bevy_render::camera::Camera) to convert from screen-space to
++    /// using methods on [`Camera`](bevy_camera::Camera) to convert from screen-space to
+     /// world-space.
+     pub delta: Vec2,
+ }
+@@ -247,7 +247,7 @@ pub struct DragEnd {
+     ///
+     /// This is stored in screen pixels, not world coordinates. Screen pixels go from top-left to
+     /// bottom-right, whereas (in 2D) world coordinates go from bottom-left to top-right. Consider
+-    /// using methods on [`Camera`](bevy_render::camera::Camera) to convert from screen-space to
++    /// using methods on [`Camera`](bevy_camera::Camera) to convert from screen-space to
+     /// world-space.
+     pub distance: Vec2,
+ }
+@@ -308,16 +308,16 @@ pub struct DragEntry {
+     ///
+     /// This is stored in screen pixels, not world coordinates. Screen pixels go from top-left to
+     /// bottom-right, whereas (in 2D) world coordinates go from bottom-left to top-right. Consider
+-    /// using [`Camera::viewport_to_world`](bevy_render::camera::Camera::viewport_to_world) or
+-    /// [`Camera::viewport_to_world_2d`](bevy_render::camera::Camera::viewport_to_world_2d) to
++    /// using [`Camera::viewport_to_world`](bevy_camera::Camera::viewport_to_world) or
++    /// [`Camera::viewport_to_world_2d`](bevy_camera::Camera::viewport_to_world_2d) to
+     /// convert from screen-space to world-space.
+     pub start_pos: Vec2,
+     /// The latest position of the pointer during this drag, used to compute deltas.
+     ///
+     /// This is stored in screen pixels, not world coordinates. Screen pixels go from top-left to
+     /// bottom-right, whereas (in 2D) world coordinates go from bottom-left to top-right. Consider
+-    /// using [`Camera::viewport_to_world`](bevy_render::camera::Camera::viewport_to_world) or
+-    /// [`Camera::viewport_to_world_2d`](bevy_render::camera::Camera::viewport_to_world_2d) to
++    /// using [`Camera::viewport_to_world`](bevy_camera::Camera::viewport_to_world) or
++    /// [`Camera::viewport_to_world_2d`](bevy_camera::Camera::viewport_to_world_2d) to
+     /// convert from screen-space to world-space.
+     pub latest_pos: Vec2,
+ }
+diff --git a/crates/bevy_picking/src/hover.rs b/crates/bevy_picking/src/hover.rs
+index 2621f105c2c40..3c86e438f4801 100644
+--- a/crates/bevy_picking/src/hover.rs
++++ b/crates/bevy_picking/src/hover.rs
+@@ -404,7 +404,7 @@ pub fn update_is_directly_hovered(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use bevy_render::camera::Camera;
++    use bevy_camera::Camera;
+ 
+     use super::*;
+ 
+diff --git a/crates/bevy_picking/src/input.rs b/crates/bevy_picking/src/input.rs
+index 5108a849a1b79..67c4811516702 100644
+--- a/crates/bevy_picking/src/input.rs
++++ b/crates/bevy_picking/src/input.rs
+@@ -12,6 +12,7 @@
+ //! you need to be sure that you also write a [`PointerInput`] event stream.
+ 
+ use bevy_app::prelude::*;
++use bevy_camera::RenderTarget;
+ use bevy_ecs::prelude::*;
+ use bevy_input::{
+     mouse::MouseWheel,
+@@ -22,7 +23,6 @@ use bevy_input::{
+ use bevy_math::Vec2;
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_reflect::prelude::*;
+-use bevy_render::camera::{RenderTarget, ToNormalizedRenderTarget as _};
+ use bevy_window::{PrimaryWindow, WindowEvent, WindowRef};
+ use tracing::debug;
+ 
+diff --git a/crates/bevy_picking/src/mesh_picking/mod.rs b/crates/bevy_picking/src/mesh_picking/mod.rs
+index 41b981385b7fc..50b181c8e5821 100644
+--- a/crates/bevy_picking/src/mesh_picking/mod.rs
++++ b/crates/bevy_picking/src/mesh_picking/mod.rs
+@@ -22,9 +22,9 @@ use crate::{
+     PickingSystems,
+ };
+ use bevy_app::prelude::*;
++use bevy_camera::{visibility::RenderLayers, Camera};
+ use bevy_ecs::prelude::*;
+ use bevy_reflect::prelude::*;
+-use bevy_render::{prelude::*, view::RenderLayers};
+ use ray_cast::{MeshRayCast, MeshRayCastSettings, RayCastVisibility};
+ 
+ /// An optional component that marks cameras that should be used in the [`MeshPickingPlugin`].
+@@ -45,8 +45,8 @@ pub struct MeshPickingSettings {
+     /// should be used by the mesh picking backend at runtime.
+     pub require_markers: bool,
+ 
+-    /// Determines how mesh picking should consider [`Visibility`]. When set to [`RayCastVisibility::Any`],
+-    /// ray casts can be performed against both visible and hidden entities.
++    /// Determines how mesh picking should consider [`Visibility`](bevy_camera::visibility::Visibility).
++    /// When set to [`RayCastVisibility::Any`], ray casts can be performed against both visible and hidden entities.
+     ///
+     /// Defaults to [`RayCastVisibility::VisibleInView`], only performing picking against visible entities
+     /// that are in the view of a camera.
+diff --git a/crates/bevy_picking/src/mesh_picking/ray_cast/mod.rs b/crates/bevy_picking/src/mesh_picking/ray_cast/mod.rs
+index dfc6a22c11353..b1ba933976c28 100644
+--- a/crates/bevy_picking/src/mesh_picking/ray_cast/mod.rs
++++ b/crates/bevy_picking/src/mesh_picking/ray_cast/mod.rs
+@@ -6,8 +6,12 @@ mod intersections;
+ 
+ use bevy_derive::{Deref, DerefMut};
+ 
++use bevy_camera::{
++    primitives::Aabb,
++    visibility::{InheritedVisibility, ViewVisibility},
++};
+ use bevy_math::{bounding::Aabb3d, Ray3d};
+-use bevy_mesh::Mesh;
++use bevy_mesh::{Mesh, Mesh2d, Mesh3d};
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+ 
+ use intersections::*;
+@@ -16,27 +20,26 @@ pub use intersections::{ray_aabb_intersection_3d, ray_mesh_intersection, RayMesh
+ use bevy_asset::{Assets, Handle};
+ use bevy_ecs::{prelude::*, system::lifetimeless::Read, system::SystemParam};
+ use bevy_math::FloatOrd;
+-use bevy_render::{prelude::*, primitives::Aabb};
+ use bevy_transform::components::GlobalTransform;
+ use tracing::*;
+ 
+-/// How a ray cast should handle [`Visibility`].
++/// How a ray cast should handle [`Visibility`](bevy_camera::visibility::Visibility).
+ #[derive(Clone, Copy, Reflect)]
+ #[reflect(Clone)]
+ pub enum RayCastVisibility {
+     /// Completely ignore visibility checks. Hidden items can still be ray casted against.
+     Any,
+-    /// Only cast rays against entities that are visible in the hierarchy. See [`Visibility`].
++    /// Only cast rays against entities that are visible in the hierarchy. See [`Visibility`](bevy_camera::visibility::Visibility).
+     Visible,
+     /// Only cast rays against entities that are visible in the hierarchy and visible to a camera or
+-    /// light. See [`Visibility`].
++    /// light. See [`Visibility`](bevy_camera::visibility::Visibility).
+     VisibleInView,
+ }
+ 
+ /// Settings for a ray cast.
+ #[derive(Clone)]
+ pub struct MeshRayCastSettings<'a> {
+-    /// Determines how ray casting should consider [`Visibility`].
++    /// Determines how ray casting should consider [`Visibility`](bevy_camera::visibility::Visibility).
+     pub visibility: RayCastVisibility,
+     /// A predicate that is applied for every entity that ray casts are performed against.
+     /// Only entities that return `true` will be considered.
+@@ -136,8 +139,8 @@ type MeshFilter = Or<(With<Mesh3d>, With<Mesh2d>, With<SimplifiedMesh>)>;
+ /// ## Configuration
+ ///
+ /// You can specify the behavior of the ray cast using [`MeshRayCastSettings`]. This allows you to filter out
+-/// entities, configure early-out behavior, and set whether the [`Visibility`] of an entity should be
+-/// considered.
++/// entities, configure early-out behavior, and set whether the [`Visibility`](bevy_camera::visibility::Visibility)
++/// of an entity should be considered.
+ ///
+ /// ```
+ /// # use bevy_ecs::prelude::*;
+diff --git a/crates/bevy_picking/src/pointer.rs b/crates/bevy_picking/src/pointer.rs
+index 46aef8dc3cb36..86af877362270 100644
+--- a/crates/bevy_picking/src/pointer.rs
++++ b/crates/bevy_picking/src/pointer.rs
+@@ -8,12 +8,13 @@
+ //! The purpose of this module is primarily to provide a common interface that can be
+ //! driven by lower-level input devices and consumed by higher-level interaction systems.
+ 
++use bevy_camera::Camera;
++use bevy_camera::NormalizedRenderTarget;
+ use bevy_ecs::prelude::*;
+ use bevy_input::mouse::MouseScrollUnit;
+ use bevy_math::Vec2;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::prelude::*;
+-use bevy_render::camera::{Camera, NormalizedRenderTarget, ToNormalizedRenderTarget as _};
+ use bevy_window::PrimaryWindow;
+ 
+ use uuid::Uuid;
+diff --git a/crates/bevy_picking/src/window.rs b/crates/bevy_picking/src/window.rs
+index 30093da79750b..fb48b58b91313 100644
+--- a/crates/bevy_picking/src/window.rs
++++ b/crates/bevy_picking/src/window.rs
+@@ -13,8 +13,8 @@
+ 
+ use core::f32;
+ 
++use bevy_camera::NormalizedRenderTarget;
+ use bevy_ecs::prelude::*;
+-use bevy_render::camera::NormalizedRenderTarget;
+ 
+ use crate::{
+     backend::{HitData, PointerHits},
+diff --git a/crates/bevy_render/src/camera.rs b/crates/bevy_render/src/camera.rs
+index c53ffd82f5da2..d827447cf9a4d 100644
+--- a/crates/bevy_render/src/camera.rs
++++ b/crates/bevy_render/src/camera.rs
+@@ -41,11 +41,7 @@ use bevy_math::{vec2, Mat4, URect, UVec2, UVec4, Vec2};
+ use bevy_platform::collections::{HashMap, HashSet};
+ use bevy_reflect::prelude::*;
+ use bevy_transform::components::GlobalTransform;
+-use bevy_window::{
+-    NormalizedWindowRef, PrimaryWindow, Window, WindowCreated, WindowResized,
+-    WindowScaleFactorChanged,
+-};
+-use derive_more::derive::From;
++use bevy_window::{PrimaryWindow, Window, WindowCreated, WindowResized, WindowScaleFactorChanged};
+ use tracing::warn;
+ use wgpu::TextureFormat;
+ 
+@@ -148,40 +144,39 @@ impl CameraRenderGraph {
+     }
+ }
+ 
+-pub trait ToNormalizedRenderTarget {
+-    /// Normalize the render target down to a more concrete value, mostly used for equality comparisons.
+-    fn normalize(&self, primary_window: Option<Entity>) -> Option<NormalizedRenderTarget>;
+-}
++pub trait NormalizedRenderTargetExt {
++    fn get_texture_view<'a>(
++        &self,
++        windows: &'a ExtractedWindows,
++        images: &'a RenderAssets<GpuImage>,
++        manual_texture_views: &'a ManualTextureViews,
++    ) -> Option<&'a TextureView>;
+ 
+-impl ToNormalizedRenderTarget for RenderTarget {
+-    fn normalize(&self, primary_window: Option<Entity>) -> Option<NormalizedRenderTarget> {
+-        match self {
+-            RenderTarget::Window(window_ref) => window_ref
+-                .normalize(primary_window)
+-                .map(NormalizedRenderTarget::Window),
+-            RenderTarget::Image(handle) => Some(NormalizedRenderTarget::Image(handle.clone())),
+-            RenderTarget::TextureView(id) => Some(NormalizedRenderTarget::TextureView(*id)),
+-        }
+-    }
+-}
++    /// Retrieves the [`TextureFormat`] of this render target, if it exists.
++    fn get_texture_format<'a>(
++        &self,
++        windows: &'a ExtractedWindows,
++        images: &'a RenderAssets<GpuImage>,
++        manual_texture_views: &'a ManualTextureViews,
++    ) -> Option<TextureFormat>;
+ 
+-/// Normalized version of the render target.
+-///
+-/// Once we have this we shouldn't need to resolve it down anymore.
+-#[derive(Debug, Clone, Reflect, PartialEq, Eq, Hash, PartialOrd, Ord, From)]
+-#[reflect(Clone, PartialEq, Hash)]
+-pub enum NormalizedRenderTarget {
+-    /// Window to which the camera's view is rendered.
+-    Window(NormalizedWindowRef),
+-    /// Image to which the camera's view is rendered.
+-    Image(ImageRenderTarget),
+-    /// Texture View to which the camera's view is rendered.
+-    /// Useful when the texture view needs to be created outside of Bevy, for example OpenXR.
+-    TextureView(ManualTextureViewHandle),
++    fn get_render_target_info<'a>(
++        &self,
++        resolutions: impl IntoIterator<Item = (Entity, &'a Window)>,
++        images: &Assets<Image>,
++        manual_texture_views: &ManualTextureViews,
++    ) -> Option<RenderTargetInfo>;
++
++    // Check if this render target is contained in the given changed windows or images.
++    fn is_changed(
++        &self,
++        changed_window_ids: &HashSet<Entity>,
++        changed_image_handles: &HashSet<&AssetId<Image>>,
++    ) -> bool;
+ }
+ 
+-impl NormalizedRenderTarget {
+-    pub fn get_texture_view<'a>(
++impl NormalizedRenderTargetExt for NormalizedRenderTarget {
++    fn get_texture_view<'a>(
+         &self,
+         windows: &'a ExtractedWindows,
+         images: &'a RenderAssets<GpuImage>,
+@@ -201,7 +196,7 @@ impl NormalizedRenderTarget {
+     }
+ 
+     /// Retrieves the [`TextureFormat`] of this render target, if it exists.
+-    pub fn get_texture_format<'a>(
++    fn get_texture_format<'a>(
+         &self,
+         windows: &'a ExtractedWindows,
+         images: &'a RenderAssets<GpuImage>,
+@@ -220,7 +215,7 @@ impl NormalizedRenderTarget {
+         }
+     }
+ 
+-    pub fn get_render_target_info<'a>(
++    fn get_render_target_info<'a>(
+         &self,
+         resolutions: impl IntoIterator<Item = (Entity, &'a Window)>,
+         images: &Assets<Image>,
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index bd7b350d93da4..49932a8d2b219 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -61,7 +61,7 @@ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+         alpha::AlphaMode,
+-        camera::ToNormalizedRenderTarget as _,
++        camera::NormalizedRenderTargetExt as _,
+         mesh::{
+             morph::MorphWeights, primitives::MeshBuilder, primitives::Meshable, Mesh, Mesh2d,
+             Mesh3d,
+diff --git a/crates/bevy_render/src/view/mod.rs b/crates/bevy_render/src/view/mod.rs
+index 2ffe9a24cbe3d..cf98a68036978 100644
+--- a/crates/bevy_render/src/view/mod.rs
++++ b/crates/bevy_render/src/view/mod.rs
+@@ -10,7 +10,10 @@ pub use visibility::*;
+ pub use window::*;
+ 
+ use crate::{
+-    camera::{ExtractedCamera, MipBias, NormalizedRenderTarget, TemporalJitter},
++    camera::{
++        ExtractedCamera, MipBias, NormalizedRenderTarget, NormalizedRenderTargetExt as _,
++        TemporalJitter,
++    },
+     experimental::occlusion_culling::OcclusionCulling,
+     extract_component::ExtractComponentPlugin,
+     load_shader_library,
+diff --git a/crates/bevy_render/src/view/window/screenshot.rs b/crates/bevy_render/src/view/window/screenshot.rs
+index 789e284c66d77..9d81805c8e482 100644
+--- a/crates/bevy_render/src/view/window/screenshot.rs
++++ b/crates/bevy_render/src/view/window/screenshot.rs
+@@ -1,6 +1,6 @@
+ use super::ExtractedWindows;
+ use crate::{
+-    camera::{NormalizedRenderTarget, ToNormalizedRenderTarget as _},
++    camera::NormalizedRenderTarget,
+     gpu_readback,
+     prelude::Shader,
+     render_asset::{RenderAssetUsages, RenderAssets},
+diff --git a/crates/bevy_ui/src/focus.rs b/crates/bevy_ui/src/focus.rs
+index 4584eab6a27f6..7b02d4a0b8e85 100644
+--- a/crates/bevy_ui/src/focus.rs
++++ b/crates/bevy_ui/src/focus.rs
+@@ -14,11 +14,7 @@ use bevy_input::{mouse::MouseButton, touch::Touches, ButtonInput};
+ use bevy_math::Vec2;
+ use bevy_platform::collections::HashMap;
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::{
+-    camera::{NormalizedRenderTarget, ToNormalizedRenderTarget as _},
+-    prelude::Camera,
+-    view::InheritedVisibility,
+-};
++use bevy_render::{camera::NormalizedRenderTarget, prelude::Camera, view::InheritedVisibility};
+ use bevy_window::{PrimaryWindow, Window};
+ 
+ use smallvec::SmallVec;
+diff --git a/release-content/migration-guides/bevy_render_reorganization.md b/release-content/migration-guides/bevy_render_reorganization.md
+index 4b44be1e26ade..8b99f1059a907 100644
+--- a/release-content/migration-guides/bevy_render_reorganization.md
++++ b/release-content/migration-guides/bevy_render_reorganization.md
+@@ -3,7 +3,7 @@ title: `bevy_render` reorganization
+ pull_requests: [19997, 19991, 20000, 19949, 19943, 19953]
+ ---
+ 
+-You must now import `ToNormalizedRenderTarget` to use `RenderTarget::normalize`
++You must now import `bevy_render::NormalizedRenderTargetExt` to use methods on NormalizedRenderTarget
+ `ManualTextureViews` is now in `bevy_render::texture`
+ 
+ Camera and visibility types have been moved to a new crate, `bevy_camera`, but continue to be re-exported by `bevy_render` for now.

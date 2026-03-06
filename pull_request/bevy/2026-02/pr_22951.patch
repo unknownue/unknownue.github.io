@@ -1,0 +1,203 @@
+diff --git a/crates/bevy_core_pipeline/src/core_2d/mod.rs b/crates/bevy_core_pipeline/src/core_2d/mod.rs
+index 456924697f7b2..e159b9615caf8 100644
+--- a/crates/bevy_core_pipeline/src/core_2d/mod.rs
++++ b/crates/bevy_core_pipeline/src/core_2d/mod.rs
+@@ -65,6 +65,9 @@ impl Plugin for Core2dPlugin {
+             .init_resource::<ViewSortedRenderPhases<Transparent2d>>()
+             .init_resource::<ViewBinnedRenderPhases<Opaque2d>>()
+             .init_resource::<ViewBinnedRenderPhases<AlphaMask2d>>()
++            .allow_ambiguous_resource::<ViewSortedRenderPhases<Transparent2d>>()
++            .allow_ambiguous_resource::<ViewBinnedRenderPhases<Opaque2d>>()
++            .allow_ambiguous_resource::<ViewBinnedRenderPhases<AlphaMask2d>>()
+             .add_systems(ExtractSchedule, extract_core_2d_camera_phases)
+             .add_systems(
+                 Render,
+diff --git a/crates/bevy_pbr/src/lib.rs b/crates/bevy_pbr/src/lib.rs
+index e933e914159aa..5e0084fbdd4aa 100644
+--- a/crates/bevy_pbr/src/lib.rs
++++ b/crates/bevy_pbr/src/lib.rs
+@@ -329,7 +329,8 @@ impl Plugin for PbrPlugin {
+                 ),
+             )
+             .init_resource::<LightMeta>()
+-            .init_resource::<RenderMaterialBindings>();
++            .init_resource::<RenderMaterialBindings>()
++            .allow_ambiguous_resource::<RenderMaterialBindings>();
+ 
+         render_app.world_mut().add_observer(add_light_view_entities);
+         render_app
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 02bd1bedfba80..bfcea0216e4de 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -295,7 +295,9 @@ impl Plugin for MaterialsPlugin {
+                 .init_resource::<SpecializedShadowMaterialPipelineCache>()
+                 .init_resource::<DrawFunctions<Shadow>>()
+                 .init_resource::<RenderMaterialInstances>()
++                .allow_ambiguous_resource::<RenderMaterialInstances>()
+                 .init_resource::<MaterialBindGroupAllocators>()
++                .allow_ambiguous_resource::<MaterialBindGroupAllocators>()
+                 .add_render_command::<Shadow, DrawPrepass>()
+                 .add_render_command::<Shadow, DrawDepthOnlyPrepass>()
+                 .add_render_command::<Transparent3d, DrawMaterial>()
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 10d58bbbc486f..afc5020f9da85 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -232,7 +232,10 @@ impl Plugin for MeshRenderPlugin {
+                 self.use_gpu_instance_buffer_builder && gpu_preprocessing_support.is_available();
+ 
+             let render_mesh_instances = RenderMeshInstances::new(use_gpu_instance_buffer_builder);
+-            render_app.insert_resource(render_mesh_instances);
++            render_app
++                .allow_ambiguous_resource::<no_gpu_preprocessing::BatchedInstanceBuffer::<MeshUniform>>()
++                .allow_ambiguous_resource::<gpu_preprocessing::BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
++                .insert_resource(render_mesh_instances);
+ 
+             if use_gpu_instance_buffer_builder {
+                 render_app
+diff --git a/crates/bevy_render/src/batching/gpu_preprocessing.rs b/crates/bevy_render/src/batching/gpu_preprocessing.rs
+index 3d1103e6ad9e9..d18d67d3e1996 100644
+--- a/crates/bevy_render/src/batching/gpu_preprocessing.rs
++++ b/crates/bevy_render/src/batching/gpu_preprocessing.rs
+@@ -59,6 +59,7 @@ impl Plugin for BatchingPlugin {
+                 self.debug_flags
+                     .contains(RenderDebugFlags::ALLOW_COPIES_FROM_INDIRECT_PARAMETERS),
+             ))
++            .allow_ambiguous_resource::<IndirectParametersBuffers>()
+             .add_systems(
+                 Render,
+                 write_indirect_parameters_buffers.in_set(RenderSystems::PrepareResourcesFlush),
+diff --git a/crates/bevy_render/src/erased_render_asset.rs b/crates/bevy_render/src/erased_render_asset.rs
+index 0fad715f00212..05d55ecc23745 100644
+--- a/crates/bevy_render/src/erased_render_asset.rs
++++ b/crates/bevy_render/src/erased_render_asset.rs
+@@ -125,6 +125,7 @@ impl<A: ErasedRenderAsset, AFTER: ErasedRenderAssetDependency + 'static> Plugin
+             render_app
+                 .init_resource::<ExtractedAssets<A>>()
+                 .init_resource::<ErasedRenderAssets<A::ErasedAsset>>()
++                .allow_ambiguous_resource::<ErasedRenderAssets<A::ErasedAsset>>()
+                 .init_resource::<PrepareNextFrameAssets<A>>()
+                 .add_systems(
+                     ExtractSchedule,
+diff --git a/crates/bevy_render/src/extract_plugin.rs b/crates/bevy_render/src/extract_plugin.rs
+index 79db16580c45b..a3c46bfd12492 100644
+--- a/crates/bevy_render/src/extract_plugin.rs
++++ b/crates/bevy_render/src/extract_plugin.rs
+@@ -44,17 +44,19 @@ impl Plugin for ExtractPlugin {
+         });
+         extract_schedule.set_apply_final_deferred(false);
+ 
+-        render_app.add_schedule(Render::base_schedule());
+-        render_app.add_schedule(extract_schedule);
+-        render_app.add_systems(
+-            Render,
+-            (
+-                // This set applies the commands from the extract schedule while the render schedule
+-                // is running in parallel with the main app.
+-                apply_extract_commands.in_set(RenderSystems::ExtractCommands),
+-                despawn_temporary_render_entities.in_set(RenderSystems::PostCleanup),
+-            ),
+-        );
++        render_app
++            .add_schedule(Render::base_schedule())
++            .add_schedule(extract_schedule)
++            .allow_ambiguous_resource::<MainWorld>()
++            .add_systems(
++                Render,
++                (
++                    // This set applies the commands from the extract schedule while the render schedule
++                    // is running in parallel with the main app.
++                    apply_extract_commands.in_set(RenderSystems::ExtractCommands),
++                    despawn_temporary_render_entities.in_set(RenderSystems::PostCleanup),
++                ),
++            );
+ 
+         let pre_extract = self.pre_extract;
+         render_app.set_extract(move |main_world, render_world| {
+diff --git a/crates/bevy_render/src/render_asset.rs b/crates/bevy_render/src/render_asset.rs
+index 91a859f861f90..8d90e5b5200b4 100644
+--- a/crates/bevy_render/src/render_asset.rs
++++ b/crates/bevy_render/src/render_asset.rs
+@@ -138,6 +138,7 @@ impl<A: RenderAsset, AFTER: RenderAssetDependency + 'static> Plugin
+             render_app
+                 .init_resource::<ExtractedAssets<A>>()
+                 .init_resource::<RenderAssets<A>>()
++                .allow_ambiguous_resource::<RenderAssets<A>>()
+                 .init_resource::<PrepareNextFrameAssets<A>>()
+                 .add_systems(
+                     ExtractSchedule,
+diff --git a/crates/bevy_render/src/render_phase/mod.rs b/crates/bevy_render/src/render_phase/mod.rs
+index 102fe99c4d578..f359f786bb97e 100644
+--- a/crates/bevy_render/src/render_phase/mod.rs
++++ b/crates/bevy_render/src/render_phase/mod.rs
+@@ -1134,6 +1134,7 @@ where
+ 
+         render_app
+             .init_resource::<ViewBinnedRenderPhases<BPI>>()
++            .allow_ambiguous_resource::<ViewBinnedRenderPhases<BPI>>()
+             .init_resource::<PhaseBatchedInstanceBuffers<BPI, GFBD::BufferData>>()
+             .insert_resource(PhaseIndirectParametersBuffers::<BPI>::new(
+                 self.debug_flags
+@@ -1240,6 +1241,7 @@ where
+ 
+         render_app
+             .init_resource::<ViewSortedRenderPhases<SPI>>()
++            .allow_ambiguous_resource::<ViewSortedRenderPhases<SPI>>()
+             .init_resource::<PhaseBatchedInstanceBuffers<SPI, GFBD::BufferData>>()
+             .insert_resource(PhaseIndirectParametersBuffers::<SPI>::new(
+                 self.debug_flags
+diff --git a/crates/bevy_render/src/texture/mod.rs b/crates/bevy_render/src/texture/mod.rs
+index ebd08b41847be..9afa10266fb65 100644
+--- a/crates/bevy_render/src/texture/mod.rs
++++ b/crates/bevy_render/src/texture/mod.rs
+@@ -32,10 +32,13 @@ impl Plugin for TexturePlugin {
+         ))
+         .init_resource::<ManualTextureViews>();
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            render_app.init_resource::<TextureCache>().add_systems(
+-                Render,
+-                update_texture_cache_system.in_set(RenderSystems::Cleanup),
+-            );
++            render_app
++                .init_resource::<TextureCache>()
++                .allow_ambiguous_resource::<TextureCache>()
++                .add_systems(
++                    Render,
++                    update_texture_cache_system.in_set(RenderSystems::Cleanup),
++                );
+         }
+     }
+ 
+diff --git a/crates/bevy_sprite_render/src/mesh2d/mesh.rs b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+index 7df8be5a46702..d1f861dc87bf0 100644
+--- a/crates/bevy_sprite_render/src/mesh2d/mesh.rs
++++ b/crates/bevy_sprite_render/src/mesh2d/mesh.rs
+@@ -74,6 +74,7 @@ impl Plugin for Mesh2dRenderPlugin {
+             render_app
+                 .init_resource::<ViewKeyCache>()
+                 .init_resource::<RenderMesh2dInstances>()
++                .allow_ambiguous_resource::<RenderMesh2dInstances>()
+                 .init_resource::<SpecializedMeshPipelines<Mesh2dPipeline>>()
+                 .init_resource::<ViewSpecializationTicks>()
+                 .add_systems(
+@@ -84,6 +85,7 @@ impl Plugin for Mesh2dRenderPlugin {
+                         load_mesh2d_bindings,
+                     ),
+                 )
++                .allow_ambiguous_resource::<BatchedInstanceBuffer<Mesh2dUniform>>()
+                 .add_systems(ExtractSchedule, extract_mesh2d)
+                 .add_systems(
+                     Render,
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index 45ca5d683bc89..20826eb2ae5cf 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -206,6 +206,7 @@ impl Plugin for UiRenderPlugin {
+             .allow_ambiguous_resource::<ExtractedUiNodes>()
+             .init_resource::<DrawFunctions<TransparentUi>>()
+             .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
++            .allow_ambiguous_resource::<ViewSortedRenderPhases<TransparentUi>>()
+             .add_render_command::<TransparentUi, DrawUi>()
+             .configure_sets(
+                 ExtractSchedule,

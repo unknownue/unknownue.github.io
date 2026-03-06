@@ -1,0 +1,171 @@
+diff --git a/crates/bevy_pbr/src/atmosphere/environment.wgsl b/crates/bevy_pbr/src/atmosphere/environment.wgsl
+index 0ca535088771e..befcf7c17a121 100644
+--- a/crates/bevy_pbr/src/atmosphere/environment.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/environment.wgsl
+@@ -29,9 +29,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+ 
+     let world_pos = get_view_position();
+     let r = length(world_pos);
+-    let up = normalize(world_pos);
+ 
+-    let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws.xyz, up);
++    let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws.xyz);
+     let inscattering = sample_sky_view_lut(r, ray_dir_as);
+     let color = vec4<f32>(inscattering, 1.0);
+ 
+diff --git a/crates/bevy_pbr/src/atmosphere/functions.wgsl b/crates/bevy_pbr/src/atmosphere/functions.wgsl
+index 536c928e332f7..6e0e5a2be568b 100644
+--- a/crates/bevy_pbr/src/atmosphere/functions.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/functions.wgsl
+@@ -332,16 +332,9 @@ fn ndc_to_uv(ndc: vec2<f32>) -> vec2<f32> {
+ }
+ 
+ /// Converts a direction in world space to atmosphere space
+-fn direction_world_to_atmosphere(dir_ws: vec3<f32>, up: vec3<f32>) -> vec3<f32> {
+-    // Camera forward in world space (-Z in view to world transform)
+-    let forward_ws = (view.world_from_view * vec4(0.0, 0.0, -1.0, 0.0)).xyz;
+-    let tangent_z = normalize(up * dot(forward_ws, up) - forward_ws);
+-    let tangent_x = cross(up, tangent_z);
+-    return vec3(
+-        dot(dir_ws, tangent_x),
+-        dot(dir_ws, up),
+-        dot(dir_ws, tangent_z),
+-    );
++fn direction_world_to_atmosphere(dir_ws: vec3<f32>) -> vec3<f32> {
++    let dir_as = atmosphere_transforms.atmosphere_from_world * vec4(dir_ws, 0.0);
++    return dir_as.xyz;
+ }
+ 
+ /// Converts a direction in atmosphere space to world space
+diff --git a/crates/bevy_pbr/src/atmosphere/render_sky.wgsl b/crates/bevy_pbr/src/atmosphere/render_sky.wgsl
+index 7893fb073aa72..16a9aa994a3b1 100644
+--- a/crates/bevy_pbr/src/atmosphere/render_sky.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/render_sky.wgsl
+@@ -46,7 +46,7 @@ fn main(in: FullscreenVertexOutput) -> RenderSkyOutput {
+     let sun_radiance = sample_sun_radiance(ray_dir_ws);
+ 
+     if depth == 0.0 {
+-        let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws, up);
++        let ray_dir_as = direction_world_to_atmosphere(ray_dir_ws);
+         transmittance = sample_transmittance_lut(r, mu);
+         inscattering = sample_sky_view_lut(r, ray_dir_as);
+         if should_raymarch {
+diff --git a/crates/bevy_pbr/src/atmosphere/resources.rs b/crates/bevy_pbr/src/atmosphere/resources.rs
+index 4c9f0403f4e68..d68e7b889e98d 100644
+--- a/crates/bevy_pbr/src/atmosphere/resources.rs
++++ b/crates/bevy_pbr/src/atmosphere/resources.rs
+@@ -507,9 +507,16 @@ impl AtmosphereTransforms {
+     }
+ }
+ 
++/// Transforms between world space and atmosphere space.
++///
++/// Up is the local planet surface normal, so the horizon stays along the x-z
++/// plane for horizon-detail parameterization. Back is chosen from a constant
++/// world-horizontal direction such as `Vec3A::NEG_Z`, then projected orthogonal
++/// to up. It may drift slightly from world-horizontal but stays camera-independent.
+ #[derive(ShaderType)]
+ pub struct AtmosphereTransform {
+     world_from_atmosphere: Mat4,
++    atmosphere_from_world: Mat4,
+ }
+ 
+ #[derive(Component)]
+@@ -525,7 +532,15 @@ impl AtmosphereTransformsOffset {
+ }
+ 
+ pub(super) fn prepare_atmosphere_transforms(
+-    views: Query<(Entity, &ExtractedView), (With<ExtractedAtmosphere>, With<Camera3d>)>,
++    views: Query<
++        (
++            Entity,
++            &ExtractedView,
++            &ExtractedAtmosphere,
++            &GpuAtmosphereSettings,
++        ),
++        (With<ExtractedAtmosphere>, With<Camera3d>),
++    >,
+     render_device: Res<RenderDevice>,
+     render_queue: Res<RenderQueue>,
+     mut atmo_uniforms: ResMut<AtmosphereTransforms>,
+@@ -540,24 +555,36 @@ pub(super) fn prepare_atmosphere_transforms(
+         return;
+     };
+ 
+-    for (entity, view) in &views {
+-        let world_from_view = view.world_from_view.affine();
+-        let camera_z = world_from_view.matrix3.z_axis;
+-        let camera_y = world_from_view.matrix3.y_axis;
+-        let atmo_z = camera_z
+-            .with_y(0.0)
+-            .try_normalize()
+-            .unwrap_or_else(|| camera_y.with_y(0.0).normalize());
+-        let atmo_y = Vec3A::Y;
++    for (entity, view, atmosphere, settings) in &views {
++        // Camera position in atmosphere space
++        let cam_pos = Vec3A::from(
++            view.world_from_view.translation() * settings.scene_units_to_m
++                + Vec3::new(0.0, atmosphere.bottom_radius, 0.0),
++        );
++
++        // Up is the local planet surface normal.
++        let atmo_y = cam_pos.try_normalize().unwrap_or(Vec3A::Y);
++
++        // World-horizontal reference for back, projected orthogonal to atmo_y.
++        let world_ref = Vec3A::NEG_Z;
++        let ref_horizontal = world_ref - atmo_y * atmo_y.dot(world_ref);
++        let atmo_z = ref_horizontal.normalize();
+         let atmo_x = atmo_y.cross(atmo_z).normalize();
+-        let world_from_atmosphere =
+-            Affine3A::from_cols(atmo_x, atmo_y, atmo_z, world_from_view.translation);
+ 
+-        let world_from_atmosphere = Mat4::from(world_from_atmosphere);
++        let world_from_atmosphere = Mat4::from(Affine3A::from_cols(
++            atmo_x,
++            atmo_y,
++            atmo_z,
++            view.world_from_view.translation_vec3a(),
++        ));
++        // The shader only uses the upper-left 3x3 block, where transpose equals inverse for
++        // orthonormal matrices and is cheaper than computing the full inverse.
++        let atmosphere_from_world = world_from_atmosphere.transpose();
+ 
+         commands.entity(entity).insert(AtmosphereTransformsOffset {
+             index: writer.write(&AtmosphereTransform {
+                 world_from_atmosphere,
++                atmosphere_from_world,
+             }),
+         });
+     }
+diff --git a/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl b/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl
+index 5e23e78eb9509..40826f3aeb78e 100644
+--- a/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/sky_view_lut.wgsl
+@@ -29,7 +29,7 @@ fn main(@builtin(global_invocation_id) idx: vec3<u32>) {
+     let ray_dir_as = zenith_azimuth_to_ray_dir(zenith_azimuth.x, zenith_azimuth.y);
+     let ray_dir_ws = direction_atmosphere_to_world(ray_dir_as);
+ 
+-    let world_pos = vec3(0.0, r, 0.0);
++    let world_pos = cam_pos;
+     let up = normalize(world_pos);
+     let mu = dot(ray_dir_ws, up);
+     let t_max = max_atmosphere_distance(r, mu);
+diff --git a/crates/bevy_pbr/src/atmosphere/types.wgsl b/crates/bevy_pbr/src/atmosphere/types.wgsl
+index d74a2ce46a478..48be38c50067c 100644
+--- a/crates/bevy_pbr/src/atmosphere/types.wgsl
++++ b/crates/bevy_pbr/src/atmosphere/types.wgsl
+@@ -24,10 +24,12 @@ struct AtmosphereSettings {
+     rendering_method: u32,
+ }
+ 
+-// "Atmosphere space" is just the view position with y=0 and oriented horizontally,
+-// so the horizon stays a horizontal line in our luts
++// "Atmosphere space" uses local up for the zenith so the horizon-detail
++// parameterization concentrates texels at the viewer's horizon. Azimuth uses a
++// world-fixed reference so the terminator stays stable when tilting the camera.
+ struct AtmosphereTransforms {
+     world_from_atmosphere: mat4x4<f32>,
++    atmosphere_from_world: mat4x4<f32>,
+ }
+ 
+ struct AtmosphereData {

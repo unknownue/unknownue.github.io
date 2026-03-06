@@ -1,0 +1,150 @@
+diff --git a/crates/bevy_ecs/src/entity_disabling.rs b/crates/bevy_ecs/src/entity_disabling.rs
+index 39d2aa27e8837..2110c023fcda0 100644
+--- a/crates/bevy_ecs/src/entity_disabling.rs
++++ b/crates/bevy_ecs/src/entity_disabling.rs
+@@ -105,6 +105,27 @@ use {
+ // This component is registered as a disabling component during World::bootstrap
+ pub struct Disabled;
+ 
++/// A marker component for internal entities.
++///
++/// This component is used to mark entities as being internal to the engine.
++/// These entities should be hidden from the developer's view by default,
++/// as they are both noisy and expose confusing implementation details.
++/// Internal entities are hidden from queries using [`DefaultQueryFilters`].
++/// For more information, see [the module docs].
++/// We strongly advise against altering, removing or relying on entities tagged with this component in any way.
++/// These are "internal implementation details", and may not be robust to these changes or stable across minor Bevy versions.
++///
++/// [the module docs]: crate::entity_disabling
++#[derive(Component, Clone, Debug, Default)]
++#[cfg_attr(
++    feature = "bevy_reflect",
++    derive(Reflect),
++    reflect(Component),
++    reflect(Debug, Clone, Default)
++)]
++// This component is registered as a disabling component during World::bootstrap
++pub struct Internal;
++
+ /// Default query filters work by excluding entities with certain components from most queries.
+ ///
+ /// If a query does not explicitly mention a given disabling component, it will not include entities with that component.
+@@ -143,6 +164,8 @@ impl FromWorld for DefaultQueryFilters {
+         let mut filters = DefaultQueryFilters::empty();
+         let disabled_component_id = world.register_component::<Disabled>();
+         filters.register_disabling_component(disabled_component_id);
++        let internal_component_id = world.register_component::<Internal>();
++        filters.register_disabling_component(internal_component_id);
+         filters
+     }
+ }
+@@ -205,7 +228,7 @@ mod tests {
+ 
+     use super::*;
+     use crate::{
+-        prelude::{EntityMut, EntityRef, World},
++        prelude::{Add, EntityMut, EntityRef, On, World},
+         query::{Has, With},
+     };
+     use alloc::{vec, vec::Vec};
+@@ -316,4 +339,22 @@ mod tests {
+         let mut query = world.query::<Option<&Disabled>>();
+         assert_eq!(1, query.iter(&world).count());
+     }
++
++    #[test]
++    fn internal_entities() {
++        let mut world = World::default();
++        world.register_system(|| {});
++        let mut query = world.query::<()>();
++        assert_eq!(query.iter(&world).count(), 0);
++        let mut query = world.query_filtered::<(), With<Internal>>();
++        assert_eq!(query.iter(&world).count(), 1);
++
++        #[derive(Component)]
++        struct A;
++        world.add_observer(|_: On<Add, A>| {});
++        let mut query = world.query::<()>();
++        assert_eq!(query.iter(&world).count(), 0);
++        let mut query = world.query_filtered::<(), With<Internal>>();
++        assert_eq!(query.iter(&world).count(), 2);
++    }
+ }
+diff --git a/crates/bevy_ecs/src/observer/distributed_storage.rs b/crates/bevy_ecs/src/observer/distributed_storage.rs
+index 042661a690ddf..0476f536726fb 100644
+--- a/crates/bevy_ecs/src/observer/distributed_storage.rs
++++ b/crates/bevy_ecs/src/observer/distributed_storage.rs
+@@ -12,8 +12,12 @@
+ use core::any::Any;
+ 
+ use crate::{
+-    component::{ComponentCloneBehavior, ComponentId, Mutable, StorageType},
++    component::{
++        ComponentCloneBehavior, ComponentId, ComponentsRegistrator, Mutable, RequiredComponents,
++        StorageType,
++    },
+     entity::Entity,
++    entity_disabling::Internal,
+     error::{ErrorContext, ErrorHandler},
+     lifecycle::{ComponentHook, HookContext},
+     observer::{observer_system_runner, ObserverRunner},
+@@ -342,6 +346,21 @@ impl Component for Observer {
+             });
+         })
+     }
++
++    fn register_required_components(
++        _component_id: ComponentId,
++        components: &mut ComponentsRegistrator,
++        required_components: &mut RequiredComponents,
++        inheritance_depth: u16,
++        recursion_check_stack: &mut Vec<ComponentId>,
++    ) {
++        components.register_required_components_manual::<Self, Internal>(
++            required_components,
++            Internal::default,
++            inheritance_depth,
++            recursion_check_stack,
++        );
++    }
+ }
+ 
+ /// Store information about what an [`Observer`] observes.
+diff --git a/crates/bevy_ecs/src/system/system_registry.rs b/crates/bevy_ecs/src/system/system_registry.rs
+index bc87cd4feae50..69d3da46d18c0 100644
+--- a/crates/bevy_ecs/src/system/system_registry.rs
++++ b/crates/bevy_ecs/src/system/system_registry.rs
+@@ -3,6 +3,7 @@ use crate::reflect::ReflectComponent;
+ use crate::{
+     change_detection::Mut,
+     entity::Entity,
++    entity_disabling::Internal,
+     error::BevyError,
+     system::{
+         input::SystemInput, BoxedSystem, IntoSystem, RunSystemError, SystemParamValidationError,
+@@ -18,7 +19,7 @@ use thiserror::Error;
+ 
+ /// A small wrapper for [`BoxedSystem`] that also keeps track whether or not the system has been initialized.
+ #[derive(Component)]
+-#[require(SystemIdMarker)]
++#[require(SystemIdMarker, Internal)]
+ pub(crate) struct RegisteredSystem<I, O> {
+     initialized: bool,
+     system: BoxedSystem<I, O>,
+diff --git a/release-content/migration-guides/internal_entities.md b/release-content/migration-guides/internal_entities.md
+new file mode 100644
+index 0000000000000..e57d4ba682959
+--- /dev/null
++++ b/release-content/migration-guides/internal_entities.md
+@@ -0,0 +1,10 @@
++---
++title: Internal Entities
++pull_requests: [20204]
++---
++
++Bevy 0.17 introduces internal entities. Entities tagged by the `Internal` component that are hidden from most queries using [`DefaultQueryFilters`](https://docs.rs/bevy/latest/bevy/ecs/entity_disabling/index.html).
++
++Currently, both [`Observer`s](https://docs.rs/bevy/latest/bevy/ecs/observer/struct.Observer.html) and systems that are registered through [`World::register_system`](https://docs.rs/bevy/latest/bevy/prelude/struct.World.html#method.register_system) are considered internal entities.
++
++If you queried them before, add the `Allows<Internal>` filter to the query to bypass the default filter.

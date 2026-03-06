@@ -1,0 +1,497 @@
+diff --git a/crates/bevy_dev_tools/src/render_debug.rs b/crates/bevy_dev_tools/src/render_debug.rs
+index 8460c1fdf2cc0..e5cf429859670 100644
+--- a/crates/bevy_dev_tools/src/render_debug.rs
++++ b/crates/bevy_dev_tools/src/render_debug.rs
+@@ -1,7 +1,7 @@
+ //! Renderer debugging overlay
+ 
+ use bevy_app::{App, Plugin};
+-use bevy_asset::{embedded_asset, Handle};
++use bevy_asset::{embedded_asset, AssetServer, Handle};
+ use bevy_core_pipeline::{
+     mip_generation::experimental::depth::ViewDepthPyramid,
+     oit::OrderIndependentTransparencySettingsOffset,
+@@ -13,12 +13,11 @@ use bevy_ecs::{
+     component::Component,
+     entity::Entity,
+     message::{Message, MessageReader, MessageWriter},
+-    prelude::{Has, ReflectComponent, World},
++    prelude::{Has, ReflectComponent},
+     reflect::ReflectResource,
+     resource::Resource,
+     schedule::IntoScheduleConfigs,
+     system::{Commands, Query, Res, ResMut},
+-    world::FromWorld,
+ };
+ use bevy_input::{prelude::KeyCode, ButtonInput};
+ use bevy_log::info;
+@@ -38,14 +37,15 @@ use bevy_render::{
+     renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
+     texture::{FallbackImage, GpuImage},
+     view::{Msaa, ViewTarget, ViewUniformOffset},
+-    Render, RenderApp, RenderSystems,
++    Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use bevy_shader::Shader;
+ 
+ use bevy_pbr::{
+-    Bluenoise, MeshPipelineViewLayoutKey, MeshPipelineViewLayouts, MeshViewBindGroup,
+-    ViewContactShadowsUniformOffset, ViewEnvironmentMapUniformOffset, ViewFogUniformOffset,
+-    ViewLightProbesUniformOffset, ViewLightsUniformOffset, ViewScreenSpaceReflectionsUniformOffset,
++    Bluenoise, MeshPipelineSet, MeshPipelineViewLayoutKey, MeshPipelineViewLayouts,
++    MeshViewBindGroup, ViewContactShadowsUniformOffset, ViewEnvironmentMapUniformOffset,
++    ViewFogUniformOffset, ViewLightProbesUniformOffset, ViewLightsUniformOffset,
++    ViewScreenSpaceReflectionsUniformOffset,
+ };
+ 
+ /// Adds a rendering debug overlay to visualize various renderer buffers.
+@@ -65,6 +65,15 @@ impl Plugin for RenderDebugOverlayPlugin {
+                 ExtractComponentPlugin::<RenderDebugOverlay>::default(),
+             ))
+             .add_systems(bevy_app::Update, (handle_input, update_overlay).chain());
++
++        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
++            return;
++        };
++
++        render_app.add_systems(
++            RenderStartup,
++            init_render_debug_overlay_pipeline.after(MeshPipelineSet),
++        );
+     }
+ 
+     fn finish(&self, app: &mut App) {
+@@ -73,7 +82,6 @@ impl Plugin for RenderDebugOverlayPlugin {
+         };
+ 
+         render_app
+-            .init_resource::<RenderDebugOverlayPipeline>()
+             .init_resource::<SpecializedRenderPipelines<RenderDebugOverlayPipeline>>()
+             .init_resource::<RenderDebugOverlayUniforms>()
+             .add_systems(
+@@ -351,47 +359,45 @@ struct RenderDebugOverlayPipeline {
+     fullscreen_vertex_shader: VertexState,
+ }
+ 
+-impl FromWorld for RenderDebugOverlayPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let asset_server = world.resource::<bevy_asset::AssetServer>();
+-        let mesh_view_layouts = world.resource::<MeshPipelineViewLayouts>().clone();
+-        let fullscreen_vertex_shader = world.resource::<FullscreenShader>().to_vertex_state();
+-
+-        let sampler = render_device.create_sampler(&SamplerDescriptor::default());
+-
+-        let bind_group_layout_descriptor = BindGroupLayoutDescriptor::new(
+-            "debug_overlay_bind_group_layout",
+-            &BindGroupLayoutEntries::sequential(
+-                ShaderStages::FRAGMENT,
+-                (
+-                    binding_types::uniform_buffer::<RenderDebugOverlayUniform>(true),
+-                    binding_types::texture_2d(TextureSampleType::Float { filterable: true }),
+-                    binding_types::sampler(
+-                        bevy_render::render_resource::SamplerBindingType::Filtering,
+-                    ),
+-                    binding_types::texture_2d(TextureSampleType::Float { filterable: true }),
+-                    binding_types::sampler(
+-                        bevy_render::render_resource::SamplerBindingType::Filtering,
+-                    ),
+-                ),
++fn init_render_debug_overlay_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    mesh_view_layouts: Res<MeshPipelineViewLayouts>,
++    asset_server: Res<AssetServer>,
++    fullscreen_shader: Res<FullscreenShader>,
++) {
++    let fullscreen_vertex_shader = fullscreen_shader.to_vertex_state();
++
++    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
++
++    let bind_group_layout_descriptor = BindGroupLayoutDescriptor::new(
++        "debug_overlay_bind_group_layout",
++        &BindGroupLayoutEntries::sequential(
++            ShaderStages::FRAGMENT,
++            (
++                binding_types::uniform_buffer::<RenderDebugOverlayUniform>(true),
++                binding_types::texture_2d(TextureSampleType::Float { filterable: true }),
++                binding_types::sampler(bevy_render::render_resource::SamplerBindingType::Filtering),
++                binding_types::texture_2d(TextureSampleType::Float { filterable: true }),
++                binding_types::sampler(bevy_render::render_resource::SamplerBindingType::Filtering),
+             ),
+-        );
++        ),
++    );
+ 
+-        let bind_group_layout = render_device.create_bind_group_layout(
+-            bind_group_layout_descriptor.label.as_ref(),
+-            &bind_group_layout_descriptor.entries,
+-        );
++    let bind_group_layout = render_device.create_bind_group_layout(
++        bind_group_layout_descriptor.label.as_ref(),
++        &bind_group_layout_descriptor.entries,
++    );
+ 
+-        Self {
+-            shader: asset_server.load("embedded://bevy_dev_tools/debug_overlay.wgsl"),
+-            mesh_view_layouts,
+-            bind_group_layout,
+-            bind_group_layout_descriptor,
+-            sampler,
+-            fullscreen_vertex_shader,
+-        }
+-    }
++    let res = RenderDebugOverlayPipeline {
++        shader: asset_server.load("embedded://bevy_dev_tools/debug_overlay.wgsl"),
++        mesh_view_layouts: mesh_view_layouts.clone(),
++        bind_group_layout,
++        bind_group_layout_descriptor,
++        sampler,
++        fullscreen_vertex_shader,
++    };
++    commands.insert_resource(res);
+ }
+ 
+ #[derive(PartialEq, Eq, Hash, Clone, Copy)]
+diff --git a/crates/bevy_gizmos_render/src/lib.rs b/crates/bevy_gizmos_render/src/lib.rs
+index 6b5fececa4864..47e63075aa29c 100755
+--- a/crates/bevy_gizmos_render/src/lib.rs
++++ b/crates/bevy_gizmos_render/src/lib.rs
+@@ -33,6 +33,7 @@ use bevy_ecs::{
+     world::{FromWorld, World},
+ };
+ use bevy_math::Affine3Ext;
++use bevy_pbr::MeshPipelineSet;
+ use bevy_reflect::Reflect;
+ 
+ use {bevy_gizmos::config::GizmoMeshConfig, bevy_mesh::VertexBufferLayout};
+@@ -96,7 +97,10 @@ impl Plugin for GizmoRenderPlugin {
+             .init_resource::<LineGizmoEntities>();
+ 
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            render_app.add_systems(RenderStartup, init_line_gizmo_uniform_bind_group_layout);
++            render_app.add_systems(
++                RenderStartup,
++                init_line_gizmo_uniform_bind_group_layout.after(MeshPipelineSet),
++            );
+ 
+             render_app.add_systems(
+                 Render,
+diff --git a/crates/bevy_pbr/src/deferred/mod.rs b/crates/bevy_pbr/src/deferred/mod.rs
+index 54e014e75c931..6a8f0558dbea0 100644
+--- a/crates/bevy_pbr/src/deferred/mod.rs
++++ b/crates/bevy_pbr/src/deferred/mod.rs
+@@ -1,13 +1,10 @@
+ use crate::{
+-    DistanceFog, ExtractedAtmosphere, MeshPipelineKey, ViewFogUniformOffset,
+-    ViewLightsUniformOffset,
+-};
+-use crate::{
+-    MeshPipeline, MeshViewBindGroup, RenderViewLightProbes, ScreenSpaceAmbientOcclusion,
++    DistanceFog, ExtractedAtmosphere, MeshPipeline, MeshPipelineKey, MeshPipelineSet,
++    MeshViewBindGroup, RenderViewLightProbes, ScreenSpaceAmbientOcclusion,
+     ScreenSpaceReflectionsUniform, ViewContactShadowsUniformOffset,
+-    ViewEnvironmentMapUniformOffset, ViewLightProbesUniformOffset,
+-    ViewScreenSpaceReflectionsUniformOffset, TONEMAPPING_LUT_SAMPLER_BINDING_INDEX,
+-    TONEMAPPING_LUT_TEXTURE_BINDING_INDEX,
++    ViewEnvironmentMapUniformOffset, ViewFogUniformOffset, ViewLightProbesUniformOffset,
++    ViewLightsUniformOffset, ViewScreenSpaceReflectionsUniformOffset,
++    TONEMAPPING_LUT_SAMPLER_BINDING_INDEX, TONEMAPPING_LUT_TEXTURE_BINDING_INDEX,
+ };
+ use bevy_app::prelude::*;
+ use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+@@ -109,7 +106,10 @@ impl Plugin for DeferredPbrLightingPlugin {
+ 
+         render_app
+             .init_resource::<SpecializedRenderPipelines<DeferredLightingLayout>>()
+-            .add_systems(RenderStartup, init_deferred_lighting_layout)
++            .add_systems(
++                RenderStartup,
++                init_deferred_lighting_layout.after(MeshPipelineSet),
++            )
+             .add_systems(
+                 Render,
+                 (prepare_deferred_lighting_pipelines.in_set(RenderSystems::Prepare),),
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index ce8a05aa8ddcc..9a80d7e8be5c1 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -306,7 +306,7 @@ impl Plugin for MaterialsPlugin {
+                 .add_render_command::<Transparent3d, DrawMaterial>()
+                 .add_render_command::<Opaque3d, DrawMaterial>()
+                 .add_render_command::<AlphaMask3d, DrawMaterial>()
+-                .add_systems(RenderStartup, init_material_pipeline)
++                .add_systems(RenderStartup, init_material_pipeline.after(MeshPipelineSet))
+                 .add_systems(
+                     Render,
+                     (
+diff --git a/crates/bevy_pbr/src/render/mesh.rs b/crates/bevy_pbr/src/render/mesh.rs
+index 195e22e01db95..0f507e6365821 100644
+--- a/crates/bevy_pbr/src/render/mesh.rs
++++ b/crates/bevy_pbr/src/render/mesh.rs
+@@ -5,7 +5,7 @@ use crate::{
+     skin::skin_uniforms_from_world,
+ };
+ use bevy_asset::uuid::Uuid;
+-use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, AssetIndex};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, AssetIndex, AssetServer};
+ use bevy_camera::{
+     primitives::Aabb,
+     visibility::{NoFrustumCulling, RenderLayers, ViewVisibility, VisibilityRange},
+@@ -24,7 +24,7 @@ use bevy_ecs::{
+     prelude::*,
+     query::{QueryData, ROQueryItem},
+     relationship::RelationshipSourceCollection,
+-    system::{lifetimeless::*, SystemParamItem, SystemState},
++    system::{lifetimeless::*, SystemParamItem},
+ };
+ use bevy_image::{BevyDefault, ImageSampler, TextureFormatPixelInfo};
+ use bevy_light::{
+@@ -131,6 +131,9 @@ impl MeshRenderPlugin {
+ #[cfg(debug_assertions)]
+ pub const MESH_PIPELINE_VIEW_LAYOUT_SAFE_MAX_TEXTURES: usize = 10;
+ 
++#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
++pub struct MeshPipelineSet;
++
+ impl Plugin for MeshRenderPlugin {
+     fn build(&self, app: &mut App) {
+         load_shader_library!(app, "forward_io.wgsl");
+@@ -293,9 +296,12 @@ impl Plugin for MeshRenderPlugin {
+                 ));
+             }
+ 
+-            render_app
+-                .init_resource::<MeshPipelineViewLayouts>()
+-                .init_resource::<MeshPipeline>();
++            render_app.add_systems(
++                RenderStartup,
++                (init_mesh_pipeline_view_layouts, init_mesh_pipeline)
++                    .chain()
++                    .in_set(MeshPipelineSet),
++            );
+         }
+ 
+         // Load the mesh_bindings shader module here as it depends on runtime information about
+@@ -2207,35 +2213,35 @@ pub struct MeshPipeline {
+     pub skins_use_uniform_buffers: bool,
+ }
+ 
+-impl FromWorld for MeshPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let shader = load_embedded_asset!(world, "mesh.wgsl");
+-        let mut system_state: SystemState<(
+-            Res<RenderDevice>,
+-            Res<RenderAdapter>,
+-            Res<MeshPipelineViewLayouts>,
+-        )> = SystemState::new(world);
+-        let (render_device, render_adapter, view_layouts) = system_state.get_mut(world);
+-
+-        let clustered_forward_buffer_binding_type = render_device
+-            .get_supported_read_only_binding_type(CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT);
+-
+-        MeshPipeline {
+-            view_layouts: view_layouts.clone(),
+-            clustered_forward_buffer_binding_type,
+-            mesh_layouts: MeshLayouts::new(&render_device, &render_adapter),
+-            shader,
+-            per_object_buffer_batch_size: GpuArrayBuffer::<MeshUniform>::batch_size(
+-                &render_device.limits(),
+-            ),
+-            binding_arrays_are_usable: binding_arrays_are_usable(&render_device, &render_adapter),
+-            clustered_decals_are_usable: decal::clustered::clustered_decals_are_usable(
+-                &render_device,
+-                &render_adapter,
+-            ),
+-            skins_use_uniform_buffers: skins_use_uniform_buffers(&render_device.limits()),
+-        }
+-    }
++fn init_mesh_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    render_adapter: Res<RenderAdapter>,
++    view_layouts: Res<MeshPipelineViewLayouts>,
++    asset_server: Res<AssetServer>,
++) {
++    let shader = load_embedded_asset!(asset_server.as_ref(), "mesh.wgsl");
++
++    let clustered_forward_buffer_binding_type =
++        render_device.get_supported_read_only_binding_type(CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT);
++
++    let res = MeshPipeline {
++        view_layouts: view_layouts.clone(),
++        clustered_forward_buffer_binding_type,
++        mesh_layouts: MeshLayouts::new(&render_device, &render_adapter),
++        shader,
++        per_object_buffer_batch_size: GpuArrayBuffer::<MeshUniform>::batch_size(
++            &render_device.limits(),
++        ),
++        binding_arrays_are_usable: binding_arrays_are_usable(&render_device, &render_adapter),
++        clustered_decals_are_usable: decal::clustered::clustered_decals_are_usable(
++            &render_device,
++            &render_adapter,
++        ),
++        skins_use_uniform_buffers: skins_use_uniform_buffers(&render_device.limits()),
++    };
++
++    commands.insert_resource(res);
+ }
+ 
+ impl MeshPipeline {
+diff --git a/crates/bevy_pbr/src/render/mesh_view_bindings.rs b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+index a94efd7240556..b91fbf17e566f 100644
+--- a/crates/bevy_pbr/src/render/mesh_view_bindings.rs
++++ b/crates/bevy_pbr/src/render/mesh_view_bindings.rs
+@@ -13,7 +13,6 @@ use bevy_ecs::{
+     query::Has,
+     resource::Resource,
+     system::{Commands, Query, Res},
+-    world::{FromWorld, World},
+ };
+ use bevy_image::BevyDefault as _;
+ use bevy_light::{EnvironmentMapLight, IrradianceVolume};
+@@ -479,49 +478,50 @@ pub struct MeshPipelineViewLayouts(
+     pub Arc<[MeshPipelineViewLayout; MeshPipelineViewLayoutKey::COUNT]>,
+ );
+ 
+-impl FromWorld for MeshPipelineViewLayouts {
+-    fn from_world(world: &mut World) -> Self {
+-        // Generates all possible view layouts for the mesh pipeline, based on all combinations of
+-        // [`MeshPipelineViewLayoutKey`] flags.
+-
+-        let render_device = world.resource::<RenderDevice>();
+-        let render_adapter = world.resource::<RenderAdapter>();
+-
+-        let clustered_forward_buffer_binding_type = render_device
+-            .get_supported_read_only_binding_type(CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT);
+-        let visibility_ranges_buffer_binding_type = render_device
+-            .get_supported_read_only_binding_type(VISIBILITY_RANGES_STORAGE_BUFFER_COUNT);
+-
+-        Self(Arc::new(array::from_fn(|i| {
+-            let key = MeshPipelineViewLayoutKey::from_bits_truncate(i as u32);
+-            let entries = layout_entries(
+-                clustered_forward_buffer_binding_type,
+-                visibility_ranges_buffer_binding_type,
+-                key,
+-                render_device,
+-                render_adapter,
+-            );
++pub fn init_mesh_pipeline_view_layouts(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    render_adapter: Res<RenderAdapter>,
++) {
++    // Generates all possible view layouts for the mesh pipeline, based on all combinations of
++    // [`MeshPipelineViewLayoutKey`] flags.
++
++    let clustered_forward_buffer_binding_type =
++        render_device.get_supported_read_only_binding_type(CLUSTERED_FORWARD_STORAGE_BUFFER_COUNT);
++    let visibility_ranges_buffer_binding_type =
++        render_device.get_supported_read_only_binding_type(VISIBILITY_RANGES_STORAGE_BUFFER_COUNT);
++
++    let res = MeshPipelineViewLayouts(Arc::new(array::from_fn(|i| {
++        let key = MeshPipelineViewLayoutKey::from_bits_truncate(i as u32);
++        let entries = layout_entries(
++            clustered_forward_buffer_binding_type,
++            visibility_ranges_buffer_binding_type,
++            key,
++            &render_device,
++            &render_adapter,
++        );
++        #[cfg(debug_assertions)]
++        let texture_count: usize = entries
++            .iter()
++            .flat_map(|e| {
++                e.iter()
++                    .filter(|entry| matches!(entry.ty, BindingType::Texture { .. }))
++            })
++            .count();
++
++        MeshPipelineViewLayout {
++            main_layout: BindGroupLayoutDescriptor::new(key.label(), &entries[0]),
++            binding_array_layout: BindGroupLayoutDescriptor::new(
++                format!("{}_binding_array", key.label()),
++                &entries[1],
++            ),
++            empty_layout: BindGroupLayoutDescriptor::new(format!("{}_empty", key.label()), &[]),
+             #[cfg(debug_assertions)]
+-            let texture_count: usize = entries
+-                .iter()
+-                .flat_map(|e| {
+-                    e.iter()
+-                        .filter(|entry| matches!(entry.ty, BindingType::Texture { .. }))
+-                })
+-                .count();
+-
+-            MeshPipelineViewLayout {
+-                main_layout: BindGroupLayoutDescriptor::new(key.label(), &entries[0]),
+-                binding_array_layout: BindGroupLayoutDescriptor::new(
+-                    format!("{}_binding_array", key.label()),
+-                    &entries[1],
+-                ),
+-                empty_layout: BindGroupLayoutDescriptor::new(format!("{}_empty", key.label()), &[]),
+-                #[cfg(debug_assertions)]
+-                texture_count,
+-            }
+-        })))
+-    }
++            texture_count,
++        }
++    })));
++
++    commands.insert_resource(res);
+ }
+ 
+ impl MeshPipelineViewLayouts {
+diff --git a/crates/bevy_pbr/src/ssr/mod.rs b/crates/bevy_pbr/src/ssr/mod.rs
+index e2c70954c23fa..9c5ec9bc63837 100644
+--- a/crates/bevy_pbr/src/ssr/mod.rs
++++ b/crates/bevy_pbr/src/ssr/mod.rs
+@@ -48,8 +48,8 @@ use tracing::info;
+ 
+ use crate::{
+     binding_arrays_are_usable, contact_shadows::ViewContactShadowsUniformOffset,
+-    deferred::deferred_lighting, Bluenoise, ExtractedAtmosphere, MeshPipelineViewLayoutKey,
+-    MeshPipelineViewLayouts, MeshViewBindGroup, RenderViewLightProbes,
++    deferred::deferred_lighting, Bluenoise, ExtractedAtmosphere, MeshPipelineSet,
++    MeshPipelineViewLayoutKey, MeshPipelineViewLayouts, MeshViewBindGroup, RenderViewLightProbes,
+     ViewEnvironmentMapUniformOffset, ViewFogUniformOffset, ViewLightProbesUniformOffset,
+     ViewLightsUniformOffset,
+ };
+@@ -211,7 +211,10 @@ impl Plugin for ScreenSpaceReflectionsPlugin {
+         render_app
+             .init_resource::<ScreenSpaceReflectionsBuffer>()
+             .init_resource::<SpecializedRenderPipelines<ScreenSpaceReflectionsPipeline>>()
+-            .add_systems(RenderStartup, init_screen_space_reflections_pipeline)
++            .add_systems(
++                RenderStartup,
++                init_screen_space_reflections_pipeline.after(MeshPipelineSet),
++            )
+             .add_systems(Render, prepare_ssr_pipelines.in_set(RenderSystems::Prepare))
+             .add_systems(
+                 Render,
+diff --git a/crates/bevy_pbr/src/volumetric_fog/mod.rs b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+index d6d1bf353c5f0..8248baa6b62d1 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/mod.rs
++++ b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+@@ -49,7 +49,7 @@ use bevy_render::{
+ };
+ use render::{volumetric_fog, VolumetricFogPipeline, VolumetricFogUniformBuffer};
+ 
+-use crate::volumetric_fog::render::init_volumetric_fog_pipeline;
++use crate::{volumetric_fog::render::init_volumetric_fog_pipeline, MeshPipelineSet};
+ 
+ pub mod render;
+ 
+@@ -83,7 +83,10 @@ impl Plugin for VolumetricFogPlugin {
+             })
+             .init_resource::<SpecializedRenderPipelines<VolumetricFogPipeline>>()
+             .init_resource::<VolumetricFogUniformBuffer>()
+-            .add_systems(RenderStartup, init_volumetric_fog_pipeline)
++            .add_systems(
++                RenderStartup,
++                init_volumetric_fog_pipeline.after(MeshPipelineSet),
++            )
+             .add_systems(ExtractSchedule, render::extract_volumetric_fog)
+             .add_systems(
+                 Render,
