@@ -1,0 +1,252 @@
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index f18c1ca25d18b..db281746bdd17 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -46,6 +46,8 @@ use bevy_camera::{
+     visibility::VisibilitySystems,
+ };
+ use bevy_mesh::{Mesh, Mesh2d};
++#[cfg(feature = "bevy_text")]
++use bevy_text::detect_text_needs_rerender;
+ #[cfg(feature = "bevy_picking")]
+ pub use picking_backend::*;
+ pub use sprite::*;
+@@ -87,14 +89,12 @@ impl Plugin for SpritePlugin {
+         #[cfg(feature = "bevy_text")]
+         app.add_systems(
+             PostUpdate,
+-            (
+-                bevy_text::detect_text_needs_rerender::<Text2d>,
+-                update_text2d_layout.after(bevy_camera::CameraUpdateSystems),
+-            )
++            (update_text2d_layout.after(bevy_camera::CameraUpdateSystems),)
+                 .chain()
++                .after(detect_text_needs_rerender)
+                 .after(bevy_text::load_font_assets_into_font_collection)
+-                .before(bevy_asset::AssetEventSystems)
+-                .after(bevy_app::AnimationSystems),
++                .after(bevy_app::AnimationSystems)
++                .before(bevy_asset::AssetEventSystems),
+         )
+         .add_systems(
+             PostUpdate,
+diff --git a/crates/bevy_sprite/src/text2d.rs b/crates/bevy_sprite/src/text2d.rs
+index bf9eca6fbcd7d..b2e06af9a3a75 100644
+--- a/crates/bevy_sprite/src/text2d.rs
++++ b/crates/bevy_sprite/src/text2d.rs
+@@ -177,6 +177,7 @@ pub fn update_text2d_layout(
+     mut text_pipeline: ResMut<TextPipeline>,
+     mut text_query: Query<(
+         Entity,
++        Ref<Text2d>,
+         Option<&RenderLayers>,
+         Ref<TextLayout>,
+         Ref<TextBounds>,
+@@ -216,8 +217,16 @@ pub fn update_text2d_layout(
+     let mut previous_scale_factor = 0.;
+     let mut previous_mask = &RenderLayers::none();
+ 
+-    for (entity, maybe_entity_mask, block, bounds, mut text_layout_info, mut computed, hinting) in
+-        &mut text_query
++    for (
++        entity,
++        text2d,
++        maybe_entity_mask,
++        block,
++        bounds,
++        mut text_layout_info,
++        mut computed,
++        hinting,
++    ) in &mut text_query
+     {
+         let entity_mask = maybe_entity_mask.unwrap_or_default();
+ 
+@@ -239,6 +248,7 @@ pub fn update_text2d_layout(
+         };
+ 
+         let text_changed = scale_factor != text_layout_info.scale_factor
++            || text2d.is_changed()
+             || block.is_changed()
+             || computed.needs_rerender(viewport_size_changed, rem_size.is_changed())
+             || (!reprocess_queue.is_empty() && reprocess_queue.remove(&entity));
+@@ -397,7 +407,7 @@ mod tests {
+             .add_systems(
+                 Update,
+                 (
+-                    detect_text_needs_rerender::<Text2d>,
++                    detect_text_needs_rerender,
+                     update_text2d_layout,
+                     calculate_bounds_text2d,
+                 )
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 077585df5920c..a7d73659bda1a 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -97,7 +97,14 @@ impl Plugin for TextPlugin {
+             .init_resource::<ScaleCx>()
+             .init_resource::<TextIterScratch>()
+             .init_resource::<RemSize>()
+-            .add_systems(PostUpdate, load_font_assets_into_font_collection)
++            .add_systems(
++                PostUpdate,
++                (
++                    detect_text_needs_rerender,
++                    load_font_assets_into_font_collection,
++                )
++                    .chain(),
++            )
+             .add_systems(Last, trim_source_cache);
+ 
+         #[cfg(feature = "default_font")]
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index 3b7f172fb007b..9874573fa1aa9 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -1098,20 +1098,17 @@ impl FontHinting {
+ 
+ /// System that detects changes to text blocks and sets `ComputedTextBlock::should_rerender`.
+ ///
+-/// Generic over the root text component and text span component. For example, `Text2d`/[`TextSpan`] for
+-/// 2d or `Text`/[`TextSpan`] for UI.
+-pub fn detect_text_needs_rerender<Root: Component>(
++/// Does not check root text components (e.g. `Text`/`Text2d`) for changes. Their systems must handle change detection.
++pub fn detect_text_needs_rerender(
+     changed_roots: Query<
+         Entity,
+         (
+             Or<(
+-                Changed<Root>,
+                 Changed<TextFont>,
+                 Changed<TextLayout>,
+                 Changed<LineHeight>,
+                 Changed<Children>,
+             )>,
+-            With<Root>,
+             With<TextFont>,
+             With<TextLayout>,
+         ),
+@@ -1144,8 +1141,8 @@ pub fn detect_text_needs_rerender<Root: Component>(
+     // - Root children changed (can include additions and removals).
+     for root in changed_roots.iter() {
+         let Ok((_, Some(mut computed), _)) = computed.get_mut(root) else {
+-            once!(warn!("found entity {} with a root text component ({}) but no ComputedTextBlock; this warning only \
+-                prints once", root, core::any::type_name::<Root>()));
++            once!(warn!("found entity {} with a root text component but no ComputedTextBlock; this warning only \
++                prints once", root));
+             continue;
+         };
+         computed.needs_rerender = true;
+@@ -1158,16 +1155,15 @@ pub fn detect_text_needs_rerender<Root: Component>(
+     for (entity, maybe_span_child_of, has_text_block) in changed_spans.iter() {
+         if has_text_block {
+             once!(warn!("found entity {} with a TextSpan that has a TextLayout, which should only be on root \
+-                text entities (that have {}); this warning only prints once",
+-                entity, core::any::type_name::<Root>()));
++                text entities; this warning only prints once",
++                entity));
+         }
+ 
+         let Some(span_child_of) = maybe_span_child_of else {
+             once!(warn!(
+                 "found entity {} with a TextSpan that has no parent; it should have an ancestor \
+-                with a root text component ({}); this warning only prints once",
+-                entity,
+-                core::any::type_name::<Root>()
++                with a root text component; this warning only prints once",
++                entity
+             ));
+             continue;
+         };
+@@ -1196,9 +1192,8 @@ pub fn detect_text_needs_rerender<Root: Component>(
+             let Some(next_child_of) = maybe_child_of else {
+                 once!(warn!(
+                     "found entity {} with a TextSpan that has no ancestor with the root text \
+-                    component ({}); this warning only prints once",
+-                    entity,
+-                    core::any::type_name::<Root>()
++                    component; this warning only prints once",
++                    entity
+                 ));
+                 break;
+             };
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index fe8913066175c..d2e1e46589baf 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -35,6 +35,7 @@ mod layout;
+ mod stack;
+ mod ui_node;
+ 
++use bevy_text::detect_text_needs_rerender;
+ pub use focus::*;
+ pub use geometry::*;
+ pub use gradients::*;
+@@ -181,8 +182,7 @@ impl Plugin for UiPlugin {
+ 
+         let ui_layout_system_config = ui_layout_system_config
+             // Text and Text2D operate on disjoint sets of entities
+-            .ambiguous_with(bevy_sprite::update_text2d_layout)
+-            .ambiguous_with(bevy_text::detect_text_needs_rerender::<bevy_sprite::Text2d>);
++            .ambiguous_with(bevy_sprite::update_text2d_layout);
+ 
+         app.add_systems(
+             PostUpdate,
+@@ -221,20 +221,15 @@ impl Plugin for UiPlugin {
+ }
+ 
+ fn build_text_interop(app: &mut App) {
+-    use widget::Text;
+-
+     app.add_systems(
+         PostUpdate,
+         (
+-            (
+-                bevy_text::detect_text_needs_rerender::<Text>,
+-                widget::measure_text_system,
+-            )
++            widget::measure_text_system
+                 .chain()
++                .after(detect_text_needs_rerender)
+                 .after(bevy_text::load_font_assets_into_font_collection)
+                 .in_set(UiSystems::Content)
+                 // Text and Text2d are independent.
+-                .ambiguous_with(bevy_text::detect_text_needs_rerender::<bevy_sprite::Text2d>)
+                 // Potential conflict: `Assets<Image>`
+                 // Since both systems will only ever insert new [`Image`] assets,
+                 // they will never observe each other's effects.
+@@ -247,7 +242,6 @@ fn build_text_interop(app: &mut App) {
+                 .after(bevy_text::load_font_assets_into_font_collection)
+                 .before(bevy_asset::AssetEventSystems)
+                 // Text2d and bevy_ui text are entirely on separate entities
+-                .ambiguous_with(bevy_text::detect_text_needs_rerender::<bevy_sprite::Text2d>)
+                 .ambiguous_with(bevy_sprite::update_text2d_layout)
+                 .ambiguous_with(bevy_sprite::calculate_bounds_text2d),
+         ),
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index 5da2c8752d69a..8e51fc7e4b03e 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -241,6 +241,7 @@ pub fn measure_text_system(
+     mut text_query: Query<
+         (
+             Entity,
++            Ref<Text>,
+             Ref<TextLayout>,
+             &mut ContentSize,
+             &mut TextNodeFlags,
+@@ -258,6 +259,7 @@ pub fn measure_text_system(
+ ) {
+     for (
+         entity,
++        text,
+         block,
+         mut content_size,
+         mut text_flags,
+@@ -271,6 +273,7 @@ pub fn measure_text_system(
+         if !(1e-5
+             < (computed_target.scale_factor() - computed_node.inverse_scale_factor.recip()).abs()
+             || computed.needs_rerender(computed_target.is_changed(), rem_size.is_changed())
++            || text.is_changed()
+             || text_flags.needs_measure_fn
+             || content_size.is_added())
+         {

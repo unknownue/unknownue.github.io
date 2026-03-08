@@ -1,0 +1,408 @@
+diff --git a/crates/bevy_gltf/src/loader/extensions/mod.rs b/crates/bevy_gltf/src/loader/extensions/mod.rs
+index 32ec5ce6a7fb5..133420881a9cf 100644
+--- a/crates/bevy_gltf/src/loader/extensions/mod.rs
++++ b/crates/bevy_gltf/src/loader/extensions/mod.rs
+@@ -47,46 +47,26 @@ pub struct GltfExtensionHandlers(pub Arc<RwLock<Vec<Box<dyn GltfExtensionHandler
+ /// The type a `GltfExtensionHandler` is implemented for can define data
+ /// which will be cloned for each new glTF load. This enables stateful
+ /// handling of glTF extension data during a single load.
++///
++/// When loading a glTF file, a glTF object that could contain extension
++/// data will cause the relevant hook to execute once per object.
++/// Each invocation will receive all extension data, which is required because
++/// many extensions require accessing data defined by other extensions.
++///
++/// The hooks are always called once, even if there is no extension data
++/// This is useful for scenarios where additional extension data isn't
++/// required, but processing should still happen.
+ pub trait GltfExtensionHandler: Send + Sync {
+     /// Required for dyn cloning
+     fn dyn_clone(&self) -> Box<dyn GltfExtensionHandler>;
+ 
+-    /// When loading a glTF file, a glTF object that could contain extension
+-    /// data will cause the relevant hook to execute once for each id in this list.
+-    /// Each invocation will receive the extension data for one of the extension ids,
+-    /// along with the `extension_id` itself so implementors can differentiate
+-    /// between different calls and parse data correctly.
+-    ///
+-    /// The hooks are always called, even if there is no extension data
+-    /// for a specified id. This is useful for scenarios where additional
+-    /// extension data isn't required, but processing should still happen.
+-    ///
+-    /// Most implementors will pick one extension for this list, causing the
+-    /// relevant hooks to fire once per object. An implementor that does not
+-    /// wish to receive any data but still wants hooks to be called can use
+-    /// an empty string `""` as the extension id, which is also the default
+-    /// value if the function is not implemented by an implementor. If the
+-    /// empty string is used, all extension data in hooks will be `None`.
+-    ///
+-    /// Some implementors will choose to list multiple extensions here.
+-    /// This is an advanced use case and the alternative of having multiple
+-    /// independent handlers should be considered as an option first.
+-    /// If multiple extension ids are listed here, the hooks will fire once
+-    /// for each extension id, and each successive call will receive the data for
+-    /// a separate extension. The extension id is also included in hook arguments
+-    /// for this reason, so multiple extension id implementors can differentiate
+-    /// between the data received.
+-    fn extension_ids(&self) -> &'static [&'static str] {
+-        &[""]
+-    }
+-
+     /// Called when the "global" data for an extension
+     /// at the root of a glTF file is encountered.
+     #[expect(
+         unused,
+         reason = "default trait implementations do not use the arguments because they are no-ops"
+     )]
+-    fn on_root_data(&mut self, extension_id: &str, value: Option<&serde_json::Value>) {}
++    fn on_root(&mut self, gltf: &gltf::Gltf) {}
+ 
+     #[cfg(feature = "bevy_animation")]
+     #[expect(
+@@ -94,15 +74,7 @@ pub trait GltfExtensionHandler: Send + Sync {
+         reason = "default trait implementations do not use the arguments because they are no-ops"
+     )]
+     /// Called when an individual animation is processed
+-    fn on_animation(
+-        &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
+-        gltf_animation: &gltf::Animation,
+-        name: Option<&str>,
+-        handle: Handle<AnimationClip>,
+-    ) {
+-    }
++    fn on_animation(&mut self, gltf_animation: &gltf::Animation, handle: Handle<AnimationClip>) {}
+ 
+     #[cfg(feature = "bevy_animation")]
+     #[expect(
+@@ -123,14 +95,15 @@ pub trait GltfExtensionHandler: Send + Sync {
+     }
+ 
+     /// Called when an individual texture is processed
++    /// Unlike other hooks, this hook does not receive its glTF
++    /// object due to internal constraints.
+     #[expect(
+         unused,
+         reason = "default trait implementations do not use the arguments because they are no-ops"
+     )]
+     fn on_texture(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
++        extension_data: Option<&serde_json::Map<String, serde_json::Value>>,
+         texture: Handle<bevy_image::Image>,
+     ) {
+     }
+@@ -142,11 +115,8 @@ pub trait GltfExtensionHandler: Send + Sync {
+     )]
+     fn on_material(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
+         load_context: &mut LoadContext<'_>,
+         gltf_material: &gltf::Material,
+-        name: Option<&str>,
+         material: Handle<StandardMaterial>,
+     ) {
+     }
+@@ -158,11 +128,8 @@ pub trait GltfExtensionHandler: Send + Sync {
+     )]
+     fn on_gltf_mesh(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
+         load_context: &mut LoadContext<'_>,
+         gltf_mesh: &gltf::Mesh,
+-        name: Option<&str>,
+         mesh: Handle<GltfMesh>,
+     ) {
+     }
+@@ -191,13 +158,10 @@ pub trait GltfExtensionHandler: Send + Sync {
+     )]
+     fn on_scene_completed(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
+         scene: &gltf::Scene,
+-        name: Option<&str>,
+         world_root_id: Entity,
+         scene_world: &mut World,
+-        load_context: &mut LoadContext<'_>,
+     ) {
+     }
+ 
+@@ -208,8 +172,6 @@ pub trait GltfExtensionHandler: Send + Sync {
+     )]
+     fn on_gltf_node(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
+         load_context: &mut LoadContext<'_>,
+         gltf_node: &Node,
+         entity: &mut EntityWorldMut,
+@@ -225,8 +187,6 @@ pub trait GltfExtensionHandler: Send + Sync {
+     )]
+     fn on_spawn_light_directional(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
+         load_context: &mut LoadContext<'_>,
+         gltf_node: &Node,
+         entity: &mut EntityWorldMut,
+@@ -241,8 +201,6 @@ pub trait GltfExtensionHandler: Send + Sync {
+     )]
+     fn on_spawn_light_point(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
+         load_context: &mut LoadContext<'_>,
+         gltf_node: &Node,
+         entity: &mut EntityWorldMut,
+@@ -257,8 +215,6 @@ pub trait GltfExtensionHandler: Send + Sync {
+     )]
+     fn on_spawn_light_spot(
+         &mut self,
+-        extension_id: &str,
+-        extension_data: Option<&serde_json::Value>,
+         load_context: &mut LoadContext<'_>,
+         gltf_node: &Node,
+         entity: &mut EntityWorldMut,
+diff --git a/crates/bevy_gltf/src/loader/mod.rs b/crates/bevy_gltf/src/loader/mod.rs
+index 1c5bbd94e74c1..e4ecf35f814d4 100644
+--- a/crates/bevy_gltf/src/loader/mod.rs
++++ b/crates/bevy_gltf/src/loader/mod.rs
+@@ -258,9 +258,7 @@ impl GltfLoader {
+         // Let extensions process the root data for the extension ids
+         // they've subscribed to.
+         for extension in extensions.iter_mut() {
+-            for id in extension.extension_ids() {
+-                extension.on_root_data(id, gltf.extension_value(id));
+-            }
++            extension.on_root(&gltf);
+         }
+ 
+         let file_name = load_context
+@@ -597,15 +595,7 @@ impl GltfLoader {
+ 
+                 // let extensions handle extension data placed on animations
+                 for extension in extensions.iter_mut() {
+-                    for id in extension.extension_ids() {
+-                        extension.on_animation(
+-                            id,
+-                            animation.extension_value(id),
+-                            &animation,
+-                            animation.name(),
+-                            handle.clone(),
+-                        );
+-                    }
++                    extension.on_animation(&animation, handle.clone());
+                 }
+ 
+                 animations.push(handle);
+@@ -654,13 +644,10 @@ impl GltfLoader {
+                 image.process_loaded_texture(load_context, &mut texture_handles);
+                 // let extensions handle texture data
+                 for extension in extensions.iter_mut() {
+-                    for id in extension.extension_ids() {
+-                        extension.on_texture(
+-                            id,
+-                            texture.extension_value(id),
+-                            texture_handles.iter().last().unwrap().clone(),
+-                        );
+-                    }
++                    extension.on_texture(
++                        texture.extensions(),
++                        texture_handles.iter().last().unwrap().clone(),
++                    );
+                 }
+             }
+         } else {
+@@ -695,13 +682,10 @@ impl GltfLoader {
+                         // We do this differently here because of the IoTaskPool vs
+                         // gltf::Texture lifetimes
+                         for extension in extensions.iter_mut() {
+-                            for id in extension.extension_ids() {
+-                                extension.on_texture(
+-                                    id,
+-                                    extension_data.as_ref().and_then(|map| map.get(*id)),
+-                                    texture_handles.iter().last().unwrap().clone(),
+-                                );
+-                            }
++                            extension.on_texture(
++                                extension_data.as_ref(),
++                                texture_handles.iter().last().unwrap().clone(),
++                            );
+                         }
+                     }
+                     Err(err) => {
+@@ -723,16 +707,7 @@ impl GltfLoader {
+ 
+                 // let extensions handle material data
+                 for extension in extensions.iter_mut() {
+-                    for id in extension.extension_ids() {
+-                        extension.on_material(
+-                            id,
+-                            material.extension_value(id),
+-                            load_context,
+-                            &material,
+-                            material.name(),
+-                            handle.clone(),
+-                        );
+-                    }
++                    extension.on_material(load_context, &material, handle.clone());
+                 }
+ 
+                 materials.push(handle);
+@@ -899,16 +874,7 @@ impl GltfLoader {
+                 named_meshes.insert(name.into(), handle.clone());
+             }
+             for extension in extensions.iter_mut() {
+-                for id in extension.extension_ids() {
+-                    extension.on_gltf_mesh(
+-                        id,
+-                        gltf_mesh.extension_value(id),
+-                        load_context,
+-                        &gltf_mesh,
+-                        gltf_mesh.name(),
+-                        handle.clone(),
+-                    );
+-                }
++                extension.on_gltf_mesh(load_context, &gltf_mesh, handle.clone());
+             }
+ 
+             meshes.push(handle);
+@@ -1114,17 +1080,12 @@ impl GltfLoader {
+ 
+             // let extensions handle scene extension data
+             for extension in extensions.iter_mut() {
+-                for id in extension.extension_ids() {
+-                    extension.on_scene_completed(
+-                        id,
+-                        scene.extension_value(id),
+-                        &scene,
+-                        scene.name(),
+-                        world_root_id,
+-                        &mut world,
+-                        &mut scene_load_context,
+-                    );
+-                }
++                extension.on_scene_completed(
++                    &mut scene_load_context,
++                    &scene,
++                    world_root_id,
++                    &mut world,
++                );
+             }
+ 
+             let loaded_scene = scene_load_context.finish(Scene::new(world));
+@@ -1755,15 +1716,7 @@ fn load_node(
+                         });
+                     }
+                     for extension in extensions.iter_mut() {
+-                        for id in extension.extension_ids() {
+-                            extension.on_spawn_light_directional(
+-                                id,
+-                                gltf_node.extension_value(id),
+-                                load_context,
+-                                gltf_node,
+-                                &mut entity,
+-                            );
+-                        }
++                        extension.on_spawn_light_directional(load_context, gltf_node, &mut entity);
+                     }
+                 }
+                 gltf::khr_lights_punctual::Kind::Point => {
+@@ -1786,15 +1739,7 @@ fn load_node(
+                         });
+                     }
+                     for extension in extensions.iter_mut() {
+-                        for id in extension.extension_ids() {
+-                            extension.on_spawn_light_point(
+-                                id,
+-                                gltf_node.extension_value(id),
+-                                load_context,
+-                                gltf_node,
+-                                &mut entity,
+-                            );
+-                        }
++                        extension.on_spawn_light_point(load_context, gltf_node, &mut entity);
+                     }
+                 }
+                 gltf::khr_lights_punctual::Kind::Spot {
+@@ -1822,15 +1767,7 @@ fn load_node(
+                         });
+                     }
+                     for extension in extensions.iter_mut() {
+-                        for id in extension.extension_ids() {
+-                            extension.on_spawn_light_spot(
+-                                id,
+-                                gltf_node.extension_value(id),
+-                                load_context,
+-                                gltf_node,
+-                                &mut entity,
+-                            );
+-                        }
++                        extension.on_spawn_light_spot(load_context, gltf_node, &mut entity);
+                     }
+                 }
+             }
+@@ -1881,10 +1818,7 @@ fn load_node(
+     // accessing Mesh and Material extension data, which
+     // are merged onto the same entity in Bevy
+     for extension in extensions.iter_mut() {
+-        for id in extension.extension_ids() {
+-            let data = gltf_node.extension_value(id);
+-            extension.on_gltf_node(id, data, load_context, gltf_node, &mut node);
+-        }
++        extension.on_gltf_node(load_context, gltf_node, &mut node);
+     }
+ 
+     if let Some(err) = gltf_error {
+diff --git a/examples/gltf/gltf_extension_animation_graph.rs b/examples/gltf/gltf_extension_animation_graph.rs
+index dea4112a980b9..7c0d8d0748426 100644
+--- a/examples/gltf/gltf_extension_animation_graph.rs
++++ b/examples/gltf/gltf_extension_animation_graph.rs
+@@ -135,15 +135,8 @@ impl GltfExtensionHandler for GltfExtensionHandlerAnimation {
+     }
+ 
+     #[cfg(feature = "bevy_animation")]
+-    fn on_animation(
+-        &mut self,
+-        _extension_id: &str,
+-        _value: Option<&serde_json::Value>,
+-        _gltf_animation: &gltf::Animation,
+-        name: Option<&str>,
+-        handle: Handle<AnimationClip>,
+-    ) {
+-        if name.is_some_and(|v| v == "Walk") {
++    fn on_animation(&mut self, gltf_animation: &gltf::Animation, handle: Handle<AnimationClip>) {
++        if gltf_animation.name().is_some_and(|v| v == "Walk") {
+             self.clip = Some(handle.clone());
+         }
+     }
+@@ -160,8 +153,6 @@ impl GltfExtensionHandler for GltfExtensionHandlerAnimation {
+ 
+     fn on_gltf_node(
+         &mut self,
+-        _extension_id: &str,
+-        _value: Option<&serde_json::Value>,
+         _load_context: &mut LoadContext<'_>,
+         gltf_node: &gltf::Node,
+         entity: &mut EntityWorldMut,
+@@ -174,13 +165,10 @@ impl GltfExtensionHandler for GltfExtensionHandlerAnimation {
+     /// Called when an individual Scene is done processing
+     fn on_scene_completed(
+         &mut self,
+-        _extension_id: &str,
+-        _value: Option<&serde_json::Value>,
++        load_context: &mut LoadContext<'_>,
+         _scene: &gltf::Scene,
+-        _name: Option<&str>,
+         _world_root_id: Entity,
+         world: &mut World,
+-        load_context: &mut LoadContext<'_>,
+     ) {
+         // Create an AnimationGraph from the desired clip
+         let (graph, index) = AnimationGraph::from_clip(self.clip.clone().unwrap());

@@ -1,0 +1,140 @@
+diff --git a/crates/bevy_render/src/render_graph/camera_driver_node.rs b/crates/bevy_render/src/render_graph/camera_driver_node.rs
+index 5a8dc581625ec..4ba4e93d33f0c 100644
+--- a/crates/bevy_render/src/render_graph/camera_driver_node.rs
++++ b/crates/bevy_render/src/render_graph/camera_driver_node.rs
+@@ -54,7 +54,15 @@ impl Node for CameraDriverNode {
+                 }
+             }
+             if run_graph {
+-                graph.run_sub_graph(camera.render_graph, vec![], Some(sorted_camera.entity))?;
++                graph.run_sub_graph(
++                    camera.render_graph,
++                    vec![],
++                    Some(sorted_camera.entity),
++                    Some(format!(
++                        "Camera {} ({})",
++                        sorted_camera.order, sorted_camera.entity
++                    )),
++                )?;
+             }
+         }
+ 
+diff --git a/crates/bevy_render/src/render_graph/context.rs b/crates/bevy_render/src/render_graph/context.rs
+index 4c6ecd30c1d67..b1f35edc1d1d8 100644
+--- a/crates/bevy_render/src/render_graph/context.rs
++++ b/crates/bevy_render/src/render_graph/context.rs
+@@ -14,6 +14,7 @@ pub struct RunSubGraph {
+     pub sub_graph: InternedRenderSubGraph,
+     pub inputs: Vec<SlotValue>,
+     pub view_entity: Option<Entity>,
++    pub debug_group: Option<String>,
+ }
+ 
+ /// The context with all graph information required to run a [`Node`](super::Node).
+@@ -185,6 +186,7 @@ impl<'a> RenderGraphContext<'a> {
+         name: impl RenderSubGraph,
+         inputs: Vec<SlotValue>,
+         view_entity: Option<Entity>,
++        debug_group: Option<String>,
+     ) -> Result<(), RunSubGraphError> {
+         let name = name.intern();
+         let sub_graph = self
+@@ -219,6 +221,7 @@ impl<'a> RenderGraphContext<'a> {
+             sub_graph: name,
+             inputs,
+             view_entity,
++            debug_group,
+         });
+ 
+         Ok(())
+diff --git a/crates/bevy_render/src/render_graph/node.rs b/crates/bevy_render/src/render_graph/node.rs
+index 4355892487c00..c75218c0a2941 100644
+--- a/crates/bevy_render/src/render_graph/node.rs
++++ b/crates/bevy_render/src/render_graph/node.rs
+@@ -343,7 +343,7 @@ impl Node for RunGraphOnViewNode {
+         _render_context: &mut RenderContext,
+         _world: &World,
+     ) -> Result<(), NodeRunError> {
+-        graph.run_sub_graph(self.sub_graph, vec![], Some(graph.view_entity()))?;
++        graph.run_sub_graph(self.sub_graph, vec![], Some(graph.view_entity()), None)?;
+         Ok(())
+     }
+ }
+diff --git a/crates/bevy_render/src/renderer/graph_runner.rs b/crates/bevy_render/src/renderer/graph_runner.rs
+index ff2e421982dc7..c1aa664a07bd4 100644
+--- a/crates/bevy_render/src/renderer/graph_runner.rs
++++ b/crates/bevy_render/src/renderer/graph_runner.rs
+@@ -76,7 +76,7 @@ impl RenderGraphRunner {
+         }
+ 
+         let mut render_context = RenderContext::new(render_device, diagnostics_recorder);
+-        Self::run_graph(graph, None, &mut render_context, world, &[], None)?;
++        Self::run_graph(graph, None, &mut render_context, world, &[], None, None)?;
+         finalizer(render_context.command_encoder());
+ 
+         let (render_device, mut diagnostics_recorder) = {
+@@ -108,18 +108,30 @@ impl RenderGraphRunner {
+         world: &'w World,
+         inputs: &[SlotValue],
+         view_entity: Option<Entity>,
++        debug_group: Option<String>,
+     ) -> Result<(), RenderGraphRunnerError> {
+         let mut node_outputs: HashMap<InternedRenderLabel, SmallVec<[SlotValue; 4]>> =
+             HashMap::default();
+         #[cfg(feature = "trace")]
+-        let span = if let Some(label) = &sub_graph {
+-            info_span!("run_graph", name = format!("{label:?}"))
++        let span = if let Some(render_label) = &sub_graph {
++            let name = format!("{render_label:?}");
++            if let Some(debug_group) = debug_group.as_ref() {
++                info_span!("run_graph", name = name, debug_group = debug_group)
++            } else {
++                info_span!("run_graph", name = name)
++            }
+         } else {
+             info_span!("run_graph", name = "main_graph")
+         };
+         #[cfg(feature = "trace")]
+         let _guard = span.enter();
+ 
++        if let Some(debug_group) = debug_group.as_ref() {
++            render_context
++                .command_encoder()
++                .push_debug_group(debug_group);
++        }
++
+         // Queue up nodes without inputs, which can be run immediately
+         let mut node_queue: VecDeque<&NodeState> = graph
+             .iter_nodes()
+@@ -235,6 +247,7 @@ impl RenderGraphRunner {
+                         world,
+                         &run_sub_graph.inputs,
+                         run_sub_graph.view_entity,
++                        run_sub_graph.debug_group,
+                     )?;
+                 }
+             }
+@@ -262,6 +275,10 @@ impl RenderGraphRunner {
+             }
+         }
+ 
++        if debug_group.is_some() {
++            render_context.command_encoder().pop_debug_group();
++        }
++
+         Ok(())
+     }
+ }
+diff --git a/crates/bevy_ui_render/src/lib.rs b/crates/bevy_ui_render/src/lib.rs
+index 4a292d86ba322..c385bca66d35d 100644
+--- a/crates/bevy_ui_render/src/lib.rs
++++ b/crates/bevy_ui_render/src/lib.rs
+@@ -426,7 +426,7 @@ impl RenderGraphNode for RunUiSubgraphOnUiViewNode {
+         };
+ 
+         // Run the subgraph on the UI view.
+-        graph.run_sub_graph(SubGraphUi, vec![], Some(ui_camera_view.0))?;
++        graph.run_sub_graph(SubGraphUi, vec![], Some(ui_camera_view.0), None)?;
+         Ok(())
+     }
+ }

@@ -1,0 +1,429 @@
+diff --git a/crates/bevy_ecs/src/bundle/insert.rs b/crates/bevy_ecs/src/bundle/insert.rs
+index 116480694913b..782edf1dc2d2e 100644
+--- a/crates/bevy_ecs/src/bundle/insert.rs
++++ b/crates/bevy_ecs/src/bundle/insert.rs
+@@ -167,6 +167,13 @@ impl<'w> BundleInserter<'w> {
+ 
+             if insert_mode == InsertMode::Replace {
+                 let archetype = archetype.as_ref();
++                let new_archetype = match archetype_move_type {
++                    ArchetypeMoveType::SameArchetype => archetype,
++                    ArchetypeMoveType::NewArchetypeSameTable { new_archetype }
++                    | ArchetypeMoveType::NewArchetypeNewTable { new_archetype, .. } => {
++                        new_archetype.as_ref()
++                    }
++                };
+                 if archetype.has_replace_observer() {
+                     // SAFETY: the REPLACE event_key corresponds to the Replace event's type
+                     deferred_world.trigger_raw(
+@@ -174,6 +181,8 @@ impl<'w> BundleInserter<'w> {
+                         &mut Replace { entity },
+                         &mut EntityComponentsTrigger {
+                             components: archetype_after_insert.existing(),
++                            old_archetype: Some(archetype),
++                            new_archetype: Some(new_archetype),
+                         },
+                         caller,
+                     );
+@@ -386,6 +395,7 @@ impl<'w> BundleInserter<'w> {
+             caller,
+             relationship_hook_mode,
+             archetype_after_insert,
++            self.archetype.as_ref(),
+             new_archetype,
+             deferred_world,
+         );
+@@ -403,6 +413,7 @@ impl<'w> BundleInserter<'w> {
+         caller: MaybeLocation,
+         relationship_hook_mode: RelationshipHookMode,
+         archetype_after_insert: &ArchetypeAfterBundleInsert,
++        old_archetype: &Archetype,
+         new_archetype: &Archetype,
+         mut deferred_world: crate::world::DeferredWorld<'_>,
+     ) {
+@@ -422,6 +433,8 @@ impl<'w> BundleInserter<'w> {
+                     &mut Add { entity },
+                     &mut EntityComponentsTrigger {
+                         components: archetype_after_insert.added(),
++                        old_archetype: Some(old_archetype),
++                        new_archetype: Some(new_archetype),
+                     },
+                     caller,
+                 );
+@@ -443,6 +456,8 @@ impl<'w> BundleInserter<'w> {
+                             &mut Insert { entity },
+                             &mut EntityComponentsTrigger {
+                                 components: archetype_after_insert.inserted(),
++                                old_archetype: Some(old_archetype),
++                                new_archetype: Some(new_archetype),
+                             },
+                             caller,
+                         );
+@@ -465,6 +480,8 @@ impl<'w> BundleInserter<'w> {
+                             &mut Insert { entity },
+                             &mut EntityComponentsTrigger {
+                                 components: archetype_after_insert.added(),
++                                old_archetype: Some(old_archetype),
++                                new_archetype: Some(new_archetype),
+                             },
+                             caller,
+                         );
+diff --git a/crates/bevy_ecs/src/bundle/remove.rs b/crates/bevy_ecs/src/bundle/remove.rs
+index 5063abaf36ce9..664061a930b51 100644
+--- a/crates/bevy_ecs/src/bundle/remove.rs
++++ b/crates/bevy_ecs/src/bundle/remove.rs
+@@ -155,6 +155,8 @@ impl<'w> BundleRemover<'w> {
+                     &mut Replace { entity },
+                     &mut EntityComponentsTrigger {
+                         components: &components,
++                        old_archetype: Some(self.old_archetype.as_ref()),
++                        new_archetype: Some(self.new_archetype.as_ref()),
+                     },
+                     caller,
+                 );
+@@ -174,6 +176,8 @@ impl<'w> BundleRemover<'w> {
+                     &mut Remove { entity },
+                     &mut EntityComponentsTrigger {
+                         components: &components,
++                        old_archetype: Some(self.old_archetype.as_ref()),
++                        new_archetype: Some(self.new_archetype.as_ref()),
+                     },
+                     caller,
+                 );
+diff --git a/crates/bevy_ecs/src/bundle/spawner.rs b/crates/bevy_ecs/src/bundle/spawner.rs
+index 36a10670e868b..8a43899bb28a2 100644
+--- a/crates/bevy_ecs/src/bundle/spawner.rs
++++ b/crates/bevy_ecs/src/bundle/spawner.rs
+@@ -144,6 +144,8 @@ impl<'w> BundleSpawner<'w> {
+                     &mut Add { entity },
+                     &mut EntityComponentsTrigger {
+                         components: bundle_info.contributed_components(),
++                        old_archetype: None,
++                        new_archetype: Some(archetype),
+                     },
+                     caller,
+                 );
+@@ -162,6 +164,8 @@ impl<'w> BundleSpawner<'w> {
+                     &mut Insert { entity },
+                     &mut EntityComponentsTrigger {
+                         components: bundle_info.contributed_components(),
++                        old_archetype: None,
++                        new_archetype: Some(archetype),
+                     },
+                     caller,
+                 );
+diff --git a/crates/bevy_ecs/src/event/trigger.rs b/crates/bevy_ecs/src/event/trigger.rs
+index 7782549039a75..140e9cd17eca1 100644
+--- a/crates/bevy_ecs/src/event/trigger.rs
++++ b/crates/bevy_ecs/src/event/trigger.rs
+@@ -1,5 +1,6 @@
+ use crate::event::SetEntityEventTarget;
+ use crate::{
++    archetype::Archetype,
+     component::ComponentId,
+     entity::Entity,
+     event::{EntityEvent, Event},
+@@ -341,6 +342,84 @@ pub struct EntityComponentsTrigger<'a> {
+     /// if components `A` and `B` are added together, producing the [`Add`](crate::lifecycle::Add) event, this will
+     /// contain the [`ComponentId`] for both `A` and `B`.
+     pub components: &'a [ComponentId],
++
++    /// The [`Archetype`] of the target entity before this change, or `None` if the entity was just spawned.
++    /// For observers that run before the change, like [`Replace`](crate::lifecycle::Replace) and [`Remove`](crate::lifecycle::Remove), this will be the current archetype.
++    ///
++    /// This can be useful in [`Insert`](crate::lifecycle::Insert) and [`Add`](crate::lifecycle::Add) observers,
++    /// since the old archetype will not include any other components added at the same time.
++    ///
++    /// Note that `None` should usually be treated the same as an archetype with no components,
++    /// since spawning an entity should be equivalent to spawning an empty entity and then inserting all components.
++    ///
++    /// # Example
++    /// ```
++    /// # use bevy_ecs::{
++    /// #     component::ComponentIdFor, entity::EntityHashSet, entity_disabling::Disabled,
++    /// #     prelude::*,
++    /// # };
++    /// # #[derive(Component)]
++    /// # struct A;
++    /// # #[derive(Resource)]
++    /// # struct EntitiesWithA(EntityHashSet);
++    /// #
++    /// # let mut world = World::new();
++    /// #
++    /// fn on_add_disable(
++    ///     on: On<Add, Disabled>,
++    ///     mut cache: ResMut<EntitiesWithA>,
++    ///     a_component: ComponentIdFor<A>,
++    /// ) {
++    ///     // The `A` component may have been added at the same time as `Disabled`,
++    ///     // either due to an insert or spawn.  Only try to remove this entity from
++    ///     // our cache if the `A` component was in the old archetype.
++    ///     if on.trigger().old_archetype.is_some_and(|a| a.contains(*a_component)) {
++    ///         cache.0.remove(&on.entity);
++    ///     }
++    /// }
++    /// #
++    /// # world.add_observer(on_add_disable);
++    /// ```
++    pub old_archetype: Option<&'a Archetype>,
++
++    /// The [`Archetype`] of the target entity after this change, or `None` if the entity will be despawned.
++    /// For observers that run after the change, like [`Insert`](crate::lifecycle::Insert) and [`Add`](crate::lifecycle::Add), this will be the current archetype.
++    ///
++    /// This can be useful in [`Replace`](crate::lifecycle::Replace) and [`Remove`](crate::lifecycle::Remove) observers,
++    /// since the new archetype will not include any other components removed at the same time.
++    ///
++    /// Note that `None` should usually be treated the same as an archetype with no components,
++    /// since despawning an entity should be equivalent to removing all its components and then despawning the empty entity.
++    ///
++    /// # Example
++    /// ```
++    /// # use bevy_ecs::{
++    /// #     component::ComponentIdFor, entity::EntityHashSet, entity_disabling::Disabled,
++    /// #     prelude::*,
++    /// # };
++    /// # #[derive(Component)]
++    /// # struct A;
++    /// # #[derive(Resource)]
++    /// # struct EntitiesWithA(EntityHashSet);
++    /// #
++    /// # let mut world = World::new();
++    /// #
++    /// fn on_remove_disable(
++    ///     on: On<Remove, Disabled>,
++    ///     mut cache: ResMut<EntitiesWithA>,
++    ///     a_component: ComponentIdFor<A>,
++    /// ) {
++    ///     // The `A` component may have been removed at the same time as `Disabled`,
++    ///     // either due to a remove or despawn.  Only try to add this entity to our
++    ///     // cache if the `A` component is still in the new archetype.
++    ///     if on.trigger().new_archetype.is_some_and(|a| a.contains(*a_component)) {
++    ///         cache.0.insert(on.entity);
++    ///     }
++    /// }
++    /// #
++    /// # world.add_observer(on_remove_disable);
++    /// ```
++    pub new_archetype: Option<&'a Archetype>,
+ }
+ 
+ // SAFETY:
+diff --git a/crates/bevy_ecs/src/observer/mod.rs b/crates/bevy_ecs/src/observer/mod.rs
+index 3097595eae5c5..ae42035a77c26 100644
+--- a/crates/bevy_ecs/src/observer/mod.rs
++++ b/crates/bevy_ecs/src/observer/mod.rs
+@@ -243,10 +243,12 @@ impl World {
+ #[cfg(test)]
+ mod tests {
+     use alloc::{vec, vec::Vec};
++    use core::any::type_name;
+ 
+     use bevy_ptr::OwningPtr;
+ 
+     use crate::{
++        archetype::{Archetype, ArchetypeId},
+         change_detection::MaybeLocation,
+         error::Result,
+         event::{EntityComponentsTrigger, Event, GlobalTrigger},
+@@ -599,6 +601,8 @@ mod tests {
+             EntityComponentsEvent(entity_1),
+             EntityComponentsTrigger {
+                 components: &[component_a],
++                old_archetype: None,
++                new_archetype: None,
+             },
+         );
+         // only observer that doesn't trigger is the one only watching entity_2
+@@ -608,11 +612,19 @@ mod tests {
+         // trigger for both entities, but no components: trigger once per entity target
+         world.trigger_with(
+             EntityComponentsEvent(entity_1),
+-            EntityComponentsTrigger { components: &[] },
++            EntityComponentsTrigger {
++                components: &[],
++                old_archetype: None,
++                new_archetype: None,
++            },
+         );
+         world.trigger_with(
+             EntityComponentsEvent(entity_2),
+-            EntityComponentsTrigger { components: &[] },
++            EntityComponentsTrigger {
++                components: &[],
++                old_archetype: None,
++                new_archetype: None,
++            },
+         );
+ 
+         // only the observer that doesn't require components triggers - once per entity
+@@ -625,12 +637,16 @@ mod tests {
+             EntityComponentsEvent(entity_1),
+             EntityComponentsTrigger {
+                 components: &[component_a, component_b],
++                old_archetype: None,
++                new_archetype: None,
+             },
+         );
+         world.trigger_with(
+             EntityComponentsEvent(entity_2),
+             EntityComponentsTrigger {
+                 components: &[component_a, component_b],
++                old_archetype: None,
++                new_archetype: None,
+             },
+         );
+         assert_eq!(2222211, world.resource::<R>().0);
+@@ -1311,4 +1327,57 @@ mod tests {
+         world.trigger(EventA);
+         assert!(world.resource::<Order>().0.is_empty());
+     }
++
++    #[test]
++    fn observer_new_old_archetypes() {
++        #[derive(Resource, Default)]
++        struct Changes(Vec<(&'static str, Option<ArchetypeId>, Option<ArchetypeId>)>);
++
++        let mut world = World::new();
++        world.init_resource::<Changes>();
++
++        fn observer<E: for<'a> Event<Trigger<'a> = EntityComponentsTrigger<'a>>>(
++            e: On<E, A>,
++            mut c: ResMut<Changes>,
++        ) {
++            c.0.push((
++                type_name::<E>(),
++                e.trigger().old_archetype.map(Archetype::id),
++                e.trigger().new_archetype.map(Archetype::id),
++            ));
++        }
++
++        let empty = world.spawn(()).archetype().id();
++        let a = world.spawn(A).archetype().id();
++        let ab = world.spawn((A, B)).archetype().id();
++
++        world.add_observer(observer::<Add>);
++        world.add_observer(observer::<Insert>);
++        world.add_observer(observer::<Replace>);
++        world.add_observer(observer::<Remove>);
++        world.add_observer(observer::<Despawn>);
++
++        let mut entity = world.spawn((A, B));
++        entity.remove::<(A, B)>();
++        entity.insert(A);
++        entity.insert(A);
++        entity.despawn();
++
++        assert_eq!(
++            &world.resource_mut::<Changes>().0,
++            &[
++                ("bevy_ecs::lifecycle::Add", None, Some(ab)),
++                ("bevy_ecs::lifecycle::Insert", None, Some(ab)),
++                ("bevy_ecs::lifecycle::Replace", Some(ab), Some(empty)),
++                ("bevy_ecs::lifecycle::Remove", Some(ab), Some(empty)),
++                ("bevy_ecs::lifecycle::Add", Some(empty), Some(a)),
++                ("bevy_ecs::lifecycle::Insert", Some(empty), Some(a)),
++                ("bevy_ecs::lifecycle::Replace", Some(a), Some(a)),
++                ("bevy_ecs::lifecycle::Insert", Some(a), Some(a)),
++                ("bevy_ecs::lifecycle::Despawn", Some(a), None),
++                ("bevy_ecs::lifecycle::Replace", Some(a), None),
++                ("bevy_ecs::lifecycle::Remove", Some(a), None),
++            ],
++        );
++    }
+ }
+diff --git a/crates/bevy_ecs/src/world/deferred_world.rs b/crates/bevy_ecs/src/world/deferred_world.rs
+index 6ef13dd316c46..14025bc73fb60 100644
+--- a/crates/bevy_ecs/src/world/deferred_world.rs
++++ b/crates/bevy_ecs/src/world/deferred_world.rs
+@@ -179,6 +179,8 @@ impl<'w> DeferredWorld<'w> {
+                     &mut Replace { entity },
+                     &mut EntityComponentsTrigger {
+                         components: &[component_id],
++                        old_archetype: Some(archetype),
++                        new_archetype: Some(archetype),
+                     },
+                     MaybeLocation::caller(),
+                 );
+@@ -222,6 +224,8 @@ impl<'w> DeferredWorld<'w> {
+                     &mut Insert { entity },
+                     &mut EntityComponentsTrigger {
+                         components: &[component_id],
++                        old_archetype: Some(archetype),
++                        new_archetype: Some(archetype),
+                     },
+                     MaybeLocation::caller(),
+                 );
+diff --git a/crates/bevy_ecs/src/world/entity_access/world_mut.rs b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+index e48f546fb1688..7abdcbe3fd926 100644
+--- a/crates/bevy_ecs/src/world/entity_access/world_mut.rs
++++ b/crates/bevy_ecs/src/world/entity_access/world_mut.rs
+@@ -1589,6 +1589,8 @@ impl<'w> EntityWorldMut<'w> {
+                     },
+                     &mut EntityComponentsTrigger {
+                         components: archetype.components(),
++                        old_archetype: Some(archetype),
++                        new_archetype: None,
+                     },
+                     caller,
+                 );
+@@ -1608,6 +1610,8 @@ impl<'w> EntityWorldMut<'w> {
+                     },
+                     &mut EntityComponentsTrigger {
+                         components: archetype.components(),
++                        old_archetype: Some(archetype),
++                        new_archetype: None,
+                     },
+                     caller,
+                 );
+@@ -1628,6 +1632,8 @@ impl<'w> EntityWorldMut<'w> {
+                     },
+                     &mut EntityComponentsTrigger {
+                         components: archetype.components(),
++                        old_archetype: Some(archetype),
++                        new_archetype: None,
+                     },
+                     caller,
+                 );
+diff --git a/release-content/migration-guides/observer_old_new_archetype.md b/release-content/migration-guides/observer_old_new_archetype.md
+new file mode 100644
+index 0000000000000..009c8220f1e0f
+--- /dev/null
++++ b/release-content/migration-guides/observer_old_new_archetype.md
+@@ -0,0 +1,37 @@
++---
++title: Lifecycle observers include old and new archetypes
++pull_requests: [22828]
++---
++
++Lifecycle observers now include information about the old and new archetypes during a change in the `EntityComponentsTrigger`.
++As all of the fields for this `struct` are `pub`, adding new ones is a breaking change.  
++
++If you were pattern matching the `components` field on `EntityComponentsTrigger`, you will need to add `..` to the pattern.
++
++```rust
++// 18.0
++let EntityComponentsTrigger { components } = e.trigger();
++// 19.0
++let EntityComponentsTrigger { components, .. } = e.trigger();
++```
++
++If you were constructing an `EntityComponentsTrigger` manually, you will need to supply values for `old_archetype` and `new_archetype`.
++
++```rust
++// 18.0
++world.trigger_with(
++    event,
++    EntityComponentsTrigger {
++        components: &[component_a],
++    },
++);
++// 19.0
++world.trigger_with(
++    event,
++    EntityComponentsTrigger {
++        components: &[component_a],
++        old_archetype: None,
++        new_archetype: None,
++    },
++);
++```

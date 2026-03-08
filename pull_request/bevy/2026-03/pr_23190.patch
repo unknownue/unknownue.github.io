@@ -1,0 +1,103 @@
+diff --git a/crates/bevy_sprite/src/lib.rs b/crates/bevy_sprite/src/lib.rs
+index dc328e9519414..f18c1ca25d18b 100644
+--- a/crates/bevy_sprite/src/lib.rs
++++ b/crates/bevy_sprite/src/lib.rs
+@@ -90,12 +90,17 @@ impl Plugin for SpritePlugin {
+             (
+                 bevy_text::detect_text_needs_rerender::<Text2d>,
+                 update_text2d_layout.after(bevy_camera::CameraUpdateSystems),
+-                calculate_bounds_text2d.in_set(VisibilitySystems::CalculateBounds),
+             )
+                 .chain()
+                 .after(bevy_text::load_font_assets_into_font_collection)
+-                .in_set(bevy_text::Text2dUpdateSystems)
++                .before(bevy_asset::AssetEventSystems)
+                 .after(bevy_app::AnimationSystems),
++        )
++        .add_systems(
++            PostUpdate,
++            calculate_bounds_text2d
++                .in_set(VisibilitySystems::CalculateBounds)
++                .after(update_text2d_layout),
+         );
+ 
+         #[cfg(feature = "bevy_picking")]
+diff --git a/crates/bevy_text/src/font.rs b/crates/bevy_text/src/font.rs
+index 4618a6fe464d5..5cd1e7065ffed 100644
+--- a/crates/bevy_text/src/font.rs
++++ b/crates/bevy_text/src/font.rs
+@@ -1,12 +1,13 @@
+ use crate::ComputedTextBlock;
+ use crate::FontCx;
+ use bevy_asset::Asset;
+-use bevy_asset::AssetEvent;
++use bevy_asset::AssetId;
+ use bevy_asset::Assets;
+-use bevy_ecs::message::MessageReader;
++use bevy_ecs::system::Local;
+ use bevy_ecs::system::Query;
+ use bevy_ecs::system::Res;
+ use bevy_ecs::system::ResMut;
++use bevy_platform::collections::HashSet;
+ use bevy_reflect::TypePath;
+ use parley::fontique::Blob;
+ use parley::fontique::FontInfoOverride;
+@@ -46,16 +47,16 @@ impl Font {
+ /// Add new font assets to the internal font collection.
+ pub fn load_font_assets_into_font_collection(
+     fonts: Res<Assets<Font>>,
+-    mut events: MessageReader<AssetEvent<Font>>,
++    mut loaded_fonts: Local<HashSet<AssetId<Font>>>,
+     mut font_cx: ResMut<FontCx>,
+     mut text_block_query: Query<&mut ComputedTextBlock>,
+ ) {
+     let mut new_fonts_added = false;
+ 
+-    for event in events.read() {
+-        if let AssetEvent::Added { id } = event
+-            && let Some(font) = fonts.get(*id)
+-        {
++    loaded_fonts.retain(|id| fonts.contains(*id));
++
++    for (id, font) in fonts.iter() {
++        if loaded_fonts.insert(id) {
+             font_cx.0.collection.register_fonts(
+                 font.data.clone(),
+                 Some(FontInfoOverride {
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 0b65529bf2c29..077585df5920c 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -43,7 +43,6 @@ mod pipeline;
+ mod text;
+ mod text_access;
+ 
+-use bevy_asset::AssetEventSystems;
+ pub use bounds::*;
+ pub use error::*;
+ pub use font::*;
+@@ -98,10 +97,7 @@ impl Plugin for TextPlugin {
+             .init_resource::<ScaleCx>()
+             .init_resource::<TextIterScratch>()
+             .init_resource::<RemSize>()
+-            .add_systems(
+-                PostUpdate,
+-                load_font_assets_into_font_collection.after(AssetEventSystems),
+-            )
++            .add_systems(PostUpdate, load_font_assets_into_font_collection)
+             .add_systems(Last, trim_source_cache);
+ 
+         #[cfg(feature = "default_font")]
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index f8b7b838711f3..fe8913066175c 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -244,6 +244,8 @@ fn build_text_interop(app: &mut App) {
+                 .ambiguous_with(widget::update_image_content_size_system),
+             widget::text_system
+                 .in_set(UiSystems::PostLayout)
++                .after(bevy_text::load_font_assets_into_font_collection)
++                .before(bevy_asset::AssetEventSystems)
+                 // Text2d and bevy_ui text are entirely on separate entities
+                 .ambiguous_with(bevy_text::detect_text_needs_rerender::<bevy_sprite::Text2d>)
+                 .ambiguous_with(bevy_sprite::update_text2d_layout)

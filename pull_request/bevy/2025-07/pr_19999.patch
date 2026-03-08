@@ -1,0 +1,763 @@
+diff --git a/crates/bevy_pbr/src/deferred/mod.rs b/crates/bevy_pbr/src/deferred/mod.rs
+index 96569b2861b32..3c303331ffc11 100644
+--- a/crates/bevy_pbr/src/deferred/mod.rs
++++ b/crates/bevy_pbr/src/deferred/mod.rs
+@@ -7,7 +7,7 @@ use crate::{
+ };
+ use crate::{DistanceFog, MeshPipelineKey, ViewFogUniformOffset, ViewLightsUniformOffset};
+ use bevy_app::prelude::*;
+-use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+ use bevy_core_pipeline::{
+     core_3d::graph::{Core3d, Node3d},
+     deferred::{
+@@ -19,6 +19,7 @@ use bevy_core_pipeline::{
+ use bevy_ecs::{prelude::*, query::QueryItem};
+ use bevy_image::BevyDefault as _;
+ use bevy_light::{EnvironmentMapLight, ShadowFilteringMethod};
++use bevy_render::RenderStartup;
+ use bevy_render::{
+     extract_component::{
+         ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
+@@ -104,6 +105,7 @@ impl Plugin for DeferredPbrLightingPlugin {
+ 
+         render_app
+             .init_resource::<SpecializedRenderPipelines<DeferredLightingLayout>>()
++            .add_systems(RenderStartup, init_deferred_lighting_layout)
+             .add_systems(
+                 Render,
+                 (prepare_deferred_lighting_pipelines.in_set(RenderSystems::Prepare),),
+@@ -121,14 +123,6 @@ impl Plugin for DeferredPbrLightingPlugin {
+                 ),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app.init_resource::<DeferredLightingLayout>();
+-    }
+ }
+ 
+ #[derive(Default)]
+@@ -394,22 +388,27 @@ impl SpecializedRenderPipeline for DeferredLightingLayout {
+     }
+ }
+ 
+-impl FromWorld for DeferredLightingLayout {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let layout = render_device.create_bind_group_layout(
+-            "deferred_lighting_layout",
+-            &BindGroupLayoutEntries::single(
+-                ShaderStages::VERTEX_FRAGMENT,
+-                uniform_buffer::<PbrDeferredLightingDepthId>(false),
+-            ),
+-        );
+-        Self {
+-            mesh_pipeline: world.resource::<MeshPipeline>().clone(),
+-            bind_group_layout_2: layout,
+-            deferred_lighting_shader: load_embedded_asset!(world, "deferred_lighting.wgsl"),
+-        }
+-    }
++pub fn init_deferred_lighting_layout(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    mesh_pipeline: Res<MeshPipeline>,
++    asset_server: Res<AssetServer>,
++) {
++    let layout = render_device.create_bind_group_layout(
++        "deferred_lighting_layout",
++        &BindGroupLayoutEntries::single(
++            ShaderStages::VERTEX_FRAGMENT,
++            uniform_buffer::<PbrDeferredLightingDepthId>(false),
++        ),
++    );
++    commands.insert_resource(DeferredLightingLayout {
++        mesh_pipeline: mesh_pipeline.clone(),
++        bind_group_layout_2: layout,
++        deferred_lighting_shader: load_embedded_asset!(
++            asset_server.as_ref(),
++            "deferred_lighting.wgsl"
++        ),
++    });
+ }
+ 
+ pub fn insert_deferred_lighting_pass_id_component(
+diff --git a/crates/bevy_pbr/src/light_probe/mod.rs b/crates/bevy_pbr/src/light_probe/mod.rs
+index bce844bb21a18..3c2da1f52101e 100644
+--- a/crates/bevy_pbr/src/light_probe/mod.rs
++++ b/crates/bevy_pbr/src/light_probe/mod.rs
+@@ -289,9 +289,7 @@ impl Plugin for LightProbePlugin {
+         load_shader_library!(app, "irradiance_volume.wgsl");
+ 
+         app.add_plugins(ExtractInstancesPlugin::<EnvironmentMapIds>::new());
+-    }
+ 
+-    fn finish(&self, app: &mut App) {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+diff --git a/crates/bevy_pbr/src/lightmap/mod.rs b/crates/bevy_pbr/src/lightmap/mod.rs
+index 567bbce67436f..682fac09c053e 100644
+--- a/crates/bevy_pbr/src/lightmap/mod.rs
++++ b/crates/bevy_pbr/src/lightmap/mod.rs
+@@ -42,8 +42,7 @@ use bevy_ecs::{
+     reflect::ReflectComponent,
+     resource::Resource,
+     schedule::IntoScheduleConfigs,
+-    system::{Query, Res, ResMut},
+-    world::{FromWorld, World},
++    system::{Commands, Query, Res, ResMut},
+ };
+ use bevy_image::Image;
+ use bevy_math::{uvec2, vec4, Rect, UVec2};
+@@ -57,7 +56,7 @@ use bevy_render::{
+     sync_world::MainEntity,
+     texture::{FallbackImage, GpuImage},
+     view::ViewVisibility,
+-    Extract, ExtractSchedule, RenderApp,
++    Extract, ExtractSchedule, RenderApp, RenderStartup,
+ };
+ use bevy_render::{renderer::RenderDevice, sync_world::MainEntityHashMap};
+ use bevy_utils::default;
+@@ -186,17 +185,16 @@ pub struct LightmapSlotIndex(pub(crate) NonMaxU16);
+ impl Plugin for LightmapPlugin {
+     fn build(&self, app: &mut App) {
+         load_shader_library!(app, "lightmap.wgsl");
+-    }
+ 
+-    fn finish(&self, app: &mut App) {
+         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+             return;
+         };
+-
+-        render_app.init_resource::<RenderLightmaps>().add_systems(
+-            ExtractSchedule,
+-            extract_lightmaps.after(MeshExtractionSystems),
+-        );
++        render_app
++            .add_systems(RenderStartup, init_render_lightmaps)
++            .add_systems(
++                ExtractSchedule,
++                extract_lightmaps.after(MeshExtractionSystems),
++            );
+     }
+ }
+ 
+@@ -334,21 +332,20 @@ impl Default for Lightmap {
+     }
+ }
+ 
+-impl FromWorld for RenderLightmaps {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let render_adapter = world.resource::<RenderAdapter>();
+-
+-        let bindless_supported = binding_arrays_are_usable(render_device, render_adapter);
+-
+-        RenderLightmaps {
+-            render_lightmaps: default(),
+-            slabs: vec![],
+-            free_slabs: FixedBitSet::new(),
+-            pending_lightmaps: default(),
+-            bindless_supported,
+-        }
+-    }
++pub fn init_render_lightmaps(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    render_adapter: Res<RenderAdapter>,
++) {
++    let bindless_supported = binding_arrays_are_usable(&render_device, &render_adapter);
++
++    commands.insert_resource(RenderLightmaps {
++        render_lightmaps: default(),
++        slabs: vec![],
++        free_slabs: FixedBitSet::new(),
++        pending_lightmaps: default(),
++        bindless_supported,
++    });
+ }
+ 
+ impl RenderLightmaps {
+diff --git a/crates/bevy_pbr/src/material.rs b/crates/bevy_pbr/src/material.rs
+index 2e642dba921be..3ebc89bccd0e4 100644
+--- a/crates/bevy_pbr/src/material.rs
++++ b/crates/bevy_pbr/src/material.rs
+@@ -267,6 +267,15 @@ impl Plugin for MaterialsPlugin {
+                 .init_resource::<LightKeyCache>()
+                 .init_resource::<LightSpecializationTicks>()
+                 .init_resource::<SpecializedShadowMaterialPipelineCache>()
++                .init_resource::<DrawFunctions<Shadow>>()
++                .init_resource::<RenderMaterialInstances>()
++                .init_resource::<MaterialBindGroupAllocators>()
++                .add_render_command::<Shadow, DrawPrepass>()
++                .add_render_command::<Transmissive3d, DrawMaterial>()
++                .add_render_command::<Transparent3d, DrawMaterial>()
++                .add_render_command::<Opaque3d, DrawMaterial>()
++                .add_render_command::<AlphaMask3d, DrawMaterial>()
++                .add_systems(RenderStartup, init_material_pipeline)
+                 .add_systems(
+                     Render,
+                     (
+@@ -301,21 +310,6 @@ impl Plugin for MaterialsPlugin {
+                 );
+         }
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+-            render_app
+-                .init_resource::<DrawFunctions<Shadow>>()
+-                .init_resource::<RenderMaterialInstances>()
+-                .init_resource::<MaterialPipeline>()
+-                .init_resource::<MaterialBindGroupAllocators>()
+-                .add_render_command::<Shadow, DrawPrepass>()
+-                .add_render_command::<Transmissive3d, DrawMaterial>()
+-                .add_render_command::<Transparent3d, DrawMaterial>()
+-                .add_render_command::<Opaque3d, DrawMaterial>()
+-                .add_render_command::<AlphaMask3d, DrawMaterial>();
+-        }
+-    }
+ }
+ 
+ /// Adds the necessary ECS resources and render logic to enable rendering entities using the given [`Material`]
+@@ -485,12 +479,10 @@ impl SpecializedMeshPipeline for MaterialPipelineSpecializer {
+     }
+ }
+ 
+-impl FromWorld for MaterialPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        MaterialPipeline {
+-            mesh_pipeline: world.resource::<MeshPipeline>().clone(),
+-        }
+-    }
++pub fn init_material_pipeline(mut commands: Commands, mesh_pipeline: Res<MeshPipeline>) {
++    commands.insert_resource(MaterialPipeline {
++        mesh_pipeline: mesh_pipeline.clone(),
++    });
+ }
+ 
+ pub type DrawMaterial = (
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 0dda6127f08fc..66de219a90186 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -2,13 +2,13 @@ mod prepass_bindings;
+ 
+ use crate::{
+     alpha_mode_pipeline_key, binding_arrays_are_usable, buffer_layout,
+-    collect_meshes_for_gpu_building, set_mesh_motion_vector_flags, setup_morph_and_skinning_defs,
+-    skin, DeferredDrawFunction, DeferredFragmentShader, DeferredVertexShader, DrawMesh,
+-    EntitySpecializationTicks, ErasedMaterialPipelineKey, Material, MaterialPipeline,
+-    MaterialProperties, MeshLayouts, MeshPipeline, MeshPipelineKey, OpaqueRendererMethod,
+-    PreparedMaterial, PrepassDrawFunction, PrepassFragmentShader, PrepassVertexShader,
+-    RenderLightmaps, RenderMaterialInstances, RenderMeshInstanceFlags, RenderMeshInstances,
+-    RenderPhaseType, SetMaterialBindGroup, SetMeshBindGroup, ShadowView,
++    collect_meshes_for_gpu_building, init_material_pipeline, set_mesh_motion_vector_flags,
++    setup_morph_and_skinning_defs, skin, DeferredDrawFunction, DeferredFragmentShader,
++    DeferredVertexShader, DrawMesh, EntitySpecializationTicks, ErasedMaterialPipelineKey, Material,
++    MaterialPipeline, MaterialProperties, MeshLayouts, MeshPipeline, MeshPipelineKey,
++    OpaqueRendererMethod, PreparedMaterial, PrepassDrawFunction, PrepassFragmentShader,
++    PrepassVertexShader, RenderLightmaps, RenderMaterialInstances, RenderMeshInstanceFlags,
++    RenderMeshInstances, RenderPhaseType, SetMaterialBindGroup, SetMeshBindGroup, ShadowView,
+ };
+ use bevy_app::{App, Plugin, PreUpdate};
+ use bevy_render::{
+@@ -21,11 +21,11 @@ use bevy_render::{
+     renderer::RenderAdapter,
+     sync_world::RenderEntity,
+     view::{RenderVisibilityRanges, RetainedViewEntity, VISIBILITY_RANGES_STORAGE_BUFFER_COUNT},
+-    ExtractSchedule, Render, RenderApp, RenderDebugFlags, RenderSystems,
++    ExtractSchedule, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
+ };
+ pub use prepass_bindings::*;
+ 
+-use bevy_asset::{embedded_asset, load_embedded_asset, Handle};
++use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+ use bevy_core_pipeline::{
+     core_3d::CORE_3D_DEPTH_FORMAT, deferred::*, prelude::Camera3d, prepass::*,
+ };
+@@ -87,22 +87,20 @@ impl Plugin for PrepassPipelinePlugin {
+         };
+ 
+         render_app
++            .add_systems(
++                RenderStartup,
++                (
++                    init_prepass_pipeline.after(init_material_pipeline),
++                    init_prepass_view_bind_group,
++                )
++                    .chain(),
++            )
+             .add_systems(
+                 Render,
+                 prepare_prepass_view_bind_group.in_set(RenderSystems::PrepareBindGroups),
+             )
+             .init_resource::<SpecializedMeshPipelines<PrepassPipelineSpecializer>>();
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app
+-            .init_resource::<PrepassPipeline>()
+-            .init_resource::<PrepassViewBindGroup>();
+-    }
+ }
+ 
+ /// Sets up the prepasses for a material.
+@@ -273,78 +271,79 @@ pub struct PrepassPipeline {
+     pub material_pipeline: MaterialPipeline,
+ }
+ 
+-impl FromWorld for PrepassPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let render_adapter = world.resource::<RenderAdapter>();
+-        let visibility_ranges_buffer_binding_type = render_device
+-            .get_supported_read_only_binding_type(VISIBILITY_RANGES_STORAGE_BUFFER_COUNT);
+-
+-        let view_layout_motion_vectors = render_device.create_bind_group_layout(
+-            "prepass_view_layout_motion_vectors",
+-            &BindGroupLayoutEntries::with_indices(
+-                ShaderStages::VERTEX_FRAGMENT,
++pub fn init_prepass_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    render_adapter: Res<RenderAdapter>,
++    mesh_pipeline: Res<MeshPipeline>,
++    material_pipeline: Res<MaterialPipeline>,
++    asset_server: Res<AssetServer>,
++) {
++    let visibility_ranges_buffer_binding_type =
++        render_device.get_supported_read_only_binding_type(VISIBILITY_RANGES_STORAGE_BUFFER_COUNT);
++
++    let view_layout_motion_vectors = render_device.create_bind_group_layout(
++        "prepass_view_layout_motion_vectors",
++        &BindGroupLayoutEntries::with_indices(
++            ShaderStages::VERTEX_FRAGMENT,
++            (
++                // View
++                (0, uniform_buffer::<ViewUniform>(true)),
++                // Globals
++                (1, uniform_buffer::<GlobalsUniform>(false)),
++                // PreviousViewUniforms
++                (2, uniform_buffer::<PreviousViewData>(true)),
++                // VisibilityRanges
+                 (
+-                    // View
+-                    (0, uniform_buffer::<ViewUniform>(true)),
+-                    // Globals
+-                    (1, uniform_buffer::<GlobalsUniform>(false)),
+-                    // PreviousViewUniforms
+-                    (2, uniform_buffer::<PreviousViewData>(true)),
+-                    // VisibilityRanges
+-                    (
+-                        14,
+-                        buffer_layout(
+-                            visibility_ranges_buffer_binding_type,
+-                            false,
+-                            Some(Vec4::min_size()),
+-                        )
+-                        .visibility(ShaderStages::VERTEX),
+-                    ),
++                    14,
++                    buffer_layout(
++                        visibility_ranges_buffer_binding_type,
++                        false,
++                        Some(Vec4::min_size()),
++                    )
++                    .visibility(ShaderStages::VERTEX),
+                 ),
+             ),
+-        );
++        ),
++    );
+ 
+-        let view_layout_no_motion_vectors = render_device.create_bind_group_layout(
+-            "prepass_view_layout_no_motion_vectors",
+-            &BindGroupLayoutEntries::with_indices(
+-                ShaderStages::VERTEX_FRAGMENT,
++    let view_layout_no_motion_vectors = render_device.create_bind_group_layout(
++        "prepass_view_layout_no_motion_vectors",
++        &BindGroupLayoutEntries::with_indices(
++            ShaderStages::VERTEX_FRAGMENT,
++            (
++                // View
++                (0, uniform_buffer::<ViewUniform>(true)),
++                // Globals
++                (1, uniform_buffer::<GlobalsUniform>(false)),
++                // VisibilityRanges
+                 (
+-                    // View
+-                    (0, uniform_buffer::<ViewUniform>(true)),
+-                    // Globals
+-                    (1, uniform_buffer::<GlobalsUniform>(false)),
+-                    // VisibilityRanges
+-                    (
+-                        14,
+-                        buffer_layout(
+-                            visibility_ranges_buffer_binding_type,
+-                            false,
+-                            Some(Vec4::min_size()),
+-                        )
+-                        .visibility(ShaderStages::VERTEX),
+-                    ),
++                    14,
++                    buffer_layout(
++                        visibility_ranges_buffer_binding_type,
++                        false,
++                        Some(Vec4::min_size()),
++                    )
++                    .visibility(ShaderStages::VERTEX),
+                 ),
+             ),
+-        );
++        ),
++    );
+ 
+-        let mesh_pipeline = world.resource::<MeshPipeline>();
+-
+-        let depth_clip_control_supported = render_device
+-            .features()
+-            .contains(WgpuFeatures::DEPTH_CLIP_CONTROL);
+-        PrepassPipeline {
+-            view_layout_motion_vectors,
+-            view_layout_no_motion_vectors,
+-            mesh_layouts: mesh_pipeline.mesh_layouts.clone(),
+-            default_prepass_shader: load_embedded_asset!(world, "prepass.wgsl"),
+-            skins_use_uniform_buffers: skin::skins_use_uniform_buffers(render_device),
+-            depth_clip_control_supported,
+-            binding_arrays_are_usable: binding_arrays_are_usable(render_device, render_adapter),
+-            empty_layout: render_device.create_bind_group_layout("prepass_empty_layout", &[]),
+-            material_pipeline: world.resource::<MaterialPipeline>().clone(),
+-        }
+-    }
++    let depth_clip_control_supported = render_device
++        .features()
++        .contains(WgpuFeatures::DEPTH_CLIP_CONTROL);
++    commands.insert_resource(PrepassPipeline {
++        view_layout_motion_vectors,
++        view_layout_no_motion_vectors,
++        mesh_layouts: mesh_pipeline.mesh_layouts.clone(),
++        default_prepass_shader: load_embedded_asset!(asset_server.as_ref(), "prepass.wgsl"),
++        skins_use_uniform_buffers: skin::skins_use_uniform_buffers(&render_device),
++        depth_clip_control_supported,
++        binding_arrays_are_usable: binding_arrays_are_usable(&render_device, &render_adapter),
++        empty_layout: render_device.create_bind_group_layout("prepass_empty_layout", &[]),
++        material_pipeline: material_pipeline.clone(),
++    });
+ }
+ 
+ pub struct PrepassPipelineSpecializer {
+@@ -702,22 +701,21 @@ pub struct PrepassViewBindGroup {
+     pub empty_bind_group: BindGroup,
+ }
+ 
+-impl FromWorld for PrepassViewBindGroup {
+-    fn from_world(world: &mut World) -> Self {
+-        let pipeline = world.resource::<PrepassPipeline>();
+-
+-        let render_device = world.resource::<RenderDevice>();
+-        let empty_bind_group = render_device.create_bind_group(
+-            "prepass_view_empty_bind_group",
+-            &pipeline.empty_layout,
+-            &[],
+-        );
+-        PrepassViewBindGroup {
+-            motion_vectors: None,
+-            no_motion_vectors: None,
+-            empty_bind_group,
+-        }
+-    }
++pub fn init_prepass_view_bind_group(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    pipeline: Res<PrepassPipeline>,
++) {
++    let empty_bind_group = render_device.create_bind_group(
++        "prepass_view_empty_bind_group",
++        &pipeline.empty_layout,
++        &[],
++    );
++    commands.insert_resource(PrepassViewBindGroup {
++        motion_vectors: None,
++        no_motion_vectors: None,
++        empty_bind_group,
++    });
+ }
+ 
+ pub fn prepare_prepass_view_bind_group(
+diff --git a/crates/bevy_pbr/src/volumetric_fog/mod.rs b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+index e28412d7bd60b..0b1b21020ec76 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/mod.rs
++++ b/crates/bevy_pbr/src/volumetric_fog/mod.rs
+@@ -46,11 +46,11 @@ use bevy_render::{
+     render_graph::{RenderGraphExt, ViewNodeRunner},
+     render_resource::SpecializedRenderPipelines,
+     sync_component::SyncComponentPlugin,
+-    ExtractSchedule, Render, RenderApp, RenderSystems,
++    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+ };
+ use render::{VolumetricFogNode, VolumetricFogPipeline, VolumetricFogUniformBuffer};
+ 
+-use crate::graph::NodePbr;
++use crate::{graph::NodePbr, volumetric_fog::render::init_volumetric_fog_pipeline};
+ 
+ pub mod render;
+ 
+@@ -84,6 +84,7 @@ impl Plugin for VolumetricFogPlugin {
+             })
+             .init_resource::<SpecializedRenderPipelines<VolumetricFogPipeline>>()
+             .init_resource::<VolumetricFogUniformBuffer>()
++            .add_systems(RenderStartup, init_volumetric_fog_pipeline)
+             .add_systems(ExtractSchedule, render::extract_volumetric_fog)
+             .add_systems(
+                 Render,
+@@ -94,16 +95,7 @@ impl Plugin for VolumetricFogPlugin {
+                         .in_set(RenderSystems::Prepare)
+                         .before(prepare_core_3d_depth_textures),
+                 ),
+-            );
+-    }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-
+-        render_app
+-            .init_resource::<VolumetricFogPipeline>()
++            )
+             .add_render_graph_node::<ViewNodeRunner<VolumetricFogNode>>(
+                 Core3d,
+                 NodePbr::VolumetricFog,
+diff --git a/crates/bevy_pbr/src/volumetric_fog/render.rs b/crates/bevy_pbr/src/volumetric_fog/render.rs
+index f24550a456d55..a49e9b62a4f78 100644
+--- a/crates/bevy_pbr/src/volumetric_fog/render.rs
++++ b/crates/bevy_pbr/src/volumetric_fog/render.rs
+@@ -2,7 +2,7 @@
+ 
+ use core::array;
+ 
+-use bevy_asset::{load_embedded_asset, AssetId, Handle};
++use bevy_asset::{load_embedded_asset, AssetId, AssetServer, Handle};
+ use bevy_color::ColorToComponents as _;
+ use bevy_core_pipeline::{
+     core_3d::Camera3d,
+@@ -15,7 +15,7 @@ use bevy_ecs::{
+     query::{Has, QueryItem, With},
+     resource::Resource,
+     system::{lifetimeless::Read, Commands, Local, Query, Res, ResMut},
+-    world::{FromWorld, World},
++    world::World,
+ };
+ use bevy_image::{BevyDefault, Image};
+ use bevy_math::{vec4, Mat3A, Mat4, Vec3, Vec3A, Vec4, Vec4Swizzles as _};
+@@ -201,61 +201,61 @@ pub struct ViewFogVolume {
+ #[derive(Resource, Default, Deref, DerefMut)]
+ pub struct VolumetricFogUniformBuffer(pub DynamicUniformBuffer<VolumetricFogUniform>);
+ 
+-impl FromWorld for VolumetricFogPipeline {
+-    fn from_world(world: &mut World) -> Self {
+-        let render_device = world.resource::<RenderDevice>();
+-        let mesh_view_layouts = world.resource::<MeshPipelineViewLayouts>();
+-
+-        // Create the bind group layout entries common to all bind group
+-        // layouts.
+-        let base_bind_group_layout_entries = &BindGroupLayoutEntries::single(
+-            ShaderStages::VERTEX_FRAGMENT,
+-            // `volumetric_fog`
+-            uniform_buffer::<VolumetricFogUniform>(true),
+-        );
++pub fn init_volumetric_fog_pipeline(
++    mut commands: Commands,
++    render_device: Res<RenderDevice>,
++    mesh_view_layouts: Res<MeshPipelineViewLayouts>,
++    asset_server: Res<AssetServer>,
++) {
++    // Create the bind group layout entries common to all bind group
++    // layouts.
++    let base_bind_group_layout_entries = &BindGroupLayoutEntries::single(
++        ShaderStages::VERTEX_FRAGMENT,
++        // `volumetric_fog`
++        uniform_buffer::<VolumetricFogUniform>(true),
++    );
+ 
+-        // For every combination of `VolumetricFogBindGroupLayoutKey` bits,
+-        // create a bind group layout.
+-        let bind_group_layouts = array::from_fn(|bits| {
+-            let flags = VolumetricFogBindGroupLayoutKey::from_bits_retain(bits as u8);
++    // For every combination of `VolumetricFogBindGroupLayoutKey` bits,
++    // create a bind group layout.
++    let bind_group_layouts = array::from_fn(|bits| {
++        let flags = VolumetricFogBindGroupLayoutKey::from_bits_retain(bits as u8);
+ 
+-            let mut bind_group_layout_entries = base_bind_group_layout_entries.to_vec();
++        let mut bind_group_layout_entries = base_bind_group_layout_entries.to_vec();
+ 
+-            // `depth_texture`
++        // `depth_texture`
++        bind_group_layout_entries.extend_from_slice(&BindGroupLayoutEntries::with_indices(
++            ShaderStages::FRAGMENT,
++            ((
++                1,
++                if flags.contains(VolumetricFogBindGroupLayoutKey::MULTISAMPLED) {
++                    texture_depth_2d_multisampled()
++                } else {
++                    texture_depth_2d()
++                },
++            ),),
++        ));
++
++        // `density_texture` and `density_sampler`
++        if flags.contains(VolumetricFogBindGroupLayoutKey::DENSITY_TEXTURE) {
+             bind_group_layout_entries.extend_from_slice(&BindGroupLayoutEntries::with_indices(
+                 ShaderStages::FRAGMENT,
+-                ((
+-                    1,
+-                    if flags.contains(VolumetricFogBindGroupLayoutKey::MULTISAMPLED) {
+-                        texture_depth_2d_multisampled()
+-                    } else {
+-                        texture_depth_2d()
+-                    },
+-                ),),
++                (
++                    (2, texture_3d(TextureSampleType::Float { filterable: true })),
++                    (3, sampler(SamplerBindingType::Filtering)),
++                ),
+             ));
++        }
+ 
+-            // `density_texture` and `density_sampler`
+-            if flags.contains(VolumetricFogBindGroupLayoutKey::DENSITY_TEXTURE) {
+-                bind_group_layout_entries.extend_from_slice(&BindGroupLayoutEntries::with_indices(
+-                    ShaderStages::FRAGMENT,
+-                    (
+-                        (2, texture_3d(TextureSampleType::Float { filterable: true })),
+-                        (3, sampler(SamplerBindingType::Filtering)),
+-                    ),
+-                ));
+-            }
++        // Create the bind group layout.
++        let description = flags.bind_group_layout_description();
++        render_device.create_bind_group_layout(&*description, &bind_group_layout_entries)
++    });
+ 
+-            // Create the bind group layout.
+-            let description = flags.bind_group_layout_description();
+-            render_device.create_bind_group_layout(&*description, &bind_group_layout_entries)
+-        });
+-
+-        VolumetricFogPipeline {
+-            mesh_view_layouts: mesh_view_layouts.clone(),
+-            volumetric_view_bind_group_layouts: bind_group_layouts,
+-            shader: load_embedded_asset!(world, "volumetric_fog.wgsl"),
+-        }
+-    }
++    commands.insert_resource(VolumetricFogPipeline {
++        mesh_view_layouts: mesh_view_layouts.clone(),
++        volumetric_view_bind_group_layouts: bind_group_layouts,
++        shader: load_embedded_asset!(asset_server.as_ref(), "volumetric_fog.wgsl"),
++    });
+ }
+ 
+ /// Extracts [`VolumetricFog`], [`FogVolume`], and [`VolumetricLight`]s
+diff --git a/crates/bevy_pbr/src/wireframe.rs b/crates/bevy_pbr/src/wireframe.rs
+index 9cf3bc08dd860..ad280e054f67d 100644
+--- a/crates/bevy_pbr/src/wireframe.rs
++++ b/crates/bevy_pbr/src/wireframe.rs
+@@ -6,7 +6,7 @@ use crate::{
+ use bevy_app::{App, Plugin, PostUpdate, Startup, Update};
+ use bevy_asset::{
+     embedded_asset, load_embedded_asset, prelude::AssetChanged, AsAssetId, Asset, AssetApp,
+-    AssetEventSystems, AssetId, Assets, Handle, UntypedAssetId,
++    AssetEventSystems, AssetId, AssetServer, Assets, Handle, UntypedAssetId,
+ };
+ use bevy_color::{Color, ColorToComponents};
+ use bevy_core_pipeline::core_3d::{
+@@ -25,7 +25,6 @@ use bevy_platform::{
+     hash::FixedHasher,
+ };
+ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+-use bevy_render::camera::extract_cameras;
+ use bevy_render::{
+     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
+     camera::ExtractedCamera,
+@@ -54,6 +53,7 @@ use bevy_render::{
+     },
+     Extract, Render, RenderApp, RenderDebugFlags, RenderSystems,
+ };
++use bevy_render::{camera::extract_cameras, RenderStartup};
+ use core::{hash::Hash, ops::Range};
+ use tracing::error;
+ 
+@@ -132,6 +132,7 @@ impl Plugin for WireframePlugin {
+                     Node3d::PostProcessing,
+                 ),
+             )
++            .add_systems(RenderStartup, init_wireframe_3d_pipeline)
+             .add_systems(
+                 ExtractSchedule,
+                 (
+@@ -153,13 +154,6 @@ impl Plugin for WireframePlugin {
+                 ),
+             );
+     }
+-
+-    fn finish(&self, app: &mut App) {
+-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+-            return;
+-        };
+-        render_app.init_resource::<Wireframe3dPipeline>();
+-    }
+ }
+ 
+ /// Enables wireframe rendering for any entity it is attached to.
+@@ -331,13 +325,15 @@ pub struct Wireframe3dPipeline {
+     shader: Handle<Shader>,
+ }
+ 
+-impl FromWorld for Wireframe3dPipeline {
+-    fn from_world(render_world: &mut World) -> Self {
+-        Wireframe3dPipeline {
+-            mesh_pipeline: render_world.resource::<MeshPipeline>().clone(),
+-            shader: load_embedded_asset!(render_world, "render/wireframe.wgsl"),
+-        }
+-    }
++pub fn init_wireframe_3d_pipeline(
++    mut commands: Commands,
++    mesh_pipeline: Res<MeshPipeline>,
++    asset_server: Res<AssetServer>,
++) {
++    commands.insert_resource(Wireframe3dPipeline {
++        mesh_pipeline: mesh_pipeline.clone(),
++        shader: load_embedded_asset!(asset_server.as_ref(), "render/wireframe.wgsl"),
++    });
+ }
+ 
+ impl SpecializedMeshPipeline for Wireframe3dPipeline {
+diff --git a/release-content/migration-guides/render_startup.md b/release-content/migration-guides/render_startup.md
+index c1f20f78b3b3d..d1b9b76052fda 100644
+--- a/release-content/migration-guides/render_startup.md
++++ b/release-content/migration-guides/render_startup.md
+@@ -20,6 +20,13 @@ The following are the (public) resources that are now initialized in `RenderStar
+ - `UiPipeline`
+ - `UiMaterialPipeline<M>`
+ - `UiTextureSlicePipeline`
++- `VolumetricFogPipeline`
++- `DeferredLightingLayout`
++- `RenderLightmaps`
++- `PrepassPipeline`
++- `PrepassViewBindGroup`
++- `Wireframe3dPipeline`
++- `MaterialPipeline`
+ 
+ The vast majority of cases for initializing render resources look like so (in Bevy 0.16):
+ 

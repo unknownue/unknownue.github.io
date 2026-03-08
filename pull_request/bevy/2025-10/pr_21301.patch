@@ -1,0 +1,196 @@
+diff --git a/crates/bevy_pbr/Cargo.toml b/crates/bevy_pbr/Cargo.toml
+index 365911015d52d..a1c175ec4f686 100644
+--- a/crates/bevy_pbr/Cargo.toml
++++ b/crates/bevy_pbr/Cargo.toml
+@@ -70,9 +70,9 @@ derive_more = { version = "2", default-features = false, features = ["from"] }
+ lz4_flex = { version = "0.11", default-features = false, features = [
+   "frame",
+ ], optional = true }
+-range-alloc = { version = "0.1.3", optional = true }
+-meshopt = { version = "0.4.1", optional = true }
+-metis = { version = "0.2", optional = true }
++range-alloc = { version = "0.1", optional = true }
++meshopt = { version = "0.6.2", optional = true }
++metis = { version = "0.2.2", optional = true }
+ itertools = { version = "0.14", optional = true }
+ bitvec = { version = "1", optional = true }
+ # direct dependency required for derive macro
+diff --git a/crates/bevy_pbr/src/meshlet/asset.rs b/crates/bevy_pbr/src/meshlet/asset.rs
+index 49a993ffa4388..aebd2ddfbc526 100644
+--- a/crates/bevy_pbr/src/meshlet/asset.rs
++++ b/crates/bevy_pbr/src/meshlet/asset.rs
+@@ -17,7 +17,7 @@ use thiserror::Error;
+ const MESHLET_MESH_ASSET_MAGIC: u64 = 1717551717668;
+ 
+ /// The current version of the [`MeshletMesh`] asset format.
+-pub const MESHLET_MESH_ASSET_VERSION: u64 = 2;
++pub const MESHLET_MESH_ASSET_VERSION: u64 = 3;
+ 
+ /// A mesh that has been pre-processed into multiple small clusters of triangles called meshlets.
+ ///
+@@ -86,8 +86,8 @@ pub struct Meshlet {
+     pub start_vertex_attribute_id: u32,
+     /// The offset within the parent mesh's [`MeshletMesh::indices`] buffer where the indices for this meshlet begin.
+     pub start_index_id: u32,
+-    /// The amount of vertices in this meshlet.
+-    pub vertex_count: u8,
++    /// The amount of vertices in this meshlet (minus one to fit 256 in a u8).
++    pub vertex_count_minus_one: u8,
+     /// The amount of triangles in this meshlet.
+     pub triangle_count: u8,
+     /// Unused.
+diff --git a/crates/bevy_pbr/src/meshlet/from_mesh.rs b/crates/bevy_pbr/src/meshlet/from_mesh.rs
+index 141f4da0238ed..23de97909404f 100644
+--- a/crates/bevy_pbr/src/meshlet/from_mesh.rs
++++ b/crates/bevy_pbr/src/meshlet/from_mesh.rs
+@@ -15,8 +15,8 @@ use bitvec::{order::Lsb0, vec::BitVec, view::BitView};
+ use core::{f32, ops::Range};
+ use itertools::Itertools;
+ use meshopt::{
+-    build_meshlets, ffi::meshopt_Meshlet, generate_vertex_remap_multi,
+-    simplify_with_attributes_and_locks, Meshlets, SimplifyOptions, VertexDataAdapter, VertexStream,
++    build_meshlets, ffi::meshopt_Meshlet, generate_position_remap,
++    simplify_with_attributes_and_locks, Meshlets, SimplifyOptions, VertexDataAdapter,
+ };
+ use metis::{option::Opt, Graph};
+ use smallvec::SmallVec;
+@@ -81,23 +81,11 @@ impl MeshletMesh {
+         let vertex_normals = bytemuck::cast_slice(&vertex_buffer[12..16]);
+ 
+         // Generate a position-only vertex buffer for determining triangle/meshlet connectivity
+-        let (position_only_vertex_count, position_only_vertex_remap) = generate_vertex_remap_multi(
+-            vertices.vertex_count,
+-            &[VertexStream::new_with_stride::<Vec3, _>(
+-                vertex_buffer.as_ptr(),
+-                vertex_stride,
+-            )],
+-            Some(&indices),
+-        );
++        let position_only_vertex_remap = generate_position_remap(&vertices);
+ 
+         // Split the mesh into an initial list of meshlets (LOD 0)
+-        let (mut meshlets, mut cull_data) = compute_meshlets(
+-            &indices,
+-            &vertices,
+-            &position_only_vertex_remap,
+-            position_only_vertex_count,
+-            None,
+-        );
++        let (mut meshlets, mut cull_data) =
++            compute_meshlets(&indices, &vertices, &position_only_vertex_remap, None);
+ 
+         let mut vertex_locks = vec![false; vertices.vertex_count];
+ 
+@@ -115,7 +103,6 @@ impl MeshletMesh {
+                 &simplification_queue,
+                 &meshlets,
+                 &position_only_vertex_remap,
+-                position_only_vertex_count,
+             );
+ 
+             // Group meshlets into roughly groups of size TARGET_MESHLETS_PER_GROUP,
+@@ -133,7 +120,6 @@ impl MeshletMesh {
+                 &groups,
+                 &meshlets,
+                 &position_only_vertex_remap,
+-                position_only_vertex_count,
+             );
+ 
+             let simplified = groups.par_chunk_map(AsyncComputeTaskPool::get(), 1, |_, groups| {
+@@ -172,7 +158,6 @@ impl MeshletMesh {
+                     &simplified_group_indices,
+                     &vertices,
+                     &position_only_vertex_remap,
+-                    position_only_vertex_count,
+                     Some((group.lod_bounds, group.parent_error)),
+                 );
+ 
+@@ -295,11 +280,10 @@ fn compute_meshlets(
+     indices: &[u32],
+     vertices: &VertexDataAdapter,
+     position_only_vertex_remap: &[u32],
+-    position_only_vertex_count: usize,
+     prev_lod_data: Option<(BoundingSphere, f32)>,
+ ) -> (Meshlets, Vec<TempMeshletCullData>) {
+     // For each vertex, build a list of all triangles that use it
+-    let mut vertices_to_triangles = vec![Vec::new(); position_only_vertex_count];
++    let mut vertices_to_triangles = vec![Vec::new(); position_only_vertex_remap.len()];
+     for (i, index) in indices.iter().enumerate() {
+         let vertex_id = position_only_vertex_remap[*index as usize];
+         let vertex_to_triangles = &mut vertices_to_triangles[vertex_id as usize];
+@@ -383,7 +367,7 @@ fn compute_meshlets(
+         )
+     };
+     for meshlet_indices in &indices_per_meshlet {
+-        let meshlet = build_meshlets(meshlet_indices, vertices, 255, 128, 0.0);
++        let meshlet = build_meshlets(meshlet_indices, vertices, 256, 128, 0.0);
+         for meshlet in meshlet.iter() {
+             let (lod_group_sphere, error) = prev_lod_data.unwrap_or_else(|| {
+                 let bounds = meshopt::compute_meshlet_bounds(meshlet, vertices);
+@@ -408,10 +392,9 @@ fn find_connected_meshlets(
+     simplification_queue: &[u32],
+     meshlets: &Meshlets,
+     position_only_vertex_remap: &[u32],
+-    position_only_vertex_count: usize,
+ ) -> Vec<Vec<(usize, usize)>> {
+     // For each vertex, build a list of all meshlets that use it
+-    let mut vertices_to_meshlets = vec![Vec::new(); position_only_vertex_count];
++    let mut vertices_to_meshlets = vec![Vec::new(); position_only_vertex_remap.len()];
+     for (id_index, &meshlet_id) in simplification_queue.iter().enumerate() {
+         let meshlet = meshlets.get(meshlet_id as _);
+         for index in meshlet.triangles {
+@@ -505,9 +488,8 @@ fn lock_group_borders(
+     groups: &[TempMeshletGroup],
+     meshlets: &Meshlets,
+     position_only_vertex_remap: &[u32],
+-    position_only_vertex_count: usize,
+ ) {
+-    let mut position_only_locks = vec![-1; position_only_vertex_count];
++    let mut position_only_locks = vec![-1; position_only_vertex_remap.len()];
+ 
+     // Iterate over position-only based vertices of all meshlets in all groups
+     for (group_id, group) in groups.iter().enumerate() {
+@@ -617,7 +599,7 @@ fn build_and_compress_per_meshlet_vertex_data(
+     let mut max_quantized_position_channels = IVec3::MIN;
+ 
+     // Lossy vertex compression
+-    let mut quantized_positions = [IVec3::ZERO; 255];
++    let mut quantized_positions = [IVec3::ZERO; 256];
+     for (i, vertex_id) in meshlet_vertex_ids.iter().enumerate() {
+         // Load source vertex attributes
+         let vertex_id_byte = *vertex_id as usize * vertex_stride;
+@@ -668,7 +650,7 @@ fn build_and_compress_per_meshlet_vertex_data(
+         start_vertex_position_bit,
+         start_vertex_attribute_id,
+         start_index_id: meshlet.triangle_offset,
+-        vertex_count: meshlet.vertex_count as u8,
++        vertex_count_minus_one: (meshlet.vertex_count - 1) as u8,
+         triangle_count: meshlet.triangle_count as u8,
+         padding: 0,
+         bits_per_vertex_position_channel_x,
+diff --git a/crates/bevy_pbr/src/meshlet/meshlet_bindings.wgsl b/crates/bevy_pbr/src/meshlet/meshlet_bindings.wgsl
+index 4533b2bd7fa7e..9d624f3757f23 100644
+--- a/crates/bevy_pbr/src/meshlet/meshlet_bindings.wgsl
++++ b/crates/bevy_pbr/src/meshlet/meshlet_bindings.wgsl
+@@ -24,7 +24,7 @@ struct Meshlet {
+ }
+ 
+ fn get_meshlet_vertex_count(meshlet: ptr<function, Meshlet>) -> u32 {
+-    return extractBits((*meshlet).packed_a, 0u, 8u);
++    return extractBits((*meshlet).packed_a, 0u, 8u) + 1u;
+ }
+ 
+ fn get_meshlet_triangle_count(meshlet: ptr<function, Meshlet>) -> u32 {
+diff --git a/crates/bevy_pbr/src/meshlet/visibility_buffer_software_raster.wgsl b/crates/bevy_pbr/src/meshlet/visibility_buffer_software_raster.wgsl
+index 0ddfff896438d..13091e879ff37 100644
+--- a/crates/bevy_pbr/src/meshlet/visibility_buffer_software_raster.wgsl
++++ b/crates/bevy_pbr/src/meshlet/visibility_buffer_software_raster.wgsl
+@@ -23,7 +23,7 @@
+ 
+ // TODO: Fixed-point math and top-left rule
+ 
+-var<workgroup> viewport_vertices: array<vec3f, 255>;
++var<workgroup> viewport_vertices: array<vec3f, 256>;
+ 
+ @compute
+ @workgroup_size(128, 1, 1) // 128 threads per workgroup, 1-2 vertices per thread, 1 triangle per thread, 1 cluster per workgroup

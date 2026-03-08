@@ -1,0 +1,90 @@
+diff --git a/crates/bevy_pbr/src/cluster/cluster_z_slice.wgsl b/crates/bevy_pbr/src/cluster/cluster_z_slice.wgsl
+index a5d633d0387de..dfc0a9e4998a5 100644
+--- a/crates/bevy_pbr/src/cluster/cluster_z_slice.wgsl
++++ b/crates/bevy_pbr/src/cluster/cluster_z_slice.wgsl
+@@ -184,20 +184,18 @@ fn accumulate_farthest_z_value(
+     }
+ 
+     // Have the first thread update the global farthest-Z value.
+-    // We don't have `atomicMax` for floats in WGSL, so we use CAS instead.
+-    // Thankfully, we only have a few workgroups, so this shouldn't be terribly
+-    // slow.
+-    let this_farthest_z = shared_farthest_z[0u];
+-    var that_farthest_z = bitcast<f32>(atomicLoad(&cluster_metadata.farthest_z));
+-    while (this_farthest_z > that_farthest_z) {
+-        let exchange_result = atomicCompareExchangeWeak(
+-            &cluster_metadata.farthest_z,
+-            bitcast<u32>(that_farthest_z),
+-            bitcast<u32>(this_farthest_z)
+-        );
+-        if (exchange_result.exchanged) {
+-            break;
+-        }
+-        that_farthest_z = bitcast<f32>(exchange_result.old_value);
+-    }
++    // WGSL has no `atomicMax` for floats, so we encode into a u32 that
++    // preserves float ordering and use integer `atomicMax` instead.
++    atomicMax(&cluster_metadata.farthest_z, f32_bits_to_sortable_u32(bitcast<u32>(shared_farthest_z[0u])));
++}
++
++// Encodes f32 bits into a u32 whose unsigned ordering matches
++// the float's total order. Positive floats get the sign bit set so they
++// sort above negative floats; negative floats get all bits flipped so
++// their ordering is reversed (more negative -> smaller u32).
++//
++// The CPU decodes with `sortable_u32_to_f32_bits` in `gpu.rs`.
++fn f32_bits_to_sortable_u32(bits: u32) -> u32 {
++    let mask = bitcast<u32>(bitcast<i32>(bits) >> 31) | 0x80000000u;
++    return bits ^ mask;
+ }
+diff --git a/crates/bevy_pbr/src/cluster/gpu.rs b/crates/bevy_pbr/src/cluster/gpu.rs
+index 9925399903070..0cc03566d795e 100644
+--- a/crates/bevy_pbr/src/cluster/gpu.rs
++++ b/crates/bevy_pbr/src/cluster/gpu.rs
+@@ -255,7 +255,9 @@ pub struct ClusterMetadata {
+     ///
+     /// This is set to 0 by the CPU, and the GPU updates it with the computed
+     /// value.
+-    farthest_z: f32,
++    ///
++    /// This is a float encoded by `f32_bits_to_sortable_u32`. Decode with `sortable_u32_to_f32_bits`.
++    farthest_z: u32,
+ }
+ 
+ /// Indirect draw parameters for the raster dispatch phase, built partially by
+@@ -431,11 +433,25 @@ impl ViewClusteringReadbackData {
+         // Record the statistics we just received.
+         self.last_frame_statistics = Some(ViewClusteringLastFrameStatistics {
+             index_list_size: gpu_clustering_metadata.index_list_capacity,
+-            farthest_z: gpu_clustering_metadata.farthest_z,
++            farthest_z: f32::from_bits(sortable_u32_to_f32_bits(
++                gpu_clustering_metadata.farthest_z,
++            )),
+         });
+     }
+ }
+ 
++/// Decodes a u32 produced by `f32_bits_to_sortable_u32` (in
++/// `cluster_z_slice.wgsl`) back into f32 bits.
++///
++/// The encode flips the sign bit for positive floats and all bits for
++/// negative floats, so the decode must inspect the *encoded* sign bit
++/// (which is inverted relative to the original) and apply the
++/// complementary mask.
++fn sortable_u32_to_f32_bits(bits: u32) -> u32 {
++    let mask = (!((bits as i32) >> 31)) as u32 | 0x80000000;
++    bits ^ mask
++}
++
+ /// Global data relating to the `cluster_raster.wgsl` shader.
+ #[derive(Resource)]
+ pub struct ClusteringRasterPipeline {
+@@ -1670,7 +1686,7 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
+             decal_count,
+             index_list_capacity: view_clustering_buffer_size_data.max_index_list_capacity as u32,
+             z_slice_list_capacity: view_clustering_buffer_size_data.z_slice_list_capacity as u32,
+-            farthest_z: 0.0,
++            farthest_z: 0,
+         };
+ 
+         // Allocate Z slices.

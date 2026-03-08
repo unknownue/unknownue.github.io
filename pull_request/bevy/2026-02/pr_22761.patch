@@ -1,0 +1,565 @@
+diff --git a/crates/bevy_render/src/error_handler.rs b/crates/bevy_render/src/error_handler.rs
+new file mode 100644
+index 0000000000000..f99366f1c678d
+--- /dev/null
++++ b/crates/bevy_render/src/error_handler.rs
+@@ -0,0 +1,214 @@
++use alloc::sync::Arc;
++use bevy_ecs::{
++    resource::Resource,
++    world::{Mut, World},
++};
++use std::sync::Mutex;
++use wgpu::ErrorSource;
++use wgpu_types::error::ErrorType;
++
++use crate::{
++    insert_future_resources,
++    render_resource::PipelineCache,
++    renderer::{RenderDevice, WgpuWrapper},
++    settings::RenderCreation,
++    FutureRenderResources, RenderStartup,
++};
++
++/// Resource to indicate renderer behavior upon error.
++pub enum RenderErrorPolicy {
++    /// Pretends nothing happened and continues rendering.
++    /// This discards the error after logging it to console.
++    Ignore,
++    /// Keeps the app alive, but stops rendering further.
++    /// This keeps the error state, and will continue polling the [`RenderErrorHandler`]
++    /// every frame until some other policy is returned.
++    StopRendering,
++    /// Attempt renderer recovery with the given [`RenderCreation`].
++    Recover(RenderCreation),
++}
++
++/// Determines what [`RenderErrorPolicy`] should be used to respond to a given [`RenderError`].
++///
++/// The handler has access to both the main world and the render world in that order.
++/// By the time this is invoked, the error has already been logged. The error is provided
++/// for the decision-making reason of how to appropriately respond to it. Not all errors
++/// are equally severe: validation errors may be ignored for example, while device lost errors
++/// require recovery to continue rendering.
++#[derive(Resource)]
++pub struct RenderErrorHandler(
++    pub for<'a> fn(&'a RenderError, &'a mut World, &'a mut World) -> RenderErrorPolicy,
++);
++
++impl RenderErrorHandler {
++    fn handle(&self, error: &RenderError, main_world: &mut World, render_world: &mut World) {
++        match self.0(error, main_world, render_world) {
++            RenderErrorPolicy::Ignore => {
++                // Pretend that didn't happen.
++                render_world.insert_resource(RenderState::Ready);
++            }
++            RenderErrorPolicy::StopRendering => {
++                // do nothing
++            }
++            RenderErrorPolicy::Recover(render_creation) => {
++                assert!(insert_future_resources(&render_creation, main_world));
++                render_world.insert_resource(RenderState::Reinitializing);
++            }
++        }
++    }
++}
++
++impl Default for RenderErrorHandler {
++    fn default() -> Self {
++        // This is what we've always done historically,
++        // but we could choose a new default once recovery works better.
++        Self(|_, _, _| RenderErrorPolicy::Ignore)
++    }
++}
++
++/// An error encountered during rendering.
++#[derive(Debug)]
++pub struct RenderError {
++    pub ty: ErrorType,
++    pub description: String,
++    pub source: Option<WgpuWrapper<ErrorSource>>,
++}
++
++/// The current state of the renderer.
++#[derive(Resource, Debug)]
++pub(crate) enum RenderState {
++    /// Just started, [`crate::RenderStartup`] will run in this state.
++    Initializing,
++    /// Everything is okay and we are rendering stuff every frame.
++    Ready,
++    /// An error was encountered, and we may decide how to handle it.
++    Errored(RenderError),
++    /// We are recreating the render context after an error to recover.
++    Reinitializing,
++}
++
++/// Resource to allow polling wgpu error handlers.
++#[derive(Resource)]
++pub(crate) struct DeviceErrorHandler {
++    device_lost: Arc<Mutex<Option<(wgpu::DeviceLostReason, String)>>>,
++    uncaptured: Arc<Mutex<Option<WgpuWrapper<wgpu::Error>>>>,
++}
++
++impl DeviceErrorHandler {
++    /// Creates and registers error handlers on the given device and stores them to later be polled.
++    pub(crate) fn new(device: &RenderDevice) -> Self {
++        let device_lost = Arc::new(Mutex::new(None));
++        let uncaptured = Arc::new(Mutex::new(None));
++        {
++            // scoped clone to move into closures
++            let device_lost = device_lost.clone();
++            let uncaptured = uncaptured.clone();
++            let device = device.wgpu_device();
++            // we log errors as soon as they are captured so they stay chronological in logs
++            // and only keep the first error, as it often causes other errors downstream
++            device.set_device_lost_callback(move |reason, str| {
++                bevy_log::error!("Caught DeviceLost error: {reason:?} {str}");
++                assert!(device_lost.lock().unwrap().replace((reason, str)).is_none());
++            });
++            device.on_uncaptured_error(Arc::new(move |e| {
++                bevy_log::error!("Caught rendering error: {e}");
++                uncaptured
++                    .lock()
++                    .unwrap()
++                    .get_or_insert(WgpuWrapper::new(e));
++            }));
++        }
++        Self {
++            device_lost,
++            uncaptured,
++        }
++    }
++
++    /// Checks to see if any errors have been caught, and returns an appropriate `RenderState`
++    pub(crate) fn poll(&self) -> Option<RenderError> {
++        // Device lost is more important so we let it take precedence; every error gets logged anyways.
++        if let Some((_, description)) = self.device_lost.lock().unwrap().take() {
++            return Some(RenderError {
++                ty: ErrorType::DeviceLost,
++                description,
++                source: None,
++            });
++        }
++        if let Some(error) = self.uncaptured.lock().unwrap().take() {
++            let (ty, description, source) = match error.into_inner() {
++                wgpu::Error::OutOfMemory { source } => {
++                    (ErrorType::OutOfMemory, "".to_string(), source)
++                }
++                wgpu::Error::Validation {
++                    source,
++                    description,
++                } => (ErrorType::Validation, description, source),
++                wgpu::Error::Internal {
++                    source,
++                    description,
++                } => (ErrorType::Internal, description, source),
++            };
++            return Some(RenderError {
++                ty,
++                description,
++                source: Some(WgpuWrapper::new(source)),
++            });
++        }
++        None
++    }
++}
++
++/// Updates the state machine that handles the renderer and device lifecycle.
++/// Polls the [`DeviceErrorHandler`] and fires the [`RenderErrorHandler`] if needed.
++///
++/// Runs [`crate::RenderStartup`] after every time a [`RenderDevice`] is acquired.
++///
++/// We need both the main and render world to properly handle errors, so we wedge ourselves into [extract](bevy_app::SubApp::set_extract).
++pub(crate) fn update_state(main_world: &mut World, render_world: &mut World) {
++    if let Some(error) = render_world.resource::<DeviceErrorHandler>().poll() {
++        render_world.insert_resource(RenderState::Errored(error));
++    };
++
++    // Remove the render state so we can provide both worlds to the `RenderErrorHandler`.
++    let state = render_world.remove_resource::<RenderState>().unwrap();
++
++    match &state {
++        RenderState::Initializing => {
++            render_world.run_schedule(RenderStartup);
++            render_world.insert_resource(RenderState::Ready);
++        }
++        RenderState::Ready => {
++            // all is well
++        }
++        RenderState::Errored(error) => {
++            main_world.resource_scope(|main_world, error_handler: Mut<RenderErrorHandler>| {
++                error_handler.handle(error, main_world, render_world);
++            });
++        }
++        RenderState::Reinitializing => {
++            if let Some(render_resources) = main_world
++                .get_resource::<FutureRenderResources>()
++                .unwrap()
++                .clone()
++                .lock()
++                .unwrap()
++                .take()
++            {
++                let synchronous_pipeline_compilation = render_world
++                    .resource::<PipelineCache>()
++                    .synchronous_pipeline_compilation;
++                render_resources.unpack_into(
++                    main_world,
++                    render_world,
++                    synchronous_pipeline_compilation,
++                );
++                render_world.insert_resource(RenderState::Initializing);
++            }
++        }
++    }
++
++    // Put the state back if we didn't set a new one
++    if render_world.get_resource::<RenderState>().is_none() {
++        render_world.insert_resource(state);
++    }
++}
+diff --git a/crates/bevy_render/src/lib.rs b/crates/bevy_render/src/lib.rs
+index 3316f7606bb43..eaa8de77a0afb 100644
+--- a/crates/bevy_render/src/lib.rs
++++ b/crates/bevy_render/src/lib.rs
+@@ -39,6 +39,7 @@ pub mod batching;
+ pub mod camera;
+ pub mod diagnostic;
+ pub mod erased_render_asset;
++pub mod error_handler;
+ pub mod extract_component;
+ pub mod extract_instances;
+ mod extract_param;
+@@ -76,6 +77,7 @@ pub use extract_param::Extract;
+ 
+ use crate::{
+     camera::CameraPlugin,
++    error_handler::{RenderErrorHandler, RenderState},
+     gpu_readback::GpuReadbackPlugin,
+     mesh::{MeshRenderAssetPlugin, RenderMesh},
+     render_asset::prepare_assets,
+@@ -95,7 +97,9 @@ use bevy_ecs::{
+     prelude::*,
+     schedule::{ScheduleBuildSettings, ScheduleLabel},
+ };
++use bevy_platform::time::Instant;
+ use bevy_shader::{load_shader_library, Shader, ShaderLoader};
++use bevy_time::TimeSender;
+ use bevy_utils::prelude::default;
+ use bevy_window::{PrimaryWindow, RawHandleWrapperHolder};
+ use bitflags::bitflags;
+@@ -190,7 +194,10 @@ pub enum RenderSystems {
+     PostCleanup,
+ }
+ 
+-/// The startup schedule of the [`RenderApp`]
++/// The startup schedule of the [`RenderApp`].
++/// This can potentially run multiple times, and not on a fresh render world.
++/// Every time a new [`RenderDevice`](renderer::RenderDevice) is acquired,
++/// this schedule runs to initialize any gpu resources needed for rendering on it.
+ #[derive(ScheduleLabel, Debug, Hash, PartialEq, Eq, Clone, Default)]
+ pub struct RenderStartup;
+ 
+@@ -262,6 +269,11 @@ pub struct ExtractSchedule;
+ #[derive(Resource, Default, Deref, DerefMut)]
+ pub struct MainWorld(World);
+ 
++/// The render recovery schedule. This schedule runs the [`Render`] schedule if
++/// we are in [`RenderState::Ready`], and is otherwise hidden from users.
++#[derive(ScheduleLabel, Debug, Hash, PartialEq, Eq, Clone)]
++struct RenderRecovery;
++
+ #[derive(Resource, Default, Clone, Deref)]
+ pub(crate) struct FutureRenderResources(Arc<Mutex<Option<RenderResources>>>);
+ 
+@@ -303,7 +315,8 @@ impl Plugin for RenderPlugin {
+             diagnostic::RenderDiagnosticsPlugin,
+         ));
+ 
+-        app.init_resource::<RenderAssetBytesPerFrame>();
++        app.init_resource::<RenderAssetBytesPerFrame>()
++            .init_resource::<RenderErrorHandler>();
+         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+             render_app.init_resource::<RenderAssetBytesPerFrameLimiter>();
+             render_app
+@@ -403,7 +416,7 @@ unsafe fn initialize_render_app(app: &mut App) {
+     app.init_resource::<ScratchMainWorld>();
+ 
+     let mut render_app = SubApp::new();
+-    render_app.update_schedule = Some(Render.intern());
++    render_app.update_schedule = Some(RenderRecovery.intern());
+ 
+     let mut extract_schedule = Schedule::new(ExtractSchedule);
+     // We skip applying any commands during the ExtractSchedule
+@@ -416,9 +429,32 @@ unsafe fn initialize_render_app(app: &mut App) {
+ 
+     render_app
+         .add_schedule(extract_schedule)
++        .add_schedule(Schedule::new(RenderRecovery))
+         .add_schedule(Render::base_schedule())
+         .init_resource::<renderer::PendingCommandBuffers>()
+         .insert_resource(app.world().resource::<AssetServer>().clone())
++        .insert_resource(RenderState::Initializing)
++        .add_systems(RenderRecovery, move |world: &mut World| {
++            if matches!(world.resource::<RenderState>(), RenderState::Ready) {
++                world.run_schedule(Render);
++            }
++
++            // update the time and send it to the app world regardless of whether we render
++            let time_sender = world.resource::<TimeSender>();
++            if let Err(error) = time_sender.0.try_send(Instant::now()) {
++                match error {
++                    bevy_time::TrySendError::Full(_) => {
++                        panic!(
++                            "The TimeSender channel should always be empty during render. \
++                            You might need to add the bevy::core::time_system to your app."
++                        );
++                    }
++                    bevy_time::TrySendError::Disconnected(_) => {
++                        // ignore disconnected errors, the main world probably just got dropped during shutdown
++                    }
++                }
++            }
++        })
+         .add_systems(ExtractSchedule, PipelineCache::extract_shaders)
+         .add_systems(
+             Render,
+@@ -433,18 +469,8 @@ unsafe fn initialize_render_app(app: &mut App) {
+             ),
+         );
+ 
+-    // We want the closure to have a flag to only run the RenderStartup schedule once, but the only
+-    // way to have the closure store this flag is by capturing it. This variable is otherwise
+-    // unused.
+-    let mut should_run_startup = true;
+-    render_app.set_extract(move |main_world, render_world| {
+-        if should_run_startup {
+-            // Run the `RenderStartup` if it hasn't run yet. This does mean `RenderStartup` blocks
+-            // the rest of the app extraction, but this is necessary since extraction itself can
+-            // depend on resources initialized in `RenderStartup`.
+-            render_world.run_schedule(RenderStartup);
+-            should_run_startup = false;
+-        }
++    render_app.set_extract(|main_world, render_world| {
++        error_handler::update_state(main_world, render_world);
+ 
+         {
+             #[cfg(feature = "trace")]
+diff --git a/crates/bevy_render/src/render_resource/pipeline_cache.rs b/crates/bevy_render/src/render_resource/pipeline_cache.rs
+index 8a8e33229317b..20230b45372c5 100644
+--- a/crates/bevy_render/src/render_resource/pipeline_cache.rs
++++ b/crates/bevy_render/src/render_resource/pipeline_cache.rs
+@@ -210,7 +210,7 @@ pub struct PipelineCache {
+     global_shader_defs: Vec<ShaderDefVal>,
+     /// If `true`, disables asynchronous pipeline compilation.
+     /// This has no effect on macOS, wasm, or without the `multi_threaded` feature.
+-    synchronous_pipeline_compilation: bool,
++    pub(crate) synchronous_pipeline_compilation: bool,
+ }
+ 
+ impl PipelineCache {
+diff --git a/crates/bevy_render/src/renderer/mod.rs b/crates/bevy_render/src/renderer/mod.rs
+index 012abcb8f15fc..65341d30bb67b 100644
+--- a/crates/bevy_render/src/renderer/mod.rs
++++ b/crates/bevy_render/src/renderer/mod.rs
+@@ -20,9 +20,7 @@ use bevy_derive::{Deref, DerefMut};
+ use bevy_ecs::schedule::ScheduleLabel;
+ use bevy_ecs::{prelude::*, system::SystemState};
+ use bevy_log::{debug, info, info_span, warn};
+-use bevy_platform::time::Instant;
+ use bevy_render::camera::ExtractedCamera;
+-use bevy_time::TimeSender;
+ use bevy_window::RawHandleWrapperHolder;
+ use wgpu::{
+     Adapter, AdapterInfo, Backends, DeviceType, Instance, Queue, RequestAdapterOptions, Trace,
+@@ -93,19 +91,6 @@ pub fn render_system(
+     }
+ 
+     crate::view::screenshot::collect_screenshots(world);
+-
+-    // update the time and send it to the app world
+-    let time_sender = world.resource::<TimeSender>();
+-    if let Err(error) = time_sender.0.try_send(Instant::now()) {
+-        match error {
+-            bevy_time::TrySendError::Full(_) => {
+-                panic!("The TimeSender channel should always be empty during render. You might need to add the bevy::core::time_system to your app.");
+-            }
+-            bevy_time::TrySendError::Disconnected(_) => {
+-                // ignore disconnected errors, the main world probably just got dropped during shutdown
+-            }
+-        }
+-    }
+ }
+ 
+ /// This queue is used to enqueue tasks for the GPU to execute asynchronously.
+diff --git a/crates/bevy_render/src/settings.rs b/crates/bevy_render/src/settings.rs
+index dfdafd394b3c5..5155ff7f91639 100644
+--- a/crates/bevy_render/src/settings.rs
++++ b/crates/bevy_render/src/settings.rs
+@@ -1,4 +1,5 @@
+ use crate::{
++    error_handler::DeviceErrorHandler,
+     render_resource::PipelineCache,
+     renderer::{self, RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue},
+     FutureRenderResources,
+@@ -197,6 +198,7 @@ impl RenderResources {
+             render_adapter.clone(),
+             synchronous_pipeline_compilation,
+         ));
++        render_world.insert_resource(DeviceErrorHandler::new(&device));
+         render_world.insert_resource(device);
+         render_world.insert_resource(queue);
+         render_world.insert_resource(render_adapter);
+@@ -205,15 +207,11 @@ impl RenderResources {
+ }
+ 
+ /// An enum describing how the renderer will initialize resources. This is used when creating the [`RenderPlugin`](crate::RenderPlugin).
+-#[expect(
+-    clippy::large_enum_variant,
+-    reason = "See https://github.com/bevyengine/bevy/issues/19220"
+-)]
+ pub enum RenderCreation {
+     /// Allows renderer resource initialization to happen outside of the rendering plugin.
+     Manual(RenderResources),
+     /// Lets the rendering plugin create resources itself.
+-    Automatic(WgpuSettings),
++    Automatic(Box<WgpuSettings>),
+ }
+ 
+ impl RenderCreation {
+@@ -303,7 +301,7 @@ impl Default for RenderCreation {
+ 
+ impl From<WgpuSettings> for RenderCreation {
+     fn from(value: WgpuSettings) -> Self {
+-        Self::Automatic(value)
++        Self::Automatic(Box::new(value))
+     }
+ }
+ 
+diff --git a/examples/2d/wireframe_2d.rs b/examples/2d/wireframe_2d.rs
+index 0ae6748e7db41..64184f2853af3 100644
+--- a/examples/2d/wireframe_2d.rs
++++ b/examples/2d/wireframe_2d.rs
+@@ -11,11 +11,7 @@
+ use bevy::{
+     color::palettes::basic::{GREEN, RED, WHITE},
+     prelude::*,
+-    render::{
+-        render_resource::WgpuFeatures,
+-        settings::{RenderCreation, WgpuSettings},
+-        RenderPlugin,
+-    },
++    render::{render_resource::WgpuFeatures, settings::WgpuSettings, RenderPlugin},
+     sprite_render::{
+         NoWireframe2d, Wireframe2d, Wireframe2dColor, Wireframe2dConfig, Wireframe2dPlugin,
+     },
+@@ -25,11 +21,12 @@ fn main() {
+     App::new()
+         .add_plugins((
+             DefaultPlugins.set(RenderPlugin {
+-                render_creation: RenderCreation::Automatic(WgpuSettings {
++                render_creation: WgpuSettings {
+                     // WARN this is a native only feature. It will not work with webgl or webgpu
+                     features: WgpuFeatures::POLYGON_MODE_LINE,
+                     ..default()
+-                }),
++                }
++                .into(),
+                 ..default()
+             }),
+             // You need to add this plugin to enable wireframe rendering
+diff --git a/examples/3d/wireframe.rs b/examples/3d/wireframe.rs
+index 8b73c6c72ab10..63864fd3b409a 100644
+--- a/examples/3d/wireframe.rs
++++ b/examples/3d/wireframe.rs
+@@ -12,22 +12,19 @@ use bevy::{
+     color::palettes::css::*,
+     pbr::wireframe::{NoWireframe, Wireframe, WireframeColor, WireframeConfig, WireframePlugin},
+     prelude::*,
+-    render::{
+-        render_resource::WgpuFeatures,
+-        settings::{RenderCreation, WgpuSettings},
+-        RenderPlugin,
+-    },
++    render::{render_resource::WgpuFeatures, settings::WgpuSettings, RenderPlugin},
+ };
+ 
+ fn main() {
+     App::new()
+         .add_plugins((
+             DefaultPlugins.set(RenderPlugin {
+-                render_creation: RenderCreation::Automatic(WgpuSettings {
++                render_creation: WgpuSettings {
+                     // WARN this is a native only feature. It will not work with webgl or webgpu
+                     features: WgpuFeatures::POLYGON_MODE_LINE,
+                     ..default()
+-                }),
++                }
++                .into(),
+                 ..default()
+             }),
+             // You need to add this plugin to enable wireframe rendering
+diff --git a/examples/app/render_recovery.rs b/examples/app/render_recovery.rs
+index acdca3c1b9833..4b52bbb9d5ed1 100644
+--- a/examples/app/render_recovery.rs
++++ b/examples/app/render_recovery.rs
+@@ -4,6 +4,7 @@ use bevy::{
+     input::keyboard::Key,
+     prelude::*,
+     render::{
++        error_handler::{RenderErrorHandler, RenderErrorPolicy},
+         extract_resource::{ExtractResource, ExtractResourcePlugin},
+         render_resource::{
+             BufferDescriptor, BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor,
+@@ -67,6 +68,12 @@ fn setup(
+             Press V to trigger a Validation error\n\
+             Press D to Destroy the render device (causes device lost error)\n\
+             Press L to Loop infinitely in a compute shader (causes device lost error)\n\
++            \n\
++            Press 1 to ignore errors, pretending nothing happened and continue rendering.\n\
++            Press 2 to panic on error.\n\
++            Press 3 to signals app exit on error.\n\
++            Press 4 to keeps the app alive, but stops rendering further on error.\n\
++            Press 5 to attempt renderer recovery.\n\
+             ",
+         ),
+         Node {
+@@ -95,7 +102,11 @@ enum RenderError {
+     Loop,
+ }
+ 
+-fn input(input: Res<ButtonInput<Key>>, mut error: ResMut<RenderError>) {
++fn input(
++    input: Res<ButtonInput<Key>>,
++    mut error: ResMut<RenderError>,
++    mut handler: ResMut<RenderErrorHandler>,
++) {
+     *error = RenderError::None;
+     if input.just_pressed(Key::Character("o".into())) {
+         *error = RenderError::OutOfMemory;
+@@ -109,6 +120,25 @@ fn input(input: Res<ButtonInput<Key>>, mut error: ResMut<RenderError>) {
+     if input.just_pressed(Key::Character("l".into())) {
+         *error = RenderError::Loop;
+     }
++
++    if input.just_pressed(Key::Character("1".into())) {
++        *handler = RenderErrorHandler(|_, _, _| RenderErrorPolicy::Ignore);
++    }
++    if input.just_pressed(Key::Character("2".into())) {
++        *handler = RenderErrorHandler(|error, _, _| panic!("Rendering error {error:?}"));
++    }
++    if input.just_pressed(Key::Character("3".into())) {
++        *handler = RenderErrorHandler(|_, main_world, _| {
++            main_world.write_message(AppExit::error());
++            RenderErrorPolicy::StopRendering
++        });
++    }
++    if input.just_pressed(Key::Character("4".into())) {
++        *handler = RenderErrorHandler(|_, _, _| RenderErrorPolicy::StopRendering);
++    }
++    if input.just_pressed(Key::Character("5".into())) {
++        *handler = RenderErrorHandler(|_, _, _| RenderErrorPolicy::Recover(default()));
++    }
+ }
+ 
+ fn cause_error(error: If<Res<RenderError>>, device: Res<RenderDevice>, queue: Res<RenderQueue>) {

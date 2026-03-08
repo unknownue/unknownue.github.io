@@ -1,0 +1,184 @@
+diff --git a/crates/bevy_ecs/src/change_detection/params.rs b/crates/bevy_ecs/src/change_detection/params.rs
+index eca923f6af289..70fc6de8f4892 100644
+--- a/crates/bevy_ecs/src/change_detection/params.rs
++++ b/crates/bevy_ecs/src/change_detection/params.rs
+@@ -1311,16 +1311,22 @@ impl<'w> MutUntyped<'w> {
+ impl<'w> DetectChanges for MutUntyped<'w> {
+     #[inline]
+     fn is_added(&self) -> bool {
+-        self.ticks
+-            .added
+-            .is_newer_than(self.ticks.last_run, self.ticks.this_run)
++        self.is_added_after(self.ticks.last_run)
+     }
+ 
+     #[inline]
+     fn is_changed(&self) -> bool {
+-        self.ticks
+-            .changed
+-            .is_newer_than(self.ticks.last_run, self.ticks.this_run)
++        self.is_changed_after(self.ticks.last_run)
++    }
++
++    #[inline]
++    fn is_added_after(&self, other: Tick) -> bool {
++        self.ticks.added.is_newer_than(other, self.ticks.this_run)
++    }
++
++    #[inline]
++    fn is_changed_after(&self, other: Tick) -> bool {
++        self.ticks.changed.is_newer_than(other, self.ticks.this_run)
+     }
+ 
+     #[inline]
+diff --git a/crates/bevy_ecs/src/change_detection/traits.rs b/crates/bevy_ecs/src/change_detection/traits.rs
+index 393bb3d3d0b86..b35ec65dd824e 100644
+--- a/crates/bevy_ecs/src/change_detection/traits.rs
++++ b/crates/bevy_ecs/src/change_detection/traits.rs
+@@ -36,6 +36,40 @@ pub trait DetectChanges {
+     /// use `this.is_changed() && !this.is_added()`.
+     fn is_changed(&self) -> bool;
+ 
++    /// Returns `true` if this value was added after the `other` tick.
++    fn is_added_after(&self, other: Tick) -> bool;
++
++    /// Returns `true` if this value was added or mutably dereferenced
++    /// after the `other` tick.
++    ///
++    /// # Example
++    ///
++    /// ```
++    /// # use bevy_ecs::prelude::*;
++    /// # #[derive(Component)]
++    /// # struct Source;
++    /// # #[derive(Component)]
++    /// # struct Target;
++    /// #
++    /// # impl Target {
++    /// #     fn from_source(_: &Source) -> Self {
++    /// #         Target
++    /// #     }
++    /// # }
++    /// #
++    /// fn system(query: Query<(Ref<Source>, &mut Target)>) {
++    ///     for (source, mut target) in query {
++    ///         // Only convert the source to the target if the source is newer
++    ///         if source.is_changed_after(target.last_changed()) {
++    ///             *target = Target::from_source(&source);
++    ///         }
++    ///     }
++    /// }
++    /// #
++    /// # bevy_ecs::system::assert_is_system(system);
++    /// ```
++    fn is_changed_after(&self, other: Tick) -> bool;
++
+     /// Returns the change tick recording the time this data was most recently changed.
+     ///
+     /// Note that components and resources are also marked as changed upon insertion.
+@@ -329,16 +363,26 @@ macro_rules! change_detection_impl {
+         impl<$($generics),* : ?Sized $(+ $traits)?> DetectChanges for $name<$($generics),*> {
+             #[inline]
+             fn is_added(&self) -> bool {
++                self.is_added_after(self.ticks.last_run)
++            }
++
++            #[inline]
++            fn is_changed(&self) -> bool {
++                self.is_changed_after(self.ticks.last_run)
++            }
++
++            #[inline]
++             fn is_added_after(&self, other: Tick) -> bool {
+                 self.ticks
+                     .added
+-                    .is_newer_than(self.ticks.last_run, self.ticks.this_run)
++                    .is_newer_than(other, self.ticks.this_run)
+             }
+ 
+             #[inline]
+-            fn is_changed(&self) -> bool {
++            fn is_changed_after(&self, other: Tick) -> bool {
+                 self.ticks
+                     .changed
+-                    .is_newer_than(self.ticks.last_run, self.ticks.this_run)
++                    .is_newer_than(other, self.ticks.this_run)
+             }
+ 
+             #[inline]
+diff --git a/crates/bevy_ecs/src/observer/runner.rs b/crates/bevy_ecs/src/observer/runner.rs
+index f4a115c3d0c7e..79369dd4cd498 100644
+--- a/crates/bevy_ecs/src/observer/runner.rs
++++ b/crates/bevy_ecs/src/observer/runner.rs
+@@ -102,11 +102,7 @@ pub(super) unsafe fn observer_system_runner<E: Event, B: Bundle, S: ObserverSyst
+         #[cfg(feature = "hotpatching")]
+         if world
+             .get_resource_ref::<crate::HotPatchChanges>()
+-            .map(|r| {
+-                r.last_changed()
+-                    .is_newer_than((*system).get_last_run(), world.change_tick())
+-            })
+-            .unwrap_or(true)
++            .is_none_or(|r| r.is_changed_after((*system).get_last_run()))
+         {
+             (*system).refresh_hotpatch();
+         };
+diff --git a/crates/bevy_ecs/src/query/fetch.rs b/crates/bevy_ecs/src/query/fetch.rs
+index f52f8b8076358..95f023407266f 100644
+--- a/crates/bevy_ecs/src/query/fetch.rs
++++ b/crates/bevy_ecs/src/query/fetch.rs
+@@ -754,7 +754,14 @@ impl SpawnDetails {
+     /// Returns `true` if the entity spawned since the last time this system ran.
+     /// Otherwise, returns `false`.
+     pub fn is_spawned(self) -> bool {
+-        self.spawn_tick.is_newer_than(self.last_run, self.this_run)
++        self.is_spawned_after(self.last_run)
++    }
++
++    /// Returns `true` if the entity spawned after the `other` tick.
++    /// Otherwise, returns `false`.
++    #[inline]
++    pub fn is_spawned_after(self, other: Tick) -> bool {
++        self.spawn_tick.is_newer_than(other, self.this_run)
+     }
+ 
+     /// Returns the `Tick` this entity spawned at.
+diff --git a/crates/bevy_ecs/src/system/system_registry.rs b/crates/bevy_ecs/src/system/system_registry.rs
+index 7305bd5dd8b9f..c7efb2e013b96 100644
+--- a/crates/bevy_ecs/src/system/system_registry.rs
++++ b/crates/bevy_ecs/src/system/system_registry.rs
+@@ -405,9 +405,7 @@ impl World {
+         #[cfg(feature = "hotpatching")]
+         if self
+             .get_resource_ref::<HotPatchChanges>()
+-            .map(|r| r.last_changed())
+-            .unwrap_or_default()
+-            .is_newer_than(system.get_last_run(), self.change_tick())
++            .is_none_or(|r| r.is_changed_after(system.get_last_run()))
+         {
+             system.refresh_hotpatch();
+         }
+diff --git a/crates/bevy_pbr/src/prepass/mod.rs b/crates/bevy_pbr/src/prepass/mod.rs
+index 3cbcc2c307aa8..c83a660b53d52 100644
+--- a/crates/bevy_pbr/src/prepass/mod.rs
++++ b/crates/bevy_pbr/src/prepass/mod.rs
+@@ -227,7 +227,6 @@ pub fn update_mesh_previous_global_transforms(
+         (PreviousMeshFilter, Without<PreviousGlobalTransform>),
+     >,
+     mut meshes: Query<(Ref<GlobalTransform>, &mut PreviousGlobalTransform), PreviousMeshFilter>,
+-    system_change_tick: SystemChangeTick,
+ ) {
+     if !views.iter().any(|camera| camera.is_active) {
+         return;
+@@ -238,10 +237,7 @@ pub fn update_mesh_previous_global_transforms(
+         commands.entity(entity).try_insert(new_previous_transform);
+     }
+     meshes.par_iter_mut().for_each(|(transform, mut previous)| {
+-        if transform
+-            .last_changed()
+-            .is_newer_than(previous.last_changed(), system_change_tick.this_run())
+-        {
++        if transform.is_changed_after(previous.last_changed()) {
+             *previous = PreviousGlobalTransform(transform.affine());
+         }
+     });

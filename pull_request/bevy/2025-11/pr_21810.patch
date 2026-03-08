@@ -1,0 +1,146 @@
+diff --git a/crates/bevy_solari/src/realtime/node.rs b/crates/bevy_solari/src/realtime/node.rs
+index 1bd392fa439e6..68e36beb92ffe 100644
+--- a/crates/bevy_solari/src/realtime/node.rs
++++ b/crates/bevy_solari/src/realtime/node.rs
+@@ -185,6 +185,7 @@ impl ViewNode for SolariLightingNode {
+                 s.world_cache_life.as_entire_binding(),
+                 s.world_cache_radiance.as_entire_binding(),
+                 s.world_cache_geometry_data.as_entire_binding(),
++                s.world_cache_luminance_deltas.as_entire_binding(),
+                 s.world_cache_active_cells_new_radiance.as_entire_binding(),
+                 s.world_cache_a.as_entire_binding(),
+                 s.world_cache_b.as_entire_binding(),
+@@ -399,6 +400,7 @@ impl FromWorld for SolariLightingNode {
+                     storage_buffer_sized(false, None),
+                     storage_buffer_sized(false, None),
+                     storage_buffer_sized(false, None),
++                    storage_buffer_sized(false, None),
+                 ),
+             ),
+         );
+diff --git a/crates/bevy_solari/src/realtime/prepare.rs b/crates/bevy_solari/src/realtime/prepare.rs
+index 2a2e9584e7aeb..266ce6d071939 100644
+--- a/crates/bevy_solari/src/realtime/prepare.rs
++++ b/crates/bevy_solari/src/realtime/prepare.rs
+@@ -56,6 +56,7 @@ pub struct SolariLightingResources {
+     pub world_cache_life: Buffer,
+     pub world_cache_radiance: Buffer,
+     pub world_cache_geometry_data: Buffer,
++    pub world_cache_luminance_deltas: Buffer,
+     pub world_cache_active_cells_new_radiance: Buffer,
+     pub world_cache_a: Buffer,
+     pub world_cache_b: Buffer,
+@@ -202,6 +203,13 @@ pub fn prepare_solari_lighting_resources(
+             mapped_at_creation: false,
+         });
+ 
++        let world_cache_luminance_deltas = render_device.create_buffer(&BufferDescriptor {
++            label: Some("solari_lighting_world_cache_luminance_deltas"),
++            size: WORLD_CACHE_SIZE * size_of::<f32>() as u64,
++            usage: BufferUsages::STORAGE,
++            mapped_at_creation: false,
++        });
++
+         let world_cache_active_cells_new_radiance =
+             render_device.create_buffer(&BufferDescriptor {
+                 label: Some("solari_lighting_world_cache_active_cells_new_radiance"),
+@@ -257,6 +265,7 @@ pub fn prepare_solari_lighting_resources(
+             world_cache_life,
+             world_cache_radiance,
+             world_cache_geometry_data,
++            world_cache_luminance_deltas,
+             world_cache_active_cells_new_radiance,
+             world_cache_a,
+             world_cache_b,
+diff --git a/crates/bevy_solari/src/realtime/world_cache_compact.wgsl b/crates/bevy_solari/src/realtime/world_cache_compact.wgsl
+index f5d7b7b217ab7..a83ca817967b2 100644
+--- a/crates/bevy_solari/src/realtime/world_cache_compact.wgsl
++++ b/crates/bevy_solari/src/realtime/world_cache_compact.wgsl
+@@ -1,4 +1,14 @@
+-#import bevy_solari::world_cache::{WORLD_CACHE_EMPTY_CELL, world_cache_life, world_cache_checksums, world_cache_radiance, world_cache_a, world_cache_b, world_cache_active_cell_indices, world_cache_active_cells_count}
++#import bevy_solari::world_cache::{
++    WORLD_CACHE_EMPTY_CELL,
++    world_cache_life,
++    world_cache_checksums,
++    world_cache_radiance,
++    world_cache_luminance_deltas,
++    world_cache_a,
++    world_cache_b,
++    world_cache_active_cell_indices,
++    world_cache_active_cells_count,
++}
+ 
+ @group(2) @binding(0) var<storage, read_write> world_cache_active_cells_dispatch: vec3<u32>;
+ 
+@@ -15,6 +25,7 @@ fn decay_world_cache(@builtin(global_invocation_id) global_id: vec3<u32>) {
+         if life == 0u {
+             world_cache_checksums[global_id.x] = WORLD_CACHE_EMPTY_CELL;
+             world_cache_radiance[global_id.x] = vec4(0.0);
++            world_cache_luminance_deltas[global_id.x] = 0.0;
+         }
+     }
+ }
+diff --git a/crates/bevy_solari/src/realtime/world_cache_query.wgsl b/crates/bevy_solari/src/realtime/world_cache_query.wgsl
+index 45addedb663ba..64a7d67fdd4ee 100644
+--- a/crates/bevy_solari/src/realtime/world_cache_query.wgsl
++++ b/crates/bevy_solari/src/realtime/world_cache_query.wgsl
+@@ -4,7 +4,7 @@
+ #import bevy_render::maths::orthonormalize
+ 
+ /// How responsive the world cache is to changes in lighting (higher is less responsive, lower is more responsive)
+-const WORLD_CACHE_MAX_TEMPORAL_SAMPLES: f32 = 10.0;
++const WORLD_CACHE_MAX_TEMPORAL_SAMPLES: f32 = 32.0;
+ /// How many direct light samples each cell takes when updating each frame
+ const WORLD_CACHE_DIRECT_LIGHT_SAMPLE_COUNT: u32 = 32u;
+ /// Maximum amount of distance to trace GI rays between two cache cells
+@@ -38,11 +38,12 @@ struct WorldCacheGeometryData {
+ #endif
+ @group(1) @binding(16) var<storage, read_write> world_cache_radiance: array<vec4<f32>, #{WORLD_CACHE_SIZE}>;
+ @group(1) @binding(17) var<storage, read_write> world_cache_geometry_data: array<WorldCacheGeometryData, #{WORLD_CACHE_SIZE}>;
+-@group(1) @binding(18) var<storage, read_write> world_cache_active_cells_new_radiance: array<vec3<f32>, #{WORLD_CACHE_SIZE}>;
+-@group(1) @binding(19) var<storage, read_write> world_cache_a: array<u32, #{WORLD_CACHE_SIZE}>;
+-@group(1) @binding(20) var<storage, read_write> world_cache_b: array<u32, 1024u>;
+-@group(1) @binding(21) var<storage, read_write> world_cache_active_cell_indices: array<u32, #{WORLD_CACHE_SIZE}>;
+-@group(1) @binding(22) var<storage, read_write> world_cache_active_cells_count: u32;
++@group(1) @binding(18) var<storage, read_write> world_cache_luminance_deltas: array<f32, #{WORLD_CACHE_SIZE}>;
++@group(1) @binding(19) var<storage, read_write> world_cache_active_cells_new_radiance: array<vec3<f32>, #{WORLD_CACHE_SIZE}>;
++@group(1) @binding(20) var<storage, read_write> world_cache_a: array<u32, #{WORLD_CACHE_SIZE}>;
++@group(1) @binding(21) var<storage, read_write> world_cache_b: array<u32, 1024u>;
++@group(1) @binding(22) var<storage, read_write> world_cache_active_cell_indices: array<u32, #{WORLD_CACHE_SIZE}>;
++@group(1) @binding(23) var<storage, read_write> world_cache_active_cells_count: u32;
+ 
+ #ifndef WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER
+ fn query_world_cache(world_position: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+diff --git a/crates/bevy_solari/src/realtime/world_cache_update.wgsl b/crates/bevy_solari/src/realtime/world_cache_update.wgsl
+index f80094e0dffc6..4f4e98f84d857 100644
+--- a/crates/bevy_solari/src/realtime/world_cache_update.wgsl
++++ b/crates/bevy_solari/src/realtime/world_cache_update.wgsl
+@@ -14,6 +14,7 @@
+     world_cache_life,
+     world_cache_geometry_data,
+     world_cache_radiance,
++    world_cache_luminance_deltas,
+     world_cache_active_cells_new_radiance,
+ }
+ 
+@@ -54,11 +55,19 @@ fn blend_new_samples(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
+ 
+         let old_radiance = world_cache_radiance[cell_index];
+         let new_radiance = world_cache_active_cells_new_radiance[active_cell_id.x];
++        let luminance_delta = world_cache_luminance_deltas[cell_index];
++
++        // https://bsky.app/profile/gboisse.bsky.social/post/3m5blga3ftk2a
+         let sample_count = min(old_radiance.a + 1.0, WORLD_CACHE_MAX_TEMPORAL_SAMPLES);
++        let alpha = abs(luminance_delta) / max(luminance(old_radiance.rgb), 0.001);
++        let max_sample_count = mix(WORLD_CACHE_MAX_TEMPORAL_SAMPLES, 1.0, pow(saturate(alpha), 1.0 / 8.0));
++        let blend_amount = 1.0 / min(sample_count, max_sample_count);
+ 
+-        let blended_radiance = mix(old_radiance.rgb, new_radiance, 1.0 / sample_count);
++        let blended_radiance = mix(old_radiance.rgb, new_radiance, blend_amount);
++        let blended_luminance_delta = mix(luminance_delta, luminance(blended_radiance) - luminance(old_radiance.rgb), 1.0 / 8.0);
+ 
+         world_cache_radiance[cell_index] = vec4(blended_radiance, sample_count);
++        world_cache_luminance_deltas[cell_index] = blended_luminance_delta;
+     }
+ }
+ 
